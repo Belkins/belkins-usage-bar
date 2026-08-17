@@ -1,0 +1,22 @@
+# ── Runtime state. NEVER commit: these contain usage, absolute paths, and —
+# in codex_scan_state_quota.json — the user's subscription usage.
+settings.json
+scan_state.json
+scan_state_dedup.json
+rollups.json
+codex_scan_state.json
+codex_scan_state_quota.json
+widget.lock
+logs/
+run.sh
+
+# ── Build output
+dist/
+
+# ── Python / venv
+.venv/
+__pycache__/
+*.py[cod]
+
+# ── macOS
+.DS_Store
