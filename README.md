@@ -1,137 +1,207 @@
-# cc-usage-widget
+<div align="center">
 
-A macOS menu bar widget for **Claude Code power users**: live account quota bars,
-rate-limit reset times, and what your usage *would cost* at API list prices —
-computed locally from your own session transcripts.
+# Belkins Usage Bar
+
+**How much of your AI coding subscriptions have you actually used?**
+
+A macOS menu bar widget for Claude Code and Codex — live quota bars, reset times,
+and what your usage would cost at published API rates. Computed entirely on your
+own machine.
+
+[![tests](https://img.shields.io/badge/tests-51%20passing-success)](tests/)
+[![platform](https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey)](#requirements)
+[![python](https://img.shields.io/badge/python-3.12%2B-blue)](#requirements)
+[![license](https://img.shields.io/badge/license-MIT-informational)](LICENSE)
+[![no telemetry](https://img.shields.io/badge/telemetry-none-brightgreen)](#privacy)
+
+</div>
+
+---
 
 ```
-📊 $42/d          ← menu bar: today's notional burn rate
+▁▄█ $42/d                                    ← always visible in your menu bar
+└─────────────────────────────────────────────────────────────────┐
+  Auto-switch:      ON                                            │
+  Cost tracking:    ON                                            │
+                                                                  │
+  Accounts                                                        │
+  1  work (you@company.com)                                       │
+     5h    ░░░░░░░░░░░░░░░░░░   0%                                │
+     7d    █████████████▍░░░░  74%     resets Aug 21  (ahead)     │
+     Opus  ██████████████████ 100% (!) resets Aug 21  (ahead)     │
+  2  personal (you@gmail.com)                    ● active         │
+     5h    ██████████▋░░░░░░░  59%     resets 14:50               │
+     7d    ██▊░░░░░░░░░░░░░░░  15%     resets Aug 22               │
+                                                                  │
+  Codex (pro)                                                     │
+     weekly ██████░░░░░░░░░░░  34%     resets Aug 20              │
+                                                                  │
+  Cost (notional, API list prices)                                │
+    Today        $41.98                                           │
+    Last 7d     $310.20   ($44.31/day avg)                        │
+    Last 30d  $1,284.55                                           │
+    ── by model ─────────────────────────                         │
+    Opus 5        61.0M tok    $31.10                             │
+    gpt-5.6-sol   44.2M tok    $10.88                             │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-Click it:
+## Why
 
-```
-1  main (you@work.com)
-   5h    ░░░░░░░░░░░░░░░░░░   0%
-   7d    █████████████▍░░░░  74%     resets Aug 21 16:00  (ahead of pace)
-   Fable ██████████████████ 100%  (!)  resets Aug 21 16:00  (ahead of pace)
-
-3  personal (you@gmail.com)   ● active
-   5h    ███████████░░░░░░░  61%     resets 14:50
-   ...
-
-Cost (notional, API list prices)
-  Today        $41.98
-  Last 7d    $310.20   ($44.31/day avg)
-  Last 30d  $1,284.55
-  Opus 5       61.0M tok    $31.10
-  Sonnet 5     44.2M tok    $10.88
-```
+Subscription plans hide the two numbers you actually need: **how close to the
+wall am I**, and **which account still has room**. This puts both in the menu
+bar, for both tools, and adds a burn-rate figure so you can see a heavy week
+coming before it lands.
 
 ## What it does
 
-- **Cost tracking (works for every Claude Code user).** Incrementally scans
-  `~/.claude/projects/**/*.jsonl`, prices the token counts at Anthropic's
-  published API list prices (dated — e.g. Sonnet 5's intro rate rolls over
-  automatically on 2026-09-01), and shows today / 7d / 30d, per model.
-  *Notional*: it is what your usage would cost on the API, not your bill.
-- **Account quota + auto-switch (needs [claude-swap](https://github.com/realiti4/claude-swap)).**
-  If `cswap` manages your accounts, the widget shows every account's 5h / weekly /
-  per-model windows with reset times and pace, lets you switch with a click, and
-  can run claude-swap's auto-switch engine (top-level ON/OFF toggle). Without
-  claude-swap the accounts section simply says so; everything else works.
+**Claude Code** — every account's 5-hour, weekly, and per-model quota windows as
+bars, with real reset times and an *ahead of pace* warning when you're burning
+faster than the window refills. Click any account to switch to it. Optional
+auto-switch moves you off an account before it hits the wall.
+*Account features need [claude-swap](https://github.com/realiti4/claude-swap); everything else works without it.*
 
-## What it costs your machine
+**Codex** — your weekly subscription quota, read from the local rollout logs.
 
-Measured against 1.4 GB / ~3,300 Claude transcripts **plus** ~15 GB / ~3,000 Codex
-rollouts on one machine, not estimated:
-
-- **~0.0% CPU idle** — a steady tick opens **zero** files; it is ~100% directory
-  walk. With two corpora the walks alternate (one tree per tick, tick fires twice
-  as often), so a tick costs 18.7–22.8 ms rather than 30.1 ms combined
-- **~45–49 MB resident** in steady state and right after a first index
-- **Peak allocation 7.9 MB** during a full Claude first index (streaming, never
-  `read()`-ing a file or a line whole)
-- Honest caveat: `ru_maxrss` — the never-decreasing *high-water mark*, not what
-  `ps` shows — touches ~72 MB while the first index runs, on the Claude side,
-  from allocator pages macOS does not hand back. It settles immediately; the
-  instantaneous figure never goes near it
-- First index: ~5 s for 1.4 GB of Claude, ~20 s for 12.9 GB of in-window Codex,
-  both chunked in the background — the menu never blocks
+**Both** — notional per-model cost, computed by scanning your own transcripts.
 
 ## Install
 
-Requirements: macOS 13+, and either [uv](https://docs.astral.sh/uv/) or Python 3.12+.
+Requires macOS 13+ and either [uv](https://docs.astral.sh/uv/) or Python 3.12+.
 
 ```bash
-unzip cc-usage-widget.zip && cd cc-usage-widget
-./install.sh          # sets up a venv (or reuses claude-swap's), installs nothing globally
-./run.sh              # look for the 📊 icon
+unzip cc-usage-widget-*.zip
+cd cc-usage-widget
+./install.sh          # creates a local venv — installs nothing globally
+./run.sh              # a bar-chart icon appears in your menu bar
 ```
 
-Start at login (optional):
+Start at login: `./install.sh --launch-agent`
+Remove everything: `./uninstall.sh`
 
-```bash
-./install.sh --launch-agent    # writes ~/Library/LaunchAgents plist + prints the load command
-```
+## What it costs your machine
 
-Uninstall: `./uninstall.sh` (removes the venv, LaunchAgent, and state; your
-transcripts are never touched).
+Measured against a 1.4 GB Claude corpus and a 15 GB Codex corpus:
+
+| | |
+|---|---|
+| Idle CPU | **~0%** — unchanged files are never opened |
+| Memory | ~55–85 MB |
+| Steady tick | ~19 ms |
+| First index | seconds to under a minute, in the background — the menu never blocks |
+
+Transcripts are read incrementally: each file is remembered by size and
+modification time, and only the bytes appended since last time are parsed.
 
 ## Privacy
 
-Everything runs and stays **on your machine**. The widget reads your local
-transcripts and (via claude-swap, if installed) Anthropic's usage endpoint for
-your own accounts. It makes no other network calls and phones nothing home.
-`~/.codex` is opened read-only; nothing here ever writes under it.
+**Everything stays on your machine.** The widget makes no network calls of its
+own and has no telemetry, no analytics, and no update check.
 
-It writes its own state files next to itself. **These are private — do not
-copy, zip or commit them:**
+Your transcripts contain your source code and possibly your secrets. The
+indexers read **only** these fields from each record: token counts, the model
+name, and a timestamp. No prompt, completion, file content, or tool output is
+ever read, stored, or logged — there is a test that plants a canary secret in a
+fixture and asserts it appears in none of the files the widget writes.
 
-| file | contains |
+State files are created `0600` in the install directory:
+
+| File | Contains |
 |---|---|
-| `rollups.json` | your per-day, per-model token counters |
-| `scan_state.json`, `scan_state_dedup.json` | one entry per transcript |
-| `codex_scan_state.json` | the absolute path of every in-window Codex session — i.e. your project and worktree names |
-| `codex_scan_state_quota.json` | your ChatGPT subscription `used_percent`, plan type and reset time |
-| `settings.json`, `widget.lock` | preferences and the single-instance lock |
+| `rollups.json` | per-day, per-model token counters |
+| `scan_state.json`, `codex_scan_state.json` | absolute path, size, offset per transcript |
+| `codex_scan_state_quota.json` | your most recent Codex subscription quota |
+| `scan_state_dedup.json` | request IDs seen today, for de-duplication |
+| `settings.json` | your preferences |
+| `logs/widget.log` | only if you use `--launch-agent` |
 
-`./package.sh` builds a shareable zip from an explicit **allowlist** of source
-files, so none of the above can be swept in by accident; it fails loudly if any
-of them ever appears in the archive.
+If [claude-swap](https://github.com/realiti4/claude-swap) is installed, *it*
+talks to Anthropic to read your own account quotas. That is its network activity,
+on your behalf, not ours.
 
-## Notes & honest limits
+## About the dollar figures
 
-- Numbers are near-real-time: quota ≤ ~3 min old (staleness is shown on the
-  row), cost ≤ 5 min. Intervals are tunable in `settings.json`.
-- On a **notched Mac with a full menu bar**, macOS silently refuses to draw new
-  items. The widget self-heals the common cause (it seeds its
-  `NSStatusItem Preferred Position` when missing), but if the bar is truly full
-  something else may lose its slot — the widget is ~87 pt wide with the cost in
-  the title, ~33 pt icon-only (Settings → title toggles).
-- Don't run this **and** `cswap menubar` together — they share the autoswitch
-  state and would double-poll. The widget detects and warns about this.
-- Unknown models are shown with their token counts and $0 rather than guessed
-  prices; incomplete indexes say `indexing…` instead of showing a low number.
+They are **notional**: what your usage would cost at published API list prices.
+You are on a flat-rate subscription, so this is **not a bill** — it is a
+burn-rate signal, and a decent answer to "is this subscription worth it".
 
-## Layout
+Prices come only from vendors' published tables and are dated, so a rate change
+applies from the day it took effect. **A model we don't have a published price
+for shows its token count at `$0` and is named in the menu.** Prices are never
+guessed — if you see an unpriced model, please
+[open an issue](../../issues/new?template=unpriced-model.yml) with a link to the
+published rate.
 
-```
-cc_usage_widget/   the app (pure Python; rumps + pyobjc for the menu bar)
-tests/             51 tests — cost math traps, Codex traps, threading, regressions
-SPEC.md            design document (performance budget, correctness traps)
-SPEC-CODEX.md      the Codex (OpenAI) addendum: its three traps and its pricing
-install.sh         idempotent installer
-run.sh             foreground launcher (written by install.sh)
-package.sh         allowlist-based release zip (never ships runtime state)
-uninstall.sh       clean removal
-```
+## Troubleshooting
 
-Run the tests with the same interpreter the widget uses (pytest optional — each
-file is its own runner):
+<details>
+<summary><b>No icon appeared in my menu bar</b></summary>
+
+The most common first-run problem, and usually not a crash — check
+`ps aux | grep cc_usage_widget` first.
+
+macOS assigns menu bar slots by a stored per-app position. On a **full menu bar**
+(very likely on a notched MacBook), an item with no stored position silently
+loses arbitration and is never drawn — no error anywhere. The widget seeds its own
+position to avoid this, but if the bar is genuinely full something has to give.
+
+Fixes, in order:
+1. Quit a menu bar app you don't need and restart the widget.
+2. Shrink the widget: **Settings → title** — turning the cost text off leaves an
+   icon-only item roughly a third of the width.
+3. Confirm it is otherwise healthy: `./run.sh --dry-run` prints the composed menu
+   and every path it uses, without touching the menu bar.
+</details>
+
+<details>
+<summary><b>The accounts section says claude-swap is not installed</b></summary>
+
+Expected — account bars, switching and auto-switch come from
+[claude-swap](https://github.com/realiti4/claude-swap). Cost tracking and the
+Codex section work fine without it.
+</details>
+
+<details>
+<summary><b>Cost says "indexing…"</b></summary>
+
+The first scan is still running. It shows `indexing…` rather than a partial
+number that would look like a real total. Large corpora take under a minute.
+</details>
+
+<details>
+<summary><b>install.sh says Python 3.12+ is required</b></summary>
+
+macOS ships Python 3.9, which cannot run this. Install
+[uv](https://docs.astral.sh/uv/) (it brings its own Python) and re-run
+`./install.sh`.
+</details>
+
+## Development
 
 ```bash
-for t in tests/*.py; do python "$t"; done
+python tests/test_cost_math.py     # Claude cost math
+python tests/test_codex.py         # Codex extraction
+python tests/test_regressions.py   # everything previously broken
 ```
 
-MIT licensed. Built with Claude Code.
+The tests are the interesting part of this repository. AI transcript accounting
+is full of traps that produce a *plausible wrong number* rather than an error —
+cumulative counters that reset mid-session, cached tokens that are a subset of
+input rather than an addition, a model attribution that has to survive a scan
+resuming mid-file. Each has a test that fails on the naive implementation.
+
+Design notes: [docs/SPEC.md](docs/SPEC.md), [docs/SPEC-CODEX.md](docs/SPEC-CODEX.md).
+
+## Credits
+
+Account features build on [claude-swap](https://github.com/realiti4/claude-swap)
+by [@realiti4](https://github.com/realiti4) — a separate project, gratefully used.
+
+## Disclaimer
+
+Not affiliated with, endorsed by, or sponsored by Anthropic or OpenAI. "Claude",
+"Claude Code", "Codex" and "ChatGPT" are their respective owners' marks, used
+only to describe what this reads. Pricing is reproduced from public pages and may
+be out of date — check the vendor's own page before making decisions about money.
+
+MIT licensed.

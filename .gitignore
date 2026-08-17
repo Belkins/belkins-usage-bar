@@ -20,3 +20,11 @@ __pycache__/
 
 # ── macOS
 .DS_Store
+
+# Atomic-write temp files (settings/scan-state are written via temp + rename)
+*.tmp.*
+*.tmp
+
+# Local scratch / audit scripts
+menubar_*.py
+REPO-PLAN.md

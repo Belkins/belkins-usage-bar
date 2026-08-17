@@ -1,0 +1,37 @@
+name: Unpriced model
+description: The menu shows a model with tokens but $0.00
+title: "Unpriced model: "
+labels: [pricing]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Prices are **never guessed** — a model with no published rate we can cite
+        shows its tokens at `$0` rather than an invented number. To add one we
+        need the vendor's own page.
+  - type: input
+    id: model
+    attributes:
+      label: Model string
+      description: Exactly as the menu shows it
+      placeholder: gpt-5.5
+    validations: {required: true}
+  - type: input
+    id: source
+    attributes:
+      label: Link to the published rate
+      description: The vendor's own pricing page — not a blog or aggregator
+      placeholder: https://developers.openai.com/api/docs/pricing
+    validations: {required: true}
+  - type: input
+    id: rates
+    attributes:
+      label: Rates per 1M tokens
+      placeholder: "input $X · cached input $Y · output $Z"
+    validations: {required: true}
+  - type: input
+    id: effective
+    attributes:
+      label: Effective from (if the page says)
+      description: Prices are dated, so a change applies from the day it took effect
+      placeholder: "2026-09-01"

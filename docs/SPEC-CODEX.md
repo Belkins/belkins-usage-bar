@@ -2,7 +2,7 @@
 
 Addendum to SPEC.md. Adds a **second vendor** so one widget shows Claude Code and
 Codex usage together. Everything in SPEC.md still holds; this documents only the
-deltas. **Status:** spec — drives implementation.
+deltas. **Status:** implemented and shipped. Kept as the design record.
 
 ## 1. Evidence base (probed on this machine 2026-08-17, not assumed)
 

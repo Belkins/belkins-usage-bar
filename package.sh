@@ -49,6 +49,7 @@ FILES=(
   SPEC-CODEX.md
   README.md
   CHANGELOG.md
+  CONTRIBUTING.md
   LICENSE
   install.sh
   uninstall.sh

@@ -1966,22 +1966,40 @@ class CodexIndexer:
             return rate_limits, None, True
 
         # TRAP 4 - the fingerprint of this accounting event.
+        #
+        # SCHEMA-DRIFT SAFETY: the cumulative half is the stronger signal, but
+        # gating the whole guard on it means that if the vendor ever renames or
+        # drops ``total_token_usage`` the guard silently switches OFF and every
+        # re-emission is summed - measured at a 4.12% over-count on today's
+        # corpus, and unbounded if a future client repeats a record more often.
+        # A guard that disappears when the data shape moves is worse than a
+        # slightly blunter guard that survives, so fall back to the per-turn
+        # half alone. The residual risk of the fallback is the mirror image and
+        # far smaller: two *consecutive* genuine turns with byte-identical
+        # per-turn counters would be counted once. That requires identical
+        # input, output, cache-write and cache-read totals back to back.
         total_usage = info.get("total_token_usage")
-        fingerprint: tuple[Any, ...] | None = None
+        per_turn = (
+            usage.input,
+            usage.output,
+            usage.cache_write_5m,
+            usage.cache_read,
+        )
         if isinstance(total_usage, Mapping):
-            fingerprint = (
+            fingerprint: tuple[Any, ...] = (
                 _to_int(total_usage.get("input_tokens")),
                 _to_int(total_usage.get("cached_input_tokens")),
                 _to_int(total_usage.get("cache_write_input_tokens")),
                 _to_int(total_usage.get("output_tokens")),
-                usage.input,
-                usage.output,
-                usage.cache_write_5m,
-                usage.cache_read,
+                *per_turn,
             )
-            if fingerprint == last_fingerprint:
-                stats.records_duplicate += 1
-                return rate_limits, fingerprint, True
+        else:
+            # Degraded but still on. Tagged so it can never collide with a
+            # full-strength fingerprint from a neighbouring record.
+            fingerprint = ("per-turn-only", *per_turn)
+        if fingerprint == last_fingerprint:
+            stats.records_duplicate += 1
+            return rate_limits, fingerprint, True
 
         # SPEC 3.3 trap 4 - local-time day bucketing, so "today" is the user's.
         day = self._day_key_for(record.get("timestamp"), fallback_day)

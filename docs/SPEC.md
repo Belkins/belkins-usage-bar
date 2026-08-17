@@ -3,7 +3,8 @@
 A macOS menu bar widget showing Claude Code **account quota** and **per-model token cost**,
 with first-class on/off switches. Replaces the upstream `cswap menubar` (do not run both).
 
-**Status:** spec — not yet implemented. Implementation is driven from this document.
+**Status:** implemented and shipped. Kept as the design record — the performance
+budget and the correctness traps below are what the tests enforce.
 **Owner:** the user running it
 **Date:** 2026-08-17
 

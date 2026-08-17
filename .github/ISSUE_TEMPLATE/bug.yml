@@ -1,0 +1,41 @@
+name: Bug report
+description: Something is wrong or a number looks off
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **No icon in your menu bar?** Please read the Troubleshooting section of
+        the README first — that one is usually a full menu bar, not a crash.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+    validations: {required: true}
+  - type: textarea
+    id: dryrun
+    attributes:
+      label: Output of ./run.sh --dry-run
+      description: >
+        Prints the composed menu and every path it uses, without touching the
+        menu bar. Redact anything you would rather not share — paths may include
+        project names.
+      render: text
+    validations: {required: true}
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version, and is your Mac notched?
+      placeholder: "15.2, notched MacBook Pro"
+    validations: {required: true}
+  - type: dropdown
+    id: vendors
+    attributes:
+      label: Which are set up?
+      multiple: true
+      options: [Claude Code, Codex, claude-swap installed]
+  - type: markdown
+    attributes:
+      value: |
+        Please **do not paste transcript content**. This tool reads only token
+        counts; issue reports should too.
