@@ -43,6 +43,7 @@ FILES=(
   cc_usage_widget/rollup.py
   cc_usage_widget/state.py
   tests/test_codex.py
+  tests/test_privacy.py
   tests/test_cost_math.py
   tests/test_regressions.py
   SPEC.md

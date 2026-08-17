@@ -8,7 +8,7 @@ A macOS menu bar widget for Claude Code and Codex — live quota bars, reset tim
 and what your usage would cost at published API rates. Computed entirely on your
 own machine.
 
-[![tests](https://img.shields.io/badge/tests-51%20passing-success)](tests/)
+[![tests](https://img.shields.io/badge/tests-53%20passing-success)](tests/)
 [![platform](https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey)](#requirements)
 [![python](https://img.shields.io/badge/python-3.12%2B-blue)](#requirements)
 [![license](https://img.shields.io/badge/license-MIT-informational)](LICENSE)
@@ -181,6 +181,7 @@ macOS ships Python 3.9, which cannot run this. Install
 ```bash
 python tests/test_cost_math.py     # Claude cost math
 python tests/test_codex.py         # Codex extraction
+python tests/test_privacy.py       # the canary: no transcript content escapes
 python tests/test_regressions.py   # everything previously broken
 ```
 
