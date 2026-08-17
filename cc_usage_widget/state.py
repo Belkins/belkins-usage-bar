@@ -78,7 +78,7 @@ __all__ = [
 LOGGER: Final[logging.Logger] = logging.getLogger("cc_usage_widget.state")
 """Module logger. The default logger is used unless a store is handed one."""
 
-_FALLBACK_FILE_MODE: Final[int] = 0o644
+_FALLBACK_FILE_MODE: Final[int] = 0o600
 """Permissions for a file we are creating for the first time. An existing
 file's own mode is preserved instead."""
 

@@ -22,7 +22,12 @@ PYTHON=""
 if [ -x "$CSWAP_PY" ] && "$CSWAP_PY" -c "import rumps" >/dev/null 2>&1; then
     PYTHON="$CSWAP_PY"
     say "using claude-swap's venv (rumps already present; account features enabled)"
-elif [ -x "$VENV/bin/python" ] && "$VENV/bin/python" -c "import rumps" >/dev/null 2>&1; then
+elif [ -x "$VENV/bin/python" ] \
+        && "$VENV/bin/python" -c "import rumps" >/dev/null 2>&1 \
+        && "$VENV/bin/python" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)'; then
+    # The version check matters as much as the rumps check: a 3.9 venv built by
+    # an older installer would otherwise be adopted forever, since the pin above
+    # only guards CREATION.
     PYTHON="$VENV/bin/python"
     say "reusing existing venv at $VENV"
 else
@@ -32,8 +37,12 @@ else
         # which on a Mac with Xcode CLT can be a Python that cannot build or
         # load pyobjc, producing a venv that installs fine and then fails at
         # import time. 3.12 is the floor the package needs.
-        uv venv --quiet --python 3.12 "$VENV" 2>/dev/null \
-            || uv venv --quiet "$VENV"
+        # No `||` fallback: a bare `uv venv` picks whatever it finds first,
+        # which on a stock Mac is Apple's 3.9 — it byte-compiles fine and then
+        # dies at import on `typing.Self`. Failing loudly beats a venv that
+        # installs cleanly and never runs.
+        uv venv --quiet --python 3.12 "$VENV" \
+            || fail "uv could not provide Python >= 3.12 (try: uv python install 3.12)"
         uv pip install --quiet --python "$VENV/bin/python" rumps
     else
         command -v python3 >/dev/null 2>&1 || fail "need uv or python3 — https://docs.astral.sh/uv/"

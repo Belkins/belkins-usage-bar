@@ -69,15 +69,22 @@ for file in "${FILES[@]}"; do
   [ -f "$file" ] || { echo "allowlisted but absent: ${file}" >&2; exit 1; }
 done
 
-rm -rf "dist/${NAME}" "$OUT"
-mkdir -p "dist/${NAME}"
+# The archive must contain ONE top-level directory. Zipping from *inside* the
+# staging dir (`cd dist/$NAME && zip -r ../x.zip .`) flattens it, so `unzip`
+# sprays 22 entries into whatever directory the user happened to be in -- their
+# Downloads folder -- and the README's own first line, `cd cc-usage-widget`,
+# exits 1. The folder is deliberately UNversioned so that one README instruction
+# stays correct for every release.
+TOPDIR="cc-usage-widget"
+rm -rf "dist/${TOPDIR}" "$OUT"
+mkdir -p "dist/${TOPDIR}"
 for file in "${FILES[@]}"; do
-  mkdir -p "dist/${NAME}/$(dirname "$file")"
-  cp "$file" "dist/${NAME}/${file}"
+  mkdir -p "dist/${TOPDIR}/$(dirname "$file")"
+  cp "$file" "dist/${TOPDIR}/${file}"
 done
 
-(cd "dist/${NAME}" && zip -q -r "../${NAME}.zip" .)
-rm -rf "dist/${NAME}"
+(cd dist && zip -q -r "${NAME}.zip" "${TOPDIR}")
+rm -rf "dist/${TOPDIR}"
 
 echo "wrote ${OUT}"
 LISTING="$(unzip -l "$OUT")"

@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.0.3 — 2026-08-17
+
+Fixes found by running the release on simulated stranger machines (fake HOME, no
+claude-swap, no corpora, stock-macOS Python) rather than only on the author's.
+
+- **The archive had no top-level directory**, so `unzip` sprayed 22 entries into
+  whatever folder the user was in and the README's own first command,
+  `cd cc-usage-widget`, exited 1. The zip now contains one `cc-usage-widget/`
+  folder, deliberately unversioned so the instruction stays correct every release.
+- **`uninstall.sh` stopped every widget on the machine.** `pkill -f` is an argv
+  substring match; it reached out of an isolated test environment and killed an
+  unrelated running instance. It now reads the owning PID from `widget.lock` and
+  verifies that process really belongs to this install.
+- **`install.sh` could build a Python 3.9 venv** that byte-compiles cleanly and
+  then dies at import. The `uv` path now fails loudly instead of falling back,
+  and an existing venv is version-checked before being reused — the pin alone
+  only guarded creation.
+- **Missing claude-swap showed a raw `ModuleNotFoundError`** in the menu. It now
+  reads: "claude-swap not installed - account features are off (cost tracking
+  still works)".
+- **`--dry-run` and `--help` wrote to global macOS user defaults.** Both are
+  documented as read-only; the status-item position seed now runs only on a real
+  launch.
+- **State files were created world-readable (0644)**, including the one holding
+  subscription usage. New files are 0600.
+- `uninstall.sh` now removes `codex_scan_state.json` and
+  `codex_scan_state_quota.json`, which it previously left behind.
+
 ## 1.0.1 — 2026-08-17
 
 **Codex (OpenAI) support — the widget is now dual-vendor.**
