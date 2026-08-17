@@ -33,8 +33,9 @@ as **tokens + cost** (from transcripts), never as a quota percentage. Do not inv
 
 ### 2.1 Performance budget (non-negotiable — this is the primary design driver)
 
-Measured corpus on this machine: **1.41 GB across ~3,200 `.jsonl` files**, avg line ~4.2 KB,
-**only ~40 files touched per hour**, 39% of lines contain `"usage"`.
+Measured against a large real corpus: **~1.4 GB across ~3,200 `.jsonl` files**, avg line
+~4.2 KB, with only a small fraction of files changing per hour and 39% of lines
+containing `"usage"`. The ratios are what the design depends on, not the volume.
 
 | Budget | Target | How it is met |
 |---|---|---|
@@ -116,7 +117,7 @@ This is where the performance budget is won or lost.
 
 **First run:** no state → every in-window file is read once. Runs on the background thread in
 chunks, publishing partial results as it goes, with a menu line showing progress
-(`indexing… 1,204/~3,200`). The UI shows accounts immediately; cost appears as it fills in.
+(`indexing… 1,204/3,200`). The UI shows accounts immediately; cost appears as it fills in.
 The lookback window is what keeps this bounded — do **not** index all time by default.
 
 ### 3.3 Extraction — correctness traps

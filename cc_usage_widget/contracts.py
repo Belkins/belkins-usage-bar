@@ -470,7 +470,7 @@ CODEX_SESSIONS_DIR: Final[Path] = _env_path(
     "CC_USAGE_WIDGET_CODEX_SESSIONS_DIR", Path.home() / ".codex" / "sessions"
 )
 """Root of the Codex corpus, scanned for ``**/rollout-*.jsonl``
-(SPEC-CODEX 1: 15 GB / ~3,000 files, 90 touched in 24 h).
+(SPEC-CODEX 1: ~15 GB / ~3,000 files, a small daily fraction touched).
 
 **Read-only.** Nothing in this package may write, move or truncate anything
 under ``~/.codex``; our own state lives in :data:`WIDGET_HOME`. Its absence is

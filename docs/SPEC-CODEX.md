@@ -8,7 +8,7 @@ deltas. **Status:** implemented and shipped. Kept as the design record.
 
 | Fact | Measured |
 |---|---|
-| Corpus | `~/.codex/sessions/**/rollout-*.jsonl` — **15 GB, ~3,000 files** |
+| Corpus | `~/.codex/sessions/**/rollout-*.jsonl` — **~15 GB, ~3,000 files** |
 | Files touched in 24 h | **90** → the mtime/size pre-filter design applies unchanged |
 | Usage record | `type: event_msg` → `payload.type: token_count` |
 | Quota record | same record, `payload.rate_limits.primary` (`used_percent`, `window_minutes: 10080`, `resets_at` epoch), `plan_type: "pro"` |

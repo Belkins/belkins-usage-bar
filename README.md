@@ -98,10 +98,11 @@ modification time, and only the bytes appended since last time are parsed.
 **Everything stays on your machine.** The widget makes no network calls of its
 own and has no telemetry, no analytics, and no update check.
 
-Your transcripts contain your source code and possibly your secrets. The
-indexers read **only** these fields from each record: token counts, the model
-name, and a timestamp. No prompt, completion, file content, or tool output is
-ever read, stored, or logged — there is a test that plants a canary secret in a
+Your transcripts contain your source code and possibly your secrets. Records are
+parsed as JSON — so content passes through memory, as it must for any parser —
+but the indexers **extract only** token counts, the model name and a timestamp.
+No prompt, completion, file content or tool output is ever stored, aggregated,
+transmitted, or written to any file — there is a test that plants a canary secret in a
 fixture and asserts it appears in none of the files the widget writes.
 
 State files are created `0600` in the install directory:

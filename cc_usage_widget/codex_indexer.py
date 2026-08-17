@@ -6,12 +6,12 @@ The second :class:`~cc_usage_widget.contracts.TranscriptSource`. It runs the
 ``seek(offset)`` → substring pre-filter → parse → atomic state — against a
 different corpus, a different record shape and a different set of traps.
 
-Measured corpus on this machine (2026-08-17, probed, not assumed):
+Measured against a large real corpus (probed, not assumed) - the shape the
+incremental design has to survive:
 
 ============================================  ==========================
 ``~/.codex/sessions/**/rollout-*.jsonl``      ~15 GB / ~3,000 files
-Files touched in 24 h                         ~90 (362 in 7 days)
-Files inside the 30-day lookback              1,153 / 12.9 GB
+Files changed in a day                        a low tens-of-files fraction
 Largest single rollout                        379 MB, 50,951 lines
 ``token_count`` lines in that rollout         10,260 (8.3 MB of 379 MB)
 Lines reaching ``json.loads`` corpus-wide     ~40% of lines, ~5% of bytes
@@ -183,8 +183,8 @@ tested, usage first because it is ~24x more common.
 
 **Why wider than the contract's ``"turn_context"``.** Accepting a *superset* of
 what the contract's prefilter accepts can only add records, never drop one, and
-it buys a large accuracy gain that ``turn_context`` alone cannot. Probed over
-a full 30-day window of a heavily-used corpus (~1,150 rollouts):
+it buys a large accuracy gain that ``turn_context`` alone cannot. Probed over a
+full 30-day window of a heavily-used corpus (~1,150 rollouts):
 
 * ``turn_context`` only → **3.9%** of input tokens attribute to
   ``codex:unknown`` at ``$0``;
@@ -718,7 +718,7 @@ class CodexIndexer:
         (see :meth:`_collect`), so widening the window simply makes them
         eligible again on the next pass — no cache invalidation needed. That
         matters more here than for Claude: the window is what stands between the
-        first index and ~15 GB.
+        first index and a ~15 GB corpus.
         """
         days = max(1, int(days))
         if days == self._lookback_days:
@@ -1295,7 +1295,7 @@ class CodexIndexer:
             # Out-of-window rollouts are NOT written to the scan state: leaving
             # them untracked is what makes widening `lookback_days` re-read them
             # instead of skipping them forever. On this corpus the window is
-            # what stands between the first index and ~15 GB (12.9 GB in, 2.7
+            # what stands between the first index and ~15 GB (~13 GB in, ~2.7
             # out at 30 days).
             if mtime < window_start_epoch:
                 skipped_out_of_window += 1
