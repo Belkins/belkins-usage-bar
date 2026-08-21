@@ -431,8 +431,14 @@ def _vendor_group_label(name: str, usd: float) -> str:
     return f"{left}{format_usd(usd):>10}"
 
 
-def _quota_windows(row: AccountRow) -> list[tuple[str, float | None, str]]:
-    """``(label, pct, reset note)`` for every window a quota row reports.
+def _quota_windows(row: AccountRow) -> list[tuple[str, float | None, str, bool]]:
+    """``(label, pct, reset note, expired)`` for every window a quota row reports.
+
+    ``expired`` is True when the source marked the window's reset instant as
+    already passed (``AccountRow.expired_windows``): the percentage then
+    belongs to a window that has ENDED and must render as stale — dimmed, no
+    live ``(!)`` — instead of as a current reading (the 2026-08-17..21 Codex
+    incident kept ``100% (!) resets Aug 20`` on screen a day after Aug 20).
 
     The label is **derived from the window's width**
     (:func:`~cc_usage_widget.render.window_minutes_label`), never hardcoded:
@@ -451,17 +457,22 @@ def _quota_windows(row: AccountRow) -> list[tuple[str, float | None, str]]:
     for it would imply a quota that does not exist.
     """
     minutes = getattr(row, "window_minutes", None)
-    windows: list[tuple[str, float | None, str]] = []
+    dead = getattr(row, "expired_windows", ()) or ()
+    windows: list[tuple[str, float | None, str, bool]] = []
     if row.five_hour_pct is not None:
         label = render.window_minutes_label(FIVE_HOUR_WINDOW_MINUTES) or "5h"
-        windows.append((label, row.five_hour_pct, _reset_note(row, "five_hour")))
+        windows.append(
+            (label, row.five_hour_pct, _reset_note(row, "five_hour"), "five_hour" in dead)
+        )
     if row.seven_day_pct is not None:
         width = minutes if minutes else CODEX_WINDOW_MINUTES_WEEKLY
         label = render.window_minutes_label(width) or "7d"
-        windows.append((label, row.seven_day_pct, _reset_note(row, "seven_day")))
+        windows.append(
+            (label, row.seven_day_pct, _reset_note(row, "seven_day"), "seven_day" in dead)
+        )
     for name, pct in row.scoped_windows:
         if pct is not None:
-            windows.append((name, pct, _reset_note(row, name)))
+            windows.append((name, pct, _reset_note(row, name), name in dead))
     return windows
 
 
@@ -477,12 +488,20 @@ def _quota_row_label(row: AccountRow) -> str:
     if row.plan_type:
         head = f"{head} ({row.plan_type})"
     parts = [
-        f"{label} {format_pct(pct):>4}{_attention(pct)}" for label, pct, _note in _quota_windows(row)
+        # An expired window never carries the live "(!)": its percentage is a
+        # fact about a window that has ended, and the overdue reset note (via
+        # `_primary_reset` below) is what tells the user why.
+        f"{label} {format_pct(pct):>4}{'' if expired else _attention(pct)}"
+        for label, pct, _note, expired in _quota_windows(row)
     ]
     text = f"{head}   " + "  · ".join(parts) if parts else head
     reset = _primary_reset(row)
     if reset:
         text = f"{text}  resets {reset}"
+    if row.usage_is_stale:
+        # Same age note the attributed header carries (`_decorate_quota_item`),
+        # so the fallback really does say everything the bar block says.
+        text = f"{text}  ({_age_label(row.usage_age_seconds)} old)"
     return text
 
 
@@ -495,7 +514,9 @@ def _window_label_width(rows: Sequence[AccountRow], quota_rows: Sequence[Account
     a Codex block is actually present.
     """
     widths = [len(name) for row in rows for name, _pct in row.scoped_windows]
-    widths += [len(label) for row in quota_rows for label, _pct, _note in _quota_windows(row)]
+    widths += [
+        len(label) for row in quota_rows for label, _pct, _note, _expired in _quota_windows(row)
+    ]
     widths.append(2)  # "5h" / "7d"
     return max(widths)
 
@@ -1856,9 +1877,17 @@ class CCUsageWidgetApp(rumps.App):
             # The plan window (Codex's weekly ``primary``) is the figure that
             # answers "how much of my subscription have I used"; anything else
             # this row happens to report is a fallback, never a substitute.
-            pct = row.seven_day_pct if row.seven_day_pct is not None else windows[0][1]
+            if row.seven_day_pct is not None:
+                pct = row.seven_day_pct
+                expired = "seven_day" in (getattr(row, "expired_windows", ()) or ())
+            else:
+                _label, pct, _note, expired = windows[0]
             initial = (row.alias or vendor_label(row.vendor))[:1].upper()
-            return f"{initial}{_title_pct(pct)}"
+            # An expired window's figure keeps its number in the title but
+            # never the "(!)" — that marker means "you are capped NOW", and a
+            # window that has already ended can prove no such thing.
+            text = format_pct(pct) if expired else _title_pct(pct)
+            return f"{initial}{text}"
         return ""
 
     def _title_cost(self, snapshot: UiSnapshot) -> str | None:
@@ -2069,7 +2098,7 @@ class CCUsageWidgetApp(rumps.App):
                 ),
             )
             pace = dict(getattr(row, "pace_ahead", ()) or ())
-            for label, pct, note in _quota_windows(row):
+            for label, pct, note, expired in _quota_windows(row):
                 segments.append(("\n", None))
                 segments.extend(
                     render.window_line(
@@ -2079,6 +2108,7 @@ class CCUsageWidgetApp(rumps.App):
                         label_width=label_width,
                         note_column=5,
                         ahead=pace.get(label),
+                        expired=expired,
                     )
                 )
             render.apply_attributed(item, segments)

@@ -28,6 +28,10 @@ SPEC-CODEX 5.2  cost spans both vendors       :func:`test_cost_breakdown_splits_
 SPEC-CODEX 3a   plan-only record blanks %     :func:`test_plan_only_rate_limits_does_not_blank_the_percentage`
 SPEC-CODEX 2.1  marker collision hides model  :func:`test_model_record_carrying_the_usage_marker_is_still_read`
 SPEC 3.3 trap 4 day memo vs the UTC offset    :func:`test_day_memo_does_not_collide_across_utc_offsets`
+2026-08-21      post-construction days count  :func:`test_long_lived_indexer_counts_days_after_construction_day`
+2026-08-21      newer quota displaces held    :func:`test_long_lived_quota_displaced_by_newer_sample`
+2026-08-21      past resets_at renders stale  :func:`test_expired_reset_renders_stale_not_live_100`
+2026-08-21      quota age note at ~2 h        :func:`test_quota_age_note_threshold_is_two_hours_for_codex_only`
 ============================================  =============================================================
 
 Run with pytest if it is available, or directly - the module is its own runner::
@@ -1043,6 +1047,249 @@ def test_day_memo_does_not_collide_across_utc_offsets() -> None:
         assert first == make_indexer(tmp, root)._day_key_for(
             "2026-08-17T09:15:00.100Z", fallback
         )
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-21 incident regression wall: a 4-day-old process, a corpus that went
+# quiet mid-window, and a quota window that expired while on screen.
+# ---------------------------------------------------------------------------
+
+
+def test_long_lived_indexer_counts_days_after_construction_day() -> None:
+    """One indexer instance, constructed on day D, must count records dated
+    D+1..D+4 exactly as a freshly built one would.
+
+    This is the 2026-08-21 prime suspect made executable: a widget process ran
+    4 days and every post-construction Codex day was missing from the rollup.
+    The root cause turned out to be the corpus (``info: null`` stubs carry
+    nothing to count), NOT a frozen clock — ``_scan_locked`` re-derives
+    ``today``/``window_start_key`` from ``now()`` on every pass — and this test
+    pins that property so a future refactor that hoists those to ``__init__``
+    fails here instead of silently eating days again. The first D+1 scan runs
+    with the clock still AT D (the stronger claim: even a stale wall clock
+    must not drop a later-dated record); the clock then advances per day as a
+    real long-lived process would experience.
+    """
+    with tempfile.TemporaryDirectory() as name:
+        tmp = Path(name)
+        root = tmp / "sessions"
+        base = _now_local() - dt.timedelta(days=5)  # "day D", inside the window
+        clock = {"t": base.timestamp()}
+        indexer = make_indexer(tmp, root, now=lambda: clock["t"])
+
+        def day_rollout(offset: int) -> str:
+            at = base + dt.timedelta(days=offset)
+            write_rollout(
+                root,
+                [
+                    turn_context(SOL, at=at),
+                    token_count(at=at, input_tokens=1_000 + offset, output_tokens=100),
+                ],
+                name=f"rollout-2026-day-d{offset}.jsonl",
+                mtime=at.timestamp(),
+            )
+            return local_day_key(at.timestamp())
+
+        # Day D itself, clock at D.
+        d0 = day_rollout(0)
+        result = indexer.scan_once()
+        assert {r.day for r in result.deltas} == {d0}, result.deltas
+
+        seen: dict[str, int] = {}
+        for offset in (1, 2, 3, 4):
+            day = day_rollout(offset)
+            if offset > 1:
+                # The process has lived into day D+offset.
+                clock["t"] = (base + dt.timedelta(days=offset)).timestamp() + 60
+            # offset == 1 scans with the clock STILL at day D on purpose.
+            result = indexer.scan_once()
+            got = {r.day: sum(u.input for u in r.models.values()) for r in result.deltas}
+            assert got == {day: 1_000 + offset}, (
+                f"day D+{offset} (clock at {local_day_key(clock['t'])}) "
+                f"expected {{{day!r}: {1_000 + offset}}}, got {got}"
+            )
+            seen.update(got)
+        assert len(seen) == 4, seen
+
+        # Nothing was left behind: a further pass finds all bytes consumed.
+        clock["t"] += 300
+        follow_up = indexer.scan_once()
+        assert follow_up.deltas == (), follow_up.deltas
+        assert follow_up.files_read == 0, follow_up.files_read
+
+
+def test_long_lived_quota_displaced_by_newer_sample() -> None:
+    """A long-lived instance must let a newer ``rate_limits`` sample displace
+    the one it holds — including a sample carried by an ``info: null`` stub.
+
+    Exactly the live 2026-08-21 16:59 transition: after four days of stub-only
+    rollouts, the first stub whose ``rate_limits.primary`` was usable had to
+    replace the Aug 17 ``100% / resets Aug 20`` snapshot even though the stub
+    itself contained nothing countable (``payload.info`` is null in the
+    0.148.0-alpha.15 automation stubs).
+    """
+    with tempfile.TemporaryDirectory() as name:
+        tmp = Path(name)
+        root = tmp / "sessions"
+        now = time.time()
+        old_mtime = now - 4 * 86_400
+        stale_reset = old_mtime + int(2.75 * 86_400)  # already in the past at `now`
+        fresh_reset = now + 7 * 86_400
+
+        write_rollout(
+            root,
+            [
+                turn_context(SOL, at=_now_local() - dt.timedelta(days=4)),
+                token_count(
+                    at=_now_local() - dt.timedelta(days=4),
+                    input_tokens=500,
+                    output_tokens=50,
+                    rate_limits=rate_limits(100.0, resets_at=stale_reset),
+                ),
+            ],
+            name="rollout-old-real-usage.jsonl",
+            mtime=old_mtime,
+        )
+        indexer = make_indexer(tmp, root)
+        indexer.scan_once()
+        held = indexer.quota()
+        assert held is not None and held.used_percent == 100.0, held
+        assert held.observed_at == old_mtime, held
+
+        # The healing record, in the live stub shape: info is NULL, the quota
+        # rides along anyway.
+        stub = {
+            "timestamp": _iso(_now_local()),
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": None,
+                "rate_limits": rate_limits(0.0, resets_at=fresh_reset),
+            },
+        }
+        write_rollout(root, [stub], name="rollout-new-stub.jsonl", mtime=now)
+
+        result = indexer.scan_once()  # SAME instance — no reconstruction
+        assert result.records_counted == 0, "a null-info stub has nothing to count"
+        healed = indexer.quota()
+        assert healed is not None and healed.used_percent == 0.0, (
+            f"newer sample did not displace the held one: {healed}"
+        )
+        assert healed.observed_at == now and healed.resets_at == fresh_reset, healed
+        row = indexer.quota_rows()[0]
+        assert row.seven_day_pct == 0.0
+        assert row.expired_windows == (), row.expired_windows
+
+
+def test_expired_reset_renders_stale_not_live_100() -> None:
+    """A quota whose ``resets_at`` is already past renders as a DEAD window:
+    ``overdue (<clock>)``, no live ``(!)``, dimmed bar, age note shown.
+
+    The incident render this forbids: ``weekly 100% (!)  resets Aug 20`` still
+    on screen on Aug 21, presenting a percentage of a window that had ended as
+    a live cap. The percentage itself stays visible — it is real data about
+    the ended window — but nothing about the row may claim it is current.
+    """
+    from cc_usage_widget.app import _quota_row_label, _quota_windows
+    from cc_usage_widget.codex_indexer import CodexQuota
+    from cc_usage_widget.render import window_line
+
+    now = time.time()
+    dead = CodexQuota(
+        used_percent=100.0,
+        window_minutes=CODEX_WINDOW_MINUTES_WEEKLY,
+        resets_at=now - 130_000,  # ~1.5 days ago
+        plan_type="pro",
+        observed_at=now - 4 * 86_400,
+    )
+    row = dead.account_row(now=now)
+    assert row.expired_windows == ("seven_day",), row.expired_windows
+    assert row.seven_day_resets_at and row.seven_day_resets_at.startswith("overdue ("), (
+        row.seven_day_resets_at
+    )
+
+    label = _quota_row_label(row)
+    assert "(!)" not in label, f"a dead window rendered as a live cap: {label!r}"
+    assert "overdue" in label, label
+    assert "old)" in label, f"a 4-day-old quota must show its age: {label!r}"
+
+    windows = _quota_windows(row)
+    assert windows and windows[0][3] is True, windows
+    segments = window_line("weekly", 100.0, "resets " + row.seven_day_resets_at, expired=True)
+    assert all("(!)" not in text for text, _kind in segments), segments
+    assert all(kind == "dim" for _text, kind in segments if _text.strip()), (
+        f"a dead window must render dimmed, got {segments}"
+    )
+
+    # Control: the same 100% with a FUTURE reset keeps the live treatment.
+    live = CodexQuota(
+        used_percent=100.0,
+        window_minutes=CODEX_WINDOW_MINUTES_WEEKLY,
+        resets_at=now + 86_400,
+        plan_type="pro",
+        observed_at=now - 60,
+    )
+    live_row = live.account_row(now=now)
+    assert live_row.expired_windows == ()
+    live_label = _quota_row_label(live_row)
+    assert "(!)" in live_label and "overdue" not in live_label, live_label
+
+    # End to end through the scanner: a rollout whose newest rate_limits
+    # carries a past reset comes out of quota_rows() marked expired.
+    with tempfile.TemporaryDirectory() as name:
+        tmp = Path(name)
+        root = tmp / "sessions"
+        write_rollout(
+            root,
+            [
+                turn_context(SOL),
+                token_count(
+                    input_tokens=10,
+                    output_tokens=1,
+                    rate_limits=rate_limits(100.0, resets_at=time.time() - 3_600),
+                ),
+            ],
+        )
+        indexer = make_indexer(tmp, root)
+        indexer.scan_once()
+        scanned = indexer.quota_rows()[0]
+        assert scanned.expired_windows == ("seven_day",), scanned.expired_windows
+        assert "(!)" not in _quota_row_label(scanned)
+
+
+def test_quota_age_note_threshold_is_two_hours_for_codex_only() -> None:
+    """The Codex quota row shows its age past ~2 h; account rows keep 300 s.
+
+    ``observed_at`` is the corpus's own mtime, so sub-2 h ages are ordinary
+    idle time, not a fault — while a claude-swap row is fed by a fetch loop
+    where five stale minutes DO mean something is broken. The age value itself
+    is carried on the row either way.
+    """
+    from cc_usage_widget.codex_indexer import CODEX_QUOTA_STALE_SECONDS, CodexQuota
+    from cc_usage_widget.contracts import AccountRow
+
+    assert CODEX_QUOTA_STALE_SECONDS == 7_200.0
+    now = time.time()
+
+    def codex_row_aged(age: float) -> Any:
+        quota = CodexQuota(
+            used_percent=40.0,
+            window_minutes=CODEX_WINDOW_MINUTES_WEEKLY,
+            resets_at=now + 86_400,
+            plan_type="pro",
+            observed_at=now - age,
+        )
+        return quota.account_row(now=now)
+
+    half_hour = codex_row_aged(1_800)
+    assert half_hour.usage_age_seconds is not None  # the age is still carried
+    assert half_hour.usage_is_stale is False, "30 min of idle Codex is not a fault"
+    three_hours = codex_row_aged(3 * 3_600)
+    assert three_hours.usage_is_stale is True
+
+    claude_row = AccountRow(slot=1, alias="main", email="x@y", is_active=True,
+                            usage_age_seconds=400.0)
+    assert claude_row.usage_is_stale is True, "claude rows must keep the 300 s threshold"
 
 
 # ---------------------------------------------------------------------------

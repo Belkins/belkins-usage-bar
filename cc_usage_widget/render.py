@@ -269,6 +269,7 @@ def window_line(
     label_width: int = 5,
     note_column: int = 0,
     ahead: bool | None = None,
+    expired: bool = False,
 ) -> list[tuple[str, str | None]]:
     """One window row: ``  5h    ████░░░░   27%  resets 54m``.
 
@@ -277,11 +278,17 @@ def window_line(
     window gets a ``(!)`` so it reads at a glance even in greyscale — colour
     alone is not an accessible signal.
 
+    *expired* means the window's reset instant has already passed
+    (``AccountRow.expired_windows``): the figure describes a window that has
+    ENDED, so the whole line renders dimmed and the live ``(!)``/severity
+    treatment is withheld — a dead window must not shout "you are capped now"
+    (its note carries the ``resets overdue (…)`` explanation instead).
+
     *label_width* and *note_column* are passed in by the caller so every
     account lines up on one vertical edge, rather than each block aligning only
     with itself.
     """
-    kind = severity(pct)
+    kind = "dim" if expired else severity(pct)
     pct_text = "  --" if pct is None else f"{pct:>3.0f}%"
     marker = "  (!)" if kind == "crit" else ""
     segs: list[tuple[str, str | None]] = [

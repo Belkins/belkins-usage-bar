@@ -6,12 +6,12 @@ The second :class:`~cc_usage_widget.contracts.TranscriptSource`. It runs the
 ``seek(offset)`` → substring pre-filter → parse → atomic state — against a
 different corpus, a different record shape and a different set of traps.
 
-Measured against a large real corpus (probed, not assumed) - the shape the
-incremental design has to survive:
+Measured corpus on this machine (2026-08-17, probed, not assumed):
 
 ============================================  ==========================
 ``~/.codex/sessions/**/rollout-*.jsonl``      ~15 GB / ~3,000 files
-Files changed in a day                        a low tens-of-files fraction
+Files touched in 24 h                         ~90 (362 in 7 days)
+Files inside the 30-day lookback              1,153 / 12.9 GB
 Largest single rollout                        379 MB, 50,951 lines
 ``token_count`` lines in that rollout         10,260 (8.3 MB of 379 MB)
 Lines reaching ``json.loads`` corpus-wide     ~40% of lines, ~5% of bytes
@@ -149,6 +149,7 @@ __all__ = [
     "CodexTranscriptSource",
     "build_codex_indexer",
     "CodexQuota",
+    "CODEX_QUOTA_STALE_SECONDS",
     "CODEX_USAGE_MARKER",
     "CODEX_MODEL_MARKER",
     "ROLLOUT_PREFIX",
@@ -183,8 +184,8 @@ tested, usage first because it is ~24x more common.
 
 **Why wider than the contract's ``"turn_context"``.** Accepting a *superset* of
 what the contract's prefilter accepts can only add records, never drop one, and
-it buys a large accuracy gain that ``turn_context`` alone cannot. Probed over a
-full 30-day window of a heavily-used corpus (~1,150 rollouts):
+it buys a large accuracy gain that ``turn_context`` alone cannot. Probed over
+the whole 30-day window (~1,150 rollouts, a large input tokens):
 
 * ``turn_context`` only → **3.9%** of input tokens attribute to
   ``codex:unknown`` at ``$0``;
@@ -288,6 +289,19 @@ CODEX_PSEUDO_ACCOUNT_SLOT: Final[int] = 0
 """Slot for the Codex pseudo-account. Real claude-swap slots start at 1, so 0
 sorts deterministically without ever colliding with one (contracts,
 ``AccountRow`` "Conventions for a Codex pseudo-account")."""
+
+CODEX_QUOTA_STALE_SECONDS: Final[float] = 2 * 3600.0
+"""Age past which the quota row shows ``· <age> old`` (``AccountRow.stale_after_seconds``).
+
+Deliberately wider than the account rows' 300 s
+(:data:`~cc_usage_widget.contracts.STALE_USAGE_SECONDS`): a claude-swap row is
+fed by a fetch loop, so five stale minutes there mean the fetcher is broken,
+while ``CodexQuota.observed_at`` is the **mtime of the newest rollout** and
+ages naturally whenever the user simply is not running Codex. At 300 s the
+note would be on for most of every working day and would mean nothing; at two
+hours it marks genuine staleness — the 2026-08-17..21 incident sat at four
+DAYS — without shouting through every coffee break. The age itself is still
+carried on every row regardless of this threshold."""
 
 
 # ---------------------------------------------------------------------------
@@ -528,26 +542,47 @@ class CodexQuota:
         ``0%``. A ``primary`` of some *other* width is **not** silently rendered
         as a weekly figure: it goes into ``scoped_windows`` under its own label
         (``"24h"``), which the menu already knows how to render.
+
+        **A reset instant in the past marks the window EXPIRED** (2026-08-21
+        incident: four days of ``info: null`` automation stubs left the last
+        real sample — ``100%``, resets Aug 20 — on screen through Aug 21, a day
+        after its window had ended). The percentage then describes a window
+        that no longer exists, so the row must stop presenting it as live: the
+        reset note becomes ``overdue (<clock>)`` and the window's key goes into
+        ``AccountRow.expired_windows`` so the renderer drops the ``(!)``/crit
+        treatment. This is a *display* verdict derived at render time from the
+        epoch OpenAI reported — the stored snapshot itself is never rewritten,
+        so SPEC 4.3's "reset times are shown verbatim" still holds for the
+        clock inside the note, and the very next usable ``rate_limits`` record
+        displaces the whole snapshot (``_offer_quota``).
         """
         reset_text = (
             _format_reset_clock(self.resets_at, now) if self.resets_at is not None else None
         )
+        expired = self.resets_at is not None and self.resets_at < now
+        if expired and reset_text:
+            reset_text = f"overdue ({reset_text})"
         seven_day_pct: Pct | None = None
         seven_day_resets: str | None = None
         scoped: tuple[tuple[str, Pct], ...] = ()
         scoped_resets: tuple[tuple[str, str], ...] = ()
+        expired_windows: tuple[str, ...] = ()
         if self.is_weekly or self.window_minutes is None:
             # window_minutes absent is treated as the weekly window because that
             # is the only width this corpus has ever reported (95,580 of 95,583
             # records) - but a *different* stated width is never coerced.
             seven_day_pct = self.used_percent
             seven_day_resets = reset_text or None
+            if expired:
+                expired_windows = ("seven_day",)
         else:
             label = _window_label(self.window_minutes)
             if self.used_percent is not None:
                 scoped = ((label, self.used_percent),)
             if reset_text:
                 scoped_resets = ((label, reset_text),)
+            if expired:
+                expired_windows = (label,)
         age = now - self.observed_at if self.observed_at else None
         return AccountRow(
             slot=CODEX_PSEUDO_ACCOUNT_SLOT,
@@ -565,6 +600,8 @@ class CodexQuota:
             vendor=VENDOR_CODEX,
             switchable=False,
             plan_type=self.plan_type,
+            stale_after_seconds=CODEX_QUOTA_STALE_SECONDS,
+            expired_windows=expired_windows,
         )
 
 
@@ -718,7 +755,7 @@ class CodexIndexer:
         (see :meth:`_collect`), so widening the window simply makes them
         eligible again on the next pass — no cache invalidation needed. That
         matters more here than for Claude: the window is what stands between the
-        first index and a ~15 GB corpus.
+        first index and ~15 GB.
         """
         days = max(1, int(days))
         if days == self._lookback_days:
@@ -1295,7 +1332,7 @@ class CodexIndexer:
             # Out-of-window rollouts are NOT written to the scan state: leaving
             # them untracked is what makes widening `lookback_days` re-read them
             # instead of skipping them forever. On this corpus the window is
-            # what stands between the first index and ~15 GB (~13 GB in, ~2.7
+            # what stands between the first index and ~15 GB (12.9 GB in, 2.7
             # out at 30 days).
             if mtime < window_start_epoch:
                 skipped_out_of_window += 1

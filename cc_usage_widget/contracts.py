@@ -470,7 +470,7 @@ CODEX_SESSIONS_DIR: Final[Path] = _env_path(
     "CC_USAGE_WIDGET_CODEX_SESSIONS_DIR", Path.home() / ".codex" / "sessions"
 )
 """Root of the Codex corpus, scanned for ``**/rollout-*.jsonl``
-(SPEC-CODEX 1: ~15 GB / ~3,000 files, a small daily fraction touched).
+(SPEC-CODEX 1: 15 GB / ~3,000 files, 90 touched in 24 h).
 
 **Read-only.** Nothing in this package may write, move or truncate anything
 under ``~/.codex``; our own state lives in :data:`WIDGET_HOME`. Its absence is
@@ -1632,6 +1632,24 @@ class AccountRow:
     plan_type: str | None = None
     """Vendor-reported plan, e.g. Codex's ``"pro"`` (SPEC-CODEX 1). Passed
     through verbatim; ``None`` when the source does not report one."""
+    stale_after_seconds: float = STALE_USAGE_SECONDS
+    """Age past which :attr:`usage_is_stale` turns on for THIS row.
+
+    Defaults to the account threshold, so every claude-swap row is unchanged.
+    A source whose ``usage_age_seconds`` ages naturally between uses — the
+    Codex quota is dated by the corpus's own mtime, not by a fetch loop — may
+    set a wider threshold so a routine idle gap does not read as a fault while
+    genuine staleness (hours to days) is still shown (SPEC 4.3)."""
+    expired_windows: tuple[str, ...] = ()
+    """Window keys (``"five_hour"``/``"seven_day"``/a scoped window's name)
+    whose reported reset instant had already PASSED when the row was built.
+
+    An expired window's percentage describes a window that has ENDED: the
+    renderer must present it as stale — dimmed, never the live ``(!)``
+    treatment — and mark its reset as overdue instead of presenting a bygone
+    date as an upcoming reset. Only a source that carries the reset as an
+    epoch (Codex) can know this; claude-swap rows pass verbatim strings and
+    always leave this empty."""
 
     @property
     def is_pseudo(self) -> bool:
@@ -1685,10 +1703,15 @@ class AccountRow:
 
     @property
     def usage_is_stale(self) -> bool:
-        """True when the usage read is old enough that its age must be shown."""
+        """True when the usage read is old enough that its age must be shown.
+
+        The threshold is per row (:attr:`stale_after_seconds`); it defaults to
+        :data:`STALE_USAGE_SECONDS` so claude-swap rows behave exactly as
+        before.
+        """
         return (
             self.usage_age_seconds is not None
-            and self.usage_age_seconds > STALE_USAGE_SECONDS
+            and self.usage_age_seconds > self.stale_after_seconds
         )
 
 

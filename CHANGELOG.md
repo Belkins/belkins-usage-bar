@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.0.4 — 2026-08-21
+
+Provoked by a real 4-day incident: Codex hit its weekly cap, the vendor's client
+then wrote only aborted stubs (`info: null`, and a new `rate_limits` shape with
+`primary: null`), and the widget — correctly refusing to invent data — kept
+showing the last real sample: "100% (!), resets Aug 20" for a day after Aug 20
+had passed. The pipeline was right; the display was dishonest.
+
+- A quota window whose reset instant has passed now renders as **overdue**, never
+  as a live percentage with a `(!)`: the widget cannot know the current value, so
+  it says so.
+- A quota sample older than 2 hours shows its age, same idiom as account rows.
+- Adversarially verified against clock edge cases: an indexer living across
+  month boundaries and 30-day lookback aging counts every day correctly (a
+  frozen-clock hypothesis was disproved by execution — regression-locked anyway).
+- 4 new tests (57 total).
+
 ## 1.0.3 — 2026-08-17
 
 Fixes found by running the release on simulated stranger machines (fake HOME, no
