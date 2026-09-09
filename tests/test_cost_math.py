@@ -793,5 +793,96 @@ def main() -> int:
     return 1 if failures else 0
 
 
+# ---------------------------------------------------------------------------
+# 2026-08-25 incident regressions: unpriced tokens must be a VISIBLE floor
+# ---------------------------------------------------------------------------
+
+
+def test_unpriced_tokens_are_a_visible_floor() -> None:
+    """Unknown-model tokens surface in ``WindowCost.unpriced_tokens``.
+
+    The incident: 18.9M codex tokens priced $0 behind a clean-looking
+    "Today" figure — correct pricing policy (never borrow a rate), invisible
+    magnitude. The windows must now carry the excluded token count so the
+    renderer can mark the totals as floors.
+    """
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        clock = _epoch(2026, 9, 5)
+        day = "2026-09-05"
+        _write(
+            root / "projects" / "p" / "a.jsonl",
+            [
+                _record("r1", MYSTERY, {"input_tokens": 400_000, "output_tokens": 600_000}, epoch=clock),
+                _record("r2", FABLE, {"input_tokens": 1_000_000}, epoch=clock),
+            ],
+        )
+        result = _indexer(root, now=clock).scan_once()
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        store.merge(result.deltas)
+
+        breakdown = store.cost_breakdown(DEFAULT_PRICING, today=day, progress=COMPLETE_INDEX)
+        # Exactly the unknown model's tokens, in every window containing them.
+        assert breakdown.today.unpriced_tokens == 1_000_000, breakdown.today
+        assert breakdown.last_7d.unpriced_tokens == 1_000_000
+        assert breakdown.last_30d.unpriced_tokens == 1_000_000
+        # The priced model's tokens never leak into the unpriced counter.
+        assert breakdown.today.total_tokens == 2_000_000
+
+
+def test_priced_only_day_has_zero_unpriced_tokens() -> None:
+    """The floor marker must never fire when every model is priced."""
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        clock = _epoch(2026, 9, 5)
+        day = "2026-09-05"
+        _write(
+            root / "projects" / "p" / "a.jsonl",
+            [_record("r1", FABLE, {"input_tokens": 1_000_000}, epoch=clock)],
+        )
+        result = _indexer(root, now=clock).scan_once()
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        store.merge(result.deltas)
+        breakdown = store.cost_breakdown(DEFAULT_PRICING, today=day, progress=COMPLETE_INDEX)
+        assert breakdown.today.unpriced_tokens == 0
+        assert breakdown.unknown_models == ()
+
+
+def test_gpt_6_astra_is_priced() -> None:
+    """gpt-6-astra is the corpus's dominant model since 2026-09-03; it must not
+    fall through to the $0 unknown path. $10/$1/$50 per Mtok (OpenAI pricing
+    page, 2026-09-09): 1M uncached input, 0.5M cached reads, 0.1M output =
+    10 + 0.50 + 5 = 15.50 (``ModelUsage.input`` is already uncached,
+    SPEC-CODEX 2.3)."""
+    usage = ModelUsage(input=1_000_000, output=100_000, cache_read=500_000)
+    cost = DEFAULT_PRICING.cost_usd("codex:gpt-6-astra", usage, dt.date(2026, 9, 9))
+    assert abs(cost - 15.50) < 1e-9, cost
+    assert DEFAULT_PRICING.display_name("codex:gpt-6-astra") == "gpt-6-astra"
+
+
+def test_gpt_5_6_sol_rate_cut_prices_by_record_date() -> None:
+    """Sol's cut ($5/$30 -> $4/$20) resolves by the USAGE record's day at the
+    OPENAI_SOL_RATE_CUT_DAY bound, never by today (SPEC 3.4): 1M uncached
+    input + 0.1M output = 5+3 = 8.00 before, 4+2 = 6.00 from the cut day."""
+    from cc_usage_widget.pricing import OPENAI_SOL_RATE_CUT_DAY
+    assert OPENAI_SOL_RATE_CUT_DAY == "2026-09-03"
+    usage = ModelUsage(input=1_000_000, output=100_000)
+    before = DEFAULT_PRICING.cost_usd("codex:gpt-5.6-sol", usage, dt.date(2026, 9, 2))
+    after = DEFAULT_PRICING.cost_usd("codex:gpt-5.6-sol", usage, dt.date(2026, 9, 3))
+    assert abs(before - 8.00) < 1e-9, before
+    assert abs(after - 6.00) < 1e-9, after
+
+
+def test_gpt_5_5_is_priced() -> None:
+    """gpt-5.5 must never fall through to the $0 unknown path again.
+
+    1.46B live-window tokens priced $0 before the row landed (added
+    2026-08-25 from three agreeing secondary sources; $5/$0.50/$30 per Mtok).
+    """
+    usage = ModelUsage(input=1_000_000, output=1_000_000, cache_read=1_000_000)
+    cost = DEFAULT_PRICING.cost_usd("codex:gpt-5.5", usage, dt.date(2026, 8, 25))
+    assert abs(cost - (5.00 + 30.00 + 0.50)) < 1e-9, cost
+
+
 if __name__ == "__main__":
     raise SystemExit(main())

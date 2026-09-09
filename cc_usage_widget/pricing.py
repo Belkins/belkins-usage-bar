@@ -605,6 +605,22 @@ the caveat is greppable from code rather than living only in prose.
 """
 
 
+OPENAI_SOL_RATE_CUT_DAY: Final[str] = "2026-09-03"
+"""The day from which ``gpt-5.6-sol`` prices at its cut rate ($4/$0.40/$20).
+
+Two rates are REAL: $5/$0.50/$30 was OpenAI's published standard rate when this
+table was verified on 2026-08-17, and $4/$0.40/$20 is what
+developers.openai.com/api/docs/pricing publishes on 2026-09-09 (cloudzero.com,
+2026-09-04, reports the same $4/$20 and calls it guaranteed through
+2026-11-21). OpenAI does not publish the day the cut took effect. The bound is
+placed at ``gpt-6-astra``'s launch day (2026-09-03, cloudzero.com) because the
+new rate is already reported the day after it and the old one was verified
+before it. If the cut was earlier, days between 2026-08-18 and 2026-09-02 read
+HIGH by 20-33 %; move this constant when OpenAI publishes the date. Stated here
+rather than hidden, per `OpenAI rate history`_.
+"""
+
+
 CLAUDE_PRICE_ROWS: Final[tuple[PriceRow, ...]] = (
     # model              input   output   from          until
     _row("claude-fable-5", "10.00", "50.00"),
@@ -627,14 +643,31 @@ frozen multipliers. Rows are resolved against the **usage record's** date.
 
 OPENAI_PRICE_ROWS: Final[tuple[PriceRow, ...]] = (
     # model                input   cached   output
-    _openai_row("gpt-5.6-sol", "5.00", "0.50", "30.00"),
+    # gpt-6-astra: OpenAI's flagship since 2026-09-03 and the dominant model in
+    # this corpus (1,257 turn_context records in the three days to
+    # 2026-09-09 vs 404 for Sol). Standard tier; Fast/Batch/Flex tiers are
+    # not represented because a rollout does not say which tier ran.
+    _openai_row("gpt-6-astra", "10.00", "1.00", "50.00"),
+    # gpt-5.6-sol: two real rates, bounded at OPENAI_SOL_RATE_CUT_DAY.
+    _openai_row("gpt-5.6-sol", "5.00", "0.50", "30.00", effective_until="2026-09-02"),
+    _openai_row("gpt-5.6-sol", "4.00", "0.40", "20.00", effective_from=OPENAI_SOL_RATE_CUT_DAY),
     _openai_row("gpt-5.6-terra", "2.00", "0.20", "12.00"),
     _openai_row("gpt-5.6-luna", "0.20", "0.02", "1.20"),
+    _openai_row("gpt-5.5", "5.00", "0.50", "30.00"),
     _openai_row("gpt-5.4", "2.50", "0.25", "15.00"),
     _openai_row("gpt-5.4-mini", "0.75", "0.075", "4.50"),
 )
-"""OpenAI rows, USD per million tokens - verified 2026-08-17 against OpenAI's
-official pricing docs (developers.openai.com/api/docs/pricing), SPEC-CODEX 3.
+"""OpenAI rows, USD per million tokens - verified 2026-08-17 and re-verified
+2026-09-09 against OpenAI's official pricing docs
+(developers.openai.com/api/docs/pricing), SPEC-CODEX 3. The 2026-09-09 pass
+added ``gpt-6-astra`` ($10/$1/$50, corroborated by cloudzero.com 2026-09-04)
+and split ``gpt-5.6-sol`` into its pre- and post-cut rates
+(:data:`OPENAI_SOL_RATE_CUT_DAY`); Terra, Luna, 5.4 and 5.4-mini were
+unchanged on the official page that day.
+The ``gpt-5.5`` row was added 2026-08-25 from three agreeing secondary
+sources (openrouter.ai/openai/gpt-5.5, morphllm.com/openai-api-pricing,
+benchlm.ai/openai/api-pricing) because 1.46B live-window tokens were pricing
+at $0; re-verify it against OpenAI's own page on the next table pass.
 
 The middle column is the **published** cached-input rate, stored verbatim and
 never derived; see `Two cache-rate shapes`_. Every rate here lands on an exact
@@ -671,9 +704,11 @@ MODEL_DISPLAY_NAMES: Final[Mapping[VendorModelKey, str]] = {
     "claude-haiku-4-5": "Haiku 4.5",
     # OpenAI keys are vendor-qualified, so a future Anthropic model that
     # happened to share a name could not overwrite one of these.
+    "codex:gpt-6-astra": "gpt-6-astra",
     "codex:gpt-5.6-sol": "gpt-5.6-sol",
     "codex:gpt-5.6-terra": "gpt-5.6-terra",
     "codex:gpt-5.6-luna": "gpt-5.6-luna",
+    "codex:gpt-5.5": "gpt-5.5",
     "codex:gpt-5.4": "gpt-5.4",
     "codex:gpt-5.4-mini": "gpt-5.4-mini",
 }

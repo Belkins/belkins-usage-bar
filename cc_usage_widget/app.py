@@ -59,22 +59,31 @@ Honesty rules this module is responsible for (SPEC 4.3)
 
 from __future__ import annotations
 
+import datetime as dt
 import inspect
 import json
+import os
 import queue
+import re
 import sys
 import threading
 import time
 import traceback
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Final, Iterator, Sequence
 
 import rumps
 
-from . import render
+from . import fleet, render
 from .contracts import (
+    ALERT_ACCOUNT_QUARANTINED,
+    ALERT_ALL_EXHAUSTED,
+    ALERT_EXTERNAL_SWITCH,
+    ALERT_NO_TARGET,
     ATTENTION_PCT,
     CODEX_SCAN_STATE_PATH,
+    CODEX_ACCOUNTS_REGISTRY_PATH,
+    CODEX_PSEUDO_ACCOUNT_SLOT,
     CODEX_SESSIONS_DIR,
     CODEX_WINDOW_MINUTES_WEEKLY,
     NOTIONAL_LABEL,
@@ -96,10 +105,12 @@ from .contracts import (
     TranscriptIndexer,
     TranscriptSource,
     Vendor,
+    WindowCost,
     format_pct,
     format_tokens,
     format_usd,
     local_day_key,
+    merge_quota_rows,
     normalize_settings,
     vendor_label,
 )
@@ -142,6 +153,11 @@ STEADY_SCAN_DEADLINE_SECONDS = 30.0
 """Safety net for a steady-state scan, whose budget is < 30 ms (SPEC 2.1). It
 exists only so a pathological corpus cannot wedge the worker forever."""
 
+AUTOSWITCH_WAKE_FLOOR_SECONDS = 15.0
+"""Floor on an engine-only wake-up. The adapter clamps its own tick delay to
+the same 15 s, so this only guards against a surprising `next_tick_in()` (a
+test double, a future upstream) turning the worker into a spin loop."""
+
 ROLLUP_SAVE_MIN_INTERVAL_SECONDS = 5.0
 """Throttle on ``RollupStore.save()`` during a chunked first index, so a few
 thousand files do not mean a few thousand atomic writes."""
@@ -149,6 +165,26 @@ thousand files do not mean a few thousand atomic writes."""
 MAX_ERROR_CHARS = 140
 """Menu lines are one line. Longer messages are truncated (full traceback goes
 to stderr)."""
+
+RECENT_SWITCH_LINES = 5
+"""How many recent switch/verdict lines the menu shows. Enough to see a thrash
+episode (tonight's was three flips), short enough that the block stays a
+footnote under the accounts rather than the menu's centre of gravity."""
+
+RIVAL_RESCAN_SECONDS = 300.0
+"""How often the worker re-reads the process table for another switch actor.
+
+Startup-only detection is a lie the moment a `cswap` TUI is opened after the
+widget launched (2026-09-01: pid 15206, up since 19:22, invisible). One
+``pgrep`` per five minutes is far off SPEC 2.1's per-tick budget - it is not a
+per-tick cost at all - and five minutes is short next to how long a rival lives
+(hours) but long next to a switch cycle."""
+
+RIVAL_MARKER = "another switch actor:"
+"""Prefix of the lines :meth:`BackgroundWorker._rescan_rivals` owns inside
+``UiSnapshot.wiring_errors``. The rescan REPLACES every line carrying it, so a
+rival that quit stops being reported and one still running is not duplicated;
+wiring errors from any other seam are matched by nothing here and survive."""
 
 _ZWSP = "\u200b"
 """Zero-width space. ``rumps`` keys menu items by title and *silently drops* an
@@ -158,6 +194,13 @@ appended rather than disappearing (see :func:`_dedupe_titles`)."""
 _LOOKBACK_CHOICES = (7, 14, 30, 60, 90)
 _UI_INTERVAL_CHOICES = (30, 60, 120, 300)
 _COST_INTERVAL_CHOICES = (60, 300, 600, 1800)
+_CODEX_QUOTA_INTERVAL_CHOICES = (60, 120, 300, 600, 1800)
+"""Per-account poll periods offered for the live Codex quota (SPEC-CODEX 6).
+
+Every value is inside ``SETTINGS_BOUNDS["codex_quota_interval_seconds"]``
+(60-3600), so no menu click can be clamped into something other than what it
+says. The floor protects the endpoint, not the CPU: four accounts at 60 s is
+four requests a minute against someone else's service."""
 
 _TITLE_TOGGLES = (
     ("title_show_icon", "Icon"),
@@ -165,8 +208,43 @@ _TITLE_TOGGLES = (
     ("title_show_five_hour_pct", "5h percentage"),
     ("title_show_scoped_pct", "Weekly scoped percentage"),
     ("title_show_cost", "Today's cost"),
-    ("title_show_codex_pct", "Codex weekly percentage"),
+    # Relabelled with SPEC-CODEX 6: the component now renders the ACTIVE Codex
+    # account's figure only (the login ~/.codex holds), never a sum or a pick
+    # across the four tracked accounts - so the old "weekly percentage" would
+    # have named a number the title no longer shows.
+    ("title_show_codex_pct", "Active Codex account %"),
+    ("title_show_fleet", "Fleet headroom (when at limit)"),
 )
+
+_TITLE_FLEET_THRESHOLD_DEFAULT = 85.0
+"""Fallback for :attr:`UiSnapshot.autoswitch_threshold` — claude-swap's own
+documented ``autoswitch.threshold`` default. Used only to bucket accounts into
+"room" / "no room"; no percentage is ever derived from it."""
+
+_TITLE_FLEET_BASE_BUDGET = 28
+"""Characters the rest of the title may occupy before the fleet suffix starts
+shedding parts.
+
+A menu bar that is already full evicts items silently, and this widget is
+found by its glyph (README troubleshooting). The suffix therefore pays for any
+overshoot: ``· next HH:MM`` goes first (the count is the decision, the time is
+the detail), then ``N/M``."""
+
+_TITLE_FLEET_TAIL_BUDGET = len(" · next HH:MM")
+"""What the ``· next`` half is allowed to buy back, as a NOMINAL width.
+
+Budgeted against the shape rather than the realised string: with no usable
+reset the tail is empty, and charging its real length would drop the count too
+— making the title with LESS to say the one that says nothing."""
+
+_TITLE_FLEET_ALERT_KINDS = (ALERT_ALL_EXHAUSTED, ALERT_NO_TARGET)
+"""Standing verdicts that make the fleet suffix worth its width even below the
+threshold: the engine has said it cannot move.
+
+Both are imported names, never literals. ``ALERT_NO_TARGET`` is raised in
+``accounts.py`` and matched here; spelling it out in one of the two places
+would give the no-target trigger a silently dead branch the moment the other
+side spelled it differently — see :data:`ALERT_KINDS`."""
 
 FIVE_HOUR_WINDOW_MINUTES = 300
 """Width of Claude's rolling 5-hour window, in minutes.
@@ -180,14 +258,18 @@ _CMD_REFRESH = "refresh"
 _CMD_SET_AUTOSWITCH = "set_autoswitch"
 _CMD_SET_SETTING = "set_setting"
 _CMD_SWITCH_TO = "switch_to"
+_CMD_SWITCH_BEST = "switch_best"  # switch-ux
 _CMD_REBUILD_INDEX = "rebuild_index"
 _CMD_WIRE_SOURCES = "wire_sources"
+_CMD_MAP_DIR = "map_dir"  # W3
+_CMD_UNMAP_DIR = "unmap_dir"  # W3
+_CMD_SET_CODEX_ACCOUNT = "set_codex_account"  # SPEC-CODEX 6
 
 
 def _log(message: str) -> None:
     """Timestamped stderr line. The widget runs in the foreground for v1, so
     stderr is the log."""
-    sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] cc-usage-widget: {message}\n")
+    sys.stderr.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] cc-usage-widget: {message}\n")
     sys.stderr.flush()
 
 
@@ -241,6 +323,168 @@ def _forget_failures(scope: str | None = None) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _slot_strings_of(source: Any, method: str) -> dict[int, str]:
+    """``{slot: text}`` from an optional ``source.<method>()`` accessor.
+
+    Used for ``sentinels()`` (claude-swap's derived-usage prose) and
+    ``sentinel_kinds()`` (the stable key behind it). A test double may not
+    offer the method, and an adapter failure must never take the menu down, so
+    both degrade to "nothing to show".
+    """
+    getter = getattr(source, method, None)
+    if not callable(getter):
+        return {}
+    try:
+        values = getter()
+    except Exception:
+        return {}
+    out: dict[int, str] = {}
+    if isinstance(values, dict):
+        for slot, text in values.items():
+            try:
+                if text:
+                    out[int(slot)] = str(text)
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
+def _account_notes_of(source: Any) -> dict[int, str]:
+    """``{slot: note}`` derived-usage prose from the accounts adapter."""
+    return _slot_strings_of(source, "sentinels")
+
+
+def _account_note_kinds_of(source: Any) -> dict[int, str]:
+    """``{slot: kind}`` — the stable sentinel key behind each note."""
+    return _slot_strings_of(source, "sentinel_kinds")
+
+
+def _recent_events_of(source: Any) -> tuple[str, ...]:
+    """The adapter's recent autoswitch/switch lines, newest last."""
+    getter = getattr(source, "recent_events", None)
+    if not callable(getter):
+        return ()
+    try:
+        lines = getter()
+    except Exception:
+        return ()
+    try:
+        return tuple(str(line) for line in lines if line)
+    except TypeError:
+        return ()
+
+
+def _switch_note_of(source: Any) -> str | None:
+    """The adapter's ``last switch …`` line, if the state file carries one."""
+    getter = getattr(source, "switch_note", None)
+    if not callable(getter):
+        return None
+    try:
+        note = getter()
+    except Exception:
+        return None
+    return str(note) if note else None
+
+
+def _alert_of(source: Any) -> tuple[str, str] | None:
+    """The adapter's standing autoswitch verdict as ``(kind, line)``, if any."""
+    getter = getattr(source, "current_alert", None)
+    if not callable(getter):
+        return None
+    try:
+        alert = getter()
+    except Exception:
+        return None
+    if isinstance(alert, tuple) and len(alert) == 2:
+        return (str(alert[0]), str(alert[1]))
+    return None
+
+
+def _autoswitch_threshold_of(source: Any) -> float | None:  # W4
+    """The adapter's CACHED ``autoswitch.threshold``, or ``None``.
+
+    Deliberately the cached reading and not ``source.autoswitch_threshold()``:
+    that call does an ungated ``load_policy`` (a JSON read of the backup dir)
+    every time, and this runs on every accounts tick — SPEC 2.1 allows no
+    per-tick unconditional file read. The cache is filled from the same policy
+    object the engine is constructed from, behind the same mtime gate, so it
+    cannot disagree with the engine it is meant to agree with.
+    """
+    getter = getattr(source, "cached_autoswitch_threshold", None)
+    if not callable(getter):
+        return None
+    try:
+        value = getter()
+    except Exception:
+        return None
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def _title_note(note: str, kind: str = "") -> str:
+    """Menu-bar form of a derived-usage state: short, unmistakably not a pct.
+
+    Classifies on *kind* — claude-swap's own stable sentinel key — and falls
+    back to the prose only when no kind is available. The prose is upstream's
+    long human sentence; matching it meant a wording change there silently
+    demoted a re-login warning to a generic bucket (2026-08-26).
+    """
+    low = (kind or note).lower()
+    if "re-login" in low or "relogin" in low:
+        return "⚠ relogin"
+    if "expired" in low:
+        return "⚠ expired"
+    if "api key" in low:
+        return "api key"
+    if "another account" in low or "foreign" in low:
+        return "⚠ foreign"
+    if "keychain" in low:
+        return "⚠ keychain"
+    return "⚠ " + (kind or note).split(" — ")[0][:12]
+
+
+def _title_alert(kind: str) -> str:
+    """Menu-bar form of the engine's standing verdict."""
+    if kind == ALERT_ALL_EXHAUSTED:
+        return "⛔ exhausted"
+    if kind == ALERT_ACCOUNT_QUARANTINED:
+        return "⚠ quarantine"
+    if kind == ALERT_EXTERNAL_SWITCH:
+        return "⚠ ext"
+    if kind == ALERT_NO_TARGET:
+        return "⚠ no target"
+    return "⚠ autoswitch"
+
+
+_ISO_INSTANT_RE: Final[re.Pattern[str]] = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z"
+)
+"""An ISO-8601 UTC instant as claude-swap writes it into its human lines."""
+
+
+def _localize_instants(text: str) -> str:
+    """Rewrite ISO-UTC instants in *text* as the viewer's local ``HH:MM``.
+
+    Upstream's all-exhausted line ends ``earliest reset 2026-08-27T21:00:00Z``,
+    which is the one number the operator acts on and the one they cannot read
+    at a glance — tonight it was seven hours off the wall clock. Local time is
+    a RE-EXPRESSION of the value upstream gave us, not a new fact; anything the
+    parser rejects is left verbatim rather than guessed at (SPEC 4.3).
+    """
+
+    def _swap(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        try:
+            when = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return raw
+        try:
+            return when.astimezone().strftime("%H:%M")
+        except (OSError, OverflowError, ValueError):  # pragma: no cover
+            return raw
+
+    return _ISO_INSTANT_RE.sub(_swap, text)
+
+
 @dataclass(frozen=True, slots=True, eq=False)
 class UiSnapshot:
     """Everything the main thread needs to paint, and nothing it must compute.
@@ -273,6 +517,67 @@ class UiSnapshot:
     scan_note: str | None = None
     accounts_at: float = 0.0
     cost_at: float = 0.0
+    account_notes: dict[int, str] = field(default_factory=dict)
+    """Per-slot derived usage states (``re-login needed …``), keyed by slot.
+
+    A note REPLACES that slot's figures in the title: the stored pct is a
+    last-good value that can be days old and reads as healthy (2026-08-25: a
+    quarantined active account showed ``vlad 0%`` for 39 hours).
+    """
+    account_note_kinds: dict[int, str] = field(default_factory=dict)
+    """The stable sentinel key behind each entry of :attr:`account_notes`.
+
+    The menu classifies on this, never on the prose — see :func:`_title_note`.
+    """
+    alert: tuple[str, str] | None = None
+    """The autoswitch engine's standing verdict as ``(kind, human line)``."""
+    recent_events: tuple[str, ...] = ()  # forensics (W1)
+    """Recent switch/verdict lines from the adapter, oldest first.
+
+    Each already carries a local ``HH:MM`` prefix; the menu renders the last few
+    newest-first. Before 2026-09-01 the adapter kept this deque and nothing read
+    it, so a switch left no trace anywhere the operator looks.
+    """
+    switch_note: str | None = None  # forensics (W1)
+    """``last switch HH:MM (trigger) · cooldown Nm left``, or ``None``.
+
+    Read from claude-swap's shared ``autoswitch_state.json``, so it describes a
+    switch made by ``cswap`` or the TUI too. ``None`` whenever the file does not
+    carry the keys — never a guess.
+    """
+    autoswitch_threshold: float | None = None  # W4
+    """claude-swap's ``autoswitch.threshold`` (0-100), or ``None`` if unread.
+
+    Populated from the very policy object the adapter builds its engine from
+    (``SwapAccountSource.cached_autoswitch_threshold``), so the title's "1/4
+    room" buckets on the same number autoswitch will act on. It is ``None``
+    until the engine has been built once — with autoswitch off, that is
+    forever — and then :data:`_TITLE_FLEET_THRESHOLD_DEFAULT` applies, which
+    is claude-swap's own documented default rather than a number of ours. The
+    fallback decides only how a count is bucketed, never what a percentage
+    says; when it is in force the count may bucket differently from a policy
+    the widget has not read.
+    """
+    sessions: tuple[fleet.SessionRow, ...] = ()  # W3
+    """Live Claude Code instances and the account each one is spending.
+
+    The fleet, not the roster: four sessions on one login burn one
+    account's window four times as fast, and until this field existed the
+    widget could not show that at all.
+    """
+    mappings: tuple[fleet.MappingRow, ...] = ()  # W3
+    """Directory -> account pins as they are on disk (``cswap map``).
+
+    A pin governs the NEXT ``cswap run`` in that directory; it never moves
+    a running session, and the menu says so.
+    """
+    fleet_notes: tuple[str, ...] = ()  # W3
+    """Fleet facts that are not rows: records we could not read, a scan we
+    could not run. Shown verbatim so "no sessions" is never confused with
+    "no readable records"."""
+    fleet_scanned: bool = False  # W3
+    """Whether the pinned-profile scan ran; the heading claims a pinned count
+    only when it did."""
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +705,161 @@ def _account_row_label(row: AccountRow, name_width: int = 10) -> str:
     return label
 
 
+def _switch_targets(accounts: Sequence[AccountRow]) -> tuple[AccountRow, ...]:
+    """Rows the operator can switch TO, most headroom first (switch-ux).
+
+    Filtered on ``switchable`` and not ``is_active``: ``switchable`` is the
+    only thing that makes a row clickable (contract on ``AccountRow``), so a
+    read-only pseudo-account can never reach the submenu.
+
+    Ordered by :attr:`AccountRow.max_pct` ascending — the HIGHEST window the
+    API reported for that account, which is the one that will refuse work
+    first. Ranking on the 5-hour window alone put an account at 5h 10% /
+    7d 100% at the top of the list while the Accounts section two blocks
+    above marked its weekly window ``(!)``; headroom is the *minimum* across
+    windows, so the ranking has to be too. The 5-hour window breaks ties
+    (it is the one a user acts on), then the slot.
+
+    A row whose windows the API did not report at all sorts AFTER every row
+    that has numbers: "not reported" is not "empty", and guessing it is free
+    headroom would send the operator onto an account nobody can vouch for.
+
+    The reset time is *displayed* on the row, never ranked on: the strings
+    are upstream's verbatim clock (``"10:59"``, or ``"Aug 24 14:50"`` when
+    the reset is not today — see ``SwapAccountSource._reset_clock``), so
+    comparing them as text is wrong across midnight (``"00:30"`` sorts before
+    ``"23:50"`` though it resets later) and wrong across the date form. The
+    countdown upstream parsed is not on the row, so there is nothing honest
+    to sort by here (SPEC 4.3) — see the hand-off note about carrying
+    ``five_hour_resets_in`` if the reset should ever be a ranking key.
+    """
+    targets = [
+        row
+        for row in accounts
+        if not row.is_active and getattr(row, "switchable", True)
+    ]
+
+    def _key(row: AccountRow) -> tuple[bool, float, bool, float, int]:
+        worst = row.max_pct
+        five = row.five_hour_pct
+        return (
+            worst is None,
+            worst if worst is not None else 0.0,
+            five is None,
+            five if five is not None else 0.0,
+            row.slot,
+        )
+
+    return tuple(sorted(targets, key=_key))
+
+
+def _switch_target_label(row: AccountRow, name_width: int = 8) -> str:
+    """``"3 podol    5h 100% (!) ↺00:00 · 7d 20% · Fable 40% (at limit)"``.
+
+    Before switch-ux this row carried the 5-hour percentage alone, so on a
+    night when all four accounts read 100% (2026-09-01) the operator had
+    nothing to choose by - the staggered resets and the weekly windows were
+    the whole decision and none of them were on screen.
+
+    Reset strings are verbatim (SPEC 4.3); a window the API did not report
+    renders an em dash, never ``0%``. Every window carries the same
+    :func:`_attention` ``(!)`` marker :func:`_account_row_label` puts on it,
+    ``(at limit)`` is :attr:`AccountRow.needs_attention` (ANY window at or
+    over :data:`ATTENTION_PCT`, not just the 5-hour one), and a stale read
+    carries its age exactly as the account row does — this submenu is where
+    the target is chosen, so a three-hour-old read must not render as live
+    data. Reusing those helpers is what keeps the two surfaces from
+    disagreeing about the same account.
+
+    The row stays clickable at any percentage: a manual switch is an
+    operator override by design.
+    """
+    five = f"5h {format_pct(row.five_hour_pct)}{_attention(row.five_hour_pct)}"
+    if row.five_hour_resets_at:
+        five = f"{five} ↺{row.five_hour_resets_at}"
+    windows = [five, f"7d {format_pct(row.seven_day_pct)}{_attention(row.seven_day_pct)}"]
+    windows.extend(
+        f"{name} {format_pct(pct)}{_attention(pct)}" for name, pct in row.scoped_windows
+    )
+    label = f"{row.slot} {_display_name(row):<{name_width}} " + " · ".join(windows)
+    if row.needs_attention:
+        label = f"{label} (at limit)"
+    if row.usage_is_stale:
+        label = f"{label}  (usage {_age_label(row.usage_age_seconds)} old)"
+    return label
+
+
+# -- fleet formatters (W3) ---------------------------------------------------
+
+
+def _short_path(cwd: str) -> str:
+    """``/Users/me/Desktop`` -> ``~/Desktop``. Abbreviation only.
+
+    The home prefix is the one substitution allowed here: everything else about
+    the path is printed exactly as the session reported it (SPEC 4.3), and the
+    submenu carries the unabbreviated string as its first line.
+    """
+    if not cwd:
+        return "(no directory)"
+    home = os.path.expanduser("~")
+    if home and (cwd == home or cwd.startswith(home + os.sep)):
+        return "~" + cwd[len(home) :]
+    return cwd
+
+
+def _slot_name(slot: int | None, names: dict[int, str]) -> str:
+    """Display name for *slot*, or a slot label when there is no row for it."""
+    if slot is None:
+        return ""
+    return names.get(slot) or f"slot {slot}"
+
+
+def _fleet_heading(rows: Sequence[Any], names: dict[int, str], *, scanned: bool = True) -> str:
+    """``Sessions - 4 on main (default login) . 0 pinned``.
+
+    The count that matters is the first one: sessions sharing the default login
+    share one 5-hour window, so four of them drain it four times as fast.
+    """
+    default_rows = [row for row in rows if not row.pinned]
+    pinned = len(rows) - len(default_rows)
+    slots = {row.slot for row in default_rows if row.slot is not None}
+    if not default_rows:
+        left = "0 on the default login"
+    elif len(slots) == 1:
+        left = f"{len(default_rows)} on {_slot_name(next(iter(slots)), names)} (default login)"
+    else:
+        # Either no active slot is known, or the pass straddled a switch. Say
+        # how many there are and stop - naming one of them would be a guess.
+        left = f"{len(default_rows)} on the default login"
+    # "0 pinned" is a claim about directories we may not have read: only a
+    # completed profile scan earns the count (SPEC 4.3).
+    tail = f" · {pinned} pinned" if scanned else ""
+    return f"Sessions — {left}{tail}"
+
+
+def _session_row_label(row: Any, names: dict[int, str]) -> str:
+    """``  ● obsidian-2d   ~/Desktop/Obsidian   busy   → main (default)``.
+
+    Name and status are verbatim and simply absent when the registry did not
+    report them. The arrow is the attribution: ``(pinned)`` cannot move on a
+    switch, ``(default)`` follows every switch, and a directory pin that has
+    not taken effect yet is stated as such rather than as the current login.
+    """
+    parts: list[str] = []
+    if row.name:
+        parts.append(row.name)
+    parts.append(_short_path(row.cwd))
+    if row.status:
+        parts.append(row.status)
+    who = _slot_name(row.slot, names)
+    if who:
+        parts.append(f"→ {who} ({'pinned' if row.pinned else 'default'})")
+    if row.mapped_slot is not None or row.mapped_email:
+        target = _slot_name(row.mapped_slot, names) or row.mapped_email
+        parts.append(f"(mapped → {target}, next launch)")
+    return "  ● " + "   ".join(parts)
+
+
 def _cost_row_label(label: str, value: str, extra: str = "") -> str:
     """``"  Today                     $12.40"`` (SPEC 4.2)."""
     text = f"  {label:<11}{value:>11}"
@@ -476,17 +936,78 @@ def _quota_windows(row: AccountRow) -> list[tuple[str, float | None, str, bool]]
     return windows
 
 
+def _quota_note(row: AccountRow) -> tuple[str, str]:
+    """``(note, kind)`` for one quota row's header — at most ONE note.
+
+    Two candidates compete and they must never both be shown (SPEC 4.3):
+
+    * ``attention_note`` — a standing verdict (``relogin``, ``no access``,
+      ``rate limited``, ``offline``, ``awaiting first reading``) that has
+      already REPLACED the figures upstream, in ``codex_accounts.py``;
+    * the age note — "this number is old", which is only meaningful about a
+      number that is still on screen.
+
+    The verdict outranks the age, because on a row whose credential is dead
+    "``2h old``" is the less true of the two sentences: the reading is not
+    merely stale, it is not coming back until the user logs in. The age is not
+    lost — the verdict's own row still carries ``usage_age_seconds`` — it just
+    stops being the headline.
+
+    The kind is carried through verbatim for :data:`render.NOTE_KIND_COLORS`;
+    an age note has no kind, which is exactly how it was drawn before
+    SPEC-CODEX 6 (dim).
+    """
+    note = getattr(row, "attention_note", "") or ""
+    if note:
+        return note, getattr(row, "attention_kind", "") or ""
+    if row.usage_is_stale:
+        return f"{_age_label(row.usage_age_seconds)} old", ""
+    return "", ""
+
+
+_ALARM_KINDS = ("warn", "crit")
+"""``attention_kind`` values that reach the menu bar (SPEC-CODEX 6).
+
+``info`` deliberately does not: a ``relogin in 1d 4h`` countdown or an
+``awaiting first reading`` is a thing to notice in the menu, not a standing
+problem worth a glyph in a bar that has room for five components."""
+
+
+def _quota_alarm(row: AccountRow) -> bool:
+    """True when this quota row carries a standing problem, by KIND.
+
+    Never by wording: classifying on the prose is what once demoted a re-login
+    warning when upstream reworded it (2026-08-26, ``_title_note``).
+    """
+    if not getattr(row, "attention_note", ""):
+        return False
+    if getattr(row, "attention_kind", "") not in _ALARM_KINDS:
+        return False
+    # Kind plus structure: a warn sentinel has already REPLACED the figures
+    # upstream (codex_accounts withholds the bars), so a row that still carries
+    # a figure is a ``capped`` plan - the number is the point, and the title
+    # keeps ``C100%`` rather than an alarm glyph that hides it.
+    return not _quota_windows(row)
+
+
 def _quota_row_label(row: AccountRow) -> str:
     """One-line plain fallback for a quota block.
 
     ``Codex (pro)   weekly  12%  resets Aug 21 14:00``
+    ``belkins work (business) · active   weekly  61%  (relogin in 1d 4h)``
 
     This is what VoiceOver reads and what shows if attributed rendering is
-    unavailable, so it must carry every figure the bar block does.
+    unavailable, so it must carry every figure the bar block does — including
+    the ``· active`` marker and the standing note, which on a sentinel row are
+    the only content there is (SPEC-CODEX 6).
     """
     head = row.alias or vendor_label(row.vendor)
     if row.plan_type:
         head = f"{head} ({row.plan_type})"
+    if row.is_active:
+        # Same wording as the attributed header (`render.quota_header`), so the
+        # fallback and the bar block cannot disagree about which login is live.
+        head = f"{head} · active"
     parts = [
         # An expired window never carries the live "(!)": its percentage is a
         # fact about a window that has ended, and the overdue reset note (via
@@ -498,11 +1019,21 @@ def _quota_row_label(row: AccountRow) -> str:
     reset = _primary_reset(row)
     if reset:
         text = f"{text}  resets {reset}"
-    if row.usage_is_stale:
-        # Same age note the attributed header carries (`_decorate_quota_item`),
-        # so the fallback really does say everything the bar block says.
-        text = f"{text}  ({_age_label(row.usage_age_seconds)} old)"
+    note, _kind = _quota_note(row)
+    if note:
+        # Same single note the attributed header carries
+        # (`_decorate_quota_item` via `_quota_note`), so the fallback really
+        # does say everything the bar block says.
+        text = f"{text}  ({note})"
     return text
+
+
+_WINDOW_LABEL_MAX = 12
+"""Widest window label that may set the shared bar column (SPEC-CODEX 6).
+
+``weekly`` (6) and the longest claude-swap scoped name seen to date fit well
+inside it, so this clamp changes nothing on today's surfaces; it exists so an
+endpoint-named bucket cannot re-indent the whole menu."""
 
 
 def _window_label_width(rows: Sequence[AccountRow], quota_rows: Sequence[AccountRow]) -> int:
@@ -512,13 +1043,110 @@ def _window_label_width(rows: Sequence[AccountRow], quota_rows: Sequence[Account
     align with each other and the Codex bar with itself, two columns apart.
     Claude-only menus are unaffected — ``weekly`` only enters the maximum when
     a Codex block is actually present.
+
+    Clamped at :data:`_WINDOW_LABEL_MAX` because with SPEC-CODEX 6 the labels
+    are no longer ours: a scoped Codex window is named by the endpoint
+    (``GPT-5.3-Codex-Spark``), and one 20-character bucket name would push
+    every bar on the surface — Claude's included — twenty columns right. The
+    long name still renders in full; it just stops buying padding for everyone
+    else. Nothing is truncated, so no figure is hidden.
     """
     widths = [len(name) for row in rows for name, _pct in row.scoped_windows]
+    # The clamp applies to the endpoint-named labels only: a claude-swap
+    # scoped name is not ours to shorten, and a Claude-only menu must lay out
+    # exactly as it did before SPEC-CODEX 6.
     widths += [
-        len(label) for row in quota_rows for label, _pct, _note, _expired in _quota_windows(row)
+        min(len(label), _WINDOW_LABEL_MAX)
+        for row in quota_rows
+        for label, _pct, _note, _expired in _quota_windows(row)
     ]
     widths.append(2)  # "5h" / "7d"
     return max(widths)
+
+
+_REGISTRY_ATTRS = ("registry", "_registry")
+"""Where a source might keep its ``codex_accounts.Registry`` (SPEC-CODEX 6).
+
+The frozen build contract fixes the *Registry* API (``entries()``,
+``set_enabled()``, ``exists()``) and the source's constructor keyword, but not
+the attribute the source stores it under. Probing two names — and preferring a
+source's own ``registry_entries()``/``set_account_enabled()`` when it exposes
+them — keeps this seam one function wide instead of spreading a guess across
+the menu code."""
+
+
+def _codex_registry_present() -> bool:
+    """Whether ``codex_accounts.json`` exists (SPEC-CODEX 6).
+
+    The gate on every live-quota control in the Settings menu. One ``stat`` per
+    menu build, on a path that is a module constant - cheap enough for the
+    AppKit thread, and the honest question: the controls act on that file, so
+    "is it there" is exactly what decides whether they can do anything. Read
+    through the module global rather than captured, so a test can point it at a
+    temporary directory without touching the real widget home.
+    """
+    try:
+        return CODEX_ACCOUNTS_REGISTRY_PATH.exists()
+    except OSError:  # pragma: no cover - an unreadable parent directory
+        return False
+
+
+def _codex_registry(sources: Sequence[Any]) -> Any | None:
+    """The first source's account registry, or ``None`` when none is wired.
+
+    ``None`` is the ordinary Claude-only answer, not an error: the Settings
+    submenu it feeds is gated on the registry FILE existing anyway.
+    """
+    for source in sources:
+        for name in _REGISTRY_ATTRS:
+            registry = getattr(source, name, None)
+            if registry is None:
+                continue
+            if callable(registry) and not hasattr(registry, "entries"):
+                try:
+                    registry = registry()
+                except Exception:
+                    continue
+            if hasattr(registry, "entries"):
+                return registry
+    return None
+
+
+def _codex_registry_entries(sources: Sequence[Any]) -> tuple[tuple[str, str, bool], ...]:
+    """``(account_id, alias, enabled)`` per registry entry. Worker thread only.
+
+    Read here, on the tick that already touches the source, so the Settings
+    menu can be built from a plain tuple without reading a file on the AppKit
+    thread (SPEC 2.3). A registry that cannot be read yields ``()`` — the
+    submenu then offers no checkboxes rather than inventing account names.
+    """
+    for source in sources:
+        getter = getattr(source, "registry_entries", None)
+        if callable(getter):
+            try:
+                return tuple(
+                    (str(a), str(b), bool(c)) for a, b, c in (getter() or ())
+                )
+            except Exception as exc:
+                _log(f"codex registry unreadable: {_describe(exc)}")
+                return ()
+    registry = _codex_registry(sources)
+    if registry is None:
+        return ()
+    try:
+        entries = registry.entries() or ()
+    except Exception as exc:
+        _log(f"codex registry unreadable: {_describe(exc)}")
+        return ()
+    out: list[tuple[str, str, bool]] = []
+    for entry in entries:
+        account_id = str(getattr(entry, "account_id", "") or "")
+        if not account_id:
+            continue
+        out.append(
+            (account_id, str(getattr(entry, "alias", "") or ""), bool(getattr(entry, "enabled", True)))
+        )
+    return tuple(out)
 
 
 def _progress_label(progress: IndexProgress) -> str:
@@ -605,20 +1233,58 @@ class BackgroundWorker:
         self._sources_wired = sources is not None
         self._source_factory = source_factory
         self._source_errors: tuple[str, ...] = ()
+        self._sources_started: set[int] = set()
+        """``id()`` of every source whose ``start()`` we have already called.
+
+        A source that owns a poller thread (``codex_accounts.CodexAccountsSource``,
+        SPEC-CODEX 6) must be started exactly once however many times the worker
+        is restarted by the liveness watchdog — two pollers on one credential set
+        would double the request rate against someone else's endpoint."""
+        self._source_diagnostics: tuple[str, ...] = ()
+        """Last ``diagnostics()`` lines from the sources that offer them.
+
+        Cached on the worker for the same reason as :attr:`available_vendors`:
+        the menu is built on the AppKit thread, and a diagnostics line that
+        stats a credential directory there would put I/O on the one thread SPEC
+        2.3 keeps free. Refreshed once per :meth:`_collect_quota_rows`."""
+        self._codex_accounts: tuple[tuple[str, str, bool], ...] = ()
+        """``(account_id, alias, enabled)`` per registry entry, cached from the
+        worker thread so the Settings submenu can be built without reading
+        ``codex_accounts.json`` on the main thread. Empty when no live Codex
+        source is wired, which is what a Claude-only machine sees."""
         self._available_vendors: tuple[Vendor, ...] = ()
         """Extra vendors whose corpus actually exists, as of the last
         ``_collect_quota_rows``. Written on the worker thread, read on the main
         one, and the reason a Claude-only machine gets the pre-Codex menu."""
+        self._rival_detector: Callable[[], Sequence[str]] | None = None  # W2
+        """Injected process-table reader; ``None`` resolves ``__main__``'s on
+        first use. A seam so the cadence can be tested without ``pgrep``."""
+        self._next_rival_scan = time.monotonic() + RIVAL_RESCAN_SECONDS  # W2
+        self._engine_not_before: float = 0.0  # W6
+        """Earliest monotonic time the engine may be ticked again from the
+        engine-only path. Held HERE, not in the loop-local deadline, because
+        the top of every iteration is free to pull that deadline in to
+        whatever the adapter reports - a guard that lived only in the
+        deadline could be undercut on the very next pass (review 2026-09-01)."""
+        """``__main__`` already scanned once before this object existed, so the
+        first worker-side scan is one full interval away, not immediate."""
 
     # -- lifecycle ---------------------------------------------------------
 
     def start(self) -> None:
-        """Spawn the worker. Idempotent."""
+        """Spawn the worker, and any source that owns a loop of its own.
+
+        Idempotent, including :meth:`_start_sources` — the liveness watchdog
+        restarts this worker on a crash and must not leave a second Codex
+        poller behind (SPEC-CODEX 6).
+        """
         if self._thread is not None and self._thread.is_alive():
+            self._start_sources()
             return
         self._stop.clear()
         self._thread = threading.Thread(target=self._loop, name="cc-usage-worker", daemon=True)
         self._thread.start()
+        self._start_sources()
 
     def stop(self, timeout: float = 2.0) -> bool:
         """Ask the worker to finish and wait briefly. Safe to call twice.
@@ -629,6 +1295,7 @@ class BackgroundWorker:
         """
         self._stop.set()
         self._commands.put(("__stop__", None))
+        self._stop_sources(timeout)
         thread, self._thread = self._thread, None
         if thread is None:
             return True
@@ -642,9 +1309,143 @@ class BackgroundWorker:
         The quit path uses this so the AppKit main thread is never blocked on a
         Keychain read or an HTTPS request that the worker happens to be inside
         (SPEC 2.3); liveness is then polled from the repaint tick.
+
+        The extra sources are signalled here too, with a zero join so this stays
+        the non-blocking path. That is how ``_on_quit`` (Quit item, SIGINT,
+        SIGTERM — all of which route into ``shutdown``) reaches
+        ``CodexAccountsSource.stop()``: a poller left running past the quit
+        would keep requesting quota for a menu bar item that is already gone.
         """
         self._stop.set()
         self._commands.put(("__stop__", None))
+        self._stop_sources(0.0)
+
+    # -- extra sources that own a loop (SPEC-CODEX 6) ----------------------
+
+    def _each_source(self, method: str) -> Iterator[tuple[Any, Any]]:
+        """Yield ``(source, bound_method)`` for every source offering *method*.
+
+        Duck-typed exactly like ``quota_rows``/``available``: a source that
+        predates the lifecycle contract (the ``CodexIndexer``, which has no
+        thread of its own) simply does not answer, and no branch anywhere has
+        to know which source is which.
+        """
+        for source in self._sources:
+            attr = getattr(source, method, None)
+            if callable(attr):
+                yield source, attr
+
+    def _start_sources(self) -> None:
+        """``start()`` each source that owns a loop, at most once each."""
+        started = False
+        for source, start in self._each_source("start"):
+            key = id(source)
+            if key in self._sources_started:
+                continue
+            available = getattr(source, "available", None)
+            if callable(available):
+                try:
+                    if not available():
+                        # Nothing to poll yet (no credential adopted, or the
+                        # feature switched off): no thread. Re-checked on
+                        # every worker tick, so the poller starts the moment
+                        # the source becomes available - never at boot on a
+                        # Claude-only machine.
+                        continue
+                except Exception as exc:
+                    _log(f"source availability check failed: {_describe(exc)}")
+                    continue
+            self._sources_started.add(key)
+            started = True
+            try:
+                start()
+            except Exception as exc:
+                # A poller that will not start must not stop the widget: the
+                # Claude figures and the log-derived Codex row are unaffected.
+                _log(f"source start failed: {_describe(exc)}")
+        if started:
+            # A newly started poller has not seen the vendor switch yet. Only
+            # then: re-asserting it on every restart of an already-running
+            # worker would be a redundant call the source cannot tell from a
+            # user action.
+            self._apply_source_pause()
+
+    def _stop_sources(self, timeout: float = 2.0) -> None:
+        """``stop()`` each source that owns a loop. Safe to call twice."""
+        for source, stop in self._each_source("stop"):
+            self._sources_started.discard(id(source))
+            try:
+                stop(timeout=timeout)
+            except TypeError:  # a stop() that takes no timeout
+                try:
+                    stop()
+                except Exception as exc:
+                    _log(f"source stop failed: {_describe(exc)}")
+            except Exception as exc:
+                _log(f"source stop failed: {_describe(exc)}")
+
+    def _force_sources_due(self) -> None:
+        """Mark every pollable source due now — the ``Refresh now`` click.
+
+        The click means "answer me", so it must not wait out a 300 s per-account
+        period. The source still owns the request: this only moves its deadline.
+        """
+        for _source, force_due in self._each_source("force_due"):
+            try:
+                force_due()
+            except Exception as exc:
+                _log(f"source force_due failed: {_describe(exc)}")
+
+    def _apply_source_pause(self) -> None:
+        """Mirror ``codex_tracking_enabled`` onto every pausable source.
+
+        Vendor tracking off must mean **no request is made**, not merely that
+        the rows are hidden: leaving a poller running behind an OFF switch would
+        keep hitting someone else's endpoint for a section the user has turned
+        off. Paused, not stopped, so the sidecar and the standing sentinels
+        survive and the switch is reversible without a restart.
+        """
+        codex_on = bool(self._settings().get("codex_tracking_enabled", True))
+        for _source, pause in self._each_source("pause"):
+            try:
+                pause(not codex_on)
+            except Exception as exc:
+                _log(f"source pause failed: {_describe(exc)}")
+
+    @property
+    def source_diagnostics(self) -> tuple[str, ...]:
+        """Diagnostics lines produced by the sources on the last quota tick."""
+        return self._source_diagnostics
+
+    @property
+    def codex_accounts(self) -> tuple[tuple[str, str, bool], ...]:
+        """``(account_id, alias, enabled)`` for the tracked Codex accounts."""
+        return self._codex_accounts
+
+    def _set_codex_account_enabled(self, account_id: str, flag: bool) -> None:
+        """Flip one registry entry's ``enabled``. **Worker thread only.**
+
+        The write goes through the source's own registry object rather than
+        through a second reader of ``codex_accounts.json``: two writers over one
+        atomic file take turns dropping each other's edits, which is the same
+        trap ``state.settings_store()`` exists to avoid.
+        """
+        for _source, setter in self._each_source("set_account_enabled"):
+            try:
+                setter(account_id, flag)
+            except Exception as exc:
+                _log(f"codex account toggle failed: {_describe(exc)}")
+            break
+        else:
+            registry = _codex_registry(self._sources)
+            if registry is None:
+                _log("codex account toggle ignored: no registry wired")
+                return
+            try:
+                registry.set_enabled(account_id, flag)
+            except Exception as exc:
+                _log(f"codex account toggle failed: {_describe(exc)}")
+        self._publish(replace(self._snapshot, quota_rows=self._collect_quota_rows()))
 
     @property
     def alive(self) -> bool:
@@ -753,6 +1554,10 @@ class BackgroundWorker:
         self._sources = built
         if built:
             _log(f"wired {len(built)} extra transcript source(s)")
+        # A source wired after `start()` still gets its loop started (and the
+        # current `codex_tracking_enabled` applied); `_start_sources` is
+        # idempotent per source, so the ones already running are untouched.
+        self._start_sources()
         self._publish(replace(self._snapshot, quota_rows=self._collect_quota_rows()))
 
     def _collect_quota_rows(self) -> tuple[AccountRow, ...]:
@@ -774,6 +1579,9 @@ class BackgroundWorker:
         rows: list[AccountRow] = []
         present: list[Vendor] = []
         codex_on = bool(self._settings().get("codex_tracking_enabled", True))
+        # A source that was unavailable at boot (no credential yet, feature
+        # off) is started here, the tick after it becomes available; idempotent.
+        self._start_sources()
         for source in self._sources:
             vendor = getattr(source, "vendor", VENDOR_CODEX)
             available = getattr(source, "available", None)
@@ -795,7 +1603,38 @@ class BackgroundWorker:
             except Exception as exc:
                 _log(f"quota_rows failed: {_describe(exc, 'quota')}")
         self._available_vendors = tuple(present)
-        return tuple(rows)
+        self._source_diagnostics = self._read_source_diagnostics()
+        self._codex_accounts = _codex_registry_entries(self._sources)
+        # Last, and on every tick: the transcript-derived Codex row and a live
+        # per-account row for the same login must never be two numbers for one
+        # account (SPEC 4.3). Pure and total, so a registry toggle or a fetch
+        # landing takes effect on the next tick with no restart, and with no
+        # live source at all it returns the rows untouched — which is what
+        # makes "zero credentials" byte-for-byte today's menu.
+        return merge_quota_rows(rows)
+
+    def _read_source_diagnostics(self) -> tuple[str, ...]:
+        """Diagnostics lines from every source that offers them. Never raises.
+
+        Gated on the registry FILE existing, for the same reason the Settings
+        controls are: ``__main__.build()`` constructs the live quota source
+        unconditionally, so "a source exists" says nothing about whether this
+        machine uses the feature. Without the gate a Claude-only install would
+        grow three new lines under Settings describing a credential directory
+        it does not have - the exact regression
+        ``test_absent_codex_corpus_offers_no_codex_settings`` was written for.
+        ``--dry-run`` asks the sources directly and is deliberately not gated:
+        it is an explicit diagnostic, not the widget's layout.
+        """
+        if not _codex_registry_present():
+            return ()
+        lines: list[str] = []
+        for _source, diagnostics in self._each_source("diagnostics"):
+            try:
+                lines.extend(str(line) for line in (diagnostics() or ()))
+            except Exception as exc:
+                lines.append(f"diagnostics unavailable: {_describe(exc)}")
+        return tuple(lines)
 
     @property
     def available_vendors(self) -> tuple[Vendor, ...]:
@@ -831,15 +1670,70 @@ class BackgroundWorker:
     def _settings(self) -> dict[str, Any]:
         return self._snapshot.settings
 
+    # -- rival actors (SPEC 5) ---------------------------------------------
+
+    def _maybe_rescan_rivals(self, now: float) -> bool:
+        """Rescan at most once per :data:`RIVAL_RESCAN_SECONDS`. Returns whether
+        it did.
+
+        The gate is separate from the scan so the cadence is testable against a
+        fake clock: the promise being defended is that a 60 s UI tick does NOT
+        mean a 60 s subprocess.
+        """
+        if now < self._next_rival_scan:
+            return False
+        self._next_rival_scan = now + RIVAL_RESCAN_SECONDS
+        self._rescan_rivals()
+        return True
+
+    def _rescan_rivals(self) -> None:
+        """Republish ``wiring_errors`` with the actors currently running.
+
+        Worker thread only - it shells out to ``pgrep`` with a 3 s timeout, and
+        the main thread may not block for 3 s (SPEC 2.3). The detector lives in
+        ``__main__`` next to the pattern it uses and is imported lazily, both to
+        avoid an import cycle (``__main__`` imports this module) and because a
+        widget that never runs must never pay for it.
+        """
+        detector = self._rival_detector
+        if detector is None:
+            try:
+                from .__main__ import _detect_rival_engines
+            except Exception as exc:  # pragma: no cover - defensive
+                _log(f"rival rescan unavailable: {_describe(exc)}")
+                return
+            detector = self._rival_detector = _detect_rival_engines
+        try:
+            found = tuple(detector())
+        except Exception as exc:  # a failed scan must not kill the loop
+            _log(f"rival rescan failed: {_describe(exc)}")
+            return
+        previous = self._snapshot.wiring_errors
+        kept = tuple(text for text in previous if RIVAL_MARKER not in text)
+        merged = kept + found
+        if merged == previous:
+            return
+        for line in found:
+            if line not in previous:
+                _log(f"! {line}")
+        self._publish(replace(self._snapshot, wiring_errors=merged))
+
     # -- the loop ----------------------------------------------------------
 
     def _loop(self) -> None:
         next_ui = 0.0
         next_cost = 0.0
+        # The engine's own deadline (SPEC 3.5: "claude-swap's own cadence").
+        # `inf` until an accounts job has asked the adapter for one, so an
+        # adapter that has no schedule to offer keeps the pre-2026-09 behaviour
+        # of being ticked inside the UI job and nothing else.
+        next_engine = float("inf")
         try:
             while not self._stop.is_set():
                 try:
-                    stop_now, next_ui, next_cost = self._loop_once(next_ui, next_cost)
+                    stop_now, next_ui, next_cost, next_engine = self._loop_once(
+                        next_ui, next_cost, next_engine
+                    )
                 except BaseException as exc:  # noqa: BLE001 - see below
                     # `except Exception` was not enough. A CLI-shaped helper
                     # inside claude_swap calling `sys.exit()` on a fatal config
@@ -856,6 +1750,9 @@ class BackgroundWorker:
                     )
                     next_ui = time.monotonic() + self._ui_interval()
                     next_cost = time.monotonic() + self._cost_interval()
+                    # Re-armed by the next accounts job; never left in the past,
+                    # or a raising adapter becomes a hot loop.
+                    next_engine = float("inf")
                     continue
                 if stop_now:
                     break
@@ -865,10 +1762,25 @@ class BackgroundWorker:
             # merged-but-unsaved rollup window.
             self._flush()
 
-    def _loop_once(self, next_ui: float, next_cost: float) -> tuple[bool, float, float]:
-        """One iteration of :meth:`_loop`. Returns ``(stop, next_ui, next_cost)``."""
+    def _loop_once(
+        self, next_ui: float, next_cost: float, next_engine: float = float("inf")
+    ) -> tuple[bool, float, float, float]:
+        """One iteration of :meth:`_loop`.
+
+        Returns ``(stop, next_ui, next_cost, next_engine)`` - three independent
+        deadlines, of which only the first two are ours. ``next_engine`` is
+        claude-swap's, read back from the adapter after every tick, and is what
+        stops a 15 s autoswitch interval from being served once a minute.
+        """
         now = time.monotonic()
-        due = min(next_ui, next_cost)
+        reported = self._autoswitch_due_at(now)
+        # An overdue engine (``reported <= now``) wakes us at once - that is
+        # the case W6 exists for. The 15 s floor lives in worker state so an
+        # adapter that keeps answering "due now" is bounded to one tick per
+        # floor; ``max(inf, floor)`` is still ``inf``, so an adapter with no
+        # schedule buys no wake-up at all.
+        next_engine = min(next_engine, max(reported, self._engine_not_before))
+        due = min(next_ui, next_cost, next_engine)
         timeout = due - now
         command: tuple[str, Any] | None = None
         if timeout > 0:
@@ -884,7 +1796,7 @@ class BackgroundWorker:
 
         if command is not None:
             if command[0] == "__stop__":
-                return True, next_ui, next_cost
+                return True, next_ui, next_cost, next_engine
             force_ui, force_cost = self._handle_command(command)
             if force_ui:
                 next_ui = 0.0
@@ -893,17 +1805,126 @@ class BackgroundWorker:
                 # An explicit click reads every corpus, not the one whose turn
                 # it happens to be in the steady-state rotation.
                 self._force_all_sources = True
-            return False, next_ui, next_cost
+            return False, next_ui, next_cost, next_engine
 
         now = time.monotonic()
+        # W2: its own cadence, deliberately not the UI one - this is the only
+        # subprocess the steady state runs. Pinned by
+        # `test_the_worker_loop_actually_reaches_the_rival_gate`; a rewrite of
+        # this function that drops the call fails that test rather than
+        # silently reverting the widget to startup-only detection.
+        self._maybe_rescan_rivals(now)
         if now >= next_ui:
             # Always re-arm, even if the job raised, so one broken read
             # cannot turn into a hot loop.
             next_ui = now + self._ui_interval()
             self._run_accounts_job(force=False)
+            # That job ticked the engine too, so take its new deadline.
+            next_engine = max(
+                self._autoswitch_due_at(time.monotonic()), self._engine_not_before
+            )
+        elif now >= next_engine:
+            # Re-arm BEFORE the call, in worker state: the deadline must move
+            # even if the tick raises or the adapter keeps answering "due now".
+            self._engine_not_before = now + AUTOSWITCH_WAKE_FLOOR_SECONDS
+            next_engine = self._engine_not_before
+            self._run_autoswitch_tick()
+            next_engine = max(next_engine, self._autoswitch_due_at(time.monotonic()))
         if not self._stop.is_set() and time.monotonic() >= next_cost:
             next_cost = self._run_cost_job()
-        return False, next_ui, next_cost
+        return False, next_ui, next_cost, next_engine
+
+    def _autoswitch_due_at(self, now: float) -> float:
+        """Monotonic deadline of the adapter's next autoswitch evaluation.
+
+        ``inf`` when there is no schedule to honour: no adapter, an adapter
+        that predates :meth:`SwapAccountSource.next_tick_in`, autoswitch off,
+        or an unreadable answer. Never guesses a cadence of its own - an
+        unknown due time is "no extra wake-up", not an invented one.
+        """
+        source = self._accounts
+        getter = getattr(source, "next_tick_in", None)
+        if source is None or not callable(getter):
+            return float("inf")
+        try:
+            delay = getter()
+        except Exception as exc:
+            _log(f"next_tick_in failed: {_describe(exc)}")
+            return float("inf")
+        if delay is None:
+            return float("inf")
+        try:
+            return now + float(delay)
+        except (TypeError, ValueError):
+            return float("inf")
+
+    def _run_autoswitch_tick(self) -> None:
+        """One autoswitch evaluation between two UI ticks.
+
+        Deliberately *not* :meth:`_run_accounts_job`: this path exists to give
+        the engine its own due time, not to run the UI job four times as often.
+        It therefore publishes only what a tick can change - a switch (rows +
+        active account) or the engine's standing verdict.
+        """
+        accounts = self._accounts
+        if accounts is None:
+            return
+        try:
+            if not self._read_autoswitch(
+                default=bool(self._settings().get("autoswitch_enabled", False))
+            ):
+                return
+            switched = accounts.evaluate_autoswitch()
+            if switched:
+                _log(f"autoswitch -> {switched}")
+                accounts.refresh(force=True)
+                rows = tuple(accounts.rows())
+                # Same diagnosis the UI job runs, so a switch published from
+                # here cannot sit next to a stale error banner for a minute.
+                error = self._accounts_diagnosis(rows)
+                if not error:
+                    _forget_failures("accounts")
+                self._publish(
+                    replace(
+                        self._snapshot,
+                        accounts=rows,
+                        active=accounts.active(),
+                        accounts_at=time.time(),
+                        accounts_error=error,
+                        autoswitch_enabled=True,
+                        account_notes=_account_notes_of(accounts),
+                        account_note_kinds=_account_note_kinds_of(accounts),
+                        alert=_alert_of(accounts),
+                        # The switch this tick made is the newest line of the
+                        # journal; publishing rows without it would show a new
+                        # active account above a "Recent switches" block that
+                        # still ends on the previous one (up to 60 s).
+                        recent_events=_recent_events_of(accounts),
+                        switch_note=_switch_note_of(accounts),
+                        autoswitch_threshold=_autoswitch_threshold_of(accounts),
+                    )
+                )
+                return
+            # No switch: the tick can still have changed the standing verdict
+            # (all-exhausted, a quarantine) or appended a journal line (a
+            # no-viable-target verdict, a detected external switch), and a
+            # verdict the menu bar shows a minute late is the stale-state bug
+            # the alert exists to end.
+            alert = _alert_of(accounts)
+            events = _recent_events_of(accounts)
+            if alert != self._snapshot.alert or events != self._snapshot.recent_events:
+                self._publish(
+                    replace(
+                        self._snapshot,
+                        alert=alert,
+                        recent_events=events,
+                        switch_note=_switch_note_of(accounts),
+                    )
+                )
+        except Exception as exc:
+            self._publish(
+                replace(self._snapshot, accounts_error=_describe(exc, "accounts"))
+            )
 
     def _flush(self) -> None:
         """Last save before the thread exits - still off the main thread.
@@ -987,6 +2008,11 @@ class BackgroundWorker:
         name, payload = command
         try:
             if name == _CMD_REFRESH:
+                # "Refresh now" answers for every seam at once, so a source
+                # that polls on its own clock is told to stop waiting rather
+                # than being left to its 300 s period (SPEC-CODEX 6). It still
+                # decides when and whether to make the request.
+                self._force_sources_due()
                 self._run_accounts_job(force=True)
                 return False, True
             if name == _CMD_SET_AUTOSWITCH:
@@ -1004,12 +2030,28 @@ class BackgroundWorker:
             if name == _CMD_SWITCH_TO:
                 self._switch_to(str(payload))
                 return True, False
+            if name == _CMD_SWITCH_BEST:
+                self._switch_best()
+                return True, False
             if name == _CMD_REBUILD_INDEX:
                 self._rebuild_index()
                 return False, True
             if name == _CMD_WIRE_SOURCES:
                 self._wire_sources()
                 return True, True
+            if name == _CMD_MAP_DIR:  # W3
+                cwd, slot = payload
+                # Both refresh themselves; a forced UI tick here would run the
+                # accounts job (and a menu rebuild) a second time.
+                self._map_directory(str(cwd), int(slot))
+                return False, False
+            if name == _CMD_UNMAP_DIR:  # W3
+                self._unmap_directory(str(payload))
+                return False, False
+            if name == _CMD_SET_CODEX_ACCOUNT:  # SPEC-CODEX 6
+                account_id, flag = payload
+                self._set_codex_account_enabled(str(account_id), bool(flag))
+                return True, False
         except Exception as exc:
             self._publish(replace(self._snapshot, accounts_error=_describe(exc)))
         else:
@@ -1045,6 +2087,14 @@ class BackgroundWorker:
     def _set_setting(self, key: str, value: Any) -> None:
         settings = self._merge_settings(key, value)
         snapshot = replace(self._snapshot, settings=settings)
+        if key == "codex_tracking_enabled":
+            # Publish the snapshot the settings imply AND stop the requests.
+            # Hiding the rows while a poller kept fetching would leave the
+            # switch honest about the menu and silently wrong about the network
+            # (SPEC-CODEX 6). `_apply_source_pause` reads the merged settings,
+            # which are already in `self._snapshot` by way of `_merge_settings`.
+            self._snapshot = snapshot
+            self._apply_source_pause()
         if not settings.get("cost_tracking_enabled", True):
             snapshot = replace(snapshot, cost=None, cost_error=None)
         if not settings.get("codex_tracking_enabled", True):
@@ -1080,6 +2130,45 @@ class BackgroundWorker:
             error = _describe(exc)
         self._run_accounts_job(force=True, error_override=error)
 
+    def _switch_best(self) -> None:
+        """One-click "go where the engine would go" (switch-ux).
+
+        The pick is claude-swap's (``strategy="best"``), not ours. A source
+        that predates this command simply has no ``switch_best`` - report that
+        instead of raising, so an older adapter degrades to a visible line.
+        """
+        if self._accounts is None:
+            return
+        switch_best = getattr(self._accounts, "switch_best", None)
+        if not callable(switch_best):
+            self._run_accounts_job(
+                force=True,
+                error_override="this account source cannot pick a best account",
+            )
+            return
+        # The reason the refusal happened is the whole value of this command:
+        # "all four are at their limit, staying on main" and "I could not read
+        # the current account's usage" are different situations and the
+        # operator acts differently on each. The source records that reason in
+        # `last_error`, but `_accounts_diagnosis` only surfaces `last_error`
+        # when `rows()` came back EMPTY - on a healthy fleet it returns None
+        # and the reason would never reach the menu. So read it here and pass
+        # it as the override; the generic line is the fallback for a source
+        # that recorded nothing.
+        before = getattr(self._accounts, "last_error", None)
+        error: str | None = None
+        try:
+            if not switch_best():
+                after = getattr(self._accounts, "last_error", None)
+                error = (
+                    after[:MAX_ERROR_CHARS]
+                    if after and after != before
+                    else "switch to the best account was refused"
+                )
+        except Exception as exc:
+            error = _describe(exc)
+        self._run_accounts_job(force=True, error_override=error)
+
     def _rebuild_index(self) -> None:
         """Empty the rollup store and reset **every** scanner, then re-index.
 
@@ -1104,12 +2193,24 @@ class BackgroundWorker:
             # Deliberately emptied, so no vendor may later be diagnosed as
             # having "lost" its offsets and have its rows dropped a second time.
             self._reconciled.update(vendor for vendor, _scanner in scanners)
+            save_error: str | None = None
             try:
                 self._rollups.save()
             except Exception as exc:
-                _log(f"rollup save after reset failed: {_describe(exc)}")
+                # A failed save here means the emptied store never reached disk
+                # while every scanner's offsets HAVE been reset — the next
+                # restart reads a stale rollup against reset offsets. Logging
+                # it and then publishing cost_error=None hid that from the only
+                # person who can act on it (2026-08-26).
+                save_error = _describe(exc)
+                _log(f"rollup save after reset failed: {save_error}")
             self._publish(
-                replace(self._snapshot, cost=None, cost_error=None, progress=IndexProgress())
+                replace(
+                    self._snapshot,
+                    cost=None,
+                    cost_error=save_error,
+                    progress=IndexProgress(),
+                )
             )
         except Exception as exc:
             self._publish(replace(self._snapshot, cost_error=_describe(exc)))
@@ -1205,6 +2306,7 @@ class BackgroundWorker:
                 error_override = self._accounts_diagnosis(rows)
             if not error_override:
                 _forget_failures("accounts")
+            fleet_snapshot = self._collect_fleet(rows, active)  # W3
             self._publish(
                 replace(
                     self._snapshot,
@@ -1214,6 +2316,16 @@ class BackgroundWorker:
                     autoswitch_enabled=autoswitch,
                     accounts_error=error_override,
                     accounts_at=time.time(),
+                    account_notes=_account_notes_of(self._accounts),
+                    account_note_kinds=_account_note_kinds_of(self._accounts),
+                    alert=_alert_of(self._accounts),
+                    recent_events=_recent_events_of(self._accounts),
+                    switch_note=_switch_note_of(self._accounts),
+                    autoswitch_threshold=_autoswitch_threshold_of(self._accounts),
+                    sessions=fleet_snapshot.sessions,  # W3
+                    mappings=fleet_snapshot.mappings,  # W3
+                    fleet_notes=fleet_snapshot.notes,  # W3
+                    fleet_scanned=fleet_snapshot.pinned_scanned,  # W3
                 )
             )
         except Exception as exc:
@@ -1224,6 +2336,98 @@ class BackgroundWorker:
                     accounts_at=time.time(),
                 )
             )
+
+    # -- fleet (W3) --------------------------------------------------------
+
+    def _backup_dir(self) -> Any:
+        """claude-swap's backup root, or ``None``.
+
+        Derived from the adapter's own ``autoswitch_state_path()`` (that file
+        lives directly in the backup dir) rather than hardcoded: claude-swap
+        resolves the root per platform, and a hardcoded ``~/.claude-swap-backup``
+        would silently read a directory nobody writes.
+        """
+        getter = getattr(self._accounts, "autoswitch_state_path", None)
+        if not callable(getter):
+            return None
+        try:
+            path = getter()
+        except Exception:
+            return None
+        return path.parent if path is not None else None
+
+    def _collect_fleet(
+        self, rows: tuple[AccountRow, ...], active: AccountRow | None
+    ) -> "fleet.FleetSnapshot":
+        """One fleet pass, on the worker thread. Never raises.
+
+        Pure file reads (SPEC 2.1): a handful of small JSON registry files plus
+        ``os.kill(pid, 0)``. No subprocess, no network, nothing on the main
+        thread. A failure degrades to a note the menu shows - never to a
+        missing section that would read as "no sessions".
+        """
+        try:
+            emails = {
+                row.slot: row.email
+                for row in rows
+                if row.vendor == VENDOR_CLAUDE and row.email
+            }
+            return fleet.collect(
+                backup_dir=self._backup_dir(),
+                active_slot=active.slot if active is not None else None,
+                emails=emails,
+            )
+        except Exception as exc:
+            return fleet.FleetSnapshot(notes=(f"fleet unreadable: {_describe(exc)}",))
+
+    def _map_directory(self, cwd: str, slot: int) -> None:
+        """Pin *cwd* to *slot* for the next ``cswap run`` there.
+
+        Stored by IDENTITY (email + organizationUuid), which is what upstream
+        keys on - slot numbers are reused when an account is removed and
+        re-added. A slot whose identity we cannot read raises rather than
+        writing a guessed mapping that would never resolve.
+        """
+        if not cwd or not os.path.isabs(cwd):
+            # `MappingStore.set("")` would resolve to the WIDGET's own cwd and
+            # pin that for every future `cswap run` there (review 2026-09-01).
+            raise RuntimeError(
+                f"cannot pin {cwd!r}: the session reported no absolute directory"
+            )
+        backup = self._backup_dir()
+        if backup is None:
+            raise RuntimeError(
+                "cannot pin a directory: claude-swap's backup directory is unknown"
+            )
+        identity = fleet.identity_for_slot(backup, slot)
+        if identity is None:
+            raise RuntimeError(
+                f"cannot pin to slot {slot}: its stored identity is unreadable"
+            )
+        email, org_uuid = identity
+        fleet.set_mapping(backup, cwd, email, org_uuid)
+        _log(f"pinned {cwd} -> slot {slot}")
+        active = self._snapshot.active
+        if active is not None and active.slot == slot:
+            # The same-account fast path in `cswap run` execs plain `claude` on
+            # the DEFAULT profile, so this pin buys no isolation while slot is
+            # the active login - and that session will follow the next switch.
+            _log(
+                f"note: slot {slot} is the current default login, so `cswap run` in "
+                f"{cwd} launches an UNPINNED session until the login changes"
+            )
+        self._run_accounts_job(force=False)
+
+    def _unmap_directory(self, cwd: str) -> None:
+        """Remove the pin on *cwd* (exact directory, not its ancestors)."""
+        backup = self._backup_dir()
+        if backup is None:
+            raise RuntimeError(
+                "cannot unpin a directory: claude-swap's backup directory is unknown"
+            )
+        removed = fleet.clear_mapping(backup, cwd)
+        _log(f"unpinned {cwd}" if removed else f"no pin to remove for {cwd}")
+        self._run_accounts_job(force=False)
 
     @staticmethod
     def _store_has_vendor(rollups: RollupStore, vendor: Vendor) -> bool:
@@ -1656,6 +2860,7 @@ class CCUsageWidgetApp(rumps.App):
         self._quit_timer: Any = None
         self._quit_deadline = 0.0
         self._worker_restarts = 0
+        self._worker_alive_since = 0.0
         self._running = False
         self.rebuild_menu()
 
@@ -1801,9 +3006,31 @@ class CCUsageWidgetApp(rumps.App):
         if not self._running or self._quit_timer is not None:
             return
         if self._worker.alive:
+            # A stretch of continuous health earns the restart budget back:
+            # without this, 5 crashes spread over months exhaust the counter
+            # and the 6th (unrelated) death would strand the app.
+            if self._worker_restarts and self._worker_alive_since:
+                if time.monotonic() - self._worker_alive_since > 3600.0:
+                    _log(
+                        f"worker healthy for 1h — resetting restart budget "
+                        f"(was {self._worker_restarts}/{self.MAX_WORKER_RESTARTS})"
+                    )
+                    self._worker_restarts = 0
+            if not self._worker_alive_since:
+                self._worker_alive_since = time.monotonic()
             return
+        self._worker_alive_since = 0.0
         if self._worker_restarts >= self.MAX_WORKER_RESTARTS:
-            return
+            # Do NOT linger painting stale data forever: exit non-zero so
+            # launchd's KeepAlive relaunches the whole process clean. The
+            # previous behavior (silent return, menu stuck on "restarting
+            # (5/5)") was invisible to both the operator and launchd.
+            _log(
+                "background worker died "
+                f"{self.MAX_WORKER_RESTARTS} times — exiting for a clean "
+                "launchd relaunch"
+            )
+            os._exit(1)
         self._worker_restarts += 1
         message = (
             f"background worker stopped — restarting "
@@ -1834,16 +3061,25 @@ class CCUsageWidgetApp(rumps.App):
         if settings.get("title_show_icon", True):
             parts.append(TITLE_ICON)
         active = snapshot.active
+        notes = snapshot.account_notes
         if active is not None:
             if settings.get("title_show_alias", True):
                 parts.append(_display_name(active))
-            if settings.get("title_show_five_hour_pct", True) and active.five_hour_pct is not None:
-                parts.append(_title_pct(active.five_hour_pct))
-            if settings.get("title_show_scoped_pct", True):
-                window = active.primary_scoped_window
-                if window is not None:
-                    name, pct = window
-                    parts.append(f"{active.scoped_abbrev(name)}{_title_pct(pct)}")
+            note = notes.get(active.slot)
+            if note:
+                # A derived state replaces the figures (contract on
+                # UiSnapshot.account_notes): "vlad ⚠ relogin", never "vlad 0%".
+                parts.append(
+                    _title_note(note, snapshot.account_note_kinds.get(active.slot, ""))
+                )
+            else:
+                if settings.get("title_show_five_hour_pct", True) and active.five_hour_pct is not None:
+                    parts.append(_title_pct(active.five_hour_pct))
+                if settings.get("title_show_scoped_pct", True):
+                    window = active.primary_scoped_window
+                    if window is not None:
+                        name, pct = window
+                        parts.append(f"{active.scoped_abbrev(name)}{_title_pct(pct)}")
         if settings.get("title_show_codex_pct", False):
             codex = self._title_vendor_pct(snapshot)
             if codex:
@@ -1852,6 +3088,40 @@ class CCUsageWidgetApp(rumps.App):
             cost_part = self._title_cost(snapshot)
             if cost_part:
                 parts.append(cost_part)
+        # Standing problems always reach the bar, whatever the toggles say:
+        # the engine's verdict first, else a bare "⚠" when a slot other than
+        # the active one needs the operator (its note is in the menu).
+        #
+        # A Codex account that is NOT the active login joins that same bare
+        # "⚠" rather than adding a second one (SPEC-CODEX 6): the glyph means
+        # "something in the menu needs you", and two of them would say nothing
+        # the first did not. The active Codex account is deliberately not
+        # counted here - it has its own "C⚠" component above, which names the
+        # vendor instead of leaving the user to hunt.
+        if snapshot.alert is not None:
+            parts.append(_title_alert(snapshot.alert[0]))
+        elif any(slot != getattr(active, "slot", None) for slot in notes) or any(
+            _quota_alarm(row)
+            for row in self._visible_quota_rows(snapshot)
+            if not row.is_active
+        ):
+            parts.append("⚠")
+        # Last, and only when the active room is full: "is there another room,
+        # and when does one open" is the only question left at that point, and
+        # answering it at the wall saves opening the menu (2026-09-01: a title
+        # reading "main 100% ⛔ exhausted" told the operator nothing about the
+        # other three accounts or the 00:00 reset).
+        #
+        # `parts` first: this is a SUFFIX, not a title. With every text
+        # component off the item is deliberately icon-only (RCA 2026-08-17),
+        # and a naked "1/2 · next 00:00" with no alias and no glyph is
+        # unreadable at the wall — it would defeat that path rather than
+        # extend it. The alert block above is the one standing-problem
+        # exception, and it is a glyph.
+        if parts and settings.get("title_show_fleet", True):
+            fleet = self._title_fleet(snapshot, base=" ".join(parts))
+            if fleet:
+                parts.append(fleet)
         if parts:
             return " ".join(parts)
         # Every text component off: with a real NSImage on the status item the
@@ -1861,34 +3131,232 @@ class CCUsageWidgetApp(rumps.App):
         # an item with neither image nor title is zero-width and invisible.
         return "" if getattr(self, "_icon_image_set", False) else TITLE_ICON
 
+    def _title_fleet(
+        self,
+        snapshot: UiSnapshot,
+        *,
+        base: str = "",
+        now_minutes: int | None = None,
+    ) -> str:
+        """``"0/4 · next 00:00"`` — rooms with headroom, and when one opens.
+
+        Shown only while there is a decision to make: the active account's
+        5-hour window is at or over claude-swap's autoswitch threshold, or the
+        engine's standing verdict is one of :data:`_TITLE_FLEET_ALERT_KINDS`.
+        A healthy fleet renders nothing at all, so the SPEC 4.1 title is
+        unchanged in the steady state.
+
+        Nothing here is derived beyond the rows' own numbers (SPEC 4.3):
+
+        * ``M`` counts the switchable rows already in the snapshot — the same
+          fact that makes a row clickable, so the count cannot promise a room
+          the menu would refuse to switch to;
+        * ``N`` counts those whose 5-hour percentage is *known*, *trusted* and
+          below the threshold. A row whose window the API did not report is
+          not room, and neither is a row carrying an
+          :attr:`UiSnapshot.account_notes` entry: that note REPLACES the
+          slot's figures everywhere else in the title precisely because the
+          stored pct is a last-good value that can be days old and read as
+          healthy (2026-08-25: a quarantined account showed ``vlad 0%`` for 39
+          hours). Counting one as a free room would advertise a dead login as
+          the way out, at the moment the operator is deciding whether to keep
+          working. A noted slot stays in ``M``: it exists, it just is not room;
+        * ``next`` is one row's ``five_hour_resets_at`` string reprinted
+          VERBATIM — claude-swap already rendered it in local time. Ordering
+          uses a clock-only reading of that string; a row whose reset is not a
+          plain ``HH:MM`` (a next-day ``"Aug 24 14:50"``) is not a candidate,
+          and when none is, the ``next`` half is simply omitted. Noted slots
+          are excluded here too — the same untrusted read produced the reset.
+
+        Two limits this suffix does NOT show, so they are recorded instead of
+        implied:
+
+        * **Age.** Non-active slots are served from claude-swap's store
+          without a fetch while the engine is running, so an ``N`` can be
+          built from reads well past ``STALE_USAGE_SECONDS``. A stale-HIGH
+          percentage errs safe (it under-counts room); a stale-LOW one
+          over-counts, which is exactly what a rival actor burning a slot the
+          widget last read as free looks like. There is no room for an age in
+          a menu-bar suffix and dropping stale rows would usually zero the
+          count outright, so the menu — which does print ``<n>m old`` per row
+          (SPEC 4.3) — stays the place to check freshness.
+        * **Enablement.** ``switchable`` is upstream's "has credentials and a
+          config backup", which is not the same as "in rotation": a slot the
+          operator ran ``cswap disable`` on is still switchable and is still
+          counted here, while the autoswitch engine will never pick it. The
+          widget does not read ``disabled`` anywhere yet; fixing that needs an
+          ``AccountRow.enabled`` field, which is outside this renderer's
+          change (flagged 2026-09-01 for the plan owner).
+
+        ``base`` is the title rendered so far, and ``now_minutes`` (minutes
+        since local midnight) exists for tests; both default to the live case.
+        """
+        active = snapshot.active
+        threshold = snapshot.autoswitch_threshold
+        if threshold is None:
+            threshold = _TITLE_FLEET_THRESHOLD_DEFAULT
+        active_pct = active.five_hour_pct if active is not None else None
+        at_limit = active_pct is not None and active_pct >= threshold
+        alert_kind = snapshot.alert[0] if snapshot.alert is not None else ""
+        if not at_limit and alert_kind not in _TITLE_FLEET_ALERT_KINDS:
+            return ""
+
+        rows = [row for row in snapshot.accounts if row.switchable]
+        if not rows:
+            return ""
+        notes = snapshot.account_notes
+        room = sum(
+            1
+            for row in rows
+            if row.slot not in notes
+            and row.five_hour_pct is not None
+            and row.five_hour_pct < threshold
+        )
+        count = f"{room}/{len(rows)}"
+
+        if now_minutes is None:
+            local = time.localtime()
+            now_minutes = local.tm_hour * 60 + local.tm_min
+        soonest: tuple[int, str] | None = None
+        for row in rows:
+            if row.slot in notes:
+                # A noted slot's reset comes off the same last-good read its
+                # percentage does; "next 00:00" from it would be a guess.
+                continue
+            pct = row.five_hour_pct
+            if pct is None or pct < threshold:
+                continue
+            clock = row.five_hour_resets_at
+            minutes = self._clock_minutes(clock)
+            if minutes is None:
+                continue
+            # Wrap through midnight: a 5-hour window that resets at 00:20 is
+            # ahead of one that resets at 23:50, not 23.5 hours behind it.
+            delta = (minutes - now_minutes) % (24 * 60)
+            if soonest is None or delta < soonest[0]:
+                soonest = (delta, str(clock))
+        tail = f" · next {soonest[1]}" if soonest is not None else ""
+
+        # Whatever the rest of the title overshoots the budget by is taken out
+        # of this suffix, longest part first: the count is the decision, the
+        # time is the detail. Charged against the tail's NOMINAL width, not
+        # `len(tail)` — otherwise a title with no usable reset drops its count
+        # at an overshoot the same title with a reset survives.
+        over = len(base) - _TITLE_FLEET_BASE_BUDGET
+        if over <= 0:
+            return count + tail
+        if over <= _TITLE_FLEET_TAIL_BUDGET:
+            return count
+        return ""
+
+    @staticmethod
+    def _clock_minutes(clock: str | None) -> int | None:
+        """``"00:20"`` -> ``20``; anything else -> ``None`` (not a candidate).
+
+        Deliberately strict. claude-swap renders a reset that is not today as
+        ``"Aug 24 14:50"``, and a 5-hour window that far out is not the "next
+        room" the title is advertising; guessing a date here would be exactly
+        the kind of invented figure SPEC 4.3 forbids.
+        """
+        text = (clock or "").strip()
+        if len(text) not in (4, 5) or ":" not in text:
+            return None
+        hour, _, minute = text.partition(":")
+        if not (hour.isdigit() and minute.isdigit() and len(minute) == 2):
+            return None
+        hours, minutes = int(hour), int(minute)
+        if hours > 23 or minutes > 59:
+            return None
+        return hours * 60 + minutes
+
     def _title_vendor_pct(self, snapshot: UiSnapshot) -> str:
-        """``"C12%"`` — a pseudo-account's window in the menu bar.
+        """``"C12%"`` — the ACTIVE Codex account's window in the menu bar.
 
         Off by default (``title_show_codex_pct``): the title is already five
-        components wide and the menu bar is finite. The abbreviation is the
-        vendor's initial, derived exactly as ``AccountRow.scoped_abbrev``
-        derives a scoped window's, so no second naming rule exists. The menu's
-        Codex section is **not** gated on this setting.
+        components wide and the menu bar is finite. The menu's Codex section is
+        **not** gated on this setting.
+
+        **Which row** (SPEC-CODEX 6): the one with ``is_active``, meaning the
+        login ``~/.codex`` currently holds — and no other. Four accounts are
+        tracked, only one of them is being spent against right now, and the
+        title has room for one figure: showing the first row, or the highest,
+        or a sum would each be a number the user cannot act on.
+
+        With no identified active row the transcript-derived row (slot
+        :data:`CODEX_PSEUDO_ACCOUNT_SLOT`) stands in, because it describes the
+        active login too — it is built from the rollouts the active login
+        produced, which is the same reasoning
+        :func:`~cc_usage_widget.contracts.merge_quota_rows` uses to let a live
+        active row displace it. That covers three real states with one rule:
+        nothing onboarded yet (today's widget, byte for byte), live quota
+        switched off (the rollback switch), and an active login that is not in
+        the registry — where the unidentified figure is the ONLY thing that can
+        speak for the account being spent against. With neither row the
+        component is simply absent; nothing invents a glyph to fill it.
+
+        **What it shows.** A standing warn/crit verdict REPLACES the figure
+        with ``C⚠`` — the same rule as ``_title_note`` on the Claude side; the
+        menu carries the wording. A stale *live* reading shows nothing at all:
+        a figure in the menu bar reads as current, and the honest answer to
+        "how much is left" when the last fetch is six hours old is silence, not
+        a stale number wearing an age note the bar has no room for. The
+        transcript row is exempt from that rule and keeps its pre-SPEC-CODEX-6
+        behaviour: its age is the corpus's own mtime, so hours of it are
+        ordinary idle time rather than a failed read (the same reason its
+        ``stale_after_seconds`` is 2 h and not 5 min). An expired *window*
+        still shows its number but never the ``(!)`` — that marker means "you
+        are capped NOW", which a window that has already ended cannot prove.
+        """
+        row = self._active_quota_row(snapshot)
+        identified = row is not None
+        if row is None:
+            row = self._transcript_quota_row(snapshot)
+        if row is None:
+            return ""
+        # The VENDOR's initial, never the alias's. Before SPEC-CODEX 6 the only
+        # quota row was aliased "Codex" and the two were the same letter by
+        # accident; with per-account aliases they are not, and a title that
+        # read "V19%" today and "G19%" after a `codex login` would be naming
+        # something the bar cannot explain. The vendor is the constant, and the
+        # menu is where the account is named.
+        initial = vendor_label(row.vendor)[:1].upper()
+        if _quota_alarm(row):
+            return f"{initial}⚠"
+        if identified and row.usage_is_stale:
+            return ""
+        windows = _quota_windows(row)
+        if not windows:
+            return ""
+        # The plan window (Codex's weekly ``primary``) is the figure that
+        # answers "how much of my subscription have I used"; anything else
+        # this row happens to report is a fallback, never a substitute.
+        if row.seven_day_pct is not None:
+            pct = row.seven_day_pct
+            expired = "seven_day" in (getattr(row, "expired_windows", ()) or ())
+        else:
+            _label, pct, _note, expired = windows[0]
+        text = format_pct(pct) if expired else _title_pct(pct)
+        return f"{initial}{text}"
+
+    def _active_quota_row(self, snapshot: UiSnapshot) -> AccountRow | None:
+        """The visible quota row for the login that is active right now."""
+        for row in self._visible_quota_rows(snapshot):
+            if row.is_active:
+                return row
+        return None
+
+    def _transcript_quota_row(self, snapshot: UiSnapshot) -> AccountRow | None:
+        """The log-derived Codex row, or ``None``.
+
+        Identified by its slot, not by its alias or its position: the alias is
+        user-facing text and the order is the registry's (SPEC-CODEX 6 gives
+        live rows negative slots precisely so the three kinds of row can be
+        told apart without matching on prose).
         """
         for row in self._visible_quota_rows(snapshot):
-            windows = _quota_windows(row)
-            if not windows:
-                continue
-            # The plan window (Codex's weekly ``primary``) is the figure that
-            # answers "how much of my subscription have I used"; anything else
-            # this row happens to report is a fallback, never a substitute.
-            if row.seven_day_pct is not None:
-                pct = row.seven_day_pct
-                expired = "seven_day" in (getattr(row, "expired_windows", ()) or ())
-            else:
-                _label, pct, _note, expired = windows[0]
-            initial = (row.alias or vendor_label(row.vendor))[:1].upper()
-            # An expired window's figure keeps its number in the title but
-            # never the "(!)" — that marker means "you are capped NOW", and a
-            # window that has already ended can prove no such thing.
-            text = format_pct(pct) if expired else _title_pct(pct)
-            return f"{initial}{text}"
-        return ""
+            if row.vendor != VENDOR_CLAUDE and row.slot == CODEX_PSEUDO_ACCOUNT_SLOT:
+                return row
+        return None
 
     def _title_cost(self, snapshot: UiSnapshot) -> str | None:
         """Today's notional cost, or ``$.../d`` while the index is partial.
@@ -1911,16 +3379,20 @@ class CCUsageWidgetApp(rumps.App):
         self.title = self.render_title(snapshot)
         self._install_icon_once()
 
-        items: list[Any] = [self._header_item(snapshot), None]
+        items: list[Any] = [self._header_item(snapshot)]
+        items.extend(self._alert_items(snapshot))
+        items.append(None)
         items.extend(self._switch_items(snapshot))
         # Sections, each preceded by its own separator and each free to be
         # empty. A Claude-only machine yields exactly the pre-Codex layout
         # (accounts, cost); a Codex-only one drops the accounts section rather
         # than showing an empty one (SPEC-CODEX 5.5).
         for section in (
+            self._recent_switch_items(snapshot),
             self._account_items(snapshot),
             self._quota_items(snapshot),
             self._cost_items(snapshot),
+            self._session_items(snapshot),  # W3
         ):
             if section:
                 items.append(None)
@@ -1938,6 +3410,53 @@ class CCUsageWidgetApp(rumps.App):
         self.menu.clear()
         self.menu = _dedupe_titles(items)
 
+    def _alert_items(self, snapshot: UiSnapshot) -> list[rumps.MenuItem]:
+        """Standing problems that need the operator, right under the header.
+
+        One line per slot with a derived usage state (verbatim claude-swap
+        note, so the remedy — ``cswap add``, a re-login — is in the text) and
+        one for the engine's current verdict. Before 2026-08-25 both were
+        computed and then dropped: the adapter's ``sentinels()`` had no reader
+        and autoswitch events went only to the log.
+        """
+        items: list[rumps.MenuItem] = []
+        names = {row.slot: _display_name(row) for row in snapshot.accounts}
+        for slot in sorted(snapshot.account_notes):
+            note = snapshot.account_notes[slot][:MAX_ERROR_CHARS]
+            items.append(_info(f"⚠ {names.get(slot, f'slot {slot}')} ({slot}): {note}"))
+        if snapshot.alert is not None:
+            kind, line = snapshot.alert
+            # Upstream writes the earliest reset as an ISO-UTC instant; the
+            # operator acts on a wall clock (2026-09-01: seven hours out).
+            line = _localize_instants(line)[:MAX_ERROR_CHARS]
+            if kind == ALERT_EXTERNAL_SWITCH:
+                # Not prefixed "autoswitch:" — attributing it to the engine is
+                # the opposite of what this verdict says.
+                items.append(_info(f"⚠ {line}"))
+            else:
+                glyph = "⛔" if kind == ALERT_ALL_EXHAUSTED else "⚠"
+                items.append(_info(f"{glyph} autoswitch: {line}"))
+        if snapshot.switch_note:
+            # Why the widget is sitting still, from claude-swap's own state.
+            items.append(_info(snapshot.switch_note[:MAX_ERROR_CHARS]))
+        return items
+
+    def _recent_switch_items(self, snapshot: UiSnapshot) -> list[rumps.MenuItem]:
+        """The last few switch/verdict lines, newest first.
+
+        A forensic block, not a status one: tonight the active login flipped
+        5→1 three times and every trace of it lived in a deque with no reader
+        and a log file nobody had open. Empty until something happens, so a
+        quiet machine renders exactly the pre-2026-09-01 menu.
+        """
+        lines = tuple(snapshot.recent_events)[-RECENT_SWITCH_LINES:]
+        if not lines:
+            return []
+        items: list[rumps.MenuItem] = [_info("Recent switches")]
+        for line in reversed(lines):
+            items.append(_info(f"  {_localize_instants(line)[:MAX_ERROR_CHARS]}"))
+        return items
+
     def _header_item(self, snapshot: UiSnapshot) -> rumps.MenuItem:
         active = snapshot.active
         if active is None:
@@ -1948,13 +3467,21 @@ class CCUsageWidgetApp(rumps.App):
         return _info(text)
 
     def _switch_items(self, snapshot: UiSnapshot) -> list[rumps.MenuItem]:
-        """The two top-level on/off switches - one click each (SPEC 4.2).
+        """The two top-level on/off switches, plus the one-click best switch.
 
-        These are deliberately *not* inside Settings: it is an explicit product
-        requirement that both are reachable in a single click.
+        The switches are deliberately *not* inside Settings: it is an explicit
+        product requirement that both are reachable in a single click
+        (SPEC 4.2). ``Switch to best now`` joins them because the moment it is
+        for - the active account at its limit - is the moment nobody wants to
+        walk a submenu comparing four sets of percentages.
+
+        With no other switchable account the item is rendered without a
+        callback, which AppKit greys out: the click had nowhere to go, and a
+        live-looking item that silently does nothing is worse than a dim one.
         """
         autoswitch_on = bool(snapshot.autoswitch_enabled)
         cost_on = bool(snapshot.settings.get("cost_tracking_enabled", True))
+        has_target = bool(_switch_targets(snapshot.accounts))
         return [
             _check(
                 rumps.MenuItem(
@@ -1969,6 +3496,10 @@ class CCUsageWidgetApp(rumps.App):
                     callback=self._on_toggle_cost_tracking,
                 ),
                 cost_on,
+            ),
+            rumps.MenuItem(
+                "Switch to best now",
+                callback=self._on_switch_best if has_target else None,
             ),
         ]
 
@@ -2028,6 +3559,9 @@ class CCUsageWidgetApp(rumps.App):
             # Plain label first: it is what shows if attributed rendering is
             # unavailable, and it is what VoiceOver reads.
             label = "  " + _account_row_label(row, name_width=min(width, 16))
+            note = snapshot.account_notes.get(row.slot, "")
+            if note:
+                label = f"{label}  ⚠ {note}"
             item = rumps.MenuItem(
                 label,
                 # `switchable` gates the click, not the vendor: a read-only row
@@ -2038,7 +3572,7 @@ class CCUsageWidgetApp(rumps.App):
                     else self._make_switch_callback(row)
                 ),
             )
-            self._decorate_account_item(item, row, label_width=label_width)
+            self._decorate_account_item(item, row, label_width=label_width, note=note)
             _check(item, row.is_active)
             items.append(item)
         return items
@@ -2050,12 +3584,24 @@ class CCUsageWidgetApp(rumps.App):
         percentage at all. The second is the "no data" half of requirement 3 -
         a source that exists but has learned nothing yet renders **nothing**,
         not a heading over an empty bar.
+
+        **Except when the row has something to say** (SPEC-CODEX 6). A live
+        per-account row whose credential is dead, whose endpoint is refusing
+        us, or which has not had its first reading yet carries an
+        ``attention_note`` and no windows at all — and dropping it would hide
+        exactly the account the user needs to act on, leaving a menu that looks
+        complete while one of four accounts has silently fallen out of it. Such
+        a row renders as a header plus its note, with no bar line: a sentinel
+        REPLACES a figure, it never sits beside an invented one.
         """
         if not snapshot.settings.get("codex_tracking_enabled", True):
             rows = tuple(row for row in snapshot.quota_rows if row.vendor == VENDOR_CLAUDE)
         else:
             rows = tuple(snapshot.quota_rows)
-        return tuple(row for row in rows if _quota_windows(row))
+        # The RENDERED note, not the raw field: a live row whose reading aged
+        # past CODEX_FETCH_EXPIRE_SECONDS has its bars withheld and no
+        # sentinel, and its age note is exactly what it has to say.
+        return tuple(row for row in rows if _quota_windows(row) or _quota_note(row)[0])
 
     def _quota_items(self, snapshot: UiSnapshot) -> list[rumps.MenuItem]:
         """The Codex (and any future read-only vendor) quota section.
@@ -2088,14 +3634,20 @@ class CCUsageWidgetApp(rumps.App):
         geometry, the identical 70/90 severity palette and the identical
         ``(!)`` marker as a Claude window. A second bar renderer here would be
         two things to keep in sync and one of them would eventually be wrong.
+
+        The header carries the ``· active`` marker and **one** note, chosen by
+        :func:`_quota_note` (a standing verdict outranks an age; they are never
+        both shown). A row with no windows therefore renders as a single
+        header line and nothing else.
         """
         try:
+            note, note_kind = _quota_note(row)
             segments = render.quota_header(
                 row.alias or vendor_label(row.vendor),
                 plan=row.plan_type or "",
-                note=(
-                    f"{_age_label(row.usage_age_seconds)} old" if row.usage_is_stale else ""
-                ),
+                note=note,
+                active=bool(row.is_active),
+                note_kind=note_kind,
             )
             pace = dict(getattr(row, "pace_ahead", ()) or ())
             for label, pct, note, expired in _quota_windows(row):
@@ -2116,7 +3668,12 @@ class CCUsageWidgetApp(rumps.App):
             pass  # plain label stands
 
     def _decorate_account_item(
-        self, item: rumps.MenuItem, row: AccountRow, *, label_width: int = 5
+        self,
+        item: rumps.MenuItem,
+        row: AccountRow,
+        *,
+        label_width: int = 5,
+        note: str = "",
     ) -> None:
         """Upgrade one account row to a multi-line bar block (`cswap watch` look).
 
@@ -2130,8 +3687,14 @@ class CCUsageWidgetApp(rumps.App):
                 _display_name(row),
                 row.email,
                 row.is_active,
+                # A derived state outranks staleness on the header line: the
+                # note says WHY the figures below cannot be current.
                 age_note=(
-                    f"{_age_label(row.usage_age_seconds)} old" if row.usage_is_stale else ""
+                    f"⚠ {note}"
+                    if note
+                    else (
+                        f"{_age_label(row.usage_age_seconds)} old" if row.usage_is_stale else ""
+                    )
                 ),
             )
             windows: list[tuple[str, float | None, str]] = [
@@ -2178,25 +3741,38 @@ class CCUsageWidgetApp(rumps.App):
             rows = [_info(_cost_row_label(label, "indexing…")) for label in ("Today", "Last 7d", "Last 30d")]
             return [header, *rows, _info(f"  {_progress_label(progress) or 'indexing…'}")]
 
+        def _usd_label(window: WindowCost) -> str:
+            # A "+" suffix marks a FLOOR: the window holds tokens whose model
+            # has no published rate, so the true figure is at least this.
+            text = format_usd(window.usd)
+            return f"{text}+" if window.unpriced_tokens else text
+
         items = [
             header,
-            _info(_cost_row_label(cost.today.label or "Today", format_usd(cost.today.usd))),
+            _info(_cost_row_label(cost.today.label or "Today", _usd_label(cost.today))),
             _info(
                 _cost_row_label(
                     cost.last_7d.label or "Last 7d",
-                    format_usd(cost.last_7d.usd),
+                    _usd_label(cost.last_7d),
                     extra=f"({format_usd(cost.last_7d_avg_per_day)}/day avg)",
                 )
             ),
-            _info(_cost_row_label(cost.last_30d.label or "Last 30d", format_usd(cost.last_30d.usd))),
+            _info(_cost_row_label(cost.last_30d.label or "Last 30d", _usd_label(cost.last_30d))),
         ]
         items.extend(self._model_items(cost))
-        if cost.unknown_models:
-            # SPEC 3.3 trap 5: show the actual unrecognised name, priced at $0.
+        if cost.unknown_models or cost.last_30d.unpriced_tokens:
+            # SPEC 3.3 trap 5: show the actual unrecognised name, priced at $0
+            # — and the magnitude, so "+" totals above are quantified here.
             names = ", ".join(cost.unknown_models[:3])
             if len(cost.unknown_models) > 3:
                 names = f"{names}, +{len(cost.unknown_models) - 3} more"
-            items.append(_info(f"  unpriced model(s) at $0: {names}"))
+            scale = (
+                f" ({format_tokens(cost.last_30d.unpriced_tokens)} tok/30d)"
+                if cost.last_30d.unpriced_tokens
+                else ""
+            )
+            suffix = f": {names}" if names else ""
+            items.append(_info(f"  unpriced at $0{scale}{suffix}"))
         return items
 
     def _model_items(self, cost: CostBreakdown) -> list[rumps.MenuItem]:
@@ -2236,6 +3812,88 @@ class CCUsageWidgetApp(rumps.App):
             )
         return items
 
+    def _session_items(self, snapshot: UiSnapshot) -> list[rumps.MenuItem]:
+        """The fleet: who is running, and on whose login (W3).
+
+        Absent fleet, absent section - a machine with no live session shows no
+        heading rather than an empty one, the same rule the Codex quota block
+        follows (SPEC-CODEX 5.5). A note (unreadable records, a scan that could
+        not run) is enough to draw the section on its own: "we could not tell"
+        must never render as "nobody is running".
+        """
+        rows = snapshot.sessions
+        if not rows and not snapshot.fleet_notes:
+            return []
+        names = {row.slot: _display_name(row) for row in snapshot.accounts}
+        items: list[rumps.MenuItem] = [
+            _info(_fleet_heading(rows, names, scanned=snapshot.fleet_scanned))
+        ]
+        for row in rows:
+            items.append(self._pin_submenu(row, snapshot, names))
+        for note in snapshot.fleet_notes:
+            items.append(_info(f"  ! {note[:MAX_ERROR_CHARS]}"))
+        items.append(_info(f"  {fleet.PIN_HINT}"))
+        return items
+
+    def _pin_submenu(
+        self,
+        row: "fleet.SessionRow",
+        snapshot: UiSnapshot,
+        names: dict[int, str],
+    ) -> rumps.MenuItem:
+        """One session row, as a submenu that can pin its directory.
+
+        The pin targets the DIRECTORY, not the process: nothing here can move a
+        running session onto another account (that needs a relaunch), and the
+        submenu says which account each choice would take effect for.
+        """
+        children: list[Any] = [_info(row.cwd or "(no directory reported)")]
+        if not row.cwd:
+            # Nothing to pin: a pin needs the directory the session reported.
+            children.append(_info("Pin directory to   (no directory reported)"))
+            children.append(_info("Unpin directory   (not pinned)"))
+            return _submenu(_session_row_label(row, names), children)
+        targets = [
+            account
+            for account in snapshot.accounts
+            if account.vendor == VENDOR_CLAUDE and getattr(account, "switchable", True)
+        ]
+        pin_children: list[Any] = []
+        for account in targets:
+            label = f"{account.slot} {_display_name(account)}"
+            if account.is_active:
+                # `cswap run N` on the account that is already the default
+                # login execs plain `claude` on the default profile: the pin is
+                # real, the isolation is not, until the login moves.
+                label = f"{label}   (default login — launches unpinned)"
+            pin_children.append(
+                rumps.MenuItem(label, callback=self._make_pin_callback(row.cwd, account.slot))
+            )
+        if not pin_children:
+            pin_children.append(_info("No switchable accounts"))
+        children.append(_submenu("Pin directory to", pin_children))
+        # `pinned_here` was decided on the worker: resolving a path is a
+        # syscall, and this runs on the AppKit main thread (SPEC 2.3).
+        if row.pinned_here:
+            children.append(
+                rumps.MenuItem("Unpin directory", callback=self._make_unpin_callback(row.cwd))
+            )
+        else:
+            children.append(_info("Unpin directory   (not pinned)"))
+        return _submenu(_session_row_label(row, names), children)
+
+    def _make_pin_callback(self, cwd: str, slot: int) -> Callable[[Any], None]:
+        def callback(_sender: Any) -> None:
+            self._worker.submit(_CMD_MAP_DIR, (cwd, slot))
+
+        return callback
+
+    def _make_unpin_callback(self, cwd: str) -> Callable[[Any], None]:
+        def callback(_sender: Any) -> None:
+            self._worker.submit(_CMD_UNMAP_DIR, cwd)
+
+        return callback
+
     def _problem_items(self, snapshot: UiSnapshot) -> list[rumps.MenuItem]:
         """Background failures as menu lines - never a crash, never silence."""
         items: list[rumps.MenuItem] = []
@@ -2253,18 +3911,21 @@ class CCUsageWidgetApp(rumps.App):
         return items
 
     def _switch_account_submenu(self, snapshot: UiSnapshot) -> rumps.MenuItem:
-        children: list[Any] = []
-        for row in snapshot.accounts:
-            # Pseudo-accounts live in `quota_rows` and never reach here; the
-            # `switchable` test is the belt to that structural braces.
-            if row.is_active or not getattr(row, "switchable", True):
-                continue
-            children.append(
-                rumps.MenuItem(
-                    f"{row.slot} {_display_name(row)}   5h {format_pct(row.five_hour_pct)}",
-                    callback=self._make_switch_callback(row),
-                )
+        """``Switch account ▸`` - every target, with what to choose by.
+
+        Pseudo-accounts live in `quota_rows` and never reach here; the
+        `switchable` test inside :func:`_switch_targets` is the belt to that
+        structural braces.
+        """
+        targets = _switch_targets(snapshot.accounts)
+        width = min(max((len(_display_name(row)) for row in targets), default=8), 16)
+        children: list[Any] = [
+            rumps.MenuItem(
+                _switch_target_label(row, name_width=width),
+                callback=self._make_switch_callback(row),
             )
+            for row in targets
+        ]
         if not children:
             children.append(_info("No other accounts"))
         return _submenu("Switch account", children)
@@ -2330,24 +3991,109 @@ class CCUsageWidgetApp(rumps.App):
             ),
             None,
         ]
+        codex_children: list[Any] = []
         if has_vendors:
             codex_on = bool(settings.get("codex_tracking_enabled", True))
-            children.insert(
-                1,
+            codex_children.append(
                 _check(
                     rumps.MenuItem(
                         self._switch_label(f"{vendor_label(VENDOR_CODEX)} tracking", codex_on),
                         callback=self._make_setting_toggle("codex_tracking_enabled"),
                     ),
                     codex_on,
-                ),
+                )
             )
+        # The live per-account controls (SPEC-CODEX 6) appear once the registry
+        # file exists - i.e. once `codex_accounts adopt` has run. Before that
+        # there is nothing for them to act on: a "Codex live quota" switch with
+        # no credential behind it would be a control that cannot change
+        # anything, and an accounts submenu would be empty. A machine that
+        # never onboards sees the pre-SPEC-CODEX-6 Settings menu, byte for byte.
+        #
+        # Gated on the registry ALONE, not on `has_vendors`: that flag answers
+        # "is there a Codex corpus / are there rows", and the live source is
+        # unavailable until this very switch is turned on. Requiring it would
+        # have made the switch its own precondition - the only way to enable
+        # live quota on a machine with credentials but no ~/.codex/sessions
+        # would have been to hand-edit settings.json.
+        if _codex_registry_present():
+            live_on = bool(settings.get("codex_live_quota_enabled", False))
+            codex_children.append(
+                _check(
+                    rumps.MenuItem(
+                        self._switch_label(f"{vendor_label(VENDOR_CODEX)} live quota", live_on),
+                        callback=self._make_setting_toggle("codex_live_quota_enabled"),
+                    ),
+                    live_on,
+                )
+            )
+            codex_children.append(self._codex_accounts_submenu(snapshot))
+        # Directly under `Title`, where the vendor switch has always been.
+        children[1:1] = codex_children
         if self._worker.supports_index_rebuild():
             children.append(rumps.MenuItem("Rebuild cost index", callback=self._on_rebuild_index))
         children.append(rumps.MenuItem("Reveal settings.json", callback=self._on_reveal_settings))
         children.append(None)
         children.extend(self._diagnostic_items(snapshot))
         return _submenu("Settings", children)
+
+    def _codex_accounts_submenu(self, snapshot: UiSnapshot) -> rumps.MenuItem:
+        """``Codex accounts ▸`` - one checkbox per tracked account, plus the
+        registry file and the poll period (SPEC-CODEX 6).
+
+        The checkboxes are built from the tuple the worker cached on its last
+        quota tick, never from a read of ``codex_accounts.json`` here: the menu
+        is assembled on the AppKit thread, which does no I/O (SPEC 2.3). A
+        click goes back to the worker as a command for the same reason - the
+        registry is one atomic file with one writer.
+
+        An account with no alias is listed by the first 8 characters of its id.
+        That is not a fabricated name: it is the account's own identifier,
+        shortened, and it is what the onboarding CLI prints. No email is shown
+        here - the endpoint's email is the account's, not ours to display in a
+        surface that is screen-shared.
+        """
+        children: list[Any] = []
+        for account_id, alias, enabled in self._worker.codex_accounts:
+            children.append(
+                _check(
+                    rumps.MenuItem(
+                        alias or account_id[:8],
+                        callback=self._make_codex_account_toggle(account_id, enabled),
+                    ),
+                    enabled,
+                )
+            )
+        if not children:
+            children.append(_info("No accounts adopted yet"))
+        children.append(None)
+        interval = int(
+            snapshot.settings.get(
+                "codex_quota_interval_seconds",
+                SETTINGS_DEFAULTS["codex_quota_interval_seconds"],
+            )
+        )
+        children.append(
+            _submenu(
+                f"Poll every: {_duration_label(interval)}",
+                [
+                    _check(
+                        rumps.MenuItem(
+                            _duration_label(secs),
+                            callback=self._make_setting_value(
+                                "codex_quota_interval_seconds", secs
+                            ),
+                        ),
+                        interval == secs,
+                    )
+                    for secs in _CODEX_QUOTA_INTERVAL_CHOICES
+                ],
+            )
+        )
+        children.append(
+            rumps.MenuItem("Reveal codex_accounts.json", callback=self._on_reveal_codex_accounts)
+        )
+        return _submenu(f"{vendor_label(VENDOR_CODEX)} accounts", children)
 
     def _diagnostic_items(self, snapshot: UiSnapshot) -> list[rumps.MenuItem]:
         """Evidence for the SPEC 2.1 budget, visible without a debugger."""
@@ -2361,6 +4107,13 @@ class CCUsageWidgetApp(rumps.App):
         # so the line cannot claim a root the source is not actually reading.
         for label, root in self._worker.source_roots():
             items.append(_info(f"{label}: {root}"))
+        # What the live quota source is doing, in its own words (SPEC-CODEX 6):
+        # credential count, poll state, last status per account. Read from the
+        # worker's cache - the source produced these lines on its own thread,
+        # and a diagnostics line must never be the thing that stats a
+        # credential directory from the AppKit thread.
+        for line in self._worker.source_diagnostics:
+            items.append(_info(line))
         items.append(_info(f"State: {SCAN_STATE_PATH.parent}"))
         return items
 
@@ -2408,6 +4161,23 @@ class CCUsageWidgetApp(rumps.App):
 
         return callback
 
+    def _make_codex_account_toggle(
+        self, account_id: str, enabled: bool
+    ) -> Callable[[Any], None]:
+        """Flip one tracked Codex account's ``enabled`` flag (SPEC-CODEX 6).
+
+        Deliberately NOT optimistic: the registry entries are cached from the
+        worker, not held in ``settings``, so there is no snapshot field to
+        repaint from. The worker writes the file and republishes the rows,
+        which is when the checkmark moves - a click that failed therefore
+        leaves the checkmark where it was instead of lying about it.
+        """
+
+        def callback(_sender: Any) -> None:
+            self._worker.submit(_CMD_SET_CODEX_ACCOUNT, (account_id, not enabled))
+
+        return callback
+
     def _make_switch_callback(self, row: AccountRow) -> Callable[[Any], None]:
         target = row.alias or str(row.slot)
 
@@ -2415,6 +4185,10 @@ class CCUsageWidgetApp(rumps.App):
             self._worker.submit(_CMD_SWITCH_TO, target)
 
         return callback
+
+    def _on_switch_best(self, _sender: Any) -> None:
+        """Hand the pick to claude-swap on the worker. Main thread does no I/O."""
+        self._worker.submit(_CMD_SWITCH_BEST, None)
 
     def _on_refresh_now(self, _sender: Any) -> None:
         self._worker.submit(_CMD_REFRESH, None)
@@ -2433,6 +4207,24 @@ class CCUsageWidgetApp(rumps.App):
             )
         except Exception as exc:
             _log(f"could not reveal {SETTINGS_PATH}: {exc!r}")
+
+    def _on_reveal_codex_accounts(self, _sender: Any) -> None:
+        """Reveal ``codex_accounts.json`` in Finder (SPEC-CODEX 6).
+
+        The registry is the one piece of this feature the user hand-edits
+        (aliases, order), so it gets the same treatment ``settings.json`` has.
+        It holds no token and no email - only ids, aliases and flags - which is
+        why revealing it is safe.
+        """
+        path = CODEX_ACCOUNTS_REGISTRY_PATH
+        try:
+            import AppKit
+
+            AppKit.NSWorkspace.sharedWorkspace().selectFile_inFileViewerRootedAtPath_(
+                str(path), str(path.parent)
+            )
+        except Exception as exc:
+            _log(f"could not reveal {path}: {exc!r}")
 
     def _on_quit(self, _sender: Any) -> None:
         self.shutdown()

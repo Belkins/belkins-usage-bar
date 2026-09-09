@@ -63,6 +63,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
 from collections import deque
@@ -71,7 +72,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Final
 
-from .contracts import AccountRow, Pct, normalize_settings
+from .contracts import (
+    ALERT_ACCOUNT_QUARANTINED,
+    ALERT_ALL_EXHAUSTED,
+    ALERT_ERROR,
+    ALERT_EXTERNAL_SWITCH,
+    ALERT_NO_TARGET,
+    AccountRow,
+    Pct,
+    normalize_settings,
+)
 
 __all__ = [
     "LOGGER",
@@ -88,6 +98,12 @@ LOGGER: Final[logging.Logger] = logging.getLogger("cc_usage_widget.accounts")
 ACCOUNTS_UNAVAILABLE: Final[str] = "accounts unavailable"
 """Exact menu text when claude-swap cannot be read at all. Defined here so the
 adapter and ``app.py`` cannot disagree about the wording."""
+
+ENGINE_UNAVAILABLE_PREFIX: Final[str] = "autoswitch engine unavailable: "
+"""Prefix of the alert this adapter raises when the engine will not construct.
+
+Ours, not upstream's — so a later successful construction can retract exactly
+that alert without touching an ``error`` verdict the engine itself emitted."""
 
 AUTOSWITCH_SECTION: Final[str] = "autoswitch"
 """Section of claude-swap's ``settings.json`` that holds autoswitch keys."""
@@ -123,6 +139,42 @@ _EVENT_LOG_LIMIT: Final[int] = 20
 """How many recent autoswitch event lines :meth:`SwapAccountSource.recent_events`
 keeps."""
 
+_NO_TARGET_REASONS: Final[frozenset[str]] = frozenset(
+    {"no-viable-target", "no-candidates"}
+)
+"""``NoSwitchEvent.reason`` values that are a STANDING problem, not a shrug.
+
+Every other reason ("below-threshold", "cooldown", "active-idle", ...) means the
+engine looked and had nothing to do. These two mean it wanted to move and could
+not - the state behind tonight's ``main 100% ⛔ exhausted`` sitting silent, since
+a plain ``no-switch`` also CLEARS whatever alert was standing."""
+
+_ANY_SLOT: Final[str] = "*"
+"""``_expect_active`` value meaning "we switched, target slot unknown".
+
+Set when a manual switch names an alias claude-swap owns and we cannot map back
+to a number. It suppresses the external-switch verdict for exactly one pass -
+mislabelling our own click as a rival actor would be a lie, and the click is
+already in the log two lines up."""
+
+_QUIET_EVENT_KINDS: Final[frozenset[str]] = frozenset({"poll", "sleep"})
+"""Event kinds kept out of :meth:`SwapAccountSource.recent_events`.
+
+They carry no verdict and the engine emits one of them on nearly every tick, so
+including them would push every real line out of the 20-slot deque within ~20
+minutes - i.e. the "Recent switches" menu block would show no switches. They are
+still DEBUG-logged, which is where a cadence question is answered."""
+
+_TIMESTAMP_TAIL_RE: Final[re.Pattern[str]] = re.compile(
+    r"(\d{4}-\d{2}-\d{2})T[\d:.]+Z?"
+)
+"""Matches an ISO instant and keeps only its date - see :func:`_episode_key`."""
+
+_TESTED_CLAUDE_SWAP_PREFIX: Final[str] = "0.25."
+"""claude-swap versions this adapter's private-symbol reach-ins were verified
+against. A mismatch WARNS (never refuses): the failure policy already degrades
+gracefully, this just makes the degradation datable."""
+
 
 # ---------------------------------------------------------------------------
 # Small pure helpers (no claude_swap involved)
@@ -146,6 +198,30 @@ def _as_mapping(settings: Any) -> Mapping[str, Any] | None:
             return None
         return value if isinstance(value, Mapping) else None
     return settings if isinstance(settings, Mapping) else None
+
+
+
+def _stamp() -> str:
+    """Local ``HH:MM`` for a forensic line.
+
+    Local, not UTC: the operator reads these against the wall clock next to the
+    menu bar. Upstream's own lines are UTC ISO instants, which is exactly why
+    the all-exhausted line needed rewriting (SPEC 4.3 - show a time a human can
+    act on, never a number they must convert).
+    """
+    return time.strftime("%H:%M")
+
+
+def _episode_key(line: str) -> str:
+    """Jitter-free identity for a repeating engine event line.
+
+    Engine event text carries an ISO reset instant whose sub-second part (and
+    therefore sometimes its whole second, minute and hour) moves between
+    emissions of the SAME episode. Collapse every timestamp to its date so
+    repeat detection is stable; a genuinely new episode almost always carries
+    a different reset date, and the hourly re-WARN covers the rest.
+    """
+    return _TIMESTAMP_TAIL_RE.sub(r"\1", line)
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -187,6 +263,50 @@ def _on_main_thread() -> bool:
     return threading.current_thread() is threading.main_thread()
 
 
+_SWITCH_WARNING_LIMIT: Final[int] = 5
+"""How many of one switch result's ``warnings`` lines reach the event log.
+
+The log is a 20-line deque shared with the engine's own events; a rotation
+that skipped every disabled slot must not evict the switch itself. The log
+line count is capped, never the WARNING records - see
+:func:`_switch_warnings_for_log`."""
+
+
+def _switch_warnings(result: Mapping[str, Any]) -> tuple[str, ...]:
+    """ALL of a claude-swap switch result's ``warnings``, as clean strings.
+
+    Upstream returns ``{"switched", "from", "to", "strategy", "reason",
+    "message", "warnings"}``; the widget dropped ``warnings`` entirely, so
+    "Skipped Account-3 (disabled)" never reached the operator. Anything that
+    is not a non-empty string is discarded rather than str()-ed into noise.
+
+    Nothing is truncated here: every line is logged. The *menu* view is
+    capped separately by :func:`_switch_warnings_for_log`.
+    """
+    raw = result.get("warnings")
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    return tuple(
+        line.strip() for line in raw if isinstance(line, str) and line.strip()
+    )
+
+
+def _switch_warnings_for_log(lines: tuple[str, ...]) -> tuple[str, ...]:
+    """At most :data:`_SWITCH_WARNING_LIMIT` lines, and honest when it cut.
+
+    Several disabled slots plus an inert-model-limit warning can exceed the
+    cap. Silently keeping the first five renders a complete-LOOKING list that
+    is not complete, so an over-long run keeps four lines and spends the
+    fifth saying how many were dropped and where to read them (SPEC 4.3:
+    never imply we showed everything we had).
+    """
+    if len(lines) <= _SWITCH_WARNING_LIMIT:
+        return tuple(lines)
+    kept = _SWITCH_WARNING_LIMIT - 1
+    return (*lines[:kept], f"… and {len(lines) - kept} more (see the log)")
+
+
+
 def _alias_from_email(email: str, slot: int) -> str:
     """Fallback display alias for an account with no ``cswap alias`` set.
 
@@ -222,6 +342,12 @@ class _Backend:
     sentinel_notes: Mapping[str, str]
     schema_version: int
     backup_dir: Path
+    state_filename: str
+    """Name of claude-swap's autoswitch state file inside ``backup_dir``.
+
+    Taken from upstream rather than hardcoded so a rename lands here as a
+    missing quarantine alert, not as a silently wrong path.
+    """
 
 
 def _identity_roll(window: Any, _now: float) -> Any:
@@ -235,7 +361,7 @@ def _import_backend(switcher: Any | None) -> _Backend:
     Raises whatever the import or the switcher's construction raises; the only
     caller wraps this and records the failure.
     """
-    from claude_swap.autoswitch import AutoSwitchEngine
+    from claude_swap.autoswitch import STATE_FILENAME, AutoSwitchEngine
     from claude_swap.oauth import fresh_reset_strings
     from claude_swap.settings import (
         SETTINGS_SCHEMA_VERSION,
@@ -246,6 +372,25 @@ def _import_backend(switcher: Any | None) -> _Backend:
     from claude_swap.snapshot_source import SnapshotSource
     from claude_swap.switcher import SENTINEL_NOTES, ClaudeAccountSwitcher
 
+    # This adapter reaches into 9 upstream symbols, one of them PRIVATE
+    # (menubar._rolled_weekly_window). Warn — never refuse — when running
+    # against an untested claude-swap major/minor, so a silent
+    # good-but-degraded state after `uv tool upgrade` has a log line.
+    try:
+        from importlib.metadata import version as _dist_version
+
+        _cs_version = _dist_version("claude-swap")
+        if not _cs_version.startswith(_TESTED_CLAUDE_SWAP_PREFIX):
+            LOGGER.warning(
+                "claude-swap %s is outside the tested %sx range — the "
+                "accounts adapter may silently degrade; re-verify the menu "
+                "after upstream upgrades",
+                _cs_version,
+                _TESTED_CLAUDE_SWAP_PREFIX,
+            )
+    except Exception:  # pragma: no cover - metadata is best-effort
+        pass
+
     # Reuse upstream's weekly roll-forward: once a weekly window's ``resets_at``
     # has passed we know it rolled over, so the stored pct belongs to a window
     # that no longer exists and must not render as "Fable 100% (!)" for days.
@@ -255,6 +400,11 @@ def _import_backend(switcher: Any | None) -> _Backend:
         from claude_swap.menubar import _rolled_weekly_window as roll_weekly
     except Exception:  # pragma: no cover - upstream refactor
         roll_weekly = _identity_roll
+        LOGGER.warning(
+            "claude_swap.menubar._rolled_weekly_window is gone (upstream "
+            "refactor?) — weekly windows render RAW, so an already-rolled "
+            "week may display as a stale 100%% until its next real fetch"
+        )
 
     live = switcher if switcher is not None else ClaudeAccountSwitcher()
     return _Backend(
@@ -269,6 +419,7 @@ def _import_backend(switcher: Any | None) -> _Backend:
         sentinel_notes=dict(SENTINEL_NOTES),
         schema_version=int(SETTINGS_SCHEMA_VERSION),
         backup_dir=Path(live.backup_dir),
+        state_filename=str(STATE_FILENAME),
     )
 
 
@@ -319,11 +470,41 @@ class SwapAccountSource:
 
         # Derived per snapshot, for the extras below the protocol.
         self._sentinels: dict[int, str] = {}
+        # The STRUCTURED key behind each note ("re-login needed", "api key",
+        # ...). Kept beside the prose so the menu classifies on a stable
+        # identifier instead of substring-matching upstream's wording.
+        self._sentinel_kinds: dict[int, str] = {}
+        # All-exhausted WARNING dedupe: holds an _episode_key(), NOT a
+        # raw line (the line's timestamp jitters). See _drain_events.
+        self._last_exhausted_key: str | None = None
+        self._last_exhausted_warn_at: float = 0.0
+        # The engine's standing verdict for the menu bar (see _drain_events).
+        self._alert: tuple[str, str] | None = None
+        # no-viable-target WARNING dedupe, same shape as _last_exhausted_key:
+        # the engine re-emits the event every blocked tick.
+        self._last_no_target_key: str | None = None
+        # (mtime, parsed) of the last read of claude-swap's autoswitch state, so
+        # every reader of that file costs one stat in the steady state.
+        self._state_cache: tuple[float | None, Mapping[str, Any] | None] = (None, None)
+        # Previous pass's active slot, and the slot a switch WE made is expected
+        # to land on (consumed by the next pass). Together these are the whole
+        # external-switch detector: claude-swap re-derives the active login from
+        # ~/.claude.json every pass, so a switch another actor made is visible -
+        # but only if something compares two passes (2026-09-01: three ghost
+        # flips tonight left no line anywhere).
+        self._last_active_number: str | None = None
+        self._expect_active: str | None = None
+        # The widget's OWN verdict, kept apart from the engine's `_alert`: an
+        # ordinary no-switch tick clears `_alert` (correctly - the engine moved
+        # on), and in the first cut that took this verdict with it within 60 s
+        # (review 2026-09-01). Only a widget-made switch retracts it.
+        self._external_alert: tuple[str, str] | None = None
         self._switchable: frozenset[int] = frozenset()
         self._alias_by_slot: dict[int, str] = {}
 
         self._engine: Any | None = None
         self._engine_policy_mtime: float | None = None
+        self._policy_threshold: float | None = None  # W4
         self._next_tick_at: float = 0.0
 
         self._warned_main_thread = False
@@ -456,9 +637,54 @@ class SwapAccountSource:
             self._take_lock.release()
 
         with self._lock:
+            previous = self._last_active_number
+            # Consumed once, whether or not the active actually moved: an
+            # expectation that outlives the pass it was made for would swallow
+            # the NEXT external switch to the same slot.
+            expected, self._expect_active = self._expect_active, None
+            current = getattr(snapshot, "active_number", None)
+            current = str(current) if isinstance(current, str) and current else None
+            self._last_active_number = current
             self._snapshot = snapshot
             self._snapshot_at = time.monotonic()
             self._last_error = None
+        self._note_external_switch(previous, current, expected)
+
+    def _note_external_switch(
+        self, previous: str | None, current: str | None, expected: str | None
+    ) -> None:
+        """Report an active-account change the widget did not cause.
+
+        Called once per completed snapshot pass. Silent unless *all* of these
+        hold, because a false "someone else switched" is worse than none:
+
+        * both passes knew which slot was active (the first pass after start
+          has no ``previous`` - we cannot say who moved it, so we do not);
+        * the slot actually changed;
+        * no switch of ours is outstanding - an engine ``switch`` event drained
+          in this pass, or a manual switch recorded by :meth:`switch_to`, both
+          of which set ``_expect_active`` to the slot they aimed at.
+
+        The alert stands until the widget itself switches again (an engine
+        switch or a menu click clears it); it is deliberately NOT cleared by a
+        later quiet tick, because "another actor is driving this login" stays
+        true until we take the wheel back.
+        """
+        if previous is None or current is None or current == previous:
+            return
+        if expected is not None and expected in (current, _ANY_SLOT):
+            return
+        LOGGER.warning(
+            "accounts: active changed outside the widget: %s -> %s (no engine "
+            "or manual switch; a running session's token refresh or another "
+            "cswap actor)",
+            previous,
+            current,
+        )
+        line = f"{_stamp()} active {previous}\u2192{current} (external)"
+        with self._lock:
+            self._event_log.append(line)
+            self._external_alert = (ALERT_EXTERNAL_SWITCH, line)
 
     def rows(self) -> tuple[AccountRow, ...]:
         """All accounts, ordered by :attr:`AccountRow.slot` ascending.
@@ -539,6 +765,7 @@ class SwapAccountSource:
 
         rows: list[AccountRow] = []
         sentinels: dict[int, str] = {}
+        sentinel_kinds: dict[int, str] = {}
         switchable: set[int] = set()
         aliases: dict[int, str] = {}
         for account in accounts:
@@ -549,15 +776,18 @@ class SwapAccountSource:
                 continue
             rows.append(row)
             aliases[row.slot] = row.alias
-            note = self._sentinel_note(account, backend)
-            if note:
+            derived = self._sentinel_note(account, backend)
+            if derived is not None:
+                kind, note = derived
                 sentinels[row.slot] = note
-            if bool(getattr(account, "switchable", True)):
+                sentinel_kinds[row.slot] = kind
+            if row.switchable:
                 switchable.add(row.slot)
 
         rows.sort(key=lambda row: row.slot)
         with self._lock:
             self._sentinels = sentinels
+            self._sentinel_kinds = sentinel_kinds
             self._switchable = frozenset(switchable)
             self._alias_by_slot = aliases
         return tuple(rows)
@@ -618,6 +848,19 @@ class SwapAccountSource:
             alias=alias,
             email=email,
             is_active=is_active,
+            # Upstream's `switchable` means "this slot has BOTH stored
+            # credentials and a config backup", i.e. it can be activated
+            # without re-adding the account (switcher._account_is_switchable).
+            # AccountRow.switchable is the ONLY thing that makes a row
+            # clickable, and it was never populated here: a slot claude-swap
+            # cannot activate still rendered as a live menu item whose click
+            # was guaranteed to fail. Defaults to True when the attribute is
+            # absent, matching this adapter's fail-open policy (a missing
+            # upstream field must not disable manual switching).
+            switchable=bool(getattr(account, "switchable", True)),
+            # Upstream's `cswap disable` flag, carried so the title's room count
+            # can skip a slot the engine would never rotate onto.
+            disabled=bool(getattr(account, "disabled", False)),
             five_hour_pct=_pct(five_hour),
             seven_day_pct=_pct(seven_day),
             scoped_windows=tuple(scoped_windows),
@@ -655,21 +898,27 @@ class SwapAccountSource:
         raw = window.get("resets_at")
         return str(raw) if isinstance(raw, str) and raw else None
 
-    def _sentinel_note(self, account: Any, backend: _Backend | None) -> str | None:
-        """Human note for a derived usage state (``api key``, ``token
-        expired``, ``re-login needed``, ...) or ``None`` for a real measurement.
+    def _sentinel_note(
+        self, account: Any, backend: _Backend | None
+    ) -> tuple[str, str] | None:
+        """``(kind, human note)`` for a derived usage state, or ``None``.
 
-        :class:`AccountRow` has nowhere to carry this, so it is exposed
-        alongside the rows via :meth:`sentinel_for` for the menu to annotate.
+        The *kind* is upstream's own sentinel key — a short stable identifier
+        (``"re-login needed"``, ``"api key"``, ``"token expired"``); the note is
+        the long prose it maps to. Both are exposed (:meth:`sentinel_for`,
+        :meth:`sentinel_kinds`) because :class:`AccountRow` has nowhere to
+        carry them, and because the menu must classify on the key: matching the
+        prose meant a wording change upstream silently demoted a re-login
+        warning to a generic bucket (2026-08-26).
         """
         sentinel = getattr(getattr(account, "usage", None), "sentinel", None)
         if not isinstance(sentinel, str) or not sentinel:
             return None
         notes = backend.sentinel_notes if backend is not None else {}
         try:
-            return str(notes.get(sentinel, sentinel))
+            return sentinel, str(notes.get(sentinel, sentinel))
         except Exception:  # pragma: no cover - defensive
-            return sentinel
+            return sentinel, sentinel
 
     # -- extras beyond the protocol ---------------------------------------
 
@@ -682,6 +931,15 @@ class SwapAccountSource:
         """Every slot with a derived usage state, as ``{slot: note}``."""
         with self._lock:
             return dict(self._sentinels)
+
+    def sentinel_kinds(self) -> dict[int, str]:
+        """The stable key behind each note, as ``{slot: kind}``.
+
+        Keys are upstream's own (``"re-login needed"``, ``"token expired"``,
+        ``"api key"``, ...). Classify on these, never on the prose.
+        """
+        with self._lock:
+            return dict(self._sentinel_kinds)
 
     def switchable_slots(self) -> frozenset[int]:
         """Slots claude-swap reports as switchable (they have a usable backup).
@@ -697,6 +955,194 @@ class SwapAccountSource:
         with self._lock:
             return tuple(self._event_log)
 
+    def current_alert(self) -> tuple[str, str] | None:
+        """The engine's standing verdict as ``(kind, line)``, or ``None``.
+
+        Set by an ``all-exhausted`` / ``account-quarantined`` / ``error`` event
+        and cleared by the next switch or no-switch tick, so the menu bar shows
+        what the engine currently believes rather than a one-off log line.
+        Before 2026-08-25 these events reached only the log: the fleet sat at
+        "all accounts exhausted" for hours while the title read ``vlad 0%``.
+
+        Two things here are DERIVED rather than remembered, because a verdict
+        that outlives what produced it is exactly the bug this feature exists
+        to end (both shipped in the first cut and were fixed 2026-08-26):
+
+        * with autoswitch off there is no engine and therefore no ENGINE
+          verdict — checked on every read, so a toggle written by another
+          process (``cswap config set``) is honoured without waiting for a
+          tick. An ``external-switch`` verdict is ours, not the engine's, and
+          is the one thing that survives the toggle;
+        * a quarantine that predates this process never fires an event, so it
+          falls back to the state file (see
+          :meth:`_persisted_quarantine_alert`).
+        """
+        with self._lock:
+            alert = self._alert
+            external = self._external_alert
+        if not self.autoswitch_enabled():
+            # An external switch is the widget's OWN observation, not an engine
+            # verdict, so it survives the toggle - and autoswitch is OFF by
+            # default, which is precisely when a rival actor owns the login.
+            # Every other verdict belongs to the engine and dies with it.
+            return external
+        # Precedence is deliberate: a live verdict outranks the state file.
+        # An engine that will not start is the most urgent of all — nothing is
+        # switching for ANY account — so it legitimately hides a per-account
+        # quarantine, which is still spelled out on that account's own row.
+        return alert or external or self._persisted_quarantine_alert()
+
+    def _autoswitch_state_path(self) -> Path | None:
+        """claude-swap's ``autoswitch_state.json``, or ``None`` if unavailable."""
+        backend = self._backend_or_none()
+        if backend is None:
+            return None
+        try:
+            return Path(backend.backup_dir) / backend.state_filename
+        except Exception as exc:  # pragma: no cover - upstream refactor
+            self._log.debug("accounts: autoswitch state path unknown: %r", exc)
+            return None
+
+    def _persisted_quarantine_alert(self) -> tuple[str, str] | None:
+        """A quarantine already recorded in ``autoswitch_state.json``.
+
+        ``QuarantineEvent`` fires only at the TRANSITION, and upstream filters
+        an already-quarantined slot out of the candidate path before it could
+        fire again — so a quarantine that predates this process (a restart, or
+        the widget being started after the fact) reaches the menu only if we
+        read the file. Re-reading it also means the alert disappears on its own
+        once upstream releases the quarantine, instead of needing a clear.
+
+        mtime-gated: one ``stat`` in the steady state. Unreadable or corrupt
+        state is "no alert", never an exception — the menu must not go down
+        because a file upstream owns is mid-write.
+        """
+        data = self._autoswitch_state()
+        alert: tuple[str, str] | None = None
+        try:
+            entries = data.get("quarantine") if isinstance(data, Mapping) else None
+            if isinstance(entries, Mapping) and entries:
+                # Deterministic pick so the line does not flap between slots;
+                # the count carries the rest rather than dropping them.
+                slot = sorted(entries, key=lambda k: (len(str(k)), str(k)))[0]
+                entry = entries.get(slot)
+                entry = entry if isinstance(entry, Mapping) else {}
+                email = str(entry.get("email") or "")
+                reason = str(entry.get("reason") or "unknown reason")
+                extra = len(entries) - 1
+                more = f" (+{extra} more)" if extra > 0 else ""
+                # Word-for-word upstream's QuarantineEvent.human(), so the two
+                # paths to this line cannot disagree in the menu.
+                alert = (
+                    ALERT_ACCOUNT_QUARANTINED,
+                    f"Account-{slot} ({email}) quarantined: {reason}. "
+                    f"Log in with it and run 'cswap --add-account --slot {slot}' "
+                    f"to recover.{more}",
+                )
+        except (AttributeError, TypeError, ValueError) as exc:  # pragma: no cover
+            self._log.debug("accounts: autoswitch quarantine unreadable: %r", exc)
+            return None
+        return alert
+
+    def _autoswitch_state(self) -> Mapping[str, Any] | None:
+        """claude-swap's parsed ``autoswitch_state.json``, or ``None``.
+
+        mtime-gated: one ``stat`` in the steady state, which is what lets three
+        readers (quarantine, last-switch, cooldown) share the file without three
+        parses per tick. Unreadable, corrupt or non-object state is ``None``,
+        never an exception - the menu must not go down because a file upstream
+        owns is mid-write.
+        """
+        path = self._autoswitch_state_path()
+        if path is None:
+            return None
+        try:
+            mtime: float | None = path.stat().st_mtime
+        except OSError:
+            with self._lock:
+                self._state_cache = (None, None)
+            return None
+
+        with self._lock:
+            cached_mtime, cached = self._state_cache
+            if cached_mtime == mtime:
+                return cached
+
+        data: Mapping[str, Any] | None = None
+        try:
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            self._log.debug("accounts: autoswitch state unreadable: %r", exc)
+            return None
+        if isinstance(parsed, Mapping):
+            data = parsed
+
+        with self._lock:
+            self._state_cache = (mtime, data)
+        return data
+
+    def switch_note(self) -> str | None:
+        """One line about the last recorded switch, or ``None``.
+
+        ``last switch 21:05 (at-limit) - cooldown 3m left`` - answers "why is
+        the widget sitting still?" from claude-swap's own shared state rather
+        than from anything we remember, so a switch made by ``cswap`` or the TUI
+        is described too.
+
+        Every part is omitted rather than guessed (SPEC 4.3): no
+        ``lastSwitchAt`` -> no line at all; no ``leftTrigger`` -> no reason in
+        parentheses; no running engine -> no cooldown clause, because the
+        cooldown only binds an engine and reading the policy file per tick just
+        to print a number nothing is waiting on is not worth the syscall.
+        """
+        state = self._autoswitch_state()
+        if not state:
+            return None
+        try:
+            when = float(state.get("lastSwitchAt"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+        if when <= 0:
+            return None
+        try:
+            local = time.localtime(when)
+            today = time.localtime()
+            recent = (local.tm_year, local.tm_yday) == (today.tm_year, today.tm_yday)
+            # A bare clock reads as "today". The state file persists for weeks
+            # and autoswitch is off by default, so a switch from another day
+            # carries its date rather than implying one this evening (SPEC 4.3).
+            stamp = time.strftime("%H:%M" if recent else "%b %d %H:%M", local)
+        except (OSError, OverflowError, ValueError):
+            return None
+
+        line = f"last switch {stamp}"
+        trigger = state.get("leftTrigger")
+        if isinstance(trigger, str) and trigger:
+            line = f"{line} ({trigger})"
+
+        cooldown = self._engine_cooldown_seconds()
+        if cooldown is not None:
+            left = cooldown - (time.time() - when)
+            if left > 0:
+                minutes = int(left // 60) + (1 if left % 60 else 0)
+                line = f"{line} \u00b7 cooldown {minutes}m left"
+        return line
+
+    def _engine_cooldown_seconds(self) -> float | None:
+        """``autoswitch.cooldownSeconds`` as the RUNNING engine sees it.
+
+        Read off the live engine only - no engine means no cooldown is being
+        enforced, and inventing one from the settings file would describe a gate
+        that is not there.
+        """
+        with self._lock:
+            engine = self._engine
+        value = getattr(getattr(engine, "settings", None), "cooldown_seconds", None)
+        try:
+            return float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+
     def autoswitch_threshold(self) -> float | None:
         """claude-swap's current ``autoswitch.threshold``, or ``None``.
 
@@ -710,6 +1156,23 @@ class SwapAccountSource:
         except Exception as exc:
             self._record_error("autoswitch policy unreadable", exc)
             return None
+
+    def cached_autoswitch_threshold(self) -> float | None:  # W4
+        """The threshold the live engine was built with, or ``None``.
+
+        The cheap sibling of :meth:`autoswitch_threshold`: no file read at
+        all, just the value captured in :meth:`_ensure_engine` from the same
+        policy object the engine snapshotted, refreshed behind the same
+        ``settings.json`` mtime gate. That is what makes it safe to publish on
+        every UI tick, and what guarantees a renderer bucketing on it cannot
+        disagree with what autoswitch will actually do.
+
+        ``None`` until an engine has been built once — with autoswitch off,
+        that is for the whole session. Callers must have their own answer for
+        "unknown"; this never guesses one.
+        """
+        with self._lock:
+            return self._policy_threshold
 
     def autoswitch_state_path(self) -> Path | None:
         """The shared ``autoswitch_state.json`` this adapter's engine uses.
@@ -748,15 +1211,65 @@ class SwapAccountSource:
             self._record_error("switch requested with an empty identifier")
             return False
 
+        # Manual switches bypass every engine gate (usage, quarantine, token
+        # freshness) BY DESIGN — the click is an operator override. Make the
+        # override informed and forensically visible: the 2026-08-25 15:06
+        # manual switch landed on a token-dead account and left no log line
+        # at all, which cost real diagnosis time.
+        target_slot = self._resolve_slot_for_logging(identifier)
+        sentinel = None
+        if target_slot is not None:
+            with self._lock:
+                sentinel = self._sentinels.get(target_slot)
+        if sentinel:
+            LOGGER.warning(
+                "manual switch -> %s requested although the target reports "
+                "%r — the engine would not have chosen it; proceeding "
+                "(operator override)",
+                identifier,
+                sentinel,
+            )
+        else:
+            LOGGER.info("manual switch -> %s requested", identifier)
+
         ok = self._attempt_switch(backend, identifier)
         if not ok:
             fallback = self._slot_identifier_for(identifier)
             if fallback is not None and fallback != identifier:
                 ok = self._attempt_switch(backend, fallback)
         if ok:
+            LOGGER.info("manual switch -> %s succeeded", identifier)
+            with self._lock:
+                # Claim the change the refresh below is about to see, so our
+                # own click is never reported as an external switch. The slot
+                # is best-effort; `_ANY_SLOT` still suppresses exactly one pass.
+                self._expect_active = (
+                    str(target_slot) if target_slot is not None else _ANY_SLOT
+                )
+                self._event_log.append(f"{_stamp()} manual \u2192 {identifier}")
+                # Taking the wheel back retracts "another actor is driving".
+                self._external_alert = None
             # Reflect the new active row now rather than up to a tick later.
             self.refresh(force=True)
         return ok
+
+    def _resolve_slot_for_logging(self, identifier: str) -> int | None:
+        """Best-effort slot number for *identifier*; never raises.
+
+        Only used to annotate manual-switch log lines with the target's
+        sentinel state — resolution failures must not affect the switch.
+        """
+        try:
+            return int(identifier)
+        except ValueError:
+            pass
+        try:
+            fallback = self._slot_identifier_for(identifier)
+            if fallback is not None:
+                return int(fallback)
+        except Exception:  # pragma: no cover - defensive
+            pass
+        return None
 
     def _attempt_switch(self, backend: _Backend, identifier: str) -> bool:
         """One ``switcher.switch_to`` attempt, fully wrapped."""
@@ -792,6 +1305,107 @@ class SwapAccountSource:
             if alias.strip().lower() == wanted:
                 return str(slot)
         return None
+
+    def switch_best(self) -> bool:
+        """Switch to the switchable account with the most remaining quota.
+
+        Delegates to ``switcher.switch(strategy="best", json_output=True)`` -
+        claude-swap's OWN usage-aware pick, folding in the per-model weekly
+        windows the autoswitch policy names, so one click lands where the
+        engine would have gone. We do not rank the rows ourselves: the menu's
+        percentages are a display read that may be minutes old, and a
+        second, disagreeing ranking is exactly the kind of invented number
+        SPEC 4.3 forbids.
+
+        Unlike :meth:`switch_to` this is **not** an operator override.
+        Upstream stays put unless it can prove another account has more
+        headroom; that verdict (``already-best``, ``candidates-exhausted``,
+        ``usage-unavailable``) is reported rather than swallowed - staying on
+        the best account is a success, being unable to tell is not.
+
+        Every ``warnings`` line upstream returns (skipped disabled slots,
+        inert model limits) is appended to the event log; ``switch_to`` used
+        to drop them on the floor.
+        """
+        backend = self._backend_or_none()
+        if backend is None:
+            return False
+        models = self._policy_models(backend)
+        LOGGER.info(
+            "manual switch (best) requested%s",
+            f" (model limits: {', '.join(models)})" if models else "",
+        )
+        try:
+            result = backend.switcher.switch(
+                strategy="best", json_output=True, models=models
+            )
+        except Exception as exc:
+            self._record_error("switch to the best account failed", exc)
+            return False
+        if not isinstance(result, Mapping):
+            # Only the interactive path returns None; anything else is a
+            # switch we cannot confirm, and an unconfirmed switch is a failure.
+            self._record_error("switch to the best account returned no result")
+            return False
+
+        warnings = _switch_warnings(result)
+        # Log EVERY line, then cap only the menu view - the log is the "see
+        # the log" the summary line points at, so it cannot be the capped one.
+        for warning in warnings:
+            LOGGER.warning("switch (best): %s", warning)
+        for warning in _switch_warnings_for_log(warnings):
+            self._append_event(f"switch (best): {warning}")
+
+        target = self._alias_for_ref(result.get("to")) or "the best account"
+        reason = result.get("reason")
+        if result.get("switched") is True or reason in ("already-active", "activated"):
+            LOGGER.info("manual switch (best) -> %s succeeded", target)
+            self._append_event(f"manual switch (best) -> {target}")
+            with self._lock:
+                # Claim the landing slot so the refresh below does not report
+                # our own click as an external switch; taking the wheel back
+                # also retracts a standing "another actor is driving" verdict.
+                self._expect_active = self._ref_number(result.get("to")) or _ANY_SLOT
+                self._external_alert = None
+            # Reflect the new active row now rather than up to a tick later.
+            self.refresh(force=True)
+            return True
+        message = result.get("message") or reason or "unknown reason"
+        if reason == "already-best":
+            # Nothing to do IS the right outcome; do not report it as a fault.
+            LOGGER.info("manual switch (best): %s", message)
+            self._append_event(f"switch (best): {message}")
+            return True
+        self._record_error(f"switch to the best account did not take: {message}")
+        return False
+
+    def _policy_models(self, backend: _Backend) -> tuple[str, ...]:
+        """Per-model weekly windows the autoswitch policy names, or ``()``.
+
+        Same key the engine reads (``autoswitch.model``), split by upstream's
+        own parser so a one-click best switch weighs exactly what the engine
+        weighs. Any failure means "compare 5h/7d only" - never a guess at
+        which models matter.
+        """
+        try:
+            from claude_swap.settings import parse_model_names
+
+            policy = backend.load_policy(backend.backup_dir)
+            return tuple(parse_model_names(getattr(policy, "model", None)))
+        except Exception as exc:
+            LOGGER.debug(
+                "autoswitch model limits unreadable (%r); comparing 5h/7d only", exc
+            )
+            return ()
+
+    def _append_event(self, line: str) -> None:
+        """Append one line to the event log read by :meth:`recent_events`.
+
+        Stamped with the local ``HH:MM`` like every other journal line, so the
+        "Recent switches" block reads as one timeline whichever path wrote it.
+        """
+        with self._lock:
+            self._event_log.append(f"{_stamp()} {line}")
 
     # -- AccountSource: autoswitch toggle ---------------------------------
 
@@ -863,10 +1477,18 @@ class SwapAccountSource:
 
         self._mirror_local_setting(wanted)
         ok = self._write_enabled(wanted)
-        if not ok:
-            # From here on this process trusts its own flag over the file it
-            # could not write, so the toggle cannot silently revert.
-            with self._lock:
+        with self._lock:
+            if ok:
+                # Release the latch. It was set on a previous failed write and
+                # never cleared, so ONE transient failure made this process
+                # ignore claude-swap's settings.json for the rest of its life —
+                # a `cswap config set autoswitch.enabled` from the terminal
+                # would then never be seen again, with the widget silently
+                # disagreeing with the file it claims to mirror (2026-08-26).
+                self._enabled_write_failed = False
+            else:
+                # From here on this process trusts its own flag over the file it
+                # could not write, so the toggle cannot silently revert.
                 self._enabled_write_failed = True
         if not wanted:
             self._stop_engine()
@@ -966,6 +1588,30 @@ class SwapAccountSource:
 
     # -- AccountSource: autoswitch evaluation -----------------------------
 
+    def next_tick_in(self) -> float | None:
+        """Seconds until the next autoswitch evaluation is due, or ``None``.
+
+        Read-only: it starts no engine, calls no claude-swap code, and moves no
+        schedule - it only reports the deadline :meth:`evaluate_autoswitch`
+        already set. The worker uses it to size its sleep, so the engine keeps
+        claude-swap's cadence (SPEC 3.5) instead of being rounded up to the
+        60 s UI tick: with ``autoswitch.intervalSeconds`` at 15 s the engine
+        used to be evaluated once a minute, four times later than configured.
+
+        ``None`` means "no schedule of ours to honour" - autoswitch is off (the
+        file is the source of truth, so a ``cswap config set`` is seen without
+        a restart) or the toggle could not be read. ``0.0`` means due now.
+        """
+        try:
+            if not self.autoswitch_enabled():
+                return None
+        except Exception as exc:  # pragma: no cover - the toggle read is guarded
+            self._log.debug("accounts: autoswitch toggle unreadable: %r", exc)
+            return None
+        with self._lock:
+            due = self._next_tick_at
+        return max(0.0, due - time.monotonic())
+
     def evaluate_autoswitch(self) -> str | None:
         """Run one autoswitch evaluation at claude-swap's cadence.
 
@@ -995,9 +1641,36 @@ class SwapAccountSource:
 
         engine = self._ensure_engine()
         if engine is None:
+            # Autoswitch is ON but the engine will not start (a malformed
+            # `autoswitch` section, an incompatible upstream). Every OTHER
+            # autoswitch failure reaches the menu bar as an alert; this one
+            # reached only `last_error`, whose sole reader is a no-op once any
+            # account row exists — so the toggle read ON while nothing was
+            # switching, indefinitely and silently (2026-08-26).
             with self._lock:
                 self._next_tick_at = time.monotonic() + _BACKEND_RETRY_S
+                self._alert = (
+                    ALERT_ERROR,
+                    f"{ENGINE_UNAVAILABLE_PREFIX}"
+                    f"{self._last_error or 'unknown reason'}",
+                )
             return None
+
+        # Construction succeeded: retract our own engine-unavailable alert
+        # rather than waiting for a tick that happens to emit a qualifying
+        # event. Without this the widget could sit on "⚠ autoswitch" long
+        # after autoswitch recovered — the same stale-verdict bug this
+        # feature exists to end, reintroduced by its own error path
+        # (2026-08-26, second pre-ship gate pass). Matched on OUR prefix so an
+        # `error` verdict the engine itself emitted is never swallowed.
+        with self._lock:
+            standing = self._alert
+            if (
+                standing is not None
+                and standing[0] == ALERT_ERROR
+                and standing[1].startswith(ENGINE_UNAVAILABLE_PREFIX)
+            ):
+                self._alert = None
 
         outcome: Any = None
         try:
@@ -1054,6 +1727,13 @@ class SwapAccountSource:
         with self._lock:
             self._engine = engine
             self._engine_policy_mtime = mtime
+            # W4: cache the number the engine was just built with, so a
+            # renderer can bucket accounts on the SAME threshold without
+            # re-reading the policy file on every tick (SPEC 2.1).
+            try:
+                self._policy_threshold = float(policy.threshold)
+            except (AttributeError, TypeError, ValueError):
+                self._policy_threshold = None
         self._log.info(
             "accounts: autoswitch engine started (threshold %s, interval %ss)",
             getattr(policy, "threshold", "?"),
@@ -1067,6 +1747,14 @@ class SwapAccountSource:
             engine = self._engine
             self._engine = None
             self._engine_policy_mtime = None
+            # The alert is the RUNNING engine's verdict. Keeping it past the
+            # engine that produced it is the same "stale state rendered as
+            # live" bug this alert was added to end (2026-08-26). Anything
+            # still true is re-derived: all-exhausted re-emits every blocked
+            # tick, a quarantine is re-read from the state file. The external
+            # switch verdict lives in its own slot and is untouched here: it is
+            # a fact about the world, not a verdict of the engine being stopped.
+            self._alert = None
         if engine is None:
             return
         try:
@@ -1137,27 +1825,112 @@ class SwapAccountSource:
 
         alias: str | None = None
         lines: list[str] = []
+        expect: str | None = None
+        took_wheel = False
+        # ``False`` = no verdict-bearing event in this batch (leave _alert as
+        # is); ``None`` = the engine moved on (clear); a tuple = a new alert.
+        alert: tuple[str, str] | None | bool = False
         for event in events:
             kind = str(getattr(event, "kind", "") or "event")
             try:
                 line = str(event.human())
             except Exception:  # pragma: no cover - upstream refactor
                 line = kind
-            lines.append(line)
+            # Journal only what an operator would call an event: a plain
+            # "no switch: below-threshold" arrives every idle tick and would
+            # evict the one external line the block exists for within ~20 min
+            # (review 2026-09-01). Still DEBUG-logged below.
+            quiet = kind in _QUIET_EVENT_KINDS or (
+                kind == "no-switch"
+                and str(getattr(event, "reason", "") or "") not in _NO_TARGET_REASONS
+            )
+            if not quiet:
+                lines.append(f"{_stamp()} {line}")
             if kind == "switch" and not bool(getattr(event, "dry_run", False)):
                 alias = self._alias_for_ref(getattr(event, "to_ref", None)) or alias
+                # Claim the landing slot so the refresh below does not read our
+                # own engine's switch as somebody else's.
+                expect = self._ref_number(getattr(event, "to_ref", None)) or _ANY_SLOT
+                alert = None
+                took_wheel = True
+                self._last_no_target_key = None
                 self._log.info("accounts: %s", line)
-            elif kind in ("account-quarantined", "all-exhausted", "config-warning", "error"):
+            elif kind == ALERT_ALL_EXHAUSTED:
+                alert = (kind, line)
+                # The engine re-emits this every blocked tick (~10 min, capped
+                # 600s) for as long as the fleet is dry — potentially days.
+                # WARN once per episode (keyed on the message, which carries
+                # earliest-reset) and once per hour thereafter; every
+                # occurrence still reaches the menu via _event_log below.
+                now = time.monotonic()
+                # Key on the reset DATE, never the raw line: the line embeds a
+                # sub-second-jittering timestamp that also flips the whole
+                # second (…T20:59:59.700962Z vs …T21:00:00.132963Z for one
+                # episode), so a raw-line comparison never matches and this
+                # WARNed every tick anyway — the exact noise it was added to
+                # remove (observed live 2026-08-26 12:31/12:41/12:45/12:55).
+                key = _episode_key(line)
+                if key != self._last_exhausted_key or (
+                    now - self._last_exhausted_warn_at > 3600.0
+                ):
+                    self._last_exhausted_key = key
+                    self._last_exhausted_warn_at = now
+                    self._log.warning("accounts: autoswitch %s: %s", kind, line)
+                else:
+                    self._log.debug("accounts: autoswitch %s: %s", kind, line)
+            elif kind in (ALERT_ACCOUNT_QUARANTINED, ALERT_ERROR):
+                alert = (kind, line)
                 self._log.warning("accounts: autoswitch %s: %s", kind, line)
+            elif kind == "config-warning":
+                self._log.warning("accounts: autoswitch %s: %s", kind, line)
+            elif kind == "no-switch" and (
+                str(getattr(event, "reason", "") or "") in _NO_TARGET_REASONS
+            ):
+                # "I wanted to move and there was nowhere to go" is a standing
+                # state, not a shrug: before 2026-09-01 it took the same branch
+                # as every other no-switch and therefore CLEARED the alert the
+                # operator needed, at DEBUG level (invisible in the default log).
+                alert = (ALERT_NO_TARGET, line)
+                key = _episode_key(line)
+                if key != self._last_no_target_key:
+                    self._last_no_target_key = key
+                    self._log.warning("accounts: autoswitch %s: %s", kind, line)
+                else:
+                    self._log.debug("accounts: autoswitch %s: %s", kind, line)
+            elif kind in ("no-switch", "account-unquarantined"):
+                # The engine evaluated the fleet and found nothing to escalate:
+                # whatever verdict was standing (all-exhausted, quarantine) is
+                # over. A poll/sleep event carries no verdict and changes nothing.
+                alert = None
+                self._last_no_target_key = None
+                self._log.debug("accounts: autoswitch %s: %s", kind, line)
             else:
                 self._log.debug("accounts: autoswitch %s: %s", kind, line)
 
         with self._lock:
             self._event_log.extend(lines)
+            if expect is not None:
+                self._expect_active = expect
+            if took_wheel:
+                # Our own engine switched: "another actor is driving" is over.
+                self._external_alert = None
+            if alert is not False:
+                self._alert = alert
         if alias is not None:
             # The active slot just changed under us.
             self.refresh(force=True)
         return alias
+
+    @staticmethod
+    def _ref_number(ref: Any) -> str | None:
+        """Slot number of a ``{"number": .., "email": ..}`` event ref, as str."""
+        if not isinstance(ref, Mapping):
+            return None
+        number = ref.get("number")
+        if number is None or isinstance(number, bool):
+            return None
+        text = str(number).strip()
+        return text or None
 
     def _alias_for_ref(self, ref: Any) -> str | None:
         """Alias for a ``{"number": .., "email": ..}`` event ref."""

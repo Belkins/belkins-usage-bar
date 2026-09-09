@@ -18,6 +18,13 @@ regression: the same records with the canary REMOVED must still produce token
 counts. A test that only proves "no canary" would also pass if the indexer
 silently stopped reading anything at all.
 
+The second half of this module applies the same method to the second secret
+the widget now handles: the Codex **access token** the live per-account quota
+source (SPEC-CODEX 6) reads from an ``auth.json``. Same blunt method, plus an
+explicit negative control — the whole cycle is run again through a transport
+that deliberately logs the ``Authorization`` header, and the leak check must
+find it.
+
 Nothing here touches ``~/.claude`` or ``~/.codex``; every path is inside a
 ``TemporaryDirectory``.
 
@@ -232,6 +239,229 @@ def test_the_canary_test_can_actually_fail() -> None:
             "vacuously - fix the fixtures before trusting it"
         )
         assert written, "no state files were written"
+
+
+# ---------------------------------------------------------------------------
+# The second promise: a Codex credential never leaves its file (SPEC-CODEX 6)
+# ---------------------------------------------------------------------------
+#
+# The live per-account source (``codex_accounts.py``) holds something a
+# transcript never does: a bearer token with ten days of life on a paid
+# account. It is read from ``auth.json``, put in one ``Authorization`` header
+# and dropped. The method below is the same blunt one as above — plant a canary
+# where the token lives, run the real poll cycle, then read back every byte the
+# widget wrote plus every log line and every rendered menu label.
+#
+# The negative control matters more here than anywhere else in the suite: a
+# leak test over a component that never ran would pass beautifully. So the same
+# fixtures are run again through a transport that deliberately logs the
+# Authorization header, and the leak check must FAIL on it.
+
+TOKEN_CANARY = "SECRET_TOKEN_CANARY_4A7E1_do_not_leak"
+"""Planted as both ``access_token`` and ``refresh_token``. Not a plausible
+value in any real ``auth.json``, so a substring hit cannot be a coincidence."""
+
+CODEX_ACCOUNT_ID = "acct-canary-0000"
+
+
+class _FakeUsageTransport:
+    """Answers one usage body; records nothing. See ``_LeakyTransport``."""
+
+    def __init__(self, body: dict) -> None:
+        self._body = body
+
+    def get(self, url, headers, timeout):  # noqa: ANN001, ANN201
+        from cc_usage_widget.codex_accounts import HttpResponse
+
+        return HttpResponse(200, {}, json.dumps(self._body).encode("utf-8"))
+
+
+class _LeakyTransport:
+    """The negative control: a transport that logs the header it was given.
+
+    This is what a careless debug line looks like, and it is exactly the bug
+    the canary test exists to catch. If the assertions below can be satisfied
+    while this class is in play, they are not testing anything.
+    """
+
+    def __init__(self, inner, log) -> None:  # noqa: ANN001
+        self._inner = inner
+        self._log = log
+
+    def get(self, url, headers, timeout):  # noqa: ANN001, ANN201
+        self._log(f"GET {url} with {dict(headers)}")
+        return self._inner.get(url, headers, timeout)
+
+
+def _usage_body() -> dict:
+    """The probed Pro shape (SPEC-CODEX 6): one weekly window at 19 %."""
+    return {
+        "account_id": CODEX_ACCOUNT_ID,
+        "email": "canary@example.test",
+        "plan_type": "pro",
+        "rate_limit": {
+            "allowed": True,
+            "limit_reached": False,
+            "primary_window": {
+                "used_percent": 19,
+                "limit_window_seconds": 604800,
+                "reset_after_seconds": 3600,
+            },
+            "secondary_window": None,
+        },
+        "additional_rate_limits": [],
+        "rate_limit_reached_type": None,
+    }
+
+
+def _poll_codex_account(root: Path, *, poisoned: bool, leaky: bool = False):
+    """One full live-quota cycle over real files. Returns (rows, written, logs).
+
+    ``written`` deliberately EXCLUDES the credential directory: that file is
+    where the secret is supposed to live, and it is the one artifact the widget
+    never writes (0600, written only by ``codex login``).
+    """
+    from cc_usage_widget import codex_accounts as accounts_mod
+
+    secret = TOKEN_CANARY if poisoned else "ordinary-token-value"
+    state = root / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    credentials_dir = root / "credentials"
+    account_dir = credentials_dir / CODEX_ACCOUNT_ID
+    account_dir.mkdir(parents=True, exist_ok=True)
+    auth = account_dir / "auth.json"
+    auth.write_text(
+        json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": secret,
+                    "refresh_token": secret,
+                    "id_token": secret,
+                    "account_id": CODEX_ACCOUNT_ID,
+                },
+            }
+        )
+    )
+    auth.chmod(0o600)
+
+    registry_path = state / "codex_accounts.json"
+    registry_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "accounts": [
+                    {
+                        "account_id": CODEX_ACCOUNT_ID,
+                        "alias": "canary",
+                        "enabled": True,
+                        "order": 0,
+                    }
+                ],
+            }
+        )
+    )
+    mirror = root / "dot-codex" / "auth.json"
+    mirror.parent.mkdir(parents=True, exist_ok=True)
+    mirror.write_text(json.dumps({"tokens": {"account_id": CODEX_ACCOUNT_ID}}))
+
+    logs: list[str] = []
+    transport = _FakeUsageTransport(_usage_body())
+    if leaky:
+        transport = _LeakyTransport(transport, logs.append)
+    source = accounts_mod.CodexAccountsSource(
+        registry=accounts_mod.Registry(registry_path),
+        credentials=accounts_mod.CredentialStore(credentials_dir, auth_path=mirror),
+        transport=transport,
+        snapshots_path=state / "codex_quota_snapshots.json",
+        settings=lambda: {
+            "codex_live_quota_enabled": True,
+            "codex_quota_interval_seconds": 300,
+            "codex_show_extra_limits": True,
+        },
+        log=logs.append,
+    )
+    source.run_cycle_once()
+    rows = source.quota_rows()
+    logs.extend(source.diagnostics())
+    written = [p for p in state.rglob("*") if p.is_file()]
+    return rows, written, logs
+
+
+def _codex_leaks(rows, written, logs) -> list[str]:  # noqa: ANN001
+    """Every place the token could have escaped to."""
+    from cc_usage_widget import render as render_mod
+
+    leaked: list[str] = []
+    for path in written:
+        try:
+            body = path.read_text(errors="replace")
+        except OSError:  # pragma: no cover - unreadable artifact
+            continue
+        if TOKEN_CANARY in body:
+            leaked.append(f"{path.name}: content")
+        if TOKEN_CANARY in str(path):
+            leaked.append(f"{path.name}: filename")
+    for line in logs:
+        if TOKEN_CANARY in line:
+            leaked.append("log line")
+    for row in rows:
+        segments = list(
+            render_mod.quota_header(row.alias, row.plan_type or "", row.attention_note)
+        )
+        for window, pct in (("5h", row.five_hour_pct), ("7d", row.seven_day_pct)):
+            segments.extend(render_mod.window_line(window, pct))
+        label = "".join(text for text, _ in segments) + repr(row)
+        if TOKEN_CANARY in label:
+            leaked.append("rendered row")
+    return leaked
+
+
+def test_a_codex_credential_never_leaves_its_file() -> None:
+    """The token reaches exactly one place: the Authorization header."""
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        rows, written, logs = _poll_codex_account(root, poisoned=True)
+
+        auth = root / "credentials" / CODEX_ACCOUNT_ID / "auth.json"
+        assert TOKEN_CANARY in auth.read_text(), (
+            "the canary was not planted - this test would pass vacuously"
+        )
+        assert written, "the source wrote nothing at all - the test proves nothing"
+        assert logs, "the source logged nothing at all - the log check proves nothing"
+        assert rows and rows[0].seven_day_pct == 19.0, (
+            "the cycle must actually have completed, or there was nothing to leak"
+        )
+
+        leaked = _codex_leaks(rows, written, logs)
+        assert not leaked, "the Codex access token escaped into: " + ", ".join(leaked)
+
+
+def test_the_codex_canary_test_can_actually_fail() -> None:
+    """The negative control, and the reason to believe the test above.
+
+    Same fixtures, same assertions, one deliberately careless transport that
+    logs the Authorization header. The leak check MUST find it; if it does not,
+    the passing test above is decoration.
+    """
+    with tempfile.TemporaryDirectory() as name:
+        rows, written, logs = _poll_codex_account(Path(name), poisoned=True, leaky=True)
+        leaked = _codex_leaks(rows, written, logs)
+        assert leaked, (
+            "a transport that logs the Authorization header went UNDETECTED - "
+            "the canary check above is not testing anything"
+        )
+        assert "log line" in leaked
+
+
+def test_the_codex_row_still_carries_a_figure_without_the_canary() -> None:
+    """The mirror image: 'no leak' must mean 'read it and kept the number',
+    not 'the poller quietly did nothing'."""
+    with tempfile.TemporaryDirectory() as name:
+        rows, written, logs = _poll_codex_account(Path(name), poisoned=False)
+        assert rows and rows[0].seven_day_pct == 19.0
+        assert rows[0].plan_type == "pro" and rows[0].attention_note == ""
+        assert any(p.name == "codex_quota_snapshots.json" for p in written)
 
 
 def _tests() -> list[tuple[str, object]]:

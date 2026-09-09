@@ -713,6 +713,9 @@ class DailyRollupStore:
             short_days_counted = 0
             today_tokens = 0
             today_usd_exact = _ZERO
+            long_unpriced = 0
+            short_unpriced = 0
+            today_unpriced = 0
             today_rows: dict[VendorModelKey, _ModelAcc] = {}
             unknown_raw: set[str] = set()
             # Per-vendor USD per window (SPEC-CODEX 5.2). The window headers
@@ -728,6 +731,7 @@ class DailyRollupStore:
                 is_today = day_key == today
                 day_usd = _ZERO
                 day_tokens = 0
+                day_unpriced = 0
 
                 for raw_model, counters in models.items():
                     usage = ModelUsage.from_counters(counters)
@@ -750,6 +754,9 @@ class DailyRollupStore:
                         # string the user could look up.
                         if name != UNKNOWN_MODEL:
                             unknown_raw.add(name)
+                        # Named-unpriced or sentinel alike: these tokens
+                        # contribute $0, so the window totals are floors.
+                        day_unpriced += usage.total_tokens
                     day_usd += cost
                     day_tokens += usage.total_tokens
                     long_by_vendor[vendor] = long_by_vendor.get(vendor, _ZERO) + cost
@@ -766,15 +773,18 @@ class DailyRollupStore:
 
                 long_usd += day_usd
                 long_tokens += day_tokens
+                long_unpriced += day_unpriced
                 if day_tokens:
                     long_days_counted += 1
                 if day_key in short_window:
                     short_usd += day_usd
                     short_tokens += day_tokens
+                    short_unpriced += day_unpriced
                     if day_tokens:
                         short_days_counted += 1
                 if is_today:
                     today_tokens = day_tokens
+                    today_unpriced = day_unpriced
                     today_usd_exact = day_usd
 
             rows = self._build_rows(pricing, today_rows)
@@ -800,6 +810,7 @@ class DailyRollupStore:
                     total_tokens=today_tokens,
                     window_days=WINDOW_TODAY_DAYS,
                     days_counted=1 if today_tokens else 0,
+                    unpriced_tokens=today_unpriced,
                     vendor_usd=_vendor_split(today_by_vendor),
                 ),
                 last_7d=WindowCost(
@@ -808,6 +819,7 @@ class DailyRollupStore:
                     total_tokens=short_tokens,
                     window_days=short_days,
                     days_counted=short_days_counted,
+                    unpriced_tokens=short_unpriced,
                     vendor_usd=_vendor_split(short_by_vendor),
                 ),
                 last_30d=WindowCost(
@@ -816,6 +828,7 @@ class DailyRollupStore:
                     total_tokens=long_tokens,
                     window_days=long_days,
                     days_counted=long_days_counted,
+                    unpriced_tokens=long_unpriced,
                     vendor_usd=_vendor_split(long_by_vendor),
                 ),
                 by_model=rows,

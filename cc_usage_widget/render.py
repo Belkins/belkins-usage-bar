@@ -289,7 +289,15 @@ def window_line(
     with itself.
     """
     kind = "dim" if expired else severity(pct)
-    pct_text = "  --" if pct is None else f"{pct:>3.0f}%"
+    # "100%" is reserved for pct >= 100 (same boundary-honesty rule as
+    # contracts.format_pct): the engine's at-limit escape can land on a
+    # 99.x% account, and a rounded-up 100% here contradicted that switch.
+    if pct is None:
+        pct_text = "  --"
+    elif pct < 100 and round(pct) >= 100:
+        pct_text = f"{99:>3d}%"
+    else:
+        pct_text = f"{pct:>3.0f}%"
     marker = "  (!)" if kind == "crit" else ""
     segs: list[tuple[str, str | None]] = [
         (f"   {label:<{label_width}} ", "dim"),
@@ -330,19 +338,51 @@ def account_header(
     return segs
 
 
-def quota_header(label: str, plan: str = "", note: str = "") -> list[tuple[str, str | None]]:
-    """``Codex (pro)`` — the heading of a **read-only** quota block.
+NOTE_KIND_COLORS: dict[str, str] = {"info": "dim", "warn": "warn", "crit": "crit"}
+"""``AccountRow.attention_kind`` -> the colour kind :func:`_color` understands.
 
-    Deliberately unlike :func:`account_header`: no slot number, no email, and
-    never the ``accent``/``● active`` treatment. A pseudo-account is not an
-    account you can switch to (SPEC-CODEX 4), and the one visual promise this
-    menu makes is that accent means "this is the account you are on". The block
-    below it is drawn with the same :func:`window_line`, so the bars, the
-    severity colours and the ``(!)`` marker are shared, not re-implemented.
+The mapping is the whole reason ``attention_kind`` exists beside
+``attention_note`` (SPEC-CODEX 6): a reworded note once silently lost its
+colour, so nothing here may classify on the prose. An unknown or empty kind
+falls back to ``dim``, which is exactly how the pre-SPEC-CODEX-6 age note was
+already drawn — so a header that carries no kind renders byte-for-byte as
+before."""
+
+
+def quota_header(
+    label: str,
+    plan: str = "",
+    note: str = "",
+    *,
+    active: bool = False,
+    note_kind: str = "",
+) -> list[tuple[str, str | None]]:
+    """``Codex (pro) · active   · relogin in 1d 4h`` — a read-only quota heading.
+
+    Still deliberately unlike :func:`account_header`: no slot number, no email,
+    and never the ``accent``/``● active`` treatment. A quota row is not a
+    switch target (SPEC-CODEX 4/6 — ``switchable`` is False on every one of
+    them), and the one visual promise this menu makes is that accent means
+    "this is the account you are on". The block below it is drawn with the same
+    :func:`window_line`, so the bars, the severity colours and the ``(!)``
+    marker are shared, not re-implemented.
+
+    *active* marks the login the Codex CLI is using right now (SPEC-CODEX 6,
+    ``~/.codex/auth.json`` ``tokens.account_id``). It renders **dim**, not
+    accent, precisely because it is a statement of fact about another process
+    and not an invitation to click: four Codex rows are live at once and only
+    one of them is the one Codex would spend against.
+
+    *note* is either a staleness age or a standing sentinel that has REPLACED
+    the figures (SPEC 4.3); *note_kind* colours it through
+    :data:`NOTE_KIND_COLORS` and nothing else reads the wording. Defaults keep
+    every existing call byte-for-byte: no marker, dim note.
     """
     segs: list[tuple[str, str | None]] = [(label, None)]
     if plan:
         segs.append((f" ({plan})", "dim"))
+    if active:
+        segs.append((" · active", "dim"))
     if note:
-        segs.append((f"   · {note}", "dim"))
+        segs.append((f"   · {note}", NOTE_KIND_COLORS.get(note_kind, "dim")))
     return segs

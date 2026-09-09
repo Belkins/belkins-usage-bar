@@ -286,7 +286,7 @@ class Indexer:
         chunk_files: int = DEFAULT_CHUNK_FILES,
         now: Callable[[], float] = time.time,
         state_loader: Callable[[], Any] | None = None,
-        state_saver: Callable[[Mapping[str, Any]], None] | None = None,
+        state_saver: Callable[[Mapping[str, Any]], bool | None] | None = None,
         dedup_within_file: bool = True,
         defer_state_commit: bool = False,
     ) -> None:
@@ -467,8 +467,17 @@ class Indexer:
             return
         payload = scan_state_to_json(self._states)
         if self._state_saver is not None:
-            self._state_saver(payload)
-            self._states_dirty = False
+            # Clear the dirty flag ONLY on a durable write. The saver returns
+            # False when the state could not be persisted (disk full, a
+            # permission error, a momentarily unavailable synced volume); it
+            # never raises, by design. Treating that as success left stale
+            # offsets on disk while the rollup had already committed, so the
+            # next restart re-read those bytes and re-credited their tokens —
+            # a silent, permanent double-count. The direct-write branch below
+            # has always got this right; this branch had not (2026-08-26).
+            # ``is not False`` keeps a saver that returns None working.
+            if self._state_saver(payload) is not False:
+                self._states_dirty = False
             return
         tmp = f"{self._state_path}.tmp.{os.getpid()}"
         try:
@@ -786,7 +795,18 @@ class Indexer:
         self._files_total = 0
         self._publish_progress(scanning=False)
         if self._state_saver is not None:
-            self._state_saver({})
+            # Same durability contract as _save_states: a False return means
+            # the empty state did NOT land, so the in-memory reset must stay
+            # dirty and retry. Left unguarded this was the fix's own blind
+            # spot — app.py's "Rebuild cost index" empties rollups.json
+            # unconditionally BEFORE resetting each vendor, so a failed write
+            # here plus a crash leaves stale non-empty offsets on disk against
+            # an emptied rollup, and `_reconcile_lost_scan_state` cannot catch
+            # it (that guard keys on started_from_empty_state). Result would be
+            # a silent UNDER-count — the mirror of the double-count fixed
+            # above (2026-08-26, second pre-ship gate pass).
+            if self._state_saver({}) is False:
+                self._states_dirty = True
             return
         try:
             os.unlink(self._state_path)

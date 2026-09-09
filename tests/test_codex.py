@@ -32,7 +32,20 @@ SPEC 3.3 trap 4 day memo vs the UTC offset    :func:`test_day_memo_does_not_coll
 2026-08-21      newer quota displaces held    :func:`test_long_lived_quota_displaced_by_newer_sample`
 2026-08-21      past resets_at renders stale  :func:`test_expired_reset_renders_stale_not_live_100`
 2026-08-21      quota age note at ~2 h        :func:`test_quota_age_note_threshold_is_two_hours_for_codex_only`
+SPEC-CODEX 6    active marker + note colours  :func:`test_quota_header_marks_the_active_login_and_colours_the_note_by_kind`
+SPEC-CODEX 6    a sentinel row keeps its row  :func:`test_a_note_only_row_survives_and_renders_header_plus_note`
+SPEC-CODEX 6    verdict outranks the age      :func:`test_a_standing_verdict_outranks_the_age_note`
+SPEC-CODEX 6    four rows, four menu keys     :func:`test_four_live_rows_two_sharing_an_alias_get_four_distinct_menu_titles`
+SPEC-CODEX 6    title = the ACTIVE account    :func:`test_the_title_shows_the_active_codex_account_only`
+SPEC-CODEX 6    one bare marker, never two    :func:`test_a_non_active_codex_warning_adds_exactly_one_bare_marker`
 ============================================  =============================================================
+
+The SPEC-CODEX 6 block at the bottom is the one exception to "real files
+only": those cases own the RENDERING of a live per-account row, whose input is
+an :class:`AccountRow` built by ``codex_accounts.py`` over the network. The row
+is the frozen contract between the two halves, so it is what they construct -
+directly, with no fetcher, no transport and no mock of either. The fetcher's
+own tests live in ``tests/test_codex_accounts.py``.
 
 Run with pytest if it is available, or directly - the module is its own runner::
 
@@ -51,6 +64,7 @@ import tempfile
 import time
 import traceback
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -58,10 +72,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cc_usage_widget.codex_indexer import CodexIndexer  # noqa: E402
 from cc_usage_widget.contracts import (  # noqa: E402
+    CODEX_FETCH_STALE_SECONDS,
+    CODEX_PSEUDO_ACCOUNT_SLOT,
     CODEX_WINDOW_MINUTES_WEEKLY,
     UNKNOWN_MODEL,
     VENDOR_CLAUDE,
     VENDOR_CODEX,
+    AccountRow,
     DayRollup,
     IndexProgress,
     ModelUsage,
@@ -269,8 +286,10 @@ def test_model_attributed_across_turn_context_boundary() -> None:
         # makes the boundary observable rather than cosmetic.
         sol_usd = usd(f"{VENDOR_CODEX}:{SOL}", got[f"{VENDOR_CODEX}:{SOL}"])
         mini_usd = usd(f"{VENDOR_CODEX}:{MINI}", got[f"{VENDOR_CODEX}:{MINI}"])
-        # SOL: 30,000 * $5/Mtok + 3,000 * $30/Mtok = 0.15 + 0.09 = $0.24
-        assert round(sol_usd, 10) == 0.24, sol_usd
+        # SOL (post-cut rate, records are dated today, see pricing
+        # OPENAI_SOL_RATE_CUT_DAY): 30,000 * $4/Mtok + 3,000 * $20/Mtok
+        # = 0.12 + 0.06 = $0.18
+        assert round(sol_usd, 10) == 0.18, sol_usd
         # MINI: 100,000 * $0.75/Mtok + 5,000 * $4.50/Mtok = 0.075 + 0.0225 = $0.0975
         assert round(mini_usd, 10) == 0.0975, mini_usd
 
@@ -453,16 +472,17 @@ def test_cached_input_is_a_subset_hand_computed_cost() -> None:
     cached tokens twice - once at the full input rate and once at the cached
     rate - and every turn is overcharged.
 
-    Hand computation, ``gpt-5.6-sol`` at $5.00 / $0.50 / $30.00 per Mtok, with
-    cache writes billed at the standard input rate (SPEC-CODEX 3):
+    Hand computation, ``gpt-5.6-sol`` at $4.00 / $0.40 / $20.00 per Mtok (the
+    post-cut rate; the fixture is dated today, after ``OPENAI_SOL_RATE_CUT_DAY``),
+    with cache writes billed at the standard input rate (SPEC-CODEX 3):
 
     ==============================  ==================  ==========
-    uncached in  1,000,000 - 800,000    200,000 @ $5.00   $1.000000
-    cached in                            800,000 @ $0.50   $0.400000
-    cache write                          100,000 @ $5.00   $0.500000
-    output                                50,000 @ $30.00  $1.500000
+    uncached in  1,000,000 - 800,000    200,000 @ $4.00   $0.800000
+    cached in                            800,000 @ $0.40   $0.320000
+    cache write                          100,000 @ $4.00   $0.400000
+    output                                50,000 @ $20.00  $1.000000
     ==============================  ==================  ==========
-    **total**                                             **$3.40**
+    **total**                                             **$2.52**
     """
     with tempfile.TemporaryDirectory() as name:
         tmp = Path(name)
@@ -491,12 +511,12 @@ def test_cached_input_is_a_subset_hand_computed_cost() -> None:
         assert usage.output == 50_000
 
         got = usd(f"{VENDOR_CODEX}:{SOL}", usage)
-        assert round(got, 10) == 3.40, f"expected exactly $3.40, got ${got}"
+        assert round(got, 10) == 2.52, f"expected exactly $2.52, got ${got}"
 
         # What the additive (naive) reading would have produced, for the record:
-        # 1,000,000 @ $5.00 + 800,000 @ $0.50 + 100,000 @ $5.00 + 50,000 @ $30.00
-        # = 5.00 + 0.40 + 0.50 + 1.50 = $7.40 - more than twice the truth.
-        assert round(got, 10) != 7.40
+        # 1,000,000 @ $4.00 + 800,000 @ $0.40 + 100,000 @ $4.00 + 50,000 @ $20.00
+        # = 4.00 + 0.32 + 0.40 + 1.00 = $5.72 - more than twice the truth.
+        assert round(got, 10) != 5.72
 
 
 def test_cached_greater_than_input_is_clamped_not_negative() -> None:
@@ -529,7 +549,7 @@ def test_reasoning_output_is_not_added_twice() -> None:
     """``reasoning_output_tokens`` is already inside ``output_tokens``.
 
     Adding it again inflates output - the most expensive counter on every
-    OpenAI model ($30.00/Mtok on ``gpt-5.6-sol``) - by however much the model
+    OpenAI model ($20.00/Mtok on ``gpt-5.6-sol``) - by however much the model
     reasoned. Here that would be 4,000 of 5,000 output tokens: an 80% overcharge
     on the output line.
     """
@@ -550,8 +570,8 @@ def test_reasoning_output_is_not_added_twice() -> None:
         usage = counted(make_indexer(tmp, root).scan_once())[f"{VENDOR_CODEX}:{SOL}"]
         assert usage.output == 5_000, f"reasoning was added on top: {usage}"
         assert usage.output != 9_000, "reasoning_output_tokens double-added"
-        # 1,000 @ $5.00 + 5,000 @ $30.00 = 0.005 + 0.150 = $0.155
-        assert round(usd(f"{VENDOR_CODEX}:{SOL}", usage), 10) == 0.155
+        # 1,000 @ $4.00 + 5,000 @ $20.00 = 0.004 + 0.100 = $0.104
+        assert round(usd(f"{VENDOR_CODEX}:{SOL}", usage), 10) == 0.104
 
 
 # ---------------------------------------------------------------------------
@@ -586,7 +606,7 @@ def test_unknown_model_counts_tokens_costs_zero() -> None:
         assert key in got, f"the unpriced model's tokens were dropped: {got}"
         assert got[key] == ModelUsage(input=500_000, output=20_000)
         assert usd(key, got[key]) == 0.0, "an unpriced model was given a price"
-        # Never a neighbour's rate: at gpt-5.6-sol's rates this would be $3.10.
+        # Never a neighbour's rate: at gpt-5.6-sol's rates this would be $2.40.
         assert usd(key, got[key]) != usd(f"{VENDOR_CODEX}:{SOL}", got[key])
 
         # Surfaced by name, RAW - the user must see what OpenAI called it, not
@@ -670,6 +690,14 @@ def test_rate_limits_primary_parsed_newest_wins() -> None:
         assert row.vendor == VENDOR_CODEX
         # A quota row is informational: nothing may offer to switch to it.
         assert row.switchable is False and row.is_pseudo
+        # Scoped to the TRANSCRIPT-derived row (SPEC-CODEX 6). "Active" means
+        # "the login the Codex CLI is using right now", and the rollouts carry
+        # no account id at all - this row cannot know, so it must not claim.
+        # A LIVE per-account row (negative slot, identified by
+        # `~/.codex/auth.json`) may legitimately carry `is_active=True`; that
+        # is asserted where those rows are built, not here, and this assertion
+        # is pinned to slot 0 so it can never be read as a rule about them.
+        assert row.slot == CODEX_PSEUDO_ACCOUNT_SLOT, row.slot
         assert row.is_active is False
         # No 5-hour window exists for Codex; it must render as an em dash, not 0%.
         assert row.five_hour_pct is None
@@ -796,12 +824,13 @@ def test_cost_breakdown_splits_the_two_vendors() -> None:
 
         # Claude: 1,000,000 @ $10.00 + 100,000 @ $50.00 = 10.00 + 5.00 = $15.00
         assert by_vendor[VENDOR_CLAUDE].usd == 15.00, by_vendor[VENDOR_CLAUDE].usd
-        # Codex:  1,000,000 @ $5.00  + 100,000 @ $30.00 =  5.00 + 3.00 =  $8.00
-        assert by_vendor[VENDOR_CODEX].usd == 8.00, by_vendor[VENDOR_CODEX].usd
+        # Codex:  1,000,000 @ $4.00  + 100,000 @ $20.00 =  4.00 + 2.00 =  $6.00
+        # (gpt-5.6-sol's post-cut rate; today is after OPENAI_SOL_RATE_CUT_DAY)
+        assert by_vendor[VENDOR_CODEX].usd == 6.00, by_vendor[VENDOR_CODEX].usd
         # The header spans both, and the split behind it agrees.
-        assert breakdown.today.usd == 23.00
-        assert breakdown.today.vendor_usd == ((VENDOR_CLAUDE, 15.00), (VENDOR_CODEX, 8.00))
-        assert breakdown.today.usd_for_vendor(VENDOR_CODEX) == 8.00
+        assert breakdown.today.usd == 21.00
+        assert breakdown.today.vendor_usd == ((VENDOR_CLAUDE, 15.00), (VENDOR_CODEX, 6.00))
+        assert breakdown.today.usd_for_vendor(VENDOR_CODEX) == 6.00
 
         # The two unknown buckets stay apart - one row per vendor, both $0.
         unknown_rows = [row for row in breakdown.by_model if row.is_unknown]
@@ -1290,6 +1319,396 @@ def test_quota_age_note_threshold_is_two_hours_for_codex_only() -> None:
     claude_row = AccountRow(slot=1, alias="main", email="x@y", is_active=True,
                             usage_age_seconds=400.0)
     assert claude_row.usage_is_stale is True, "claude rows must keep the 300 s threshold"
+
+
+# ---------------------------------------------------------------------------
+# SPEC-CODEX 6 - live per-account rows: rendering, notes and the title
+#
+# These build :class:`AccountRow` objects by hand rather than driving
+# ``codex_accounts.py``: this module owns the RENDERING half of the feature,
+# and a row is the frozen contract between the two halves (the fetcher's own
+# tests live in ``tests/test_codex_accounts.py``). The figures below are
+# display fixtures - the shapes a row can take - not readings from anyone's
+# account; the one verified number from the 2026-09-09 probe, 19% weekly on
+# you@work.example, is used where a "healthy row" is needed so the fixture
+# matches something real.
+# ---------------------------------------------------------------------------
+
+
+def live_quota_row(
+    slot: int,
+    alias: str,
+    *,
+    pct: float | None = 19.0,
+    active: bool = False,
+    note: str = "",
+    kind: str = "",
+    plan: str | None = "pro",
+    email: str = "",
+    age: float = 60.0,
+    expired: bool = False,
+) -> AccountRow:
+    """One live per-account Codex row, in the shape ``codex_accounts`` emits.
+
+    Negative slot, ``switchable=False``, the fetch-loop staleness threshold
+    (:data:`CODEX_FETCH_STALE_SECONDS`) rather than the corpus one, and the
+    two SPEC-CODEX 6 attention fields. A row with no percentage carries no
+    reset string either - there is no window to reset.
+    """
+    return AccountRow(
+        slot=slot,
+        alias=alias,
+        email=email,
+        is_active=active,
+        seven_day_pct=pct,
+        seven_day_resets_at="Sep 12 14:00" if pct is not None else None,
+        expired_windows=("seven_day",) if expired else (),
+        vendor=VENDOR_CODEX,
+        switchable=False,
+        plan_type=plan,
+        usage_age_seconds=age,
+        stale_after_seconds=CODEX_FETCH_STALE_SECONDS,
+        attention_note=note,
+        attention_kind=kind,
+    )
+
+
+def _quota_settings(**overrides: Any) -> dict[str, Any]:
+    """Settings with the noise off, so a title assertion is about one thing."""
+    from cc_usage_widget.contracts import SETTINGS_DEFAULTS, normalize_settings
+
+    settings = normalize_settings(dict(SETTINGS_DEFAULTS))
+    settings.update(
+        {
+            "title_show_icon": False,
+            "title_show_cost": False,
+            "title_show_fleet": False,
+            "title_show_codex_pct": True,
+        }
+    )
+    settings.update(overrides)
+    return settings
+
+
+def _headless_app() -> Any:
+    """A real app object with no run loop - what the menu tests render into."""
+    from cc_usage_widget import app as app_mod
+
+    return app_mod.CCUsageWidgetApp()
+
+
+def test_quota_header_marks_the_active_login_and_colours_the_note_by_kind() -> None:
+    """``render.quota_header`` gains ``· active`` (dim) and a kind-coloured note.
+
+    Two promises at once. The marker is DIM, not the accent ``● active`` an
+    account header uses: accent means "this is the account you are on and can
+    switch away from", and a Codex row is never a switch target - four of them
+    are live at once and none is clickable. The note's colour comes from the
+    KIND and nothing else, because classifying on the prose is what silently
+    demoted a re-login warning when upstream reworded it (2026-08-26).
+    """
+    from cc_usage_widget import render
+
+    plain = render.quota_header("Codex", plan="pro")
+    assert plain == [("Codex", None), (" (pro)", "dim")], plain
+
+    marked = render.quota_header("acme", plan="pro", active=True)
+    assert (" · active", "dim") in marked, marked
+    assert not any(kind == "accent" for _text, kind in marked), (
+        f"a read-only row must never take the accent treatment: {marked}"
+    )
+
+    kinds = {
+        "": "dim",       # the pre-SPEC-CODEX-6 age note, unchanged
+        "info": "dim",
+        "warn": "warn",
+        "crit": "crit",
+    }
+    for kind, expected in kinds.items():
+        segs = render.quota_header("acme", plan="pro", note="relogin", note_kind=kind)
+        note_segs = [seg for seg in segs if "relogin" in seg[0]]
+        assert note_segs and note_segs[0][1] == expected, (kind, segs)
+    # An unknown kind must not vanish or shout - it falls back to dim.
+    unknown = render.quota_header("acme", note="something new", note_kind="mystery")
+    assert unknown[-1][1] == "dim", unknown
+
+
+def test_a_note_only_row_survives_and_renders_header_plus_note() -> None:
+    """A row with a sentinel and NO windows is kept, and draws no bar line.
+
+    This is the SPEC-CODEX 6 half of the "no data renders nothing" rule that
+    ``_visible_quota_rows`` has always enforced. A dead credential reports no
+    percentage, so the old filter would have dropped the row entirely - and a
+    menu that silently shows three of four accounts looks complete while
+    hiding the one the user has to act on. The row stays; what it must NOT do
+    is grow a bar at 0% or ``--``, because a sentinel REPLACES a figure.
+    """
+    from cc_usage_widget.app import UiSnapshot, _quota_row_label, _quota_windows
+
+    dead = live_quota_row(-1, "acme", pct=None, note="relogin", kind="warn")
+    assert _quota_windows(dead) == [], "a sentinel row has nothing to draw a bar from"
+
+    app = _headless_app()
+    try:
+        snapshot = UiSnapshot(settings=_quota_settings(), quota_rows=(dead,))
+        assert app._visible_quota_rows(snapshot) == (dead,)
+        items = app._quota_items(snapshot)
+        assert len(items) == 1, items
+        label = str(items[0].title)
+        assert "acme" in label and "relogin" in label, label
+        assert "%" not in label and "░" not in label, (
+            f"a sentinel row must not render a bar or a percentage: {label!r}"
+        )
+        # And the plain fallback says the same thing the attributed block does.
+        assert _quota_row_label(dead) == "acme (pro)  (relogin)", _quota_row_label(dead)
+
+        # Control: strip the note and the row goes back to being dropped.
+        silent = live_quota_row(-1, "acme", pct=None)
+        assert app._visible_quota_rows(replace(snapshot, quota_rows=(silent,))) == ()
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+def test_a_reading_past_expiry_stays_visible_with_its_age_note() -> None:
+    """A live row whose bars were withheld for age (no sentinel) keeps its
+    place in the menu as header + age note (review, 2026-09-09: it vanished).
+    """
+    from cc_usage_widget.app import UiSnapshot, _quota_note, _quota_windows
+
+    old = live_quota_row(-1, "acme", pct=None, age=7 * 3_600)
+    assert _quota_windows(old) == [] and old.attention_note == ""
+    assert old.usage_is_stale and _quota_note(old)[0].endswith("old"), _quota_note(old)
+    app = _headless_app()
+    try:
+        snapshot = UiSnapshot(settings=_quota_settings(), quota_rows=(old,))
+        assert app._visible_quota_rows(snapshot) == (old,)
+        items = app._quota_items(snapshot)
+        assert len(items) == 1 and "old" in str(items[0].title), str(items[0].title)
+        assert "%" not in str(items[0].title)
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+def test_a_live_row_says_resets_exactly_once() -> None:
+    """The reset field carries the bare clock; the renderer adds the word.
+    Pins the review blocker where every live row read "resets resets 15:46"."""
+    from cc_usage_widget.app import UiSnapshot, _quota_row_label
+
+    row = live_quota_row(-1, "acme", pct=19.0, active=True)
+    assert row.seven_day_resets_at == "Sep 12 14:00"
+    plain = _quota_row_label(row)
+    assert plain.count("resets") == 1 and "resets Sep 12 14:00" in plain, plain
+    app = _headless_app()
+    try:
+        items = app._quota_items(UiSnapshot(settings=_quota_settings(), quota_rows=(row,)))
+        title = str(items[0].title)
+        assert title.count("resets") == 1 and "resets resets" not in title, title
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+def test_the_label_clamp_never_touches_a_claude_scoped_name() -> None:
+    """Only endpoint-named Codex labels are clamped; a claude-swap scoped
+    window name lays out exactly as before SPEC-CODEX 6."""
+    from cc_usage_widget.app import _WINDOW_LABEL_MAX, _window_label_width
+
+    long_name = "A" * 20
+    claude = AccountRow(slot=1, alias="main", email="x@y", is_active=True,
+                        five_hour_pct=3.0, scoped_windows=((long_name, 1.0),))
+    assert _window_label_width((claude,), ()) == 20, "Claude labels are not ours to shorten"
+    live = AccountRow(slot=-1, alias="acme", email="", is_active=False, vendor=VENDOR_CODEX,
+                      switchable=False, scoped_windows=(("B" * 20, 1.0),))
+    assert _window_label_width((), (live,)) == _WINDOW_LABEL_MAX == 12
+    assert _window_label_width((claude,), (live,)) == 20
+
+
+def test_a_standing_verdict_outranks_the_age_note() -> None:
+    """Verdict or age - never both, and the verdict wins (SPEC 4.3).
+
+    On a row whose credential is dead, "``4h old``" is the less true of the two
+    sentences: the reading is not merely stale, it is not coming back until the
+    user logs in. Showing both would also put two ``·``-separated notes in one
+    header, which is where the honest one gets lost.
+    """
+    from cc_usage_widget.app import _quota_note, _quota_row_label
+
+    stale = live_quota_row(-1, "acme", age=4 * 3_600)
+    assert stale.usage_is_stale is True
+    assert _quota_note(stale) == ("4h old", ""), _quota_note(stale)
+
+    verdict = live_quota_row(-1, "acme", age=4 * 3_600, note="relogin", kind="warn")
+    assert verdict.usage_is_stale is True, "the row is BOTH stale and dead"
+    assert _quota_note(verdict) == ("relogin", "warn"), _quota_note(verdict)
+    label = _quota_row_label(verdict)
+    assert "relogin" in label and "old" not in label, label
+
+
+def test_four_live_rows_two_sharing_an_alias_get_four_distinct_menu_titles() -> None:
+    """Two accounts that render identically must still be two menu items.
+
+    ``rumps.Menu`` keys items by title and SILENTLY DROPS a key it already
+    holds. The registry is a hand-edited file and one login owns two
+    workspaces, so two rows carrying the same alias, plan and percentage is an
+    ordinary state, not a corruption - and it would cost the user a whole
+    account row with no error anywhere. ``_dedupe_titles`` already solves this
+    for the accounts section; this pins that the quota section goes through it.
+    """
+    from cc_usage_widget.app import UiSnapshot, _dedupe_titles
+
+    rows = (
+        live_quota_row(-1, "acme", pct=19.0, active=True, email="you@work.example"),
+        # Same login, two workspaces - and the same alias typed twice, which is
+        # what makes the two labels collide exactly.
+        live_quota_row(-2, "belkins", pct=42.0, email="you@corp.example"),
+        live_quota_row(-3, "belkins", pct=42.0, email="you@corp.example"),
+        live_quota_row(-4, "gmail", pct=7.0, email="you@gmail.example"),
+    )
+    app = _headless_app()
+    try:
+        snapshot = UiSnapshot(settings=_quota_settings(), quota_rows=rows)
+        items = app._quota_items(snapshot)
+        assert len(items) == 4, items
+        raw = [str(item.title) for item in items]
+        assert len(set(raw)) == 3, f"the collision this test defends is gone: {raw}"
+        titles = [str(item.title) for item in _dedupe_titles(items)]
+        assert len(set(titles)) == 4, titles
+        # The padding is invisible: zero-width spaces only, so the two rows
+        # still read identically on screen - they are just two keys now.
+        assert titles[2].rstrip("​") == titles[1], titles
+        assert titles[2] != titles[1] and titles[2].endswith("​"), titles
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+def test_the_title_shows_the_active_codex_account_only() -> None:
+    """``C19%`` is the ACTIVE login's figure, or nothing (SPEC-CODEX 6).
+
+    Four accounts, one menu bar component: showing the first row, the highest,
+    or a sum would each put a number in the bar that the user cannot act on -
+    they are spending against exactly one of the four. The cases pinned here
+    are the whole policy, including the two silences: a stale live reading and
+    "no active row" both render NO component rather than a stale figure or an
+    invented glyph.
+    """
+    from cc_usage_widget.app import UiSnapshot
+
+    app = _headless_app()
+
+    def title(*rows: AccountRow, **overrides: Any) -> str:
+        return app.render_title(
+            UiSnapshot(settings=_quota_settings(**overrides), quota_rows=rows)
+        )
+
+    try:
+        active = live_quota_row(-1, "acme", pct=19.0, active=True)
+        idle = live_quota_row(-2, "belkins", pct=88.0)
+        assert title(idle, active) == "C19%", title(idle, active)
+        # The toggle still gates the component.
+        assert "C" not in title(idle, active, title_show_codex_pct=False)
+
+        # An ENDED window keeps its number and loses the "(!)": that marker
+        # says "you are capped now", which a bygone window cannot prove.
+        expired = live_quota_row(-1, "acme", pct=100.0, active=True, expired=True)
+        assert title(expired) == "C100%", title(expired)
+        assert "(!)" not in title(expired)
+
+        # A standing verdict REPLACES the figure, exactly as a claude-swap
+        # sentinel does on the account half of the title. The source has
+        # already withheld the bars of such a row (SPEC-CODEX 6.6), which is
+        # what the alarm keys on: kind AND no figure.
+        for kind in ("warn", "crit"):
+            dead = live_quota_row(-1, "acme", pct=None, active=True, note="relogin", kind=kind)
+            assert title(dead) == "C⚠", (kind, title(dead))
+        # A CAPPED plan is the one crit note that keeps its figures beside it:
+        # the percentage is the evidence, so the title keeps the number.
+        capped = live_quota_row(-1, "acme", pct=100.0, active=True, note="capped weekly", kind="crit")
+        assert title(capped).startswith("C100%"), title(capped)
+        # ...but an `info` note is not a problem: the figure stands.
+        soon = live_quota_row(
+            -1, "acme", pct=19.0, active=True, note="relogin in 1d 4h", kind="info"
+        )
+        assert title(soon) == "C19%", title(soon)
+
+        # A stale reading is silence, not a stale number: the bar has no room
+        # for the age note that would make it honest.
+        # (With every other component off, a title with no Codex component
+        # falls back to the glyph - a status item with an empty title is
+        # invisible - so the assertion is on the ABSENCE of the component.)
+        stale = live_quota_row(-1, "acme", pct=19.0, active=True, age=7 * 3_600)
+        assert stale.usage_is_stale is True
+        assert "C" not in title(stale), title(stale)
+
+        # No active row at all - the active login is not one of the tracked
+        # accounts - and there is nothing to say.
+        assert "C" not in title(idle), title(idle)
+
+        # The transcript-derived row (slot 0) is the exception: it has no
+        # identity, but it is built from the rollouts the ACTIVE login wrote,
+        # so it speaks for that login when no identified row can. This is what
+        # keeps a Codex-only machine's title byte-for-byte today's.
+        scanned = AccountRow(
+            slot=CODEX_PSEUDO_ACCOUNT_SLOT, alias="Codex", email="", is_active=False,
+            seven_day_pct=19.0, seven_day_resets_at="Sep 12 14:00",
+            vendor=VENDOR_CODEX, switchable=False, plan_type="pro",
+            usage_age_seconds=60.0, stale_after_seconds=7_200.0,
+        )
+        assert title(scanned) == "C19%", title(scanned)
+        # ...and it steps aside the moment an identified active row speaks.
+        assert title(scanned, active) == "C19%"
+        assert title(scanned, live_quota_row(-1, "acme", pct=63.0, active=True)) == "C63%"
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+def test_a_non_active_codex_warning_adds_exactly_one_bare_marker() -> None:
+    """A problem on a NON-active Codex account marks the bar once, not twice.
+
+    The bare ``⚠`` means "something in the menu needs you". A second one says
+    nothing the first did not, and the menu bar is the surface where width is
+    actually scarce - so the Codex path joins the existing Claude branch rather
+    than appending its own glyph. The engine's own standing verdict still wins
+    outright: it is the more specific statement.
+    """
+    from cc_usage_widget.app import UiSnapshot
+
+    app = _headless_app()
+    try:
+        claude = AccountRow(slot=1, alias="main", email="m@x", is_active=True,
+                            five_hour_pct=12.0)
+        broken = live_quota_row(-2, "belkins", pct=None, note="no access", kind="warn")
+        healthy = live_quota_row(-1, "acme", pct=19.0, active=True)
+
+        settings = _quota_settings(title_show_codex_pct=False)
+        plain = UiSnapshot(settings=settings, accounts=(claude,), active=claude,
+                           quota_rows=(healthy, broken))
+        title = app.render_title(plain)
+        assert title.count("⚠") == 1, title
+
+        # A Claude sentinel on another slot is the SAME marker, still once.
+        both = replace(plain, account_notes={2: "re-login needed"})
+        assert app.render_title(both).count("⚠") == 1, app.render_title(both)
+
+        # No Codex problem and no Claude sentinel: no marker at all.
+        quiet = replace(plain, quota_rows=(healthy,))
+        assert "⚠" not in app.render_title(quiet), app.render_title(quiet)
+
+        # An `info` note is not a problem and must not raise the marker.
+        pending = live_quota_row(-2, "belkins", pct=None,
+                                 note="awaiting first reading", kind="info")
+        assert "⚠" not in app.render_title(replace(plain, quota_rows=(healthy, pending)))
+
+        # The engine's verdict outranks it - one glyph, and it is the specific one.
+        alerted = replace(plain, alert=("all-exhausted", "all accounts exhausted"))
+        assert app.render_title(alerted).count("⚠") == 0
+        assert "exhausted" in app.render_title(alerted)
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
 
 
 # ---------------------------------------------------------------------------

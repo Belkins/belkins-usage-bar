@@ -116,6 +116,7 @@ from pathlib import Path
 from typing import Any, Final
 
 from .contracts import (
+    CODEX_PSEUDO_ACCOUNT_SLOT,
     CODEX_SCAN_STATE_PATH,
     CODEX_SESSIONS_DIR,
     CODEX_WINDOW_MINUTES_WEEKLY,
@@ -285,10 +286,10 @@ exactly the ``{path: entry}`` shape
 :func:`~cc_usage_widget.contracts.scan_state_from_json` expects. Mirrors the
 Claude indexer's ``*_dedup.json`` sidecar."""
 
-CODEX_PSEUDO_ACCOUNT_SLOT: Final[int] = 0
-"""Slot for the Codex pseudo-account. Real claude-swap slots start at 1, so 0
-sorts deterministically without ever colliding with one (contracts,
-``AccountRow`` "Conventions for a Codex pseudo-account")."""
+# ``CODEX_PSEUDO_ACCOUNT_SLOT`` (0) now lives in ``contracts`` (SPEC-CODEX 6):
+# ``merge_quota_rows`` needs it to tell this transcript-derived row from the
+# live per-account rows, and contracts cannot import this module. Re-exported
+# here unchanged so every existing import site keeps working.
 
 CODEX_QUOTA_STALE_SECONDS: Final[float] = 2 * 3600.0
 """Age past which the quota row shows ``· <age> old`` (``AccountRow.stale_after_seconds``).
@@ -636,7 +637,7 @@ class CodexIndexer:
         chunk_files: int = DEFAULT_CHUNK_FILES,
         now: Callable[[], float] = time.time,
         state_loader: Callable[[], Any] | None = None,
-        state_saver: Callable[[Mapping[str, Any]], None] | None = None,
+        state_saver: Callable[[Mapping[str, Any]], bool | None] | None = None,
         defer_state_commit: bool = False,
     ) -> None:
         self._sessions_dir = os.path.abspath(os.fspath(sessions_dir))
@@ -842,8 +843,13 @@ class CodexIndexer:
             return
         payload = scan_state_to_json(self._states)
         if self._state_saver is not None:
-            self._state_saver(payload)
-            self._states_dirty = False
+            # Same durability contract as the Claude indexer: a False return
+            # means the write did not land, so the dirty flag must survive for
+            # the next tick. The `_atomic_write_json` branch below already
+            # gated on success; this one did not, and a lost Codex scan state
+            # double-counts exactly the same way (2026-08-26).
+            if self._state_saver(payload) is not False:
+                self._states_dirty = False
             return
         if self._atomic_write_json(self._state_path, payload):
             self._states_dirty = False
@@ -980,6 +986,18 @@ class CodexIndexer:
         Returns ``()`` — not a row of zeros — when nothing has been observed, so
         a Claude-only machine renders no Codex quota block at all
         (SPEC-CODEX 5.5).
+
+        **This row is now the FALLBACK for the active login (SPEC-CODEX 6).**
+        The rollouts carry no account id, so this percentage can only honestly
+        describe whichever login produced them — the active one. When
+        ``codex_accounts.py`` has a live, identified row for that same login
+        carrying a figure, the two must not sit side by side as two different
+        ages of one account (SPEC 4.3). Nothing is decided here: this method
+        keeps returning its row unconditionally, and the arbitration lives in
+        :func:`~cc_usage_widget.contracts.merge_quota_rows`, which the worker
+        applies to the whole collection every tick. Keeping the choice out of
+        this class is what lets the live source be off, absent or broken and
+        still leave this row exactly as it was before SPEC-CODEX 6.
         """
         self._ensure_quota_loaded()
         snapshot = self._quota
@@ -1279,7 +1297,12 @@ class CodexIndexer:
         self._files_total = 0
         self._publish_progress(scanning=False)
         if self._state_saver is not None:
-            self._state_saver({})
+            # See indexer.Indexer.reset: a failed write of the empty state must
+            # keep the dirty flag set, or a crash before the next successful
+            # save leaves stale offsets against an already-emptied rollup and
+            # silently UNDER-counts this vendor (2026-08-26).
+            if self._state_saver({}) is False:
+                self._states_dirty = True
             return
         try:
             os.unlink(self._state_path)

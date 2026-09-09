@@ -46,6 +46,9 @@ from . import rollup as rollup_mod
 from . import state as state_mod
 from .app import CCUsageWidgetApp
 from .contracts import (
+    CODEX_ACCOUNTS_DIR,
+    CODEX_ACCOUNTS_REGISTRY_PATH,
+    CODEX_QUOTA_SNAPSHOTS_PATH,
     CODEX_SCAN_STATE_PATH,
     CODEX_SESSIONS_DIR,
     PROJECTS_DIR,
@@ -66,13 +69,50 @@ and the whole ``rollups.json`` with ``os.replace``. Last writer wins, so one
 instance's advanced offsets can land while only the other's rollup survives -
 tokens counted by the first are then permanently missing."""
 
-_RIVAL_PATTERN = r"cswap[[:space:]]+(auto|menubar)"
-"""Upstream engines that would share ``autoswitch_state.json`` with us. SPEC 5
-says to quit ``cswap menubar`` first; nothing enforced or even detected it.
+_RIVAL_SUBCOMMANDS = ("auto", "menubar", "tui", "watch")
+"""claude-swap entry points that can change the active account behind our back.
+
+``auto``/``menubar`` host an ``AutoSwitchEngine`` outright. ``tui`` (and a bare
+``cswap``, which *is* the TUI) switches on a keypress and can start its own
+engine from the account view, and ``watch`` polls. Everything else the CLI
+offers - ``list``, ``status``, ``config``, a one-shot ``switch`` - either does
+not switch or exits immediately, so it is not a standing rival.
+
+Each of these also has a ``--flag`` spelling: ``claude_swap.cli``'s
+``_SUBCOMMAND_FLAGS`` rewrites ``tui``/``watch``/``menubar`` into ``--tui``/
+``--watch``/``--menubar``, which its own docstring calls the established
+interface - so a LaunchAgent or alias written against it runs ``cswap
+--menubar``, a real second engine. (``auto`` has no flag spelling upstream; the
+pattern's ``(--)?`` covers it uniformly, and a ``cswap --auto`` would exit on
+the unknown flag rather than stand around to be matched.)"""
+
+_RIVAL_PATTERN = (
+    r"(^|/)cswap([[:space:]]*$"
+    r"|[[:space:]]+(--)?(auto|menubar|tui|watch)([[:space:]]|$))"
+)
+"""Actors that would share ``autoswitch_state.json`` (and the active login)
+with us. SPEC 5 says to quit ``cswap menubar`` first; nothing enforced it, and
+until 2026-09-01 nothing even saw the bare TUI (pid 15206, up since 19:22,
+switching by keypress while our engine switched back).
+
+Anchored on the argv *tail*, because a ``pgrep -fl`` line is
+``<pid> <python> <dir>/cswap [args]``: ``(^|/)`` pins the match to the
+executable's own name so ``/tmp/cswap.log`` or ``grep cswap`` cannot fire it,
+and the trailing ``([[:space:]]|$)`` keeps ``cswap autoswitch`` from matching
+``auto`` and ``cswap --watch-foo`` from matching ``--watch``. The bare-TUI arm
+is ``[[:space:]]*$`` - argv ends at ``cswap``.
+
+**This is a pre-filter, not the decision.** An ERE cannot say "in argv[0]
+position", so the bare-TUI arm also fires on any command line that merely *ends*
+in a path named ``cswap`` - ``tail -f ~/logs/cswap``, ``vim ~/notes/cswap``,
+``cat ~/.local/bin/cswap``. Reporting one of those would be a fabricated ``!``
+row telling the operator to quit a process that cannot switch anything, so
+:func:`_rival_actor` re-checks the position and :func:`_detect_rival_engines`
+drops what it rejects.
 
 A **POSIX** character class, not ``\\s``: macOS ``pgrep`` compiles its pattern as
 POSIX extended regex, where ``\\s`` is not a shorthand and the match silently
-never fires. Verified against a live ``cswap menubar``."""
+never fires. Verified against a live ``cswap menubar`` and a live bare TUI."""
 
 _lock_handle: Any = None
 """Module-global so the ``flock`` lives as long as the process."""
@@ -87,8 +127,51 @@ USAGE = """usage: python -m cc_usage_widget [--dry-run] [--help]
 
 def _log(message: str) -> None:
     """Timestamped stderr line, same shape as ``app.py``'s log."""
-    sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] cc-usage-widget: {message}\n")
+    sys.stderr.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] cc-usage-widget: {message}\n")
     sys.stderr.flush()
+
+
+def _sweep_tmp_orphans(max_age_s: float = 86_400.0) -> None:
+    """Unlink day-old ``<state>.tmp.<pid>`` orphans next to the state files.
+
+    Safe under the single-instance lock: no live writer can own a tmp file
+    that old, and every writer creates a fresh ``mkstemp`` name.
+    """
+    try:
+        now = time.time()
+        for state_path in (SCAN_STATE_PATH, CODEX_SCAN_STATE_PATH, ROLLUPS_PATH):
+            for orphan in state_path.parent.glob(f"{state_path.name}.tmp.*"):
+                try:
+                    if now - orphan.stat().st_mtime > max_age_s:
+                        orphan.unlink()
+                        _log(f"swept atomic-write orphan {orphan.name}")
+                except OSError:
+                    continue
+    except Exception as exc:  # pragma: no cover - housekeeping must not kill startup
+        _log(f"tmp-orphan sweep failed: {exc}")
+
+
+def _bound_widget_log(max_bytes: int = 5_000_000) -> None:
+    """Truncate the launchd-appended log once it passes *max_bytes*.
+
+    launchd appends to ``logs/widget.log`` forever and knows no rotation;
+    keep the tail half so recent forensics survive the cut.
+    """
+    try:
+        log_path = SCAN_STATE_PATH.parent / "logs" / "widget.log"
+        size = log_path.stat().st_size
+        if size <= max_bytes:
+            return
+        data = log_path.read_bytes()[-max_bytes // 2 :]
+        nl = data.find(b"\n")
+        if nl >= 0:
+            data = data[nl + 1 :]
+        log_path.write_bytes(data)
+        _log(f"widget.log was {size} bytes — truncated to the recent tail")
+    except FileNotFoundError:
+        pass
+    except Exception as exc:  # pragma: no cover - housekeeping must not kill startup
+        _log(f"log bound failed: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -123,8 +206,13 @@ def _scan_state_hooks(
     def loader() -> Any:
         return store.load_json()
 
-    def saver(payload: Mapping[str, Any]) -> None:
-        store.save_json(
+    def saver(payload: Mapping[str, Any]) -> bool:
+        # MUST propagate the result. ``save_json`` never raises — it reports a
+        # failed write as False precisely "so the caller can keep its dirty
+        # flag set and retry on the next tick" (state.py:_write). Discarding
+        # it told the indexer a failed write was durable, which is a silent
+        # permanent double-count after the next restart (2026-08-26).
+        return store.save_json(
             payload,
             lookback_days=int(
                 settings.get("lookback_days", SETTINGS_DEFAULTS["lookback_days"])
@@ -166,6 +254,20 @@ def build(extra_errors: Sequence[str] = ()) -> CCUsageWidgetApp:
         fail(f"settings unavailable ({SETTINGS_PATH})", exc)
 
     lookback = int(settings.get("lookback_days", SETTINGS_DEFAULTS["lookback_days"]))
+
+    def live_settings() -> Mapping[str, Any]:
+        """The settings as they are NOW, for sources that outlive one tick.
+
+        ``state.load_settings`` reads the process-wide store's in-memory copy
+        (the same store ``save_settings`` writes through on every menu click),
+        so this is cheap and current. Falls back to the boot snapshot if the
+        store could not be built at all - a source must never crash on a
+        settings read.
+        """
+        try:
+            return state_mod.load_settings()
+        except Exception:
+            return settings
 
     # --- pricing (pure, no I/O) -------------------------------------------
     pricing: Any = None
@@ -249,6 +351,42 @@ def build(extra_errors: Sequence[str] = ()) -> CCUsageWidgetApp:
         # path - that is `available()` returning False, silently.
         fail(f"codex source unavailable ({CODEX_SESSIONS_DIR})", exc)
 
+    # --- live per-account Codex quota (SPEC-CODEX 6) ----------------------
+    # A SECOND Codex source, deliberately: the log-derived one above answers
+    # "what did the corpus see" with no identity, this one answers "what does
+    # each account's plan say" over HTTP. They meet in
+    # `contracts.merge_quota_rows`, never here.
+    #
+    # The module is imported INSIDE the guard, not at the top of this file, so
+    # that a `codex_accounts.py` which is missing, half-written or raising on
+    # import degrades to one `!` line - it must never cost the user their
+    # Claude figures, which a module-level `from . import codex_accounts` would
+    # do by killing the whole entry point.
+    try:
+        from . import codex_accounts as codex_accounts_mod  # noqa: PLC0415
+
+        sources.append(
+            codex_accounts_mod.CodexAccountsSource(
+                registry=codex_accounts_mod.Registry(CODEX_ACCOUNTS_REGISTRY_PATH),
+                credentials=codex_accounts_mod.CredentialStore(CODEX_ACCOUNTS_DIR),
+                transport=codex_accounts_mod.UrllibTransport(),
+                snapshots_path=CODEX_QUOTA_SNAPSHOTS_PATH,
+                # The LIVE settings, not the dict loaded above: the source reads
+                # `codex_live_quota_enabled` and the poll interval on every
+                # cycle, and a snapshot taken at boot would make both switches
+                # need a restart. `state.load_settings` returns the
+                # process-wide store's in-memory copy, which `save_settings`
+                # (the app's persist hook) updates on every menu click - so
+                # this is a read of shared state, not a file read per cycle.
+                settings=live_settings,
+            )
+        )
+    except Exception as exc:
+        # Same rule as every other seam: no credentials, no registry and no
+        # network is a normal state answered by `available()`; only a source
+        # that cannot be BUILT lands here, and it lands visibly.
+        fail("codex accounts source unavailable", exc)
+
     # --- accounts (claude_swap is imported lazily, on the worker thread) --
     accounts: Any = None
     try:
@@ -311,13 +449,60 @@ def acquire_single_instance_lock() -> tuple[bool, str]:
     return True, f"pid {os.getpid()}"
 
 
+_EXECUTABLE_POSITIONS = (0, 1)
+"""argv indices a console script can occupy: it is either exec'd directly
+(``cswap tui``) or run by its interpreter (``<python> <dir>/cswap tui``).
+Anything further right is an *argument* - a file being read, edited or tailed."""
+
+
+def _rival_actor(command: str) -> str | None:
+    """``"/x/python /y/bin/cswap --tui --foo"`` -> ``"cswap tui"``.
+
+    ``None`` when no token in *executable position* is ``cswap``. That is the
+    half :data:`_RIVAL_PATTERN` cannot do: ``/usr/bin/tail -f ~/logs/cswap`` and
+    ``vim ~/notes/cswap`` both satisfy the bare-TUI arm, and both are processes
+    that cannot switch a thing. Verified with the real ``pgrep``: a ``tail -f``
+    on a file named ``cswap`` came back in the same listing as the genuine TUI
+    and was, before this check, textually indistinguishable in the menu.
+
+    The label itself is the actor, not its install: the raw ``pgrep -fl`` line
+    is two absolute paths and every flag, which no one can read in one menu row.
+    A leading ``--`` is stripped so the ``--menubar`` spelling of ``menubar``
+    reads as the same actor.
+    """
+    parts = command.split()
+    for index in _EXECUTABLE_POSITIONS:
+        if index >= len(parts):
+            break
+        if index == 1 and not parts[0].rsplit("/", 1)[-1].startswith("python"):
+            # argv[1] is only an executable when argv[0] is the interpreter.
+            break
+        if parts[index].rsplit("/", 1)[-1] != "cswap":
+            continue
+        following = parts[index + 1] if index + 1 < len(parts) else ""
+        subcommand = following[2:] if following.startswith("--") else following
+        if subcommand in _RIVAL_SUBCOMMANDS:
+            return f"cswap {subcommand}"
+        # A bare ``cswap`` IS the TUI; other flags are not a subcommand.
+        return "cswap"
+    return None
+
+
 def _detect_rival_engines() -> list[str]:
-    """Command lines of running ``cswap auto`` / ``cswap menubar`` processes.
+    """One operator line per running actor that can switch out from under us.
 
     Two engines against one ``autoswitch_state.json`` both evaluate the same
     threshold and both can issue a switch - double usage-API polling plus switch
     thrash, the exact failure SPEC 5 names. Upstream writes no owner/PID marker,
     so there is nothing in the shared file to check; the process table is.
+
+    A hand switch in the TUI is the same hazard with a person behind it: the
+    widget's engine sees a login it did not choose and switches back. The line
+    therefore says what the operator will otherwise see and not understand -
+    the "external" marker the account reader raises on such a change.
+
+    Callable from the worker thread (``BackgroundWorker._rescan_rivals``) as
+    well as from :func:`main`; it holds no module state beyond the pattern.
     """
     try:
         proc = subprocess.run(
@@ -333,8 +518,19 @@ def _detect_rival_engines() -> list[str]:
     found: list[str] = []
     for line in proc.stdout.splitlines():
         pid, _, rest = line.strip().partition(" ")
-        if pid and pid != mine and rest:
-            found.append(f"{rest.strip()} (pid {pid})")
+        if not pid or pid == mine or not rest:
+            continue
+        # The pattern is a pre-filter; the position check is the decision.
+        # A hit that is not in executable position is a file NAMED cswap, and
+        # reporting it would be a `!` row about a process that cannot switch.
+        actor = _rival_actor(rest)
+        if actor is None:
+            continue
+        found.append(
+            f"another switch actor: {actor} (pid {pid}) — it "
+            "can switch and can run its own engine; switches it makes show "
+            'here as "external"'
+        )
     return found
 
 
@@ -374,11 +570,39 @@ def _codex_state(app: CCUsageWidgetApp) -> str:
     if not settings.get("codex_tracking_enabled", True):
         return "tracking off"
     for source in getattr(app, "extra_sources", ()):
+        # The corpus scanner, named by the fact that it HAS a corpus: with a
+        # second Codex source wired (SPEC-CODEX 6) "the first source" is no
+        # longer a safe way to mean "the indexer", and reporting the live
+        # quota source's availability under a line about ~/.codex/sessions
+        # would be a wrong answer wearing the right label.
+        if getattr(source, "root", None) is None:
+            continue
         try:
             return "present" if source.available() else "absent — no Codex section"
         except Exception as exc:  # pragma: no cover - available() is total
             return f"probe failed: {type(exc).__name__}: {exc}"
     return "not wired"
+
+
+def _codex_accounts_lines(app: CCUsageWidgetApp) -> list[str]:
+    """``--dry-run`` block for the live per-account Codex quota (SPEC-CODEX 6).
+
+    Asks the source itself rather than re-deriving anything: it owns the
+    registry, the credential directory and the poll schedule, and a diagnostic
+    that re-implements them can disagree with the thing it describes. Blocking
+    I/O is fine here and only here - ``--dry-run`` is a CLI that exits, not the
+    AppKit thread (which reads the worker's cached copy instead).
+    """
+    lines: list[str] = []
+    for source in getattr(app, "extra_sources", ()):
+        diagnostics = getattr(source, "diagnostics", None)
+        if not callable(diagnostics):
+            continue
+        try:
+            lines.extend(f"  {line}" for line in (diagnostics() or ()))
+        except Exception as exc:  # pragma: no cover - diagnostics is total
+            lines.append(f"  diagnostics unavailable: {type(exc).__name__}: {exc}")
+    return lines
 
 
 def _diagnostics(app: CCUsageWidgetApp) -> str:
@@ -395,10 +619,18 @@ def _diagnostics(app: CCUsageWidgetApp) -> str:
         # state, so say which it is rather than leaving the reader to guess
         # from an empty Codex section.
         f"codex corpus: {CODEX_SESSIONS_DIR} ({_codex_state(app)})",
+        # The live per-account quota (SPEC-CODEX 6) is a separate seam with a
+        # separate off switch, so it gets its own two lines rather than being
+        # folded into the corpus one - "the corpus is there" and "four
+        # credentials are polling" are different facts about different files.
+        f"codex accts:  {CODEX_ACCOUNTS_REGISTRY_PATH} "
+        f"(live quota {'on' if snapshot.settings.get('codex_live_quota_enabled') else 'off'}, "
+        f"{snapshot.settings.get('codex_quota_interval_seconds')} s)",
         f"lookback:     {snapshot.settings['lookback_days']} days",
         f"ui tick:      {snapshot.settings['ui_interval_seconds']} s",
         f"cost tick:    {snapshot.settings['cost_interval_seconds']} s",
     ]
+    lines.extend(_codex_accounts_lines(app))
     for error in snapshot.wiring_errors:
         lines.append(f"! {error}")
     lines.append("menu:")
@@ -462,11 +694,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             level=logging.INFO,
             stream=sys.stderr,
             format="[%(asctime)s] %(name)s %(levelname)s: %(message)s",
-            datefmt="%H:%M:%S",
+            # Full date: widget.log is append-forever across restarts, and
+            # time-only stamps made multi-day incident forensics guesswork.
+            datefmt="%Y-%m-%d %H:%M:%S",
         )
 
     if not dry_run:
         acquired, detail = acquire_single_instance_lock()
+        if acquired:
+            # Housekeeping that is only safe under the single-instance lock:
+            # (a) atomic-write tmp orphans — a SIGKILL between mkstemp and
+            # os.replace leaks `<state>.tmp.<pid>` files forever (six were
+            # found on 2026-08-25, some carrying request IDs); (b) the
+            # append-forever widget.log launchd redirects into — truncate a
+            # runaway file so multi-month logs cannot grow unbounded.
+            _sweep_tmp_orphans()
+            _bound_widget_log()
         if not acquired:
             sys.stderr.write(
                 f"cc-usage-widget is already running ({detail}). Quit that "
@@ -478,12 +721,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Not fatal: cost tracking and the account rows are unaffected. But the user
     # has to be told, because two engines sharing autoswitch_state.json is
     # exactly what SPEC 5 warns about — both evaluate the same threshold and both
-    # can issue a switch.
-    environment_errors = [
-        f"another autoswitch engine is running: {line} — quit it, or turn "
-        "Auto-switch off here"
-        for line in _detect_rival_engines()
-    ]
+    # can issue a switch. This is the startup pass only; the worker re-runs the
+    # same check every RIVAL_RESCAN_SECONDS, so an actor started later (or one
+    # that has since quit) is not missed for the life of the process.
+    environment_errors = _detect_rival_engines()
     for text in environment_errors:
         _log(f"! {text}")
 

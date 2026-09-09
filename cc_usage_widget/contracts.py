@@ -92,6 +92,7 @@ __all__ = [
     "CostBreakdown",
     # account shapes
     "AccountRow",
+    "merge_quota_rows",
     # seams
     "PricingTable",
     "TranscriptIndexer",
@@ -123,6 +124,18 @@ __all__ = [
     "CODEX_USAGE_PREFILTER",
     "CODEX_MODEL_PREFILTER",
     "CODEX_WINDOW_MINUTES_WEEKLY",
+    "CODEX_ACCOUNTS_DIR",
+    "CODEX_ACCOUNTS_REGISTRY_PATH",
+    "CODEX_QUOTA_SNAPSHOTS_PATH",
+    "CODEX_AUTH_PATH",
+    "CODEX_USAGE_URL",
+    "CODEX_WINDOW_SECONDS_WEEKLY",
+    "CODEX_WINDOW_SECONDS_FIVE_HOUR",
+    "CODEX_FETCH_STALE_SECONDS",
+    "CODEX_FETCH_EXPIRE_SECONDS",
+    "CODEX_RELOGIN_WARN_SECONDS",
+    "CODEX_ACTIVE_GRACE_SECONDS",
+    "CODEX_PSEUDO_ACCOUNT_SLOT",
     # json glue
     "scan_state_to_json",
     "scan_state_from_json",
@@ -403,6 +416,44 @@ CACHE_WRITE_1H_MULTIPLIER: Final[float] = 2.0
 CACHE_READ_MULTIPLIER: Final[float] = 0.1
 """Cache-read price = base input price x this (SPEC 3.4)."""
 
+ALERT_ALL_EXHAUSTED: Final[str] = "all-exhausted"
+"""claude-swap ``AllExhaustedEvent.kind`` — no account has headroom left."""
+
+ALERT_ACCOUNT_QUARANTINED: Final[str] = "account-quarantined"
+"""claude-swap ``QuarantineEvent.kind`` — one account's lineage is dead."""
+
+ALERT_ERROR: Final[str] = "error"
+"""claude-swap ``ErrorEvent.kind``, and our own engine-unavailable alert."""
+
+ALERT_EXTERNAL_SWITCH: Final[str] = "external-switch"
+"""OURS, not claude-swap's - the active login changed and the widget did not do
+it (a rival ``cswap`` actor, a ``/login``, or a running session refreshing its
+own token back into the shared default). claude-swap emits no event for this
+because from its side nothing happened; the widget can only see it by comparing
+the active slot tick to tick."""
+
+ALERT_NO_TARGET: Final[str] = "no-target"
+"""OURS - the engine evaluated the fleet and found nowhere to go
+(``NoSwitchEvent`` with reason ``no-viable-target`` / ``no-candidates``). Every
+other ``no-switch`` reason means "nothing to do"; these two mean "something to
+do and no way to do it", which is a standing state the operator must see rather
+than a DEBUG line that also CLEARS whatever alert was standing."""
+
+ALERT_KINDS: Final[tuple[str, ...]] = (
+    ALERT_ALL_EXHAUSTED,
+    ALERT_ACCOUNT_QUARANTINED,
+    ALERT_ERROR,
+    ALERT_EXTERNAL_SWITCH,
+    ALERT_NO_TARGET,
+)
+"""Every autoswitch verdict the menu bar renders as a standing alert.
+
+One definition so the adapter that RAISES a verdict and the two renderers that
+match on it cannot drift apart - the same reason :data:`VENDOR_CLAUDE` exists.
+Before 2026-08-26 these three strings were written as raw literals in five
+places across two modules, with no test crossing the seam.
+"""
+
 ATTENTION_PCT: Final[Pct] = 100.0
 """At or above this percentage the UI appends ``(!)`` to a window
 (SPEC 4.2 shows ``Fable 100% (!)``). Single definition so the title renderer
@@ -494,6 +545,80 @@ The two vendors still share **one** :data:`ROLLUPS_PATH`, because the rollup is
 keyed by :data:`VendorModelKey` and the cost windows must span both vendors
 (SPEC-CODEX 5.2).
 """
+
+# --- live per-account Codex quota (SPEC-CODEX 6) ---------------------------
+
+CODEX_ACCOUNTS_DIR: Final[Path] = _env_path(
+    "CC_USAGE_WIDGET_CODEX_ACCOUNTS_DIR", WIDGET_HOME / "codex-accounts"
+)
+"""One ``CODEX_HOME`` directory per tracked Codex account, named by its
+``chatgpt_account_id``: ``codex-accounts/<account_id>/auth.json``.
+
+Each is populated ONCE by ``CODEX_HOME=<dir> codex login`` (browser flow, with
+the workspace picker) and is written by nothing else in phase 1 - the widget
+only reads ``tokens.access_token`` and ``tokens.account_id`` from it. Dirs are
+0700 and files 0600; a world-readable credential is refused, not used.
+``~/.codex`` is deliberately NOT one of these: the ChatGPT desktop app's own
+``codex app-server`` refreshes that file, and the widget never writes there.
+Git-ignored (the widget home is a git checkout)."""
+
+CODEX_ACCOUNTS_REGISTRY_PATH: Final[Path] = _env_path(
+    "CC_USAGE_WIDGET_CODEX_ACCOUNTS_REGISTRY", WIDGET_HOME / "codex_accounts.json"
+)
+"""``{"version": 1, "accounts": [{account_id, alias, enabled, order}]}`` -
+per-account alias / enable / order. Lives outside ``settings.json`` because
+:func:`normalize_settings` keeps flat scalars only. Holds no token, no email,
+no percentage; the alias is the only free text and the user typed it."""
+
+CODEX_QUOTA_SNAPSHOTS_PATH: Final[Path] = _env_path(
+    "CC_USAGE_WIDGET_CODEX_QUOTA_SNAPSHOTS", WIDGET_HOME / "codex_quota_snapshots.json"
+)
+"""Sidecar of the last fetched quota per account plus any standing sentinel,
+so a restart shows the last reading with its TRUE age (and a dead credential
+as dead) before the first fetch lands - the same reason
+:data:`CODEX_SCAN_STATE_PATH` has a quota sidecar."""
+
+CODEX_AUTH_PATH: Final[Path] = _env_path(
+    "CC_USAGE_WIDGET_CODEX_AUTH_PATH", Path.home() / ".codex" / "auth.json"
+)
+"""The Codex CLI's OWN credential file - read for exactly one field,
+``tokens.account_id``, to mark which tracked account is the active login.
+Never opened for writing, never used for a request (SPEC-CODEX 6)."""
+
+CODEX_USAGE_URL: Final[str] = "https://chatgpt.com/backend-api/wham/usage"
+"""``GET`` with ``Authorization: Bearer <access_token>`` and
+``ChatGPT-Account-Id: <tokens.account_id>``; reports the plan's rate limits
+without invoking a model (probed 2026-09-09: ``plan_type``, ``email``,
+``rate_limit.primary_window`` / ``secondary_window``, ``additional_rate_limits``)."""
+
+CODEX_WINDOW_SECONDS_WEEKLY: Final[int] = 604_800
+"""``limit_window_seconds`` of the weekly window as the endpoint reports it."""
+
+CODEX_WINDOW_SECONDS_FIVE_HOUR: Final[int] = 18_000
+"""``limit_window_seconds`` of the 5-hour window as the endpoint reports it."""
+
+CODEX_FETCH_STALE_SECONDS: Final[float] = 900.0
+"""Age past which a fetched Codex snapshot carries an ``old`` note (three
+missed 300 s polls)."""
+
+CODEX_FETCH_EXPIRE_SECONDS: Final[float] = 21_600.0
+"""Age past which a fetched snapshot's bars are WITHHELD (6 h): the row stays,
+showing the reason instead of a number (SPEC 4.3: stale replaces, never sits
+beside)."""
+
+CODEX_RELOGIN_WARN_SECONDS: Final[float] = 172_800.0
+"""How long before the stored access token's ``exp`` the row starts saying
+``relogin in <n>`` (48 h). Phase 1 never refreshes tokens (SPEC-CODEX 6)."""
+
+CODEX_ACTIVE_GRACE_SECONDS: Final[float] = 600.0
+"""How long the previously seen active ``account_id`` is kept when
+:data:`CODEX_AUTH_PATH` is momentarily unreadable (the desktop app rewrites it)."""
+
+CODEX_PSEUDO_ACCOUNT_SLOT: Final[int] = 0
+"""``slot`` of the transcript-derived Codex pseudo-account (SPEC-CODEX 4).
+Real claude-swap slots start at 1; live per-account Codex rows (SPEC-CODEX 6)
+take NEGATIVE slots (``-1, -2, ...`` in registry order), so the three kinds
+never collide and :func:`merge_quota_rows` can tell them apart by slot."""
 
 CLAUDE_USAGE_PREFILTER: Final[str] = '"usage"'
 """Substring every Claude usage line contains (SPEC 3.2 step 6).
@@ -1409,6 +1534,13 @@ class WindowCost:
     total_tokens: int
     window_days: int
     days_counted: int
+    unpriced_tokens: int = 0
+    """Tokens in this window whose model has no published rate (unknown
+    models plus the model-absent sentinel), deliberately priced $0. When
+    non-zero, :attr:`usd` is a floor, not a total - renderers must say so
+    (the 2026-08-25 incident: 18.9M unpriced tokens invisible behind a
+    clean-looking "Today" figure)."""
+
     vendor_usd: tuple[tuple[Vendor, Usd], ...] = ()
     """Optional per-vendor split of :attr:`usd`, in :data:`VENDORS` order.
 
@@ -1591,8 +1723,14 @@ class AccountRow:
     * ``slot`` ``0`` - real claude-swap slots start at 1, so a pseudo-account
       sorts before or after them deterministically without colliding;
     * ``alias`` the vendor label, ``email`` ``""`` (there is no account);
-    * ``is_active`` ``False`` - "active" means "the account claude-swap would
-      route to", which is meaningless here and must not render the ``>`` marker;
+    * ``is_active`` ``False`` for the transcript-derived row - "active" means
+      "the account claude-swap would route to", which is meaningless there.
+      A LIVE per-account Codex row (SPEC-CODEX 6, negative slot) may carry
+      ``is_active=True`` meaning "the login the Codex CLI is using right now"
+      (``~/.codex/auth.json`` ``tokens.account_id``); it still has
+      ``switchable=False``, which remains the only thing that makes a row a
+      switch target - every switch path reads ``snapshot.accounts``, never
+      ``snapshot.quota_rows``;
     * the weekly ``primary`` window (``window_minutes`` =
       :data:`CODEX_WINDOW_MINUTES_WEEKLY`) maps onto ``seven_day_pct`` /
       ``seven_day_resets_at``; there is no 5-hour window, so ``five_hour_pct``
@@ -1629,6 +1767,11 @@ class AccountRow:
     switchable: bool = True
     """False = a **read-only pseudo-account**: render it, never offer to switch
     to it. Defaults to True so every existing claude-swap row is unchanged."""
+    disabled: bool = False
+    """claude-swap ``cswap disable``: held out of auto-rotation, still a valid
+    explicit switch target. Distinct from ``switchable`` on purpose - a disabled
+    slot is clickable, but it is not a "room" the engine could move to, so
+    fleet-headroom counts must leave it out."""
     plan_type: str | None = None
     """Vendor-reported plan, e.g. Codex's ``"pro"`` (SPEC-CODEX 1). Passed
     through verbatim; ``None`` when the source does not report one."""
@@ -1650,6 +1793,19 @@ class AccountRow:
     date as an upcoming reset. Only a source that carries the reset as an
     epoch (Codex) can know this; claude-swap rows pass verbatim strings and
     always leave this empty."""
+    attention_note: str = ""
+    """A standing verdict about THIS row that REPLACES its figures in the
+    header (SPEC-CODEX 6): ``relogin``, ``no access``, ``rate limited``,
+    ``endpoint error``, ``offline``, ``awaiting first reading``, or a
+    ``relogin in 1d 4h`` countdown. Empty for every claude-swap row and for
+    the transcript-derived Codex row, so they render byte-for-byte as before.
+    Prose only - classification and colour come from :attr:`attention_kind`,
+    never from the wording (a reworded note once silently lost its colour)."""
+    attention_kind: str = ""
+    """Stable machine key for :attr:`attention_note`: ``""`` (none),
+    ``"info"`` (dim, e.g. a countdown or ``awaiting first reading``),
+    ``"warn"`` (a dead credential, no access, offline past the grace) or
+    ``"crit"`` (plan capped). Renderers colour on this and only this."""
 
     @property
     def is_pseudo(self) -> bool:
@@ -2064,6 +2220,43 @@ class AccountSource(Protocol):
         ...
 
 
+def merge_quota_rows(rows: Sequence[AccountRow]) -> tuple[AccountRow, ...]:
+    """Arbitrate the transcript-derived Codex row against live per-account rows.
+
+    The transcript corpus carries no account id, so its percentage can only
+    honestly describe whichever login produced the rollouts - the ACTIVE one.
+    When a live row (SPEC-CODEX 6) for the active login carries a figure, it is
+    identified AND fresher, and the transcript row must not sit beside it as a
+    second, older number for the same account (SPEC 4.3). When no live row can
+    speak for the active login - not onboarded, dead credential, endpoint down
+    past the expiry, feature off - the transcript row returns unchanged, with
+    its own age note. Both are never shown at once; nothing else is touched.
+
+    Pure and total: evaluated on every worker tick, so a registry toggle or a
+    fetch landing takes effect without a restart. Order is preserved.
+    """
+    def has_figure(row: AccountRow) -> bool:
+        return (
+            row.seven_day_pct is not None
+            or row.five_hour_pct is not None
+            or bool(row.scoped_windows)
+        )
+
+    def is_transcript_row(row: AccountRow) -> bool:
+        return row.vendor == VENDOR_CODEX and row.slot == CODEX_PSEUDO_ACCOUNT_SLOT
+
+    live_active_speaks = any(
+        row.vendor == VENDOR_CODEX
+        and not is_transcript_row(row)
+        and row.is_active
+        and has_figure(row)
+        for row in rows
+    )
+    if not live_active_speaks:
+        return tuple(rows)
+    return tuple(row for row in rows if not is_transcript_row(row))
+
+
 # ---------------------------------------------------------------------------
 # 7. settings.json schema
 # ---------------------------------------------------------------------------
@@ -2074,10 +2267,13 @@ SETTINGS_DEFAULTS: dict[str, Any] = {
     "cost_tracking_enabled": True,
     # --- vendors (SPEC-CODEX) ---------------------------------------------
     "codex_tracking_enabled": True,
+    "codex_live_quota_enabled": False,
+    "codex_show_extra_limits": False,
     # --- scan / cadence (SPEC 3.5); all intervals live here ---------------
     "lookback_days": 30,
     "ui_interval_seconds": 60,
     "cost_interval_seconds": 300,
+    "codex_quota_interval_seconds": 300,
     # --- title components (SPEC 4.1: "<icon> podol 17% F3% $12/d") --------
     "title_show_icon": True,
     "title_show_alias": True,
@@ -2085,6 +2281,7 @@ SETTINGS_DEFAULTS: dict[str, Any] = {
     "title_show_scoped_pct": True,
     "title_show_cost": True,
     "title_show_codex_pct": False,
+    "title_show_fleet": True,
 }
 """Full ``settings.json`` schema with defaults.
 
@@ -2103,8 +2300,28 @@ Vendor keys (SPEC-CODEX):
     :meth:`TranscriptSource.available` returns False and the source is skipped.
 ``title_show_codex_pct``
     Defaults ``False``. The title is already five components wide and the menu
-    bar is finite; the Codex weekly percentage is opt-in, and the Codex section
-    in the menu is *not* gated on it.
+    bar is finite; the Codex percentage is opt-in, and the Codex section in
+    the menu is *not* gated on it. With live per-account rows (SPEC-CODEX 6)
+    it shows the ACTIVE Codex account only - the login ``~/.codex`` holds.
+``codex_live_quota_enabled``
+    Defaults ``False``. Whether the live per-account Codex quota source
+    (SPEC-CODEX 6, ``codex_accounts.py``) polls at all. Off = no network
+    request is ever made and the menu is byte-for-byte the single log-derived
+    Codex row. This is the rollback switch.
+``codex_quota_interval_seconds``
+    Per-account poll period for the live source. Clamped by
+    :data:`SETTINGS_BOUNDS`; the floor protects the endpoint, not the CPU.
+``codex_show_extra_limits``
+    Defaults ``False``. Whether ``additional_rate_limits`` (per-model buckets
+    such as a Spark or reserve pool) render as extra bars under each account.
+
+``title_show_fleet``
+    Defaults ``True``, and unlike the other title components it costs nothing
+    in the steady state: the fleet suffix (``0/4 · next 00:00``) is rendered
+    ONLY while the active account is at or over the autoswitch threshold, or
+    while a standing verdict says nothing can be switched to. That is exactly
+    the moment the operator needs to know whether another room is free and
+    when the next one opens — see ``render_title``.
 
 **These keys must be declared here to exist.** :func:`normalize_settings`
 drops unknown keys, so a vendor setting added only in ``app.py`` would be
@@ -2115,6 +2332,7 @@ SETTINGS_BOUNDS: dict[str, tuple[int, int]] = {
     "lookback_days": (1, 365),
     "ui_interval_seconds": (15, 3600),
     "cost_interval_seconds": (30, 86_400),
+    "codex_quota_interval_seconds": (60, 3600),
 }
 """Inclusive clamps for the integer settings.
 
@@ -2320,7 +2538,18 @@ def format_pct(value: Pct | None) -> str:
 
     ``None`` renders as a dash rather than ``0%`` because "not reported" is
     not the same as "none used" - notably ``seven_day_opus`` (SPEC 1).
+
+    ``100%`` is reserved for values that are truly >= 100: the autoswitch
+    engine's at-limit escape may legitimately land on an account whose
+    window sits at 99.5-99.99%, and rounding that up to "100%" made the
+    menu contradict the switch it had just performed (2026-08-25 incident:
+    "autoswitch -> podol" while podol's Fable row read 100%). 99.x floors
+    to 99% — mirroring claude-swap's own pct_label rule ("99.9 never
+    becomes a lying 100").
     """
     if value is None:
         return "—"
-    return f"{round(value):d}%"
+    rounded = round(value)
+    if rounded >= 100 and value < 100:
+        return "99%"
+    return f"{rounded:d}%"

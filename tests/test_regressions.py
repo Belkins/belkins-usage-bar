@@ -28,6 +28,17 @@ The 2026-08-17 Codex review added five more, all in the same seam:
 12   no Codex controls on a machine with no Codex                    :func:`test_absent_codex_corpus_offers_no_codex_settings`
 ===  =============================================================  =========================================================
 
+SPEC-CODEX 6 (live per-account Codex quota) adds five more, all defending one
+promise: a second Codex source must cost the first one nothing.
+
+===  =============================================================  =========================================================
+13   no live source: today's menu and title, byte for byte           :func:`test_no_live_codex_source_renders_todays_exact_menu`
+14   refresh / vendor toggle / quit all reach the poller             :func:`test_refresh_and_the_vendor_toggle_reach_the_live_source`
+15   no registry file: no live-quota controls, no new lines          :func:`test_codex_accounts_submenu_appears_only_with_a_registry`
+16   a checkbox writes the registry once, on the worker              :func:`test_a_registry_toggle_is_written_once_on_the_worker_thread`
+17   the source's diagnostics reach the menu from a cache            :func:`test_source_diagnostics_reach_the_menu_without_touching_the_disk`
+===  =============================================================  =========================================================
+
 Plus the non-blocking items that were fixed: ``Today`` double-rounding, a
 future-dated bucket retained-and-hidden, an unknown ``cache_creation`` TTL tier
 zeroing a record's cache write, ``rows()`` blocking the main thread on a cold
@@ -43,7 +54,9 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -61,8 +74,15 @@ from cc_usage_widget import indexer as indexer_mod  # noqa: E402
 from cc_usage_widget.accounts import ACCOUNTS_UNAVAILABLE, SwapAccountSource  # noqa: E402
 from cc_usage_widget.app import BackgroundWorker, UiSnapshot  # noqa: E402
 from cc_usage_widget.codex_indexer import CodexIndexer  # noqa: E402
+from cc_usage_widget import accounts as accounts_mod  # noqa: E402
 from cc_usage_widget.contracts import (  # noqa: E402
+    ALERT_ALL_EXHAUSTED,
+    CODEX_PSEUDO_ACCOUNT_SLOT,
+    ALERT_EXTERNAL_SWITCH,
+    ALERT_KINDS,
+    ALERT_NO_TARGET,
     SETTINGS_DEFAULTS,
+    VENDOR_CODEX,
     IndexProgress,
     ModelUsage,
     local_day_key,
@@ -1229,6 +1249,392 @@ def test_one_jobs_success_does_not_unmute_anothers_failure() -> None:
 
 
 # ---------------------------------------------------------------------------
+def test_autoswitch_write_failure_latch_releases_on_a_later_success() -> None:
+    """2026-08-26 gate: one transient write failure deafened the widget forever.
+
+    On a failed write to claude-swap's settings.json the adapter starts
+    trusting its own in-memory flag over the file — correct, so the toggle
+    cannot silently revert. But the latch was never released, so a later
+    SUCCESSFUL write left it set: from then on ``autoswitch_enabled()``
+    short-circuits to the in-memory value and a ``cswap config set
+    autoswitch.enabled`` made in the terminal is never seen again.
+    """
+    source = SwapAccountSource(settings={})
+    writes: list[bool] = []
+
+    source._mirror_local_setting = lambda wanted: None
+    source._stop_engine = lambda: None
+
+    # First write fails -> latch engages (and the failure still raises).
+    source._write_enabled = lambda wanted: (writes.append(wanted), False)[1]
+    try:
+        source.set_autoswitch_enabled(True)
+    except RuntimeError:
+        pass
+    assert source._enabled_write_failed is True, "a failed write must engage the latch"
+
+    # A later write succeeds -> the latch must release, so the file is trusted
+    # again rather than being ignored for the rest of the process's life.
+    source._write_enabled = lambda wanted: (writes.append(wanted), True)[1]
+    source.set_autoswitch_enabled(False)
+    assert source._enabled_write_failed is False, (
+        "a successful write must release the latch, or settings.json is ignored forever"
+    )
+    assert writes == [True, False], writes
+
+
+def test_rebuild_surfaces_a_failed_rollup_save_instead_of_clearing_it() -> None:
+    """2026-08-26 gate: 'Rebuild cost index' hid a failed save from the user.
+
+    The save was wrapped, logged, and then ``cost_error=None`` was published
+    unconditionally — so the one failure that matters here (the emptied store
+    never reached disk, while every scanner's offsets HAVE been reset) looked
+    like a clean rebuild.
+    """
+
+    class _Rollups:
+        def __init__(self) -> None:
+            self.saved = 0
+
+        def clear(self) -> None:
+            return None
+
+        def save(self) -> None:
+            self.saved += 1
+            raise OSError("disk full")
+
+    class _Scanner:
+        def __init__(self) -> None:
+            self.reset_calls = 0
+
+        def reset(self) -> None:
+            self.reset_calls += 1
+
+    published: list[UiSnapshot] = []
+    worker = BackgroundWorker(
+        publish=published.append,
+        snapshot=UiSnapshot(settings=normalize_settings(dict(SETTINGS_DEFAULTS))),
+        accounts=None,
+        rollups=_Rollups(),
+    )
+    scanner = _Scanner()
+    worker._all_scanners = lambda: [("claude", scanner)]
+    worker._rebuild_index()
+
+    assert scanner.reset_calls == 1, "the rebuild must still reset the scanners"
+    assert published, "nothing published"
+    assert published[-1].cost_error, (
+        "a failed rollup save must reach the user, not be logged and cleared"
+    )
+    assert "disk full" in published[-1].cost_error, published[-1].cost_error
+
+
+def test_engine_unavailable_alert_is_raised_and_later_retracted() -> None:
+    """2026-08-26 second gate, MUST: the engine-unavailable alert had no test.
+
+    An engine that will not CONSTRUCT used to reach only ``last_error``, whose
+    sole reader is a no-op once any account row exists — the toggle read ON
+    while nothing switched. It now raises a standing alert; the untested half
+    was the retraction, and an alert that outlives its cause is the exact bug
+    this whole feature exists to end. Also pins the deliberate precedence: an
+    engine that cannot start outranks a per-account quarantine.
+    """
+    source = SwapAccountSource(settings={"autoswitch_enabled": True})
+    source.autoswitch_enabled = lambda: True
+    source._persisted_quarantine_alert = lambda: ("account-quarantined", "Account-3 quarantined")
+
+    source._ensure_engine = lambda: None  # construction fails
+    assert source.evaluate_autoswitch() is None
+    alert = source.current_alert()
+    assert alert is not None and alert[0] == "error", alert
+    assert alert[1].startswith("autoswitch engine unavailable: "), alert[1]
+
+    # ...and it outranks the persisted quarantine while it stands.
+    assert source.current_alert()[0] == "error"
+
+    # Construction recovers: the alert must be retracted on the spot, not on
+    # whichever later tick happens to emit a qualifying event.
+    class _Engine:
+        def tick(self) -> Any:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    source._ensure_engine = lambda: _Engine()
+    source._next_tick_at = 0.0
+    source.evaluate_autoswitch()
+    assert source.current_alert() == ("account-quarantined", "Account-3 quarantined"), (
+        "our own engine-unavailable alert must be retracted once it constructs, "
+        "revealing the quarantine underneath"
+    )
+
+
+def test_reset_that_fails_to_write_stays_dirty() -> None:
+    """2026-08-26 second gate: the durability fix missed its own reset path.
+
+    ``Rebuild cost index`` empties rollups.json BEFORE resetting each vendor,
+    so a failed write of the empty scan state leaves stale non-empty offsets
+    against an emptied rollup — and ``_reconcile_lost_scan_state`` cannot
+    catch it, because that guard keys on ``started_from_empty_state``. The
+    result is a silent UNDER-count, the mirror of the double-count fixed in
+    ``_save_states``.
+    """
+    for name, build in (
+        (
+            "Indexer",
+            lambda root, saver: Indexer(
+                projects_dir=root / "projects",
+                state_path=root / "scan_state.json",
+                pricing=DEFAULT_PRICING,
+                state_saver=saver,
+            ),
+        ),
+        (
+            "CodexIndexer",
+            lambda root, saver: CodexIndexer(
+                sessions_dir=root / "sessions",
+                state_path=root / "codex_scan_state.json",
+                pricing=DEFAULT_PRICING,
+                state_saver=saver,
+            ),
+        ),
+    ):
+        for returned, expect_dirty in ((False, True), (True, False), (None, False)):
+            with tempfile.TemporaryDirectory() as tmp:
+                indexer = build(Path(tmp), lambda _payload, _r=returned: _r)
+                indexer.reset()
+                assert indexer._states_dirty is expect_dirty, (
+                    f"{name}.reset(): saver returned {returned!r} -> _states_dirty "
+                    f"should be {expect_dirty}, got {indexer._states_dirty}"
+                )
+
+
+def test_worker_publishes_the_derived_state_seam_into_the_snapshot() -> None:
+    """2026-08-26 pre-ship gate: the seam added by 62466f6 had NO test.
+
+    Every existing test either hand-built a ``UiSnapshot`` or called the
+    adapter directly, and the only test driving ``_run_accounts_job`` used a
+    double with neither ``sentinels()`` nor ``current_alert()`` — so it covered
+    the degrade path exclusively. A rename, a swapped kwarg or a broken
+    translation in the wiring would have passed the whole suite.
+    """
+
+    class _Row:
+        slot, alias, email, is_active = 2, "acme", "v@x.io", True
+        five_hour_pct = seven_day_pct = None
+        scoped_windows: tuple[Any, ...] = ()
+        usage_age_seconds = None
+        usage_is_stale = False
+        switchable = True
+        vendor = "claude"
+
+    class _Source:
+        """A source that actually implements the optional accessors."""
+
+        def refresh(self, *, force: bool = False) -> None:
+            return None
+
+        def rows(self) -> tuple[Any, ...]:
+            return (_Row(),)
+
+        def active(self) -> Any:
+            return _Row()
+
+        def autoswitch_enabled(self) -> bool | None:
+            return True
+
+        def set_autoswitch_enabled(self, enabled: bool) -> None:
+            return None
+
+        def evaluate_autoswitch(self) -> str | None:
+            return None
+
+        def switch_to(self, slot_or_alias: str) -> bool:
+            return False
+
+        def sentinels(self) -> dict[int, str]:
+            return {2: "re-login needed — refresh token dead; run: cswap add"}
+
+        def sentinel_kinds(self) -> dict[int, str]:
+            return {2: "re-login needed"}
+
+        def current_alert(self) -> tuple[str, str]:
+            return (ALERT_ALL_EXHAUSTED, "all accounts exhausted")
+
+    published: list[UiSnapshot] = []
+    worker = BackgroundWorker(
+        publish=published.append,
+        snapshot=UiSnapshot(settings=normalize_settings(dict(SETTINGS_DEFAULTS))),
+        accounts=_Source(),
+    )
+    worker._run_accounts_job(force=False)
+    assert published, "nothing published"
+    snapshot = published[-1]
+    assert snapshot.account_notes == {2: "re-login needed — refresh token dead; run: cswap add"}
+    assert snapshot.account_note_kinds == {2: "re-login needed"}
+    assert snapshot.alert == (ALERT_ALL_EXHAUSTED, "all accounts exhausted")
+
+    # ...and the renderers consume what the worker actually published, so the
+    # adapter->snapshot->title path is covered end to end rather than in halves.
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        settings = dict(snapshot.settings)
+        settings.update({"title_show_icon": False, "title_show_cost": False})
+        painted = replace(snapshot, settings=settings)
+        title = app.render_title(painted)
+        assert "relogin" in title and "exhausted" in title, title
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+def test_a_failed_scan_state_write_keeps_the_dirty_flag_set() -> None:
+    """2026-08-26 pre-ship gate, CRITICAL: a failed save was marked clean.
+
+    ``ScanStateStore.save_json`` never raises — it reports a failed write as
+    ``False`` so the caller "can keep its dirty flag set and retry on the next
+    tick". Both indexers' ``_state_saver`` branch discarded that bool and
+    cleared ``_states_dirty`` unconditionally, so a transient disk failure left
+    STALE offsets on disk while ``rollups.json`` had already committed (the
+    rollup is written first and does raise). The next restart then re-read
+    those bytes and re-credited their tokens — a silent, permanent double
+    count of cost, invisible because ``last_save_error`` is read nowhere.
+
+    Both direct-write fallbacks already gated on success; only the production
+    hand-off did not. The bar: a save that returns False must NOT be treated
+    as durable, and one that returns None (an older saver) must still work.
+    """
+    for name, build in (
+        (
+            "Indexer",
+            lambda root, saver: Indexer(
+                projects_dir=root / "projects",
+                state_path=root / "scan_state.json",
+                pricing=DEFAULT_PRICING,
+                state_saver=saver,
+            ),
+        ),
+        (
+            "CodexIndexer",
+            lambda root, saver: CodexIndexer(
+                sessions_dir=root / "sessions",
+                state_path=root / "codex_scan_state.json",
+                pricing=DEFAULT_PRICING,
+                state_saver=saver,
+            ),
+        ),
+    ):
+        for returned, expect_dirty in ((False, True), (True, False), (None, False)):
+            with tempfile.TemporaryDirectory() as tmp:
+                calls: list[Any] = []
+
+                def _saver(payload: Any, _r: Any = returned) -> Any:
+                    calls.append(payload)
+                    return _r
+
+                indexer = build(Path(tmp), _saver)
+                indexer._states_dirty = True
+                indexer._save_states()
+                assert calls, f"{name}: the saver was never called"
+                assert indexer._states_dirty is expect_dirty, (
+                    f"{name}: saver returned {returned!r} -> _states_dirty should be "
+                    f"{expect_dirty}, got {indexer._states_dirty}"
+                )
+
+
+def test_standing_alert_does_not_outlive_the_engine_that_made_it() -> None:
+    """2026-08-26: the alert was stored on an event and never cleared, so
+    turning Auto-switch OFF froze ``⛔ exhausted`` in the menu bar forever —
+    the same "stale state rendered as live" bug the alert was added to end.
+    Re-enabling must not resurrect the old verdict either.
+    """
+
+    class _Event:
+        def __init__(self, kind: str, line: str) -> None:
+            self.kind, self._line = kind, line
+
+        def human(self) -> str:
+            return self._line
+
+    source = SwapAccountSource(settings={"autoswitch_enabled": True})
+    source._persisted_quarantine_alert = lambda: None  # isolate from the real state file
+    source.autoswitch_enabled = lambda: True
+    source._on_engine_event(_Event("all-exhausted", "all accounts exhausted"))
+    source._drain_events()
+    assert source.current_alert() == ("all-exhausted", "all accounts exhausted")
+
+    source.autoswitch_enabled = lambda: False
+    source.evaluate_autoswitch()  # the worker's per-tick call; stops the engine
+    assert source.current_alert() is None, "a stopped engine has no standing verdict"
+
+    source.autoswitch_enabled = lambda: True
+    assert source.current_alert() is None, "re-enabling must not resurrect the old verdict"
+
+
+def test_a_quarantine_that_predates_the_widget_still_reaches_the_menu() -> None:
+    """2026-08-26: ``QuarantineEvent`` fires only at the transition, and
+    upstream filters an already-quarantined slot out of the candidate path
+    before it could fire again — so a quarantine recorded before this process
+    started produced no alert at all. It is read from the state file instead,
+    which also means releasing it needs no explicit clear.
+    """
+    source = SwapAccountSource(settings={"autoswitch_enabled": True})
+    source.autoswitch_enabled = lambda: True
+    with tempfile.TemporaryDirectory() as tmp:
+        state = Path(tmp) / "autoswitch_state.json"
+        source._autoswitch_state_path = lambda: state
+
+        assert source.current_alert() is None, "no state file is not an alert"
+
+        def _write(payload: dict[str, Any], stamp: float) -> None:
+            # Explicit mtimes: the read is mtime-gated, and two writes inside
+            # one filesystem timestamp tick would serve a stale cache.
+            state.write_text(json.dumps(payload), encoding="utf-8")
+            os.utime(state, (stamp, stamp))
+
+        _write({"quarantine": {"3": {"email": "a@b.c", "reason": "invalid_grant"}}}, 1_000_000)
+        alert = source.current_alert()
+        assert alert is not None, "a persisted quarantine must reach the menu"
+        kind, line = alert
+        assert kind == "account-quarantined", kind
+        assert "Account-3 (a@b.c)" in line and "invalid_grant" in line, line
+        assert "--slot 3" in line, "the line must name the recovery command"
+
+        source._alert = ("all-exhausted", "all accounts exhausted")
+        assert source.current_alert()[0] == "all-exhausted", "a live verdict outranks the file"
+        source._alert = None
+
+        _write({"quarantine": {}}, 1_000_100)
+        assert source.current_alert() is None, "release must clear it with no explicit step"
+
+        state.write_text("{not json", encoding="utf-8")
+        os.utime(state, (1_000_200, 1_000_200))
+        assert source.current_alert() is None, "corrupt state must not take the menu down"
+
+
+def test_a_test_defined_below_the_main_guard_is_reported_not_silently_dropped() -> None:
+    """2026-08-25: a test appended after ``if __name__ == "__main__":`` is never
+    defined before ``main()`` runs, so the direct runner dropped it with no
+    error — just a smaller total. (Moving ``main()`` to the top does NOT fix
+    this: it would run before any test is defined and collect zero.) The runner
+    now diffs its collection against the source and fails loud.
+    """
+    source = "\n".join(
+        [
+            "def test_alpha() -> None: ...",
+            "def main(): ...",
+            'if __name__ == "__main__":',
+            "    raise SystemExit(main())",
+            "def test_orphan() -> None: ...",
+        ]
+    )
+    collected = [("test_alpha", lambda: None)]
+    assert _uncollected_tests(collected, source=source) == ["test_orphan"]
+    assert _uncollected_tests(collected + [("test_orphan", lambda: None)], source=source) == []
+
+
+# ---------------------------------------------------------------------------
 # Runner (pytest is not installed in claude-swap's venv)
 # ---------------------------------------------------------------------------
 
@@ -1240,6 +1646,2653 @@ def _tests() -> list[tuple[str, Any]]:
         if name.startswith("test_") and callable(obj)
     ]
     return sorted(items, key=lambda pair: pair[1].__code__.co_firstlineno)
+
+
+def _uncollected_tests(
+    collected: list[tuple[str, Any]], source: str | None = None
+) -> list[str]:
+    """Test names present in the SOURCE but absent from ``globals()``.
+
+    ``main()`` runs from the ``__main__`` guard at the bottom of this file and
+    raises ``SystemExit``, so anything defined textually below it never runs —
+    a test appended there vanishes from the direct run with no error, only a
+    smaller total (happened 2026-08-25). pytest is immune (it imports the
+    module instead of executing the guard) and this venv has no pytest, so the
+    direct runner has to police itself.
+    """
+    if source is None:
+        try:
+            source = Path(__file__).read_text(encoding="utf-8")
+        except OSError:  # pragma: no cover - the file is right there
+            return []
+    declared = re.findall(r"^def (test_\w+)", source, re.MULTILINE)
+    found = {name for name, _ in collected}
+    return [name for name in declared if name not in found]
+
+
+def test_format_pct_reserves_100_for_true_limits() -> None:
+    """2026-08-25 incident: 99.5-99.99% rendered as a lying "100%".
+
+    The autoswitch engine's at-limit escape may legitimately land on an
+    account whose window is at 99.7%; the menu then asserted "100% (!)" for
+    the very account it had just switched to. "100%" now means >= 100.0.
+    """
+    from cc_usage_widget.contracts import format_pct
+
+    assert format_pct(99.5) == "99%"
+    assert format_pct(99.99) == "99%"
+    assert format_pct(100.0) == "100%"
+    assert format_pct(100.4) == "100%"
+    assert format_pct(99.4) == "99%"
+    assert format_pct(0.4) == "0%"
+    assert format_pct(None) == "—"
+
+
+def test_derived_usage_state_reaches_title_and_menu() -> None:
+    """2026-08-25 incident: a quarantined active account rendered ``acme 0%``.
+
+    claude-swap had flagged slot 2 "re-login needed" for 39 hours and the
+    adapter computed that note every pass; nothing read it, so the title
+    showed a day-old last-good 0% and looked like the healthiest account.
+    The note must REPLACE the figure in the title and be printed verbatim in
+    the menu (it names the remedy: ``cswap add``); a non-active slot in that
+    state still marks the title; the engine's all-exhausted verdict is a
+    title-level alert, not a log line.
+    """
+    from cc_usage_widget.contracts import AccountRow
+
+    note = "re-login needed — refresh token dead; log in with Claude Code, then run: cswap add"
+    active = AccountRow(
+        slot=2, alias="acme", email="acme@example.com", is_active=True,
+        five_hour_pct=0.0, seven_day_pct=18.0, usage_age_seconds=139_000.0,
+    )
+    idle = AccountRow(
+        slot=1, alias="main", email="main@example.com", is_active=False,
+        five_hour_pct=47.0, seven_day_pct=78.0,
+    )
+    settings = normalize_settings(dict(SETTINGS_DEFAULTS))
+    settings.update({"title_show_icon": False, "title_show_cost": False})
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        plain = UiSnapshot(settings=settings, accounts=(idle, active), active=active)
+        assert "0%" in app.render_title(plain)
+
+        flagged = replace(plain, account_notes={2: note})
+        title = app.render_title(flagged)
+        assert "relogin" in title and "0%" not in title, title
+        app.rebuild_menu(flagged)
+        texts = [str(getattr(item, "title", "")) for item in app.menu.values()]
+        assert any("re-login needed" in t and "acme" in t for t in texts), texts
+
+        other = replace(plain, account_notes={1: note})
+        title = app.render_title(other)
+        assert "⚠" in title and "0%" in title, title
+
+        exhausted = replace(
+            plain,
+            alert=("all-exhausted", "all accounts exhausted; earliest reset 2026-08-27T21:00:00Z"),
+        )
+        assert "exhausted" in app.render_title(exhausted)
+        app.rebuild_menu(exhausted)
+        texts = [str(getattr(item, "title", "")) for item in app.menu.values()]
+        assert any("all accounts exhausted" in t for t in texts), texts
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+def test_autoswitch_alert_tracks_the_engines_latest_verdict() -> None:
+    """``current_alert()`` stands while the fleet is dry and clears when the
+    engine next finds a way forward — so the bar shows a state, not an echo."""
+
+    class _Event:
+        def __init__(self, kind: str, line: str) -> None:
+            self.kind, self._line = kind, line
+
+        def human(self) -> str:
+            return self._line
+
+    source = SwapAccountSource(settings={})
+    # Preconditions made explicit (2026-08-26): a verdict is only readable
+    # while the engine is running, and the file fallback is a separate test.
+    source.autoswitch_enabled = lambda: True
+    source._persisted_quarantine_alert = lambda: None
+    source._on_engine_event(_Event("all-exhausted", "all accounts exhausted"))
+    source._drain_events()
+    assert source.current_alert() == ("all-exhausted", "all accounts exhausted")
+    source._on_engine_event(_Event("poll", "poll"))
+    source._drain_events()
+    assert source.current_alert() is not None, "a poll carries no verdict"
+    source._on_engine_event(_Event("no-switch", "below-threshold"))
+    source._drain_events()
+    assert source.current_alert() is None
+
+
+def test_all_exhausted_warning_dedupes_across_timestamp_jitter() -> None:
+    """One episode must WARN once, not every ~10-minute blocked tick.
+
+    The engine's all-exhausted line embeds a reset instant whose sub-second
+    part jitters — and which flipped the whole second/minute/hour between
+    emissions of the SAME episode (…T20:59:59.700962Z vs …T21:00:00.132963Z,
+    observed live 2026-08-26). Keying repeat detection on the raw line
+    therefore never matched and the WARNING fired on every tick.
+    """
+    from cc_usage_widget.accounts import _episode_key
+
+    a = "all accounts exhausted; earliest reset 2026-08-27T21:00:00.132963Z"
+    b = "all accounts exhausted; earliest reset 2026-08-27T20:59:59.700962Z"
+    c = "all accounts exhausted; earliest reset 2026-08-27T20:59:59.732573Z"
+    assert _episode_key(a) == _episode_key(b) == _episode_key(c)
+    # A genuinely different episode (new reset date) stays distinguishable.
+    d = "all accounts exhausted; earliest reset 2026-08-28T21:00:00.000001Z"
+    assert _episode_key(d) != _episode_key(a)
+    # Lines without a timestamp are returned unchanged.
+    assert _episode_key("quarantined slot 2") == "quarantined slot 2"
+
+
+def test_unswitchable_accounts_are_not_clickable() -> None:
+    """A slot claude-swap cannot activate must not render as a live row.
+
+    ``AccountRow.switchable`` is the only thing that makes a row clickable,
+    and ``_build_row`` never populated it: every account rendered clickable,
+    including one whose stored credentials or config backup are missing, so
+    the click was guaranteed to fail. Upstream's flag means "activatable
+    without re-adding the account" — exactly the click precondition.
+    """
+
+    class _Acct:
+        def __init__(self, number: int, switchable: object) -> None:
+            self.number = number
+            self.email = f"a{number}@example.com"
+            self.is_active = False
+            self.usage = None
+            if switchable is not _MISSING:
+                self.switchable = switchable
+
+    source = SwapAccountSource(settings=None)
+    unswitchable = source._build_row(_Acct(1, False), None, 0.0, None)
+    switchable = source._build_row(_Acct(2, True), None, 0.0, None)
+    absent = source._build_row(_Acct(3, _MISSING), None, 0.0, None)
+
+    assert unswitchable.switchable is False
+    assert switchable.switchable is True
+    # Fail OPEN when upstream drops the attribute: a missing field must never
+    # silently disable manual switching for every account.
+    assert absent.switchable is True
+
+
+
+# ---------------------------------------------------------------------------
+# W1 forensics: an account switch nobody in this widget made (2026-09-01)
+# ---------------------------------------------------------------------------
+
+
+class _CapturedLog:
+    """Collects records from the accounts logger for the duration of a with."""
+
+    def __init__(self, level: int = logging.WARNING) -> None:
+        self._level = level
+        self.records: list[logging.LogRecord] = []
+        self._handler: logging.Handler | None = None
+
+    def __enter__(self) -> "_CapturedLog":
+        outer = self
+
+        class _Handler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                if record.levelno >= outer._level:
+                    outer.records.append(record)
+
+        self._handler = _Handler()
+        accounts_mod.LOGGER.addHandler(self._handler)
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        if self._handler is not None:
+            accounts_mod.LOGGER.removeHandler(self._handler)
+
+    def messages(self) -> list[str]:
+        return [record.getMessage() for record in self.records]
+
+
+class _FakeSnapshot:
+    def __init__(self, active_number: str) -> None:
+        self.active_number = active_number
+        self.accounts: tuple[Any, ...] = ()
+
+
+class _FakeSwitcher:
+    def __init__(self, snapshot: _FakeSnapshot) -> None:
+        self._snapshot = snapshot
+        self.calls: list[str] = []
+        self.result: dict[str, Any] = {"switched": True}
+
+    def switch_to(self, identifier: str, json_output: bool = False) -> dict[str, Any]:
+        self.calls.append(identifier)
+        # A real switch moves the live login; that is what the next snapshot
+        # pass reads back, and what the detector must NOT call external.
+        self._snapshot.active_number = str(identifier)
+        return self.result
+
+
+class _FakeSnapshotSource:
+    def __init__(self, snapshot: _FakeSnapshot) -> None:
+        self._snapshot = snapshot
+
+    def take(self, full: bool = False, store_only: bool = False) -> _FakeSnapshot:
+        return self._snapshot
+
+
+class _FakeBackend:
+    """The two backend attributes ``refresh``/``switch_to`` actually touch."""
+
+    def __init__(self, active_number: str) -> None:
+        self.snapshot = _FakeSnapshot(active_number)
+        self.snapshot_source = _FakeSnapshotSource(self.snapshot)
+        self.switcher = _FakeSwitcher(self.snapshot)
+
+
+class _EngineEvent:
+    def __init__(self, kind: str, line: str, **extra: Any) -> None:
+        self.kind, self._line = kind, line
+        for name, value in extra.items():
+            setattr(self, name, value)
+
+    def human(self) -> str:
+        return self._line
+
+
+def _forensics_source(active: str = "5") -> tuple[Any, _FakeBackend]:
+    """A source wired to a fake backend, primed with *active* as the live slot."""
+    source = SwapAccountSource(settings={"autoswitch_enabled": True})
+    source.autoswitch_enabled = lambda: True
+    source._persisted_quarantine_alert = lambda: None
+    backend = _FakeBackend(active)
+    source._backend_or_none = lambda: backend
+    source.refresh(force=True)  # first pass: learn the active slot, say nothing
+    return source, backend
+
+
+def test_a_switch_the_widget_did_not_make_is_detected_and_named() -> None:
+    """2026-09-01: three ghost flips, no line anywhere.
+
+    claude-swap re-derives the active login from ``~/.claude.json`` on every
+    pass, so an external switch (a rival ``cswap`` actor, a ``/login``, or a
+    running session refreshing its own token back into the shared default) IS
+    visible to the widget — but nothing compared two passes, so the title
+    silently changed alias and the engine re-switched 7 s later. It must now
+    produce a WARNING, an event-log line and a standing verdict.
+
+    The first pass must stay silent: with no previous active slot the widget
+    cannot say who moved it, and guessing would be the same lie in reverse.
+    """
+    source, backend = _forensics_source("5")
+    assert source.current_alert() is None, "the first pass has nothing to compare"
+    assert source.recent_events() == (), source.recent_events()
+
+    backend.snapshot.active_number = "1"
+    with _CapturedLog() as captured:
+        source.refresh(force=True)
+
+    alert = source.current_alert()
+    assert alert is not None, "an external switch must reach the menu bar"
+    kind, line = alert
+    assert kind == ALERT_EXTERNAL_SWITCH, kind
+    assert "active 5→1 (external)" in line, line
+    assert any("outside the widget" in m for m in captured.messages()), captured.messages()
+    assert source.recent_events()[-1] == line, source.recent_events()
+
+    # The verdict reaches the menu bar as its own glyph, not a generic one.
+    assert app_mod._title_alert(kind) == "⚠ ext"
+
+    # It stands while the rival keeps the wheel: a later quiet pass must not
+    # clear it (that is the bug this replaces, not a state to reintroduce).
+    source.refresh(force=True)
+    assert source.current_alert() == alert, "a quiet pass must not retract it"
+
+
+def test_our_own_engine_and_menu_switches_are_not_reported_as_external() -> None:
+    """The detector is only worth having if it never cries wolf.
+
+    Both widget-made paths land the active on a new slot exactly like a rival
+    would; each must claim the change first — the engine from the ``switch``
+    event's ``to_ref``, the menu click from the target it asked for. A false
+    "another actor is driving" would train the operator to ignore the real one.
+    """
+    # (a) engine switch
+    source, backend = _forensics_source("5")
+    source._on_engine_event(
+        _EngineEvent(
+            "switch",
+            "Switched Account-5 -> Account-1 (a@b.c) (at-limit)",
+            to_ref={"number": "1", "email": "a@b.c"},
+        )
+    )
+    backend.snapshot.active_number = "1"
+    source._drain_events()
+    source.refresh(force=True)
+    assert source.current_alert() is None, source.current_alert()
+    assert not any("external" in line for line in source.recent_events()), source.recent_events()
+    assert any("Switched Account-5" in line for line in source.recent_events())
+
+    # (b) manual switch from the menu
+    source, backend = _forensics_source("5")
+    assert source.switch_to("1") is True
+    assert backend.switcher.calls == ["1"], backend.switcher.calls
+    assert source.current_alert() is None, source.current_alert()
+    assert any("manual → 1" in line for line in source.recent_events()), source.recent_events()
+
+    # ...and taking the wheel back retracts a standing external verdict.
+    backend.snapshot.active_number = "3"
+    source.refresh(force=True)
+    assert source.current_alert()[0] == ALERT_EXTERNAL_SWITCH
+    source.switch_to("2")
+    assert source.current_alert() is None, "a widget switch clears the external verdict"
+
+
+def test_an_expectation_is_consumed_by_exactly_one_pass() -> None:
+    """A claim that outlives its pass would swallow the NEXT external switch.
+
+    A manual switch to slot 1 that then bounces back (the token-refresh race
+    that caused tonight's flips) must be reported the second time round.
+    """
+    source, backend = _forensics_source("5")
+    source.switch_to("1")
+    assert source.current_alert() is None
+    # Same destination, this time nobody asked for it.
+    backend.snapshot.active_number = "5"
+    source.refresh(force=True)
+    backend.snapshot.active_number = "1"
+    source.refresh(force=True)
+    alert = source.current_alert()
+    assert alert is not None and alert[0] == ALERT_EXTERNAL_SWITCH, alert
+    # Assert on the journal, not the standing verdict: the 1→5 flip already
+    # raised one, so only the LINE COUNT proves the 5→1 flip was not swallowed
+    # by a claim that outlived its pass (review 2026-09-01: the old assertion
+    # passed with the expectation never consumed).
+    external = [line for line in source.recent_events() if "(external)" in line]
+    assert len(external) == 2, external
+    assert external[-1].endswith("active 5\u21921 (external)"), external
+
+
+def test_no_viable_target_is_a_standing_verdict_not_a_debug_line() -> None:
+    """"Nowhere to go" used to CLEAR the alert and log at DEBUG.
+
+    ``NoSwitchEvent(reason="no-viable-target")`` took the same branch as
+    "below-threshold", so the one tick that proves the fleet is stuck also
+    erased the ``⛔ exhausted`` line the operator was reading — a C9-class
+    invisible state. Every other reason must keep clearing, as before.
+    """
+    source, _ = _forensics_source("5")
+    with _CapturedLog() as captured:
+        source._on_engine_event(
+            _EngineEvent("no-switch", "no switch: no-viable-target", reason="no-viable-target")
+        )
+        source._drain_events()
+    alert = source.current_alert()
+    assert alert is not None and alert[0] == ALERT_NO_TARGET, alert
+    assert app_mod._title_alert(alert[0]) == "⚠ no target"
+    assert any("no-viable-target" in m for m in captured.messages()), captured.messages()
+
+    # Repeats of the SAME episode stay out of the log (the engine re-emits it
+    # every blocked tick) but the verdict keeps standing.
+    with _CapturedLog() as repeat:
+        source._on_engine_event(
+            _EngineEvent("no-switch", "no switch: no-viable-target", reason="no-viable-target")
+        )
+        source._drain_events()
+    assert repeat.messages() == [], repeat.messages()
+    assert source.current_alert()[0] == ALERT_NO_TARGET
+
+    # An ordinary no-switch still means "nothing to escalate".
+    source._on_engine_event(
+        _EngineEvent("no-switch", "no switch: below-threshold", reason="below-threshold")
+    )
+    source._drain_events()
+    assert source.current_alert() is None, source.current_alert()
+
+
+def test_poll_and_sleep_events_do_not_evict_the_switch_history() -> None:
+    """The recent-switches block would otherwise be all polls.
+
+    The engine emits a poll or sleep on nearly every tick and the event log is a
+    20-slot deque, so keeping them means a switch line survives ~20 minutes and
+    the menu block never shows a switch. They stay in the DEBUG log.
+    """
+    source, _ = _forensics_source("5")
+    source._on_engine_event(
+        _EngineEvent("switch", "Switched Account-5 -> Account-1 (a@b.c) (at-limit)")
+    )
+    source._drain_events()
+    for index in range(30):
+        source._on_engine_event(_EngineEvent("poll", f"poll {index}"))
+        source._on_engine_event(_EngineEvent("sleep", f"sleep {index}"))
+    source._drain_events()
+    events = source.recent_events()
+    assert any("Switched Account-5" in line for line in events), events
+    assert not any(line.endswith("poll 29") for line in events), events
+
+
+def test_the_switch_history_carries_a_local_clock_the_operator_can_read() -> None:
+    """Every forensic line is stamped ``HH:MM`` local, and the menu shows it."""
+    source, _ = _forensics_source("5")
+    source._on_engine_event(
+        _EngineEvent("switch", "Switched Account-5 -> Account-1 (a@b.c) (at-limit)")
+    )
+    source._drain_events()
+    line = source.recent_events()[-1]
+    assert re.match(r"^\d{2}:\d{2} Switched Account-5", line), line
+
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        settings = normalize_settings(dict(SETTINGS_DEFAULTS))
+        snapshot = UiSnapshot(settings=settings, recent_events=(line,))
+        app.rebuild_menu(snapshot)
+        texts = [str(getattr(item, "title", "")) for item in app.menu.values()]
+        assert any(t.strip() == "Recent switches" for t in texts), texts
+        assert any("Switched Account-5" in t for t in texts), texts
+        # A machine that has seen nothing renders exactly the old menu.
+        app.rebuild_menu(UiSnapshot(settings=settings))
+        texts = [str(getattr(item, "title", "")) for item in app.menu.values()]
+        assert not any("Recent switches" in t for t in texts), texts
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+def test_the_exhausted_line_shows_a_time_the_operator_can_act_on() -> None:
+    """Upstream writes the earliest reset as an ISO-UTC instant.
+
+    ``earliest reset 2026-08-27T21:00:00Z`` is the one number that matters and
+    the one the operator has to convert in their head — seven hours out here.
+    It is re-expressed on the local clock; anything unparseable stays verbatim
+    rather than becoming a guess.
+    """
+    raw = "all accounts exhausted; earliest reset 2026-08-27T21:00:00Z"
+    local = (
+        dt.datetime(2026, 8, 27, 21, 0, tzinfo=dt.timezone.utc).astimezone().strftime("%H:%M")
+    )
+    assert app_mod._localize_instants(raw).endswith(f"earliest reset {local}")
+    assert "2026-08-27T21:00:00Z" not in app_mod._localize_instants(raw)
+    assert app_mod._localize_instants("earliest reset 2026-13-99T99:99:99Z") == (
+        "earliest reset 2026-13-99T99:99:99Z"
+    )
+
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        settings = normalize_settings(dict(SETTINGS_DEFAULTS))
+        app.rebuild_menu(
+            UiSnapshot(settings=settings, alert=(ALERT_ALL_EXHAUSTED, raw))
+        )
+        texts = [str(getattr(item, "title", "")) for item in app.menu.values()]
+        assert any(f"earliest reset {local}" in t for t in texts), texts
+        assert not any("21:00:00Z" in t for t in texts), texts
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+def test_the_last_switch_line_is_read_from_shared_state_and_never_guessed() -> None:
+    """``last switch HH:MM (trigger) · cooldown Nm left`` — or no line at all.
+
+    The file is claude-swap's, so it also describes a switch made by ``cswap``
+    or the TUI. Each part is dropped rather than invented: no ``lastSwitchAt``
+    means no line, no ``leftTrigger`` means no reason, and no running engine
+    means no cooldown clause (nothing is enforcing one).
+    """
+    source = SwapAccountSource(settings={"autoswitch_enabled": True})
+    source.autoswitch_enabled = lambda: True
+    with tempfile.TemporaryDirectory() as tmp:
+        state = Path(tmp) / "autoswitch_state.json"
+        source._autoswitch_state_path = lambda: state
+        assert source.switch_note() is None, "no state file is not a line"
+
+        def _write(payload: dict[str, Any], stamp: float) -> None:
+            state.write_text(json.dumps(payload), encoding="utf-8")
+            os.utime(state, (stamp, stamp))
+
+        _write({"schemaVersion": 1}, 1_000_000)
+        assert source.switch_note() is None, "no lastSwitchAt is not a line"
+
+        when = time.time() - 60.0
+        expected = time.strftime("%H:%M", time.localtime(when))
+        _write({"lastSwitchAt": when, "lastSwitchTo": "5"}, 1_000_100)
+        assert source.switch_note() == f"last switch {expected}", source.switch_note()
+
+        _write({"lastSwitchAt": when, "leftTrigger": "at-limit"}, 1_000_200)
+        assert source.switch_note() == f"last switch {expected} (at-limit)"
+
+        class _Policy:
+            cooldown_seconds = 300.0
+
+        class _Engine:
+            settings = _Policy()
+
+        source._engine = _Engine()
+        note = source.switch_note()
+        assert note is not None and note.startswith(f"last switch {expected} (at-limit) · cooldown ")
+        assert note.endswith("m left"), note
+
+        _write({"lastSwitchAt": "not a number"}, 1_000_300)
+        assert source.switch_note() is None, "a corrupt value must not become a guess"
+
+    # ...and it reaches the menu right under the header.
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        settings = normalize_settings(dict(SETTINGS_DEFAULTS))
+        app.rebuild_menu(
+            UiSnapshot(settings=settings, switch_note="last switch 21:05 (at-limit)")
+        )
+        texts = [str(getattr(item, "title", "")) for item in app.menu.values()]
+        assert any("last switch 21:05 (at-limit)" in t for t in texts), texts
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+def test_the_worker_publishes_the_forensic_seam_into_the_snapshot() -> None:
+    """The adapter computed all of this before; nothing read it (G2).
+
+    A field added to ``UiSnapshot`` and never populated by ``_run_accounts_job``
+    is the same silent gap as the deque with no reader, so the wiring gets its
+    own test rather than being implied by the renderers'.
+    """
+
+    class _Source:
+        def refresh(self, *, force: bool = False) -> None:
+            return None
+
+        def rows(self) -> tuple[Any, ...]:
+            return ()
+
+        def active(self) -> Any:
+            return None
+
+        def autoswitch_enabled(self) -> bool | None:
+            return False
+
+        def evaluate_autoswitch(self) -> str | None:
+            return None
+
+        def recent_events(self) -> tuple[str, ...]:
+            return ("21:05 active 5→1 (external)",)
+
+        def switch_note(self) -> str:
+            return "last switch 21:05 (at-limit) · cooldown 4m left"
+
+    published: list[UiSnapshot] = []
+    worker = BackgroundWorker(
+        publish=published.append,
+        snapshot=UiSnapshot(settings=normalize_settings(dict(SETTINGS_DEFAULTS))),
+        accounts=_Source(),
+    )
+    worker._run_accounts_job(force=False)
+    assert published, "nothing published"
+    assert published[-1].recent_events == ("21:05 active 5→1 (external)",)
+    assert published[-1].switch_note == "last switch 21:05 (at-limit) · cooldown 4m left"
+
+_MISSING = object()
+
+
+def _fleet_rows(*specs: tuple[int, str, float | None, str | None]) -> tuple[Any, ...]:
+    """``(slot, alias, five_hour_pct, five_hour_resets_at)`` -> account rows."""
+    from cc_usage_widget.contracts import AccountRow
+
+    return tuple(
+        AccountRow(
+            slot=slot,
+            alias=alias,
+            email=f"{alias}@example.com",
+            is_active=slot == 1,
+            five_hour_pct=pct,
+            five_hour_resets_at=resets,
+        )
+        for slot, alias, pct, resets in specs
+    )
+
+
+def _fleet_settings(**overrides: Any) -> dict[str, Any]:
+    settings = normalize_settings(dict(SETTINGS_DEFAULTS))
+    settings.update({"title_show_icon": False, "title_show_cost": False})
+    settings.update(overrides)
+    return settings
+
+
+def test_title_shows_fleet_headroom_only_when_the_room_is_full() -> None:
+    """2026-09-01: the wall read ``main 100% ⛔ exhausted`` and stopped there.
+
+    Three other accounts existed and one of them reset at midnight; nothing in
+    the title said whether any of them had room, so "exhausted" read as "the
+    whole fleet is gone" and the operator had to open the menu to find out. The
+    suffix answers exactly that, and ONLY while the answer matters: a healthy
+    active account renders the SPEC 4.1 title unchanged, and the component is
+    toggleable like every other one.
+    """
+    rows = _fleet_rows(
+        (1, "main", 100.0, "00:00"),
+        (2, "podol", 100.0, None),
+        (3, "acme", 100.0, "Sep 2 04:00"),
+        (4, "ops", 100.0, None),
+    )
+    settings = _fleet_settings()
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        exhausted = UiSnapshot(
+            settings=settings,
+            accounts=rows,
+            active=rows[0],
+            alert=(ALERT_ALL_EXHAUSTED, "all accounts exhausted; earliest reset ..."),
+        )
+        assert app.render_title(exhausted) == "main 100%(!) ⛔ exhausted 0/4 · next 00:00"
+
+        # Toggled off: the pre-2026-09-01 title, byte for byte.
+        off = replace(exhausted, settings=_fleet_settings(title_show_fleet=False))
+        assert app.render_title(off) == "main 100%(!) ⛔ exhausted"
+
+        # Healthy fleet: nothing appended at all, no matter how many accounts.
+        healthy_rows = _fleet_rows(
+            (1, "main", 40.0, "00:00"),
+            (2, "podol", 12.0, None),
+        )
+        healthy = UiSnapshot(
+            settings=settings, accounts=healthy_rows, active=healthy_rows[0]
+        )
+        assert app.render_title(healthy) == "main 40%"
+
+        # At/over the threshold WITHOUT an alert is also a decision point, and
+        # the threshold is claude-swap's, not a number of ours: at 90% the
+        # default 85 fires and a policy of 95 does not.
+        near_rows = _fleet_rows(
+            (1, "main", 90.0, "00:00"),
+            (2, "podol", 12.0, None),
+        )
+        near = UiSnapshot(settings=settings, accounts=near_rows, active=near_rows[0])
+        assert app.render_title(near) == "main 90% 1/2 · next 00:00"
+        assert app.render_title(replace(near, autoswitch_threshold=95.0)) == "main 90%"
+
+        # The threshold is a BOUNDARY, and both sides of it are load-bearing:
+        # an active account exactly AT it is at limit (that is when autoswitch
+        # fires), and another account exactly AT it is not room (autoswitch
+        # would not pick it either).
+        at_rows = _fleet_rows((1, "main", 85.0, "01:00"), (2, "podol", 12.0, None))
+        at = UiSnapshot(settings=settings, accounts=at_rows, active=at_rows[0])
+        assert app.render_title(at) == "main 85% 1/2 · next 01:00"
+
+        peer_at_rows = _fleet_rows(
+            (1, "main", 100.0, "00:00"),
+            (2, "podol", 85.0, None),
+        )
+        peer_at = UiSnapshot(
+            settings=settings, accounts=peer_at_rows, active=peer_at_rows[0]
+        )
+        assert app.render_title(peer_at) == "main 100%(!) 0/2 · next 00:00"
+
+        # ...and the fallback really is 85, not "some number below 90". At 60%
+        # a fleet is not a decision point and the title must not say anything;
+        # this is what pins _TITLE_FLEET_THRESHOLD_DEFAULT to claude-swap's
+        # documented default rather than to any value that happens to be low.
+        mid_rows = _fleet_rows((1, "main", 60.0, "00:00"), (2, "podol", 12.0, None))
+        mid = UiSnapshot(settings=settings, accounts=mid_rows, active=mid_rows[0])
+        assert mid.autoswitch_threshold is None
+        assert app.render_title(mid) == "main 60%"
+
+        # A slot whose 5h window the API did not report is NOT counted as room.
+        unknown_rows = _fleet_rows(
+            (1, "main", 100.0, "00:00"),
+            (2, "podol", None, None),
+        )
+        unknown = UiSnapshot(
+            settings=settings, accounts=unknown_rows, active=unknown_rows[0]
+        )
+        assert app.render_title(unknown) == "main 100%(!) 0/2 · next 00:00"
+
+        # A read-only pseudo-account (Codex) is not a room to switch into.
+        pseudo = replace(_fleet_rows((0, "Codex", 10.0, None))[0], switchable=False)
+        with_pseudo = replace(exhausted, accounts=rows + (pseudo,))
+        assert app._title_fleet(with_pseudo, now_minutes=0) == "0/4 · next 00:00"
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+def test_fleet_next_reset_is_verbatim_soonest_and_sheds_under_budget() -> None:
+    """The ``next`` half is one row's own reset string, reprinted as-is.
+
+    Ordering is the only computation: "soonest" wraps through midnight, so a
+    23:50 reset is ahead of a 00:20 one at 23:40 and behind it at 23:55. A
+    reset claude-swap rendered as a DATE is not a next-room candidate (we will
+    not invent the day), and when no candidate has a usable clock the ``next``
+    half is omitted rather than guessed. Finally the suffix pays for a title
+    that has already overshot the menu-bar budget: ``· next`` goes first.
+    """
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        rows = _fleet_rows((1, "a", 100.0, "23:50"), (2, "b", 100.0, "00:20"))
+        snap = UiSnapshot(settings=_fleet_settings(), accounts=rows, active=rows[0])
+        assert app._title_fleet(snap, now_minutes=23 * 60 + 40) == "0/2 · next 23:50"
+        assert app._title_fleet(snap, now_minutes=23 * 60 + 55) == "0/2 · next 00:20"
+
+        dated = _fleet_rows((1, "a", 100.0, "Sep 2 04:00"), (2, "b", 100.0, ""))
+        no_clock = UiSnapshot(
+            settings=_fleet_settings(), accounts=dated, active=dated[0]
+        )
+        assert app._title_fleet(no_clock, now_minutes=0) == "0/2"
+
+        # Budget: the count survives an overshoot the `next` half cannot.
+        assert app._title_fleet(snap, base="x" * 28, now_minutes=0) == "0/2 · next 00:20"
+        assert app._title_fleet(snap, base="x" * 34, now_minutes=0) == "0/2"
+        assert app._title_fleet(snap, base="x" * 60, now_minutes=0) == ""
+
+        # ...and it survives the SAME overshoot when there was no `next` to
+        # shed. Charging the realised tail inverted the order here: with an
+        # empty tail any overshoot at all dropped the count, so the title with
+        # LESS to show was the one that showed nothing (2026-09-01 review).
+        for base_len in (30, 34):
+            base = "x" * base_len
+            assert app._title_fleet(no_clock, base=base, now_minutes=0) == "0/2"
+            assert app._title_fleet(snap, base=base, now_minutes=0) == "0/2"
+        assert app._title_fleet(no_clock, base="x" * 60, now_minutes=0) == ""
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+def test_fleet_count_never_offers_a_slot_whose_figures_are_not_trusted() -> None:
+    """A slot with a derived-usage note is NOT a free room.
+
+    2026-08-25: a quarantined account showed ``acme 0%`` for 39 hours — the
+    stored percentage is a last-good value that can be days old and reads as
+    healthy, which is why a note REPLACES that slot's figures everywhere else
+    in the title. The first cut of the fleet suffix counted the same forbidden
+    number as headroom: ``⛔ exhausted 1/4`` advertised one free room, at the
+    moment the operator was deciding whether to keep working, and the room was
+    a dead login. That is strictly worse than the old title, which said
+    nothing. The note's reset is excluded for the same reason: it comes off
+    the same untrusted read.
+    """
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        rows = _fleet_rows((1, "main", 100.0, "00:00"), (2, "podol", 0.0, "02:00"))
+        note = "re-login needed — refresh token dead; run: cswap add"
+        snap = UiSnapshot(
+            settings=_fleet_settings(),
+            accounts=rows,
+            active=rows[0],
+            account_notes={2: note},
+            alert=(ALERT_ALL_EXHAUSTED, "all accounts exhausted"),
+        )
+        # 0/2, not 1/2 — and the slot stays in M: it exists, it is not room.
+        assert app.render_title(snap) == "main 100%(!) ⛔ exhausted 0/2 · next 00:00"
+
+        # Its reset is not a candidate for `next` either: with the only other
+        # row's clock unknown, the half is omitted rather than borrowed.
+        borrowed = replace(
+            snap, accounts=_fleet_rows((1, "main", 100.0, None), (2, "p", 100.0, "02:00"))
+        )
+        assert app._title_fleet(borrowed, now_minutes=0) == "0/2"
+
+        # Control: drop the note and the very same rows DO offer the room.
+        trusted = replace(snap, account_notes={})
+        assert app.render_title(trusted) == "main 100%(!) ⛔ exhausted 1/2 · next 00:00"
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+def test_fleet_alert_kinds_are_the_shared_constants_not_literals() -> None:
+    """The no-target trigger crosses a module seam; pin it there.
+
+    Half of :data:`_TITLE_FLEET_ALERT_KINDS` was a raw ``"no-target"``
+    literal while the adapter that raises the verdict lives in another module.
+    If the two ever spelled it differently the branch would go silently dead —
+    no failing test, no log line, the feature quietly down to one of its two
+    named triggers. That is the exact failure ``ALERT_KINDS`` was created to
+    end (2026-08-26, five literals across two modules).
+    """
+    kinds = set(app_mod._TITLE_FLEET_ALERT_KINDS)
+    assert kinds <= set(ALERT_KINDS), kinds - set(ALERT_KINDS)
+    assert ALERT_NO_TARGET in kinds
+
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        rows = _fleet_rows((1, "main", 12.0, "00:00"), (2, "podol", 40.0, None))
+        # Well under the threshold: the suffix is here only because the engine
+        # said it has nowhere to go.
+        snap = UiSnapshot(
+            settings=_fleet_settings(),
+            accounts=rows,
+            active=rows[0],
+            alert=(ALERT_NO_TARGET, "no viable target"),
+        )
+        title = app.render_title(snap)
+        assert title.endswith("2/2"), title
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+def test_fleet_suffix_never_becomes_the_whole_title() -> None:
+    """Icon-only stays icon-only: this is a suffix, not a title.
+
+    With every text component off the status item is deliberately image-only
+    (RCA 2026-08-17: an ~33pt item fits a saturated menu bar without evicting
+    a neighbour). The first cut let the fleet suffix fire anyway, so an
+    at-limit account rendered a naked ``1/2 · next 00:00`` — no alias, no
+    glyph, unreadable at the wall, and the icon-only path defeated. The alert
+    block is the one standing-problem exception and it is a glyph.
+    """
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        rows = _fleet_rows((1, "main", 90.0, "00:00"), (2, "podol", 12.0, None))
+        silent = _fleet_settings(
+            title_show_icon=False,
+            title_show_alias=False,
+            title_show_five_hour_pct=False,
+            title_show_scoped_pct=False,
+            title_show_cost=False,
+        )
+        snap = UiSnapshot(settings=silent, accounts=rows, active=rows[0])
+        app._icon_image_set = True
+        assert app.render_title(snap) == ""
+
+        # The glyph fallback (no NSImage) is unchanged, and still not a place
+        # to hang a room count.
+        app._icon_image_set = False
+        assert app.render_title(snap) == app_mod.TITLE_ICON
+
+        # Control: give it one text part back and the suffix attaches to it.
+        with_alias = replace(snap, settings=_fleet_settings(title_show_alias=True))
+        assert app.render_title(with_alias) == "main 90% 1/2 · next 00:00"
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+def test_autoswitch_threshold_reaches_the_snapshot_without_a_per_tick_read() -> None:
+    """The count buckets on the engine's own threshold, not on a constant.
+
+    The field existed and nothing assigned it, so the suffix always fell back
+    to 85 and its docstring's promise — that "1/4 room" cannot disagree with
+    what autoswitch will do — was false: with ``autoswitch.threshold 95`` the
+    title claimed a full room the engine considered fine. Wiring it must NOT
+    cost a file read per tick (SPEC 2.1): ``autoswitch_threshold()`` calls
+    ``load_policy`` unconditionally, so the publish path reads the value the
+    mtime-gated ``_ensure_engine`` already cached.
+    """
+
+    class _Policy:
+        threshold = 95.0
+        interval_seconds = 60
+
+    class _Engine:
+        def tick(self) -> Any:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    class _FakeBackend:
+        switcher = object()
+        backup_dir = Path("/nonexistent")
+
+        @staticmethod
+        def load_policy(_dir: Any) -> Any:
+            return _Policy()
+
+        @staticmethod
+        def engine_cls(*_args: Any, **_kwargs: Any) -> Any:
+            return _Engine()
+
+    source = SwapAccountSource(settings={"autoswitch_enabled": True})
+    source._backend_or_none = lambda: _FakeBackend()  # type: ignore[assignment]
+    source._policy_path = lambda: None  # type: ignore[assignment]
+
+    assert source.cached_autoswitch_threshold() is None, "guessed before reading"
+    assert source._ensure_engine() is not None
+    assert source.cached_autoswitch_threshold() == 95.0
+
+    # The publish path uses the cache. A source whose ungated accessor blows up
+    # must still publish the threshold — proof the tick does not call it.
+    live_rows = _fleet_rows((1, "main", 90.0, "00:00"), (2, "podol", 12.0, None))
+
+    class _Source:
+        def refresh(self, *, force: bool = False) -> None:
+            return None
+
+        def rows(self) -> tuple[Any, ...]:
+            return live_rows
+
+        def active(self) -> Any:
+            return live_rows[0]
+
+        def autoswitch_enabled(self) -> bool | None:
+            return False
+
+        def set_autoswitch_enabled(self, enabled: bool) -> None:
+            return None
+
+        def evaluate_autoswitch(self) -> str | None:
+            return None
+
+        def switch_to(self, slot_or_alias: str) -> bool:
+            return False
+
+        def cached_autoswitch_threshold(self) -> float:
+            return 95.0
+
+        def autoswitch_threshold(self) -> float:
+            raise AssertionError("per-tick load_policy read (SPEC 2.1)")
+
+    published: list[UiSnapshot] = []
+    worker = BackgroundWorker(
+        publish=published.append,
+        snapshot=UiSnapshot(settings=normalize_settings(dict(SETTINGS_DEFAULTS))),
+        accounts=_Source(),
+    )
+    worker._run_accounts_job(force=False)
+    assert published, "nothing published"
+    assert published[-1].autoswitch_threshold == 95.0
+
+    # ...and the renderer honours it: 90% is at limit under 85, not under 95.
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        painted = replace(published[-1], settings=_fleet_settings())
+        assert app.render_title(painted) == "main 90%"
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+# ---------------------------------------------------------------------------
+# switch-ux: an informed manual switch, and one click that picks for you
+# ---------------------------------------------------------------------------
+
+
+def _switch_row(
+    slot: int,
+    alias: str,
+    *,
+    five: float | None,
+    seven: float | None = None,
+    reset: str | None = None,
+    scoped: tuple[tuple[str, float], ...] = (),
+    active: bool = False,
+    age: float | None = None,
+) -> Any:
+    from cc_usage_widget.contracts import AccountRow
+
+    return AccountRow(
+        slot=slot,
+        alias=alias,
+        email=f"{alias}@example.com",
+        is_active=active,
+        five_hour_pct=five,
+        seven_day_pct=seven,
+        scoped_windows=scoped,
+        five_hour_resets_at=reset,
+        usage_age_seconds=age,
+    )
+
+
+def test_switch_submenu_carries_what_to_choose_by() -> None:
+    """2026-09-01: all four accounts read 5h 100% and the submenu said only
+    ``3 podol   5h 100%`` for each of them.
+
+    The staggered resets and the weekly/scoped windows WERE the decision, and
+    none of them were on screen. The row now carries the reset and every
+    window the API reported, marks an at-limit row, and stays clickable
+    (a manual switch is an operator override by design).
+    """
+    row = _switch_row(
+        3, "podol", five=100.0, seven=20.0, reset="00:00", scoped=(("Fable", 40.0),)
+    )
+    label = app_mod._switch_target_label(row, name_width=5)
+    assert label == (
+        "3 podol 5h 100% (!) ↺00:00 · 7d 20% · Fable 40% (at limit)"
+    ), label
+
+    # A window the API did not report is an em dash, never a fabricated 0%.
+    thin = app_mod._switch_target_label(_switch_row(4, "acme", five=None), name_width=4)
+    assert "5h —" in thin and "7d —" in thin, thin
+    assert "at limit" not in thin, thin
+
+    # An exhausted WEEKLY window is marked too. The Accounts section marks
+    # every window `(!)`; a submenu that marked only the 5-hour one presented
+    # a 5h 10% / 7d 100% account as a clean target while the block two rows
+    # above called the same account out - the two surfaces contradicting each
+    # other on the row the operator is about to click.
+    weekly = app_mod._switch_target_label(
+        _switch_row(6, "week", five=10.0, seven=100.0), name_width=4
+    )
+    assert "7d 100% (!)" in weekly, weekly
+    assert weekly.endswith("(at limit)"), weekly
+
+    # A stale read shows its age here exactly as it does on the account row
+    # (SPEC 4.3). This IS the moment of the decision: a three-hour-old read
+    # that renders identically to a live one is the dishonest case.
+    stale = app_mod._switch_target_label(
+        _switch_row(7, "old", five=12.0, age=3 * 3600.0), name_width=4
+    )
+    assert "(usage 3h old)" in stale, stale
+    fresh = app_mod._switch_target_label(
+        _switch_row(7, "old", five=12.0, age=5.0), name_width=4
+    )
+    assert "old)" not in fresh, fresh
+
+    active = _switch_row(1, "main", five=100.0, active=True)
+    settings = normalize_settings(dict(SETTINGS_DEFAULTS))
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        snapshot = UiSnapshot(settings=settings, accounts=(active, row), active=active)
+        submenu = app._switch_account_submenu(snapshot)
+        children = [str(getattr(item, "title", "")) for item in submenu.values()]
+        assert any("↺00:00" in text and "Fable 40%" in text for text in children), children
+        # At limit is a label, not a lock: the click still works.
+        clickable = [
+            item for item in submenu.values() if getattr(item, "callback", None) is not None
+        ]
+        assert len(clickable) == 1, children
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+def test_switch_targets_are_ordered_by_headroom() -> None:
+    """Most headroom first - the submenu is a ranking, not the order
+    claude-swap happened to list the slots in.
+
+    Headroom is the MINIMUM across the windows, so the ranking is on the
+    highest one reported. Ranking on the 5-hour window alone put an account at
+    5h 10% / 7d 100% at the top of the list while the Accounts section marked
+    that same account `7d 100% (!)`.
+
+    A row the API reported no window for sorts LAST: "not reported" is not
+    "empty", and guessing it is free headroom would send the operator onto an
+    account nobody can vouch for.
+    """
+    rows = (
+        _switch_row(1, "main", five=100.0, active=True),
+        _switch_row(5, "unknown", five=None),
+        _switch_row(3, "podol", five=100.0, reset="00:00"),
+        _switch_row(2, "jan", five=42.0),
+        _switch_row(4, "late", five=100.0, reset="02:30"),
+        _switch_row(9, "codex", five=0.0),
+    )
+    codex = replace(rows[-1], switchable=False)  # a read-only pseudo-account
+    ordered = app_mod._switch_targets(rows[:-1] + (codex,))
+    assert [row.slot for row in ordered] == [2, 3, 4, 5], [r.slot for r in ordered]
+    assert all(row.slot != 1 for row in ordered), "the active row is not a target"
+    assert all(row.slot != 9 for row in ordered), "a read-only row is not a target"
+
+    # An exhausted weekly window sinks the row even though its 5h is nearly
+    # free: that account will refuse work the moment it is switched to.
+    weekly = (
+        _switch_row(2, "jan", five=10.0, seven=100.0),
+        _switch_row(3, "podol", five=60.0, seven=60.0),
+    )
+    assert [row.slot for row in app_mod._switch_targets(weekly)] == [3, 2]
+
+    # The reset time is displayed, never ranked on: these strings are
+    # upstream's clock ("00:30" resets AFTER "23:50" on the same evening) and
+    # comparing them as text made the top row the worst target on exactly the
+    # late-evening click this feature exists for.
+    midnight = (
+        _switch_row(2, "early", five=100.0, seven=100.0, reset="00:30"),
+        _switch_row(3, "late", five=100.0, seven=100.0, reset="23:50"),
+    )
+    assert [row.slot for row in app_mod._switch_targets(midnight)] == [2, 3]
+    assert [row.slot for row in app_mod._switch_targets(midnight[::-1])] == [2, 3], (
+        "slot, not the reset string, is the tie-break"
+    )
+
+
+class _BestSwitchSwitcher:
+    """Stands in for ``claude_swap.switcher.ClaudeAccountSwitcher.switch``."""
+
+    def __init__(self, result: Any) -> None:
+        self.result = result
+        self.calls: list[dict[str, Any]] = []
+
+    def switch(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        return self.result
+
+
+class _BestSwitchSource(SwapAccountSource):
+    """A source whose backend is a stub and whose refresh is a no-op."""
+
+    def __init__(self, result: Any, model: str | None = None) -> None:
+        super().__init__(settings=None)
+        self.switcher = _BestSwitchSwitcher(result)
+        self._model = model
+        self.refreshed = 0
+        self._alias_by_slot = {3: "podol"}
+
+    def _backend_or_none(self) -> Any:
+        policy = type("_Policy", (), {"model": self._model})()
+        return type(
+            "_Stub",
+            (),
+            {
+                "switcher": self.switcher,
+                "load_policy": staticmethod(lambda _dir: policy),
+                "backup_dir": Path("/nonexistent"),
+            },
+        )()
+
+    def refresh(self, *, force: bool = False) -> Any:
+        self.refreshed += 1
+        return None
+
+
+def _accounts_log() -> tuple[Any, list[str]]:
+    """A handler capturing ``cc_usage_widget.accounts`` records."""
+    import logging
+
+    lines: list[str] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            lines.append(record.getMessage())
+
+    handler = _Capture()
+    logger = logging.getLogger("cc_usage_widget.accounts")
+    previous = logger.level
+    # INFO is the level the switch lines are logged at; the default NOTSET
+    # inherits root's WARNING and would silently capture nothing.
+    logger.setLevel(logging.INFO)
+    logger.addHandler(handler)
+
+    def _detach() -> None:
+        logger.removeHandler(handler)
+        logger.setLevel(previous)
+
+    return _detach, lines
+
+
+def test_switch_best_delegates_the_pick_to_claude_swap() -> None:
+    """One click must ask claude-swap where to go, not rank the rows itself.
+
+    The menu's percentages are a display read that can be minutes old, so a
+    second, disagreeing ranking would be an invented number (SPEC 4.3). The
+    call therefore goes to ``switcher.switch(strategy="best")`` with the same
+    per-model limits the autoswitch engine reads, and every ``warnings`` line
+    upstream returns reaches the event log - ``switch_to`` dropped them.
+    """
+    detach, lines = _accounts_log()
+    try:
+        source = _BestSwitchSource(
+            {
+                "switched": True,
+                "from": {"number": 1, "email": "main@example.com"},
+                "to": {"number": 3, "email": "podol@example.com"},
+                "strategy": "best",
+                "reason": "switched",
+                "message": "Switched to Account-3 (podol@example.com)",
+                "warnings": ["Skipped Account-2 (disabled)"],
+            },
+            model="Fable, Opus ,Fable",
+        )
+        assert source.switch_best() is True
+        assert len(source.switcher.calls) == 1, source.switcher.calls
+        call = source.switcher.calls[0]
+        assert call["strategy"] == "best"
+        assert call["json_output"] is True
+        # Deduped, first spelling wins - upstream's own parse of autoswitch.model.
+        assert call["models"] == ("Fable", "Opus"), call["models"]
+        assert source.refreshed == 1, "the new active row was not re-read"
+        # W1's external-switch detector calls any active-slot change it cannot
+        # explain a ghost flip. `best` picks its own target, so the expectation
+        # is recorded from upstream's own answer, BEFORE the refresh that sees
+        # it - otherwise the widget's own headline action raises W1's alarm.
+        assert getattr(source, "_expect_active", None) == "3", getattr(
+            source, "_expect_active", None
+        )
+        assert any("manual switch (best) -> podol" in line for line in lines), lines
+        events = source.recent_events()
+        assert any("manual switch (best) -> podol" in line for line in events), events
+        assert any("Skipped Account-2 (disabled)" in line for line in events), events
+
+        # A truncated warning list must SAY it was truncated: several disabled
+        # slots plus an inert-model-limit line exceed the log cap, and a
+        # complete-looking list that is not complete is the dishonest case.
+        many = _BestSwitchSource(
+            {
+                "switched": True,
+                "to": {"number": 3, "email": "podol@example.com"},
+                "reason": "switched",
+                "warnings": [f"Skipped Account-{n} (disabled)" for n in range(2, 9)],
+            }
+        )
+        assert many.switch_best() is True
+        capped = [line for line in many.recent_events() if "switch (best):" in line]
+        assert len(capped) == 5, capped
+        assert capped[-1].endswith("… and 3 more (see the log)"), capped[-1]
+        # Every line still reaches the log the summary points at.
+        for n in range(2, 9):
+            assert any(f"Account-{n} (disabled)" in line for line in lines), n
+
+        # Already on the best account is the right outcome, not a fault.
+        already = _BestSwitchSource(
+            {
+                "switched": False,
+                "to": {"number": 3, "email": "podol@example.com"},
+                "strategy": "best",
+                "reason": "already-best",
+                "message": "Already on the account with the most remaining quota",
+                "warnings": [],
+            }
+        )
+        assert already.switch_best() is True
+        assert already.switcher.calls[0]["models"] == ()
+        assert already.refreshed == 0, "nothing moved; nothing to re-read"
+        assert already.last_error is None, already.last_error
+
+        # "I cannot tell" is NOT success - it must reach the menu as an error.
+        blind = _BestSwitchSource(
+            {
+                "switched": False,
+                "to": {"number": 1, "email": "main@example.com"},
+                "strategy": "best",
+                "reason": "usage-unavailable",
+                "message": "Current account usage is unavailable — staying on Account-1.",
+                "warnings": [],
+            }
+        )
+        assert blind.switch_best() is False
+        assert "usage is unavailable" in (blind.last_error or ""), blind.last_error
+    finally:
+        detach()
+
+
+def test_switch_best_is_one_click_and_dims_with_nowhere_to_go() -> None:
+    """The item lives beside the two top-level switches and reaches the worker.
+
+    A menu item that looks live and silently does nothing is worse than a dim
+    one, so with no other switchable account it carries no callback at all.
+    """
+    active = _switch_row(1, "main", five=100.0, active=True)
+    other = _switch_row(3, "podol", five=100.0, reset="00:00")
+    settings = normalize_settings(dict(SETTINGS_DEFAULTS))
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        alone = UiSnapshot(settings=settings, accounts=(active,), active=active)
+        item = [
+            i for i in app._switch_items(alone)
+            if str(getattr(i, "title", "")) == "Switch to best now"
+        ]
+        assert item, [str(getattr(i, "title", "")) for i in app._switch_items(alone)]
+        assert getattr(item[0], "callback", None) is None, "clickable with nowhere to go"
+
+        pair = UiSnapshot(settings=settings, accounts=(active, other), active=active)
+        item = [
+            i for i in app._switch_items(pair)
+            if str(getattr(i, "title", "")) == "Switch to best now"
+        ]
+        assert getattr(item[0], "callback", None) is not None
+        app.rebuild_menu(pair)
+        assert "Switch to best now" in [
+            str(getattr(i, "title", "")) for i in app.menu.values()
+        ]
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+    # The command reaches the source on the WORKER thread, never the main one,
+    # and the REASON the source recorded is what the menu shows. "All accounts
+    # are at their limit" and "I could not read the current usage" are
+    # different situations; `_accounts_diagnosis` only surfaces `last_error`
+    # when `rows()` came back empty, so on a healthy fleet the reason would
+    # never have reached the menu and every refusal read the same.
+    class _Best:
+        def __init__(self, reason: str | None) -> None:
+            self.calls = 0
+            self.reason = reason
+            self.last_error: str | None = None
+
+        def switch_best(self) -> bool:
+            self.calls += 1
+            self.last_error = self.reason
+            return False
+
+        def rows(self, **_kw: Any) -> tuple[Any, ...]:
+            return (active,)
+
+    def _publish_refusal(source: Any) -> UiSnapshot:
+        published: list[UiSnapshot] = []
+        worker = BackgroundWorker(
+            publish=published.append,
+            snapshot=UiSnapshot(settings=settings),
+            accounts=source,
+        )
+        worker._handle_command((app_mod._CMD_SWITCH_BEST, None))
+        return published[-1]
+
+    told = _Best("Current account usage is unavailable — staying on Account-1.")
+    snapshot = _publish_refusal(told)
+    assert told.calls == 1
+    assert "usage is unavailable" in (snapshot.accounts_error or ""), (
+        snapshot.accounts_error
+    )
+
+    # A source that recorded nothing still gets a visible line (Rule 12).
+    silent = _Best(None)
+    assert "best account was refused" in (
+        _publish_refusal(silent).accounts_error or ""
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-01: a second actor that can switch must not stay invisible
+# ---------------------------------------------------------------------------
+
+# Real command lines. The bare one is verbatim (minus the home directory) from
+# ``ps -Ao pid,command`` on 2026-09-01 - the TUI that had been switching
+# accounts under the widget since 19:22; the rest keep its exact shape:
+# interpreter path, then console-script path, then argv.
+#
+# These are COMMANDS, not ``pgrep -fl`` output lines: ``pgrep -f`` matches the
+# pattern against the command alone, and only its *listing* prefixes the pid.
+# Asserting against a pid-prefixed string would have tested a shape the pattern
+# never sees (and would have hidden that ``^`` can match at all).
+_PGREP_PYTHON = "/Users/v/.local/share/uv/tools/claude-swap/bin/python"
+_PGREP_CSWAP = "/Users/v/.local/bin/cswap"
+_RIVAL_COMMANDS = (
+    f"{_PGREP_PYTHON} {_PGREP_CSWAP}",
+    f"{_PGREP_PYTHON} {_PGREP_CSWAP} tui",
+    f"{_PGREP_PYTHON} {_PGREP_CSWAP} auto",
+    f"{_PGREP_PYTHON} {_PGREP_CSWAP} menubar",
+    f"{_PGREP_PYTHON} {_PGREP_CSWAP} watch",
+    f"{_PGREP_PYTHON} {_PGREP_CSWAP} tui --refresh 30",
+    # The flag spellings of the same actors. `claude_swap.cli`'s
+    # `_SUBCOMMAND_FLAGS` rewrites the memorable subcommands into exactly
+    # these, and calls the flag form the established interface - so an alias or
+    # LaunchAgent written against upstream runs `cswap --menubar`, which is a
+    # genuine second engine on the shared autoswitch_state.json.
+    f"{_PGREP_PYTHON} {_PGREP_CSWAP} --tui",
+    f"{_PGREP_PYTHON} {_PGREP_CSWAP} --watch",
+    f"{_PGREP_PYTHON} {_PGREP_CSWAP} --menubar",
+    "cswap",
+    "cswap tui",
+)
+_INNOCENT_COMMANDS = (
+    f"{_PGREP_PYTHON} {_PGREP_CSWAP} list",
+    f"{_PGREP_PYTHON} {_PGREP_CSWAP} status --json",
+    f"{_PGREP_PYTHON} {_PGREP_CSWAP} switch 3",
+    f"{_PGREP_PYTHON} {_PGREP_CSWAP} config set autoswitch.threshold 85",
+    f"{_PGREP_PYTHON} {_PGREP_CSWAP} autoswitch",
+    # A flag whose name merely STARTS with a subcommand is not that subcommand.
+    f"{_PGREP_PYTHON} {_PGREP_CSWAP} --watch-foo",
+    f"{_PGREP_PYTHON} {_PGREP_CSWAP} --no-color",
+    "ugrep -G --hidden -I -i cswap",
+    "/usr/bin/tail -f /Users/v/logs/cswap.log",
+    f"{_PGREP_PYTHON} -m cc_usage_widget",
+)
+_FILES_NAMED_CSWAP = (
+    # These DO match the pattern - an ERE cannot express "argv[0] position", so
+    # the bare-TUI arm `[[:space:]]*$` fires on any command line that merely
+    # ENDS in a path named `cswap`. Verified against the real /usr/bin/pgrep:
+    # `/usr/bin/tail -f <dir>/cswap` came back in the same listing as the
+    # genuine TUI. Only `_rival_actor`'s position check separates them, and
+    # only the `.log` suffix above is safe by the pattern alone.
+    "/usr/bin/tail -f /Users/v/logs/cswap",
+    "vim /Users/v/notes/cswap",
+    "/bin/cat /Users/v/.local/bin/cswap",
+    "/usr/bin/less /var/log/cswap",
+)
+
+
+def _rival_regex() -> Any:
+    """``_RIVAL_PATTERN`` compiled by Python.
+
+    ``pgrep`` compiles POSIX ERE, where ``[[:space:]]`` is the class and
+    ``\\s`` is not a shorthand at all; Python's ``re`` is the other way round.
+    Translating the one construct that differs is what lets the table below
+    assert on the *same* pattern the process table is actually queried with.
+    """
+    from cc_usage_widget.__main__ import _RIVAL_PATTERN
+
+    return re.compile(_RIVAL_PATTERN.replace("[[:space:]]", r"\s"))
+
+
+def test_rival_pattern_matches_every_switch_capable_cswap_and_nothing_else() -> None:
+    """The startup check saw ``cswap auto|menubar`` only.
+
+    A bare ``cswap`` - which IS the TUI - switches on a keypress and can start
+    its own engine from the account view, and that is exactly what was running
+    (pid 15206) while the widget's engine kept switching back. The ``--tui``/
+    ``--watch``/``--menubar`` spellings are the same four actors through
+    upstream's own ``_SUBCOMMAND_FLAGS`` interface. Widening the pattern must
+    not make it fire on the read-only subcommands, on a log file whose name ends
+    in ``cswap``, on ``cswap autoswitch`` via the ``auto`` arm, or on
+    ``--watch-foo`` via the ``watch`` one; a false rival is a permanent ``!``
+    row telling the operator to quit a process that is not there.
+    """
+    pattern = _rival_regex()
+    for command in _RIVAL_COMMANDS:
+        assert pattern.search(command), f"missed a switch-capable actor: {command}"
+    for command in _INNOCENT_COMMANDS:
+        assert not pattern.search(command), f"false rival: {command}"
+
+
+def test_a_file_merely_named_cswap_is_not_reported_as_a_rival() -> None:
+    """The pattern is a pre-filter; executable position is the decision.
+
+    ``/usr/bin/tail -f ~/logs/cswap`` satisfies the bare-TUI arm, and the real
+    ``pgrep`` returns it next to the genuine TUI. Reported, it would read as
+    ``another switch actor: cswap (pid N) — it can switch …``: a fabricated
+    claim about a process that cannot switch anything, indistinguishable from
+    the true row. The detector must drop it before the menu ever sees it.
+    """
+    from cc_usage_widget.__main__ import _detect_rival_engines, _rival_actor
+
+    pattern = _rival_regex()
+    for command in _FILES_NAMED_CSWAP:
+        # Asserting on the regex here would be asserting the hole, not the fix.
+        assert pattern.search(command), f"sample no longer exercises the arm: {command}"
+        assert _rival_actor(command) is None, f"false rival: {command}"
+    for command in _RIVAL_COMMANDS:
+        assert _rival_actor(command) is not None, f"missed a real actor: {command}"
+
+    # …and the drop happens in the detector, not just in the helper. The whole
+    # `pgrep` listing is these four lines, exactly as the real one returned
+    # them (pid, then the command); the detector must return nothing at all.
+    listing = "\n".join(
+        f"{pid} {command}" for pid, command in enumerate(_FILES_NAMED_CSWAP, start=900)
+    )
+
+    class _FakeSubprocess:
+        """Stands in for the ``subprocess`` module inside ``__main__`` only -
+        patching ``subprocess.run`` itself would patch it for every module."""
+
+        SubprocessError = subprocess.SubprocessError
+
+        @staticmethod
+        def run(*args: Any, **kwargs: Any) -> Any:
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout=listing + "\n", stderr=""
+            )
+
+    main_mod = sys.modules["cc_usage_widget.__main__"]
+    real_subprocess = main_mod.subprocess
+    main_mod.subprocess = _FakeSubprocess  # type: ignore[assignment]
+    try:
+        assert _detect_rival_engines() == [], "a file named cswap reached the menu"
+    finally:
+        main_mod.subprocess = real_subprocess  # type: ignore[assignment]
+
+
+def test_rival_pattern_is_valid_posix_ere_for_pgrep() -> None:
+    """A pattern Python likes and ``pgrep`` rejects fails silently in prod.
+
+    ``pgrep`` exits 0 (matched) or 1 (no match) on a good pattern and 2 on a
+    bad one - and the widget's caller only reads stdout, so a 2 would have
+    looked exactly like "no rivals are running", forever.
+    """
+    from cc_usage_widget.__main__ import _RIVAL_PATTERN
+
+    if not Path("/usr/bin/pgrep").exists():  # pragma: no cover - macOS only
+        return
+    proc = subprocess.run(
+        ["/usr/bin/pgrep", "-fl", _RIVAL_PATTERN],
+        capture_output=True,
+        text=True,
+        timeout=10.0,
+    )
+    assert proc.returncode in (0, 1), (proc.returncode, proc.stderr.strip())
+
+
+def test_rival_actor_names_the_actor_not_its_install_path() -> None:
+    """``!`` rows are one menu line; two absolute paths do not fit in one.
+
+    The label is also what keeps the row inside ``MAX_ERROR_CHARS``: the longest
+    it can be is ``cswap menubar`` plus a 7-digit pid, and the half of the line
+    that tells the operator what to expect is at the END, which is the half a
+    truncation removes.
+    """
+    from cc_usage_widget.__main__ import _rival_actor
+
+    assert _rival_actor(f"{_PGREP_PYTHON} {_PGREP_CSWAP}") == "cswap"
+    assert _rival_actor(f"{_PGREP_PYTHON} {_PGREP_CSWAP} tui") == "cswap tui"
+    assert _rival_actor(f"{_PGREP_PYTHON} {_PGREP_CSWAP} tui --refresh 30") == "cswap tui"
+    assert _rival_actor(f"{_PGREP_PYTHON} {_PGREP_CSWAP} menubar") == "cswap menubar"
+    # The flag spelling is the same actor, so it must read as the same row.
+    assert _rival_actor(f"{_PGREP_PYTHON} {_PGREP_CSWAP} --menubar") == "cswap menubar"
+    assert _rival_actor(f"{_PGREP_PYTHON} {_PGREP_CSWAP} --watch") == "cswap watch"
+    # A flag is not a subcommand: a bare TUI stays "cswap".
+    assert _rival_actor(f"{_PGREP_PYTHON} {_PGREP_CSWAP} --no-color") == "cswap"
+    # Exec'd directly, with no interpreter in front of it.
+    assert _rival_actor("cswap tui") == "cswap tui"
+    # Every label is short enough that the actionable tail survives the menu.
+    for command in _RIVAL_COMMANDS:
+        actor = _rival_actor(command)
+        assert actor is not None and len(actor) <= 20, (command, actor)
+
+
+class _CountingDetector:
+    """Stand-in for ``pgrep``: counts calls, returns whatever is set on it."""
+
+    def __init__(self, findings: list[str]) -> None:
+        self.findings = findings
+        self.calls = 0
+
+    def __call__(self) -> list[str]:
+        self.calls += 1
+        return list(self.findings)
+
+
+def test_rival_rescan_keeps_its_own_cadence_and_replaces_its_last_finding() -> None:
+    """Periodic, but never per tick - and never additive.
+
+    Before this, ``_detect_rival_engines`` ran once in ``main()``: a TUI opened
+    after launch was invisible for the life of the process, and one that quit
+    was reported forever. The rescan therefore (a) is gated to its own
+    interval, not the 60 s UI tick, because it is the only subprocess the
+    steady state runs, and (b) REPLACES its previous lines so the menu shows
+    who is running now, while wiring errors from other seams survive untouched.
+    """
+    other = "indexer.py wiring failed: RuntimeError: boom"
+    stale = 'another switch actor: cswap auto (pid 9) — it can switch and can run its own engine; switches it makes show here as "external"'
+    fresh = 'another switch actor: cswap tui (pid 15206) — it can switch and can run its own engine; switches it makes show here as "external"'
+    published: list[UiSnapshot] = []
+    worker = BackgroundWorker(
+        publish=published.append,
+        snapshot=UiSnapshot(
+            settings=normalize_settings(dict(SETTINGS_DEFAULTS)),
+            wiring_errors=(other, stale),
+        ),
+    )
+    detector = _CountingDetector([fresh])
+    worker._rival_detector = detector
+
+    start = 10_000.0
+    worker._next_rival_scan = start
+    # One second short of due: no subprocess, whatever else the loop is doing.
+    assert worker._maybe_rescan_rivals(start - 1.0) is False
+    assert detector.calls == 0, "rescan ran early"
+    assert not published
+
+    assert worker._maybe_rescan_rivals(start) is True
+    assert detector.calls == 1
+    assert published, "a changed rival set published nothing"
+    assert published[-1].wiring_errors == (other, fresh), published[-1].wiring_errors
+
+    # The whole interval must pass, not one UI tick.
+    for elapsed in (60.0, 120.0, app_mod.RIVAL_RESCAN_SECONDS - 1.0):
+        assert worker._maybe_rescan_rivals(start + elapsed) is False
+    assert detector.calls == 1
+
+    # Due again, same finding: re-scanned, but nothing republished (the menu
+    # must not be rebuilt every five minutes for an unchanged state).
+    published_before = len(published)
+    assert worker._maybe_rescan_rivals(start + app_mod.RIVAL_RESCAN_SECONDS) is True
+    assert detector.calls == 2
+    assert len(published) == published_before
+
+    # The rival quit: its line goes, the unrelated wiring error stays.
+    detector.findings = []
+    assert worker._maybe_rescan_rivals(start + 2 * app_mod.RIVAL_RESCAN_SECONDS) is True
+    assert published[-1].wiring_errors == (other,), published[-1].wiring_errors
+
+
+def test_the_worker_loop_actually_reaches_the_rival_gate() -> None:
+    """The gate is worthless if nothing calls it.
+
+    ``_loop_once`` holds the only call site, and W6 (`cadence`) rewrites exactly
+    that region. Every other test here drives ``_maybe_rescan_rivals`` directly,
+    so all of them would still pass with the three-line insert merged away - and
+    the widget would silently be back to startup-only detection, the very bug
+    this work exists to fix. This one exercises the loop body instead.
+
+    The due times are in the PAST on purpose: a future one makes the loop block
+    on ``self._commands.get(timeout=…)`` for that long, and the rival gate sits
+    after the queue read.
+    """
+    published: list[UiSnapshot] = []
+    worker = BackgroundWorker(
+        publish=published.append,
+        snapshot=UiSnapshot(settings=normalize_settings(dict(SETTINGS_DEFAULTS))),
+    )
+    detector = _CountingDetector([])
+    worker._rival_detector = detector
+    worker._next_rival_scan = 0.0
+    ran: list[str] = []
+
+    # The two jobs are other seams' work; this test is about the gate alone.
+    def fake_accounts_job(**kwargs: Any) -> None:
+        ran.append("accounts")
+
+    def fake_cost_job() -> float:
+        ran.append("cost")
+        return time.monotonic() + 1e6
+
+    worker._run_accounts_job = fake_accounts_job  # type: ignore[method-assign]
+    worker._run_cost_job = fake_cost_job  # type: ignore[method-assign]
+
+    stop, _next_ui, _next_cost, _next_engine = worker._loop_once(0.0, 0.0)
+
+    assert stop is False
+    assert detector.calls == 1, "the loop never reached the rival gate"
+    assert ran == ["accounts", "cost"], ran
+
+
+def test_a_failed_rival_rescan_is_logged_and_the_loop_survives() -> None:
+    """``pgrep`` dying must not take the worker's schedule with it."""
+
+    def explode() -> list[str]:
+        raise OSError("pgrep: no such file")
+
+    published: list[UiSnapshot] = []
+    worker = BackgroundWorker(
+        publish=published.append,
+        snapshot=UiSnapshot(settings=normalize_settings(dict(SETTINGS_DEFAULTS))),
+    )
+    worker._rival_detector = explode
+    worker._next_rival_scan = 0.0
+    assert worker._maybe_rescan_rivals(1.0) is True
+    assert not published, "a failed scan must not publish a snapshot"
+    # Re-armed, so a transient failure is retried rather than latched.
+    assert worker._next_rival_scan == 1.0 + app_mod.RIVAL_RESCAN_SECONDS
+
+
+def test_rival_finding_reaches_the_menu_whole() -> None:
+    """The row has to survive the menu's truncation to be actionable.
+
+    The half that tells the operator what to expect - that the switches show up
+    here as ``external`` - is at the END of the line, which is precisely the
+    half a ``MAX_ERROR_CHARS`` cut removes.
+    """
+    from cc_usage_widget.__main__ import _rival_actor
+
+    label = _rival_actor(f"{_PGREP_PYTHON} {_PGREP_CSWAP} tui")
+    line = (
+        f"another switch actor: {label} (pid 15206) — it can switch and can "
+        'run its own engine; switches it makes show here as "external"'
+    )
+    published: list[UiSnapshot] = []
+    worker = BackgroundWorker(
+        publish=published.append,
+        snapshot=UiSnapshot(settings=normalize_settings(dict(SETTINGS_DEFAULTS))),
+    )
+    worker._rival_detector = _CountingDetector([line])
+    worker._next_rival_scan = 0.0
+    worker._maybe_rescan_rivals(1.0)
+    assert published, "nothing published"
+
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        app.rebuild_menu(published[-1])
+        texts = [str(getattr(item, "title", "")) for item in app.menu.values()]
+        assert any(text == f"! {line}" for text in texts), texts
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+# ---------------------------------------------------------------------------
+# W6: the autoswitch engine keeps claude-swap's cadence, not the 60 s UI tick
+# ---------------------------------------------------------------------------
+
+_Empty = app_mod.queue.Empty
+"""``queue.Empty``. Taken from ``app_mod`` rather than a new import here so the
+test file's import block stays untouched."""
+
+
+class _RecordingQueue:
+    """A command queue that never has a command, but remembers how long the
+    worker was willing to wait for one - i.e. the loop's sleep."""
+
+    def __init__(self) -> None:
+        self.timeouts: list[float] = []
+        self.polls = 0
+
+    def get(self, timeout: float | None = None) -> Any:
+        self.timeouts.append(float(timeout if timeout is not None else -1.0))
+        raise _Empty
+
+    def get_nowait(self) -> Any:
+        self.polls += 1
+        raise _Empty
+
+
+class _CadenceAccounts:
+    """A fake adapter shaped like ``SwapAccountSource`` for the loop's sake.
+
+    ``next_tick_in`` is the seam under test: the real adapter answers with the
+    deadline its own ``AutoSwitchEngine`` set (cooldown, reset-parking and the
+    usage store's poll plan all folded in), and the worker must honour it.
+    """
+
+    def __init__(self, due_in: float | None, switched: str | None = None) -> None:
+        self._due_in = due_in
+        self._switched = switched
+        self.asked = 0
+        self.evaluated = 0
+        self.refreshed = 0
+        self.alert: tuple[str, str] | None = None
+        self.row = object()
+
+    # -- the seam ------------------------------------------------------
+    def next_tick_in(self) -> float | None:
+        self.asked += 1
+        return self._due_in
+
+    # -- the rest of the AccountSource surface -------------------------
+    def refresh(self, *, force: bool = False) -> None:
+        self.refreshed += 1
+
+    def rows(self) -> tuple[Any, ...]:
+        return (self.row,)
+
+    def active(self) -> Any:
+        return self.row
+
+    def autoswitch_enabled(self) -> bool | None:
+        return True
+
+    def set_autoswitch_enabled(self, enabled: bool) -> None:
+        return None
+
+    def evaluate_autoswitch(self) -> str | None:
+        self.evaluated += 1
+        return self._switched
+
+    def switch_to(self, slot_or_alias: str) -> bool:
+        return False
+
+    def current_alert(self) -> tuple[str, str] | None:
+        return self.alert
+
+
+class _LegacyAccounts(_CadenceAccounts):
+    """An adapter from before ``next_tick_in`` existed. The worker must fall
+    back to its own cadence rather than inventing a due time."""
+
+    next_tick_in = None  # not callable -> the getattr guard must reject it
+
+
+def _cadence_worker(accounts: Any) -> tuple[Any, _RecordingQueue, list[UiSnapshot]]:
+    """A worker with slow UI/cost cadences, so only the engine can wake it."""
+    published: list[UiSnapshot] = []
+    settings = normalize_settings(
+        dict(SETTINGS_DEFAULTS, ui_interval_seconds=300, cost_interval_seconds=1800)
+    )
+    worker = BackgroundWorker(
+        publish=published.append,
+        snapshot=UiSnapshot(settings=settings),
+        accounts=accounts,
+    )
+    commands = _RecordingQueue()
+    worker._commands = commands  # type: ignore[assignment]
+    return worker, commands, published
+
+
+def test_engine_due_time_shortens_the_worker_sleep() -> None:
+    """An engine due in 20 s must not wait for the 300 s UI tick (G4).
+
+    Before this, the worker slept ``min(next_ui, next_cost)`` and evaluated
+    autoswitch only inside the UI job, so ``autoswitch.intervalSeconds`` was
+    silently rounded up to ``ui_interval_seconds`` - a 15 s interval was served
+    once a minute, and every "why did it not switch for another minute" was
+    invisible in the log.
+    """
+    accounts = _CadenceAccounts(due_in=20.0)
+    worker, commands, _published = _cadence_worker(accounts)
+
+    now = time.monotonic()
+    stop, next_ui, next_cost, next_engine = worker._loop_once(
+        now + 300.0, now + 1800.0, float("inf")
+    )
+
+    assert stop is False
+    assert commands.timeouts, "the worker never waited on its command queue"
+    slept = commands.timeouts[0]
+    assert 19.0 <= slept <= 20.5, f"engine due in 20 s but the worker slept {slept:.1f} s"
+    assert accounts.asked >= 1, "the loop never asked the adapter for its due time"
+    # The other two deadlines are untouched: this is an extra wake-up, not a
+    # faster UI.
+    assert next_ui == now + 300.0
+    assert next_cost == now + 1800.0
+    assert next_engine <= now + 20.5
+
+
+def test_engine_due_tick_runs_without_a_ui_tick() -> None:
+    """When only the engine is due, evaluate autoswitch - and nothing else.
+
+    The point of the extra wake-up is the engine's cadence, not a UI refresh
+    four times as often, so the accounts job (and its snapshot pass) must stay
+    on its own 300 s schedule.
+    """
+    accounts = _CadenceAccounts(due_in=0.0)
+    worker, _commands, published = _cadence_worker(accounts)
+
+    now = time.monotonic()
+    stop, next_ui, next_cost, next_engine = worker._loop_once(
+        now + 300.0, now + 1800.0, now - 1.0
+    )
+
+    assert stop is False
+    assert accounts.evaluated == 1, f"{accounts.evaluated} autoswitch evaluations"
+    assert accounts.refreshed == 0, "the engine tick dragged the whole UI job with it"
+    assert next_ui == now + 300.0, "the UI tick must keep its own schedule"
+    assert not published, "an idle tick published a snapshot"
+    assert next_engine >= now + 14.0, f"engine deadline re-armed to {next_engine - now:.1f} s"
+
+
+def test_engine_tick_publishes_a_switch_it_made() -> None:
+    """A switch between UI ticks must reach the menu bar immediately.
+
+    An account change the widget itself made, sitting unpublished until the
+    next 300 s tick, is the same stale-state-rendered-as-live bug the alert
+    plumbing exists to end.
+    """
+    accounts = _CadenceAccounts(due_in=0.0, switched="podol")
+    accounts.alert = (ALERT_ALL_EXHAUSTED, "all accounts exhausted")
+    worker, _commands, published = _cadence_worker(accounts)
+
+    now = time.monotonic()
+    worker._loop_once(now + 300.0, now + 1800.0, now - 1.0)
+
+    assert accounts.evaluated == 1
+    assert accounts.refreshed == 1, "a switch must be followed by a forced re-read"
+    assert published, "the switch was never published"
+    snapshot = published[-1]
+    assert snapshot.accounts == (accounts.row,)
+    assert snapshot.active is accounts.row
+    assert snapshot.alert == (ALERT_ALL_EXHAUSTED, "all accounts exhausted")
+
+
+def test_a_due_now_adapter_cannot_spin_the_worker() -> None:
+    """An adapter stuck on "due now" must cost one tick, not a hot loop.
+
+    ``evaluate_autoswitch`` always pushes its own deadline forward, so this is
+    defence in depth - but the loop is the last place that may busy-wait, and a
+    spin here would burn the < 0.3% idle-CPU budget (SPEC 2.1) invisibly.
+    """
+    accounts = _CadenceAccounts(due_in=0.0)
+    worker, commands, _published = _cadence_worker(accounts)
+
+    now = time.monotonic()
+    deadline = now - 1.0
+    for _ in range(5):
+        _stop, _next_ui, _next_cost, deadline = worker._loop_once(
+            now + 300.0, now + 1800.0, deadline
+        )
+
+    assert accounts.evaluated == 1, f"{accounts.evaluated} engine ticks in five iterations"
+    assert deadline >= now + 14.0, f"deadline only moved to +{deadline - now:.1f} s"
+
+
+def test_adapter_without_next_tick_in_keeps_the_ui_cadence() -> None:
+    """No due time on offer means no extra wake-up - never a guessed one."""
+    accounts = _LegacyAccounts(due_in=None)
+    worker, commands, _published = _cadence_worker(accounts)
+
+    now = time.monotonic()
+    stop, _next_ui, _next_cost, next_engine = worker._loop_once(
+        now + 300.0, now + 1800.0, float("inf")
+    )
+
+    assert stop is False
+    assert commands.timeouts and 299.0 <= commands.timeouts[0] <= 300.5, commands.timeouts
+    assert accounts.evaluated == 0, "the engine was ticked with no due time to justify it"
+    assert next_engine == float("inf")
+
+
+def test_next_tick_in_reports_the_engines_own_due_time() -> None:
+    """The adapter's answer is a read of the deadline a tick already set.
+
+    It must not start an engine, must clamp a passed deadline at 0 rather than
+    going negative, and must answer ``None`` (not 0) when autoswitch is off -
+    "no schedule of ours" is not "due now".
+    """
+    source = SwapAccountSource(settings={"autoswitch_enabled": True})
+    source.autoswitch_enabled = lambda: True  # type: ignore[method-assign]
+
+    source._next_tick_at = time.monotonic() + 42.0
+    delay = source.next_tick_in()
+    assert delay is not None and 41.0 <= delay <= 42.0, delay
+
+    source._next_tick_at = time.monotonic() - 10.0
+    assert source.next_tick_in() == 0.0, "an overdue tick must read as 0, not negative"
+
+    # Read-only: no engine constructed, no schedule moved.
+    assert source._engine is None, "next_tick_in started an engine"
+    before = source._next_tick_at
+    source.next_tick_in()
+    assert source._next_tick_at == before, "next_tick_in moved the schedule"
+
+    source.autoswitch_enabled = lambda: False  # type: ignore[method-assign]
+    assert source.next_tick_in() is None, "autoswitch off must read as no schedule"
+
+
+
+# ---------------------------------------------------------------------------
+# integration seams between the 2026-09-01 branches (title ↔ worker, switch-ux
+# ↔ forensics, cadence ↔ forensics)
+# ---------------------------------------------------------------------------
+
+
+def test_threshold_and_journal_reach_the_snapshot_from_both_publish_paths() -> None:
+    """The title branch added ``UiSnapshot.autoswitch_threshold`` and nothing
+    populated it (it fell back to 85 silently); the cadence branch's between-
+    tick publish carried neither the journal nor the switch note, so a switch it
+    made showed a new active account above a "Recent switches" block that still
+    ended on the previous one. Both seams are wired here and pinned here.
+    """
+
+    class _Row:
+        slot, alias, email, is_active = 1, "main", "m@x.io", True
+        five_hour_pct = seven_day_pct = None
+        scoped_windows: tuple[Any, ...] = ()
+        usage_age_seconds = None
+        usage_is_stale = False
+        switchable = True
+        vendor = "claude"
+
+    class _Source:
+        def __init__(self) -> None:
+            self.events: tuple[str, ...] = ("21:05 no switch: no-viable-target",)
+            self.switched: str | None = None
+
+        def refresh(self, *, force: bool = False) -> None:
+            return None
+
+        def rows(self) -> tuple[Any, ...]:
+            return (_Row(),)
+
+        def active(self) -> Any:
+            return _Row()
+
+        def autoswitch_enabled(self) -> bool:
+            return True
+
+        def set_autoswitch_enabled(self, enabled: bool) -> None:
+            return None
+
+        def evaluate_autoswitch(self) -> str | None:
+            return self.switched
+
+        def switch_to(self, slot_or_alias: str) -> bool:
+            return False
+
+        def current_alert(self) -> tuple[str, str] | None:
+            return None
+
+        def cached_autoswitch_threshold(self) -> float:
+            return 90.0
+
+        def recent_events(self) -> tuple[str, ...]:
+            return self.events
+
+        def switch_note(self) -> str:
+            return "last switch 21:05 (at-limit)"
+
+    source = _Source()
+    published: list[UiSnapshot] = []
+    worker = BackgroundWorker(
+        publish=published.append,
+        snapshot=UiSnapshot(settings=normalize_settings(dict(SETTINGS_DEFAULTS))),
+        accounts=source,
+    )
+    worker._read_autoswitch = lambda default: True  # type: ignore[method-assign]
+    worker._run_accounts_job(force=False)
+    snapshot = published[-1]
+    assert snapshot.autoswitch_threshold == 90.0, snapshot.autoswitch_threshold
+    assert snapshot.recent_events == source.events
+    assert snapshot.switch_note == "last switch 21:05 (at-limit)"
+
+    # Between UI ticks: a journal line without a verdict change still publishes.
+    worker._snapshot = snapshot
+    source.events = source.events + ("21:06 active 5→1 (external)",)
+    worker._run_autoswitch_tick()
+    assert published[-1].recent_events[-1] == "21:06 active 5→1 (external)"
+
+    # ...and a switch made between ticks carries the journal with the rows.
+    worker._snapshot = published[-1]
+    source.events = source.events + ("21:07 Switched Account-1 -> Account-3",)
+    source.switched = "podol"
+    worker._run_autoswitch_tick()
+    assert published[-1].recent_events[-1] == "21:07 Switched Account-1 -> Account-3"
+    assert published[-1].autoswitch_threshold == 90.0
+
+
+def test_one_click_best_switch_is_not_reported_as_an_external_switch() -> None:
+    """``switch_best`` lands on a slot the next refresh will see as "changed";
+    without claiming it (as ``switch_to`` does) the forensics detector would
+    log our own click as another actor and raise ``⚠ ext`` — the exact false
+    alarm the detector's docstring promises never to raise. It also retracts a
+    standing external-switch verdict, and its journal line is stamped like
+    every other one.
+    """
+    import re as _re
+    from cc_usage_widget.contracts import ALERT_EXTERNAL_SWITCH
+
+    class _Switcher:
+        def switch(self, strategy: str, json_output: bool, models: tuple[str, ...]) -> dict[str, Any]:
+            assert strategy == "best" and json_output is True
+            return {"switched": True, "from": {"number": "1"}, "to": {"number": "3", "email": "p@x.io"}, "warnings": ["Skipped Account-4 (disabled)"]}
+
+    class _Backend:
+        switcher = _Switcher()
+        backup_dir = "/nonexistent"
+
+        @staticmethod
+        def load_policy(_dir: str) -> Any:
+            raise RuntimeError("no policy in this test")
+
+    source = SwapAccountSource(settings={})
+    source._backend_or_none = lambda: _Backend()  # type: ignore[method-assign]
+    source._external_alert = (ALERT_EXTERNAL_SWITCH, "21:05 active 5→1 (external)")
+    seen: dict[str, Any] = {}
+
+    def _refresh(*, force: bool = False) -> None:
+        seen["expect"] = source._expect_active
+        seen["alert"] = source._external_alert
+
+    source.refresh = _refresh  # type: ignore[method-assign]
+    assert source.switch_best() is True
+    assert seen["expect"] == "3", seen
+    assert seen["alert"] is None, "taking the wheel back must retract the external verdict"
+    lines = source.recent_events()
+    assert lines and _re.match(r"^\d\d:\d\d manual switch \(best\) -> ", lines[-1]), lines
+    assert any("Skipped Account-4" in line for line in lines), lines
+
+
+def test_disabled_flag_is_carried_from_claude_swap_into_the_row() -> None:
+    """``cswap disable`` holds a slot out of rotation while it stays clickable.
+    ``AccountRow`` had no field for it, so every fleet count treated slot 4
+    (work1, disabled, 0 %) as a free room — a room the engine would never use.
+    """
+    import types
+
+    source = SwapAccountSource(settings={})
+    account = types.SimpleNamespace(
+        number="4", email="w@x.io", alias="work1", is_active=False,
+        switchable=True, disabled=True, usage=None,
+    )
+    row = source._build_row(account, "1", time.time(), None)
+    assert row.disabled is True and row.switchable is True, row
+    plain = types.SimpleNamespace(
+        number="3", email="p@x.io", alias="podol", is_active=False,
+        switchable=True, usage=None,
+    )
+    assert source._build_row(plain, "1", time.time(), None).disabled is False
+
+
+# ---------------------------------------------------------------------------
+# review fixes 2026-09-01 (forensics + cadence findings the fixers never landed)
+# ---------------------------------------------------------------------------
+
+
+class _RevEvent:
+    """An engine event double: kind, human line, and the optional fields
+    ``_drain_events`` reads (``reason``, ``to_ref``, ``dry_run``)."""
+
+    dry_run = False
+
+    def __init__(self, kind: str, line: str, *, reason: str = "", to_ref: Any = None) -> None:
+        self.kind, self._line, self.reason, self.to_ref = kind, line, reason, to_ref
+
+    def human(self) -> str:
+        return self._line
+
+
+def test_an_external_verdict_survives_idle_engine_ticks_until_the_widget_switches() -> None:
+    """The engine emits ``no switch: below-threshold`` on nearly every idle
+    tick, and a no-switch clears the engine's verdict — so the first cut lost
+    the ``⚠ ext`` glyph within 60 s of raising it (review blocker). It lives
+    in its own slot now: idle ticks and an all-exhausted verdict leave it,
+    and only a switch the widget makes retracts it.
+    """
+    from cc_usage_widget.contracts import ALERT_ALL_EXHAUSTED as _EXH
+
+    source, backend = _forensics_source("5")
+    backend.snapshot.active_number = "1"
+    source.refresh(force=True)
+    assert source.current_alert()[0] == ALERT_EXTERNAL_SWITCH
+
+    source._on_engine_event(_RevEvent("no-switch", "no switch: below-threshold", reason="below-threshold"))
+    source._drain_events()
+    assert source.current_alert()[0] == ALERT_EXTERNAL_SWITCH, "an idle tick must not retract it"
+
+    # An engine verdict outranks it while both stand, but does not destroy it.
+    source._on_engine_event(_RevEvent("all-exhausted", "all accounts exhausted"))
+    source._drain_events()
+    assert source.current_alert()[0] == _EXH
+    source._on_engine_event(_RevEvent("no-switch", "no switch: below-threshold", reason="below-threshold"))
+    source._drain_events()
+    assert source.current_alert()[0] == ALERT_EXTERNAL_SWITCH, "clearing the engine verdict reveals it again"
+
+    # Our own engine switching is "taking the wheel back".
+    backend.snapshot.active_number = "3"
+    source._on_engine_event(
+        _RevEvent("switch", "Switched Account-1 -> Account-3", to_ref={"number": "3", "email": "p@x.io"})
+    )
+    source._drain_events()
+    assert source.current_alert() is None, source.current_alert()
+
+
+def test_an_external_switch_is_visible_with_autoswitch_off() -> None:
+    """OFF is the default configuration, and the one in which a rival actor
+    most plausibly owns the login; the verdict must not die with the toggle,
+    and an engine verdict left in the slot must not be shown instead."""
+    source, backend = _forensics_source("5")
+    source.autoswitch_enabled = lambda: False
+    source._alert = ("all-exhausted", "stale engine verdict")
+    backend.snapshot.active_number = "1"
+    source.refresh(force=True)
+    alert = source.current_alert()
+    assert alert is not None and alert[0] == ALERT_EXTERNAL_SWITCH, alert
+
+
+def test_stopping_the_engine_keeps_an_external_verdict_but_drops_the_engines() -> None:
+    source, _backend = _forensics_source("5")
+    source._alert = ("all-exhausted", "engine verdict")
+    source._external_alert = (ALERT_EXTERNAL_SWITCH, "21:05 active 5→1 (external)")
+    source._stop_engine()
+    assert source._alert is None
+    assert source.current_alert() == (ALERT_EXTERNAL_SWITCH, "21:05 active 5→1 (external)")
+
+
+def test_idle_no_switch_ticks_do_not_flood_the_journal() -> None:
+    """One switch line plus thirty idle ticks: the switch must still be in the
+    20-slot deque, or "Recent switches" shows five identical non-events."""
+    source, backend = _forensics_source("5")
+    backend.snapshot.active_number = "3"
+    source._on_engine_event(
+        _RevEvent("switch", "Switched Account-5 -> Account-3", to_ref={"number": "3", "email": "p@x.io"})
+    )
+    source._drain_events()
+    for _ in range(30):
+        source._on_engine_event(_RevEvent("no-switch", "no switch: below-threshold (17% < 85%)", reason="below-threshold"))
+        source._drain_events()
+    lines = source.recent_events()
+    assert any("Switched Account-5" in line for line in lines), lines
+    assert not any("below-threshold" in line for line in lines), lines
+    # ...while a no-target verdict IS an event worth a line.
+    source._on_engine_event(_RevEvent("no-switch", "no switch: no-viable-target", reason="no-viable-target"))
+    source._drain_events()
+    assert "no-viable-target" in source.recent_events()[-1]
+
+
+def test_a_days_old_last_switch_carries_its_date() -> None:
+    """``last switch 21:05`` read from a file that persists for weeks implied
+    "today"; a switch from another day must say which day."""
+    source = SwapAccountSource(settings={"autoswitch_enabled": True})
+    with tempfile.TemporaryDirectory() as tmp:
+        state = Path(tmp) / "autoswitch_state.json"
+        source._autoswitch_state_path = lambda: state
+        three_days = time.time() - 3 * 86_400
+        state.write_text(json.dumps({"lastSwitchAt": three_days, "leftTrigger": "at-limit"}), encoding="utf-8")
+        note = source.switch_note()
+        assert note is not None and note.startswith("last switch "), note
+        expected = time.strftime("%b %d %H:%M", time.localtime(three_days))
+        assert expected in note, (note, expected)
+        os.utime(state, (three_days + 1, three_days + 1))
+        state.write_text(json.dumps({"lastSwitchAt": time.time() - 60, "leftTrigger": "proactive"}), encoding="utf-8")
+        note = source.switch_note()
+        assert note is not None and re.search(r"last switch \d\d:\d\d \(proactive\)", note), note
+
+
+def test_an_overdue_engine_is_evaluated_at_once() -> None:
+    """``reported <= now`` is exactly the case that needs an immediate wake;
+    the first cut refused to shorten the sleep for it and stalled a due engine
+    for a whole UI interval after any worker exception."""
+    accounts = _CadenceAccounts(due_in=0.0)
+    worker, _commands, _published = _cadence_worker(accounts)
+    now = time.monotonic()
+    worker._loop_once(now + 300.0, now + 1800.0, float("inf"))
+    assert accounts.evaluated == 1, accounts.evaluated
+
+
+def test_a_sub_floor_adapter_is_bounded_by_the_floor() -> None:
+    """A positive answer under the 15 s floor used to undercut the re-arm on
+    the very next iteration (58 ticks in 3 s measured in review)."""
+
+    class _SleepingQueue(_RecordingQueue):
+        """The real queue blocks for its timeout; the recording one returns
+        at once, which is why the reviewer's measurement (58 ticks in 3 s)
+        was invisible to the shipped test."""
+
+        def get(self, timeout: float | None = None) -> Any:
+            time.sleep(min(float(timeout or 0.0), 0.2))
+            return super().get(timeout=timeout)
+
+    accounts = _CadenceAccounts(due_in=0.05)
+    worker, _commands, _published = _cadence_worker(accounts)
+    worker._commands = _SleepingQueue()  # type: ignore[assignment]
+    start = time.monotonic()
+    deadline = float("inf")
+    while time.monotonic() - start < 0.6:
+        _stop, _ui, _cost, deadline = worker._loop_once(start + 300.0, start + 1800.0, deadline)
+    assert accounts.evaluated == 1, f"{accounts.evaluated} ticks in 0.6 s"
+    assert deadline >= start + 14.0, deadline - start
+
+
+def test_autoswitch_off_guard_holds_on_the_engine_only_path() -> None:
+    """A stale past deadline survives the toggle going off; the engine-only
+    path must still refuse to tick (SPEC 6.2)."""
+
+    class _Off(_CadenceAccounts):
+        def autoswitch_enabled(self) -> bool | None:
+            return False
+
+    accounts = _Off(due_in=0.0)
+    worker, _commands, published = _cadence_worker(accounts)
+    now = time.monotonic()
+    worker._loop_once(now + 300.0, now + 1800.0, now - 1.0)
+    assert accounts.evaluated == 0, accounts.evaluated
+    assert not published, "nothing to publish when the guard holds"
+
+
+# ---------------------------------------------------------------------------
+# 13. SPEC-CODEX 6: a second Codex source must cost the old one NOTHING
+# ---------------------------------------------------------------------------
+
+
+class _FakeRegistryEntry:
+    """One ``codex_accounts.RegistryEntry``, duck-typed."""
+
+    def __init__(self, account_id: str, alias: str, enabled: bool) -> None:
+        self.account_id, self.alias, self.enabled = account_id, alias, enabled
+        self.order = 0
+
+
+class _FakeRegistry:
+    def __init__(self, entries: tuple[_FakeRegistryEntry, ...]) -> None:
+        self._entries = entries
+        self.set_calls: list[tuple[str, bool]] = []
+
+    def entries(self) -> tuple[_FakeRegistryEntry, ...]:
+        return self._entries
+
+    def set_enabled(self, account_id: str, flag: bool) -> bool:
+        self.set_calls.append((account_id, flag))
+        return True
+
+
+class _FakeLiveCodexSource:
+    """A stand-in for ``codex_accounts.CodexAccountsSource``.
+
+    Hand-built rather than imported on purpose: this module owns the WIRING
+    (start/stop/pause/force_due, the merge, the menu), and the wiring's whole
+    promise is that it is duck-typed — it must hold for any object satisfying
+    the SPEC-CODEX 6 contract, including one that does not exist yet on a
+    machine where ``codex_accounts.py`` failed to import. Importing the real
+    source here would also put a poller thread and a credential-directory
+    stat inside a unit test.
+    """
+
+    vendor = VENDOR_CODEX
+
+    def __init__(
+        self,
+        rows: tuple[Any, ...] = (),
+        *,
+        available: bool = True,
+        entries: tuple[_FakeRegistryEntry, ...] = (),
+    ) -> None:
+        self.rows = rows
+        self._available = available
+        self._registry = _FakeRegistry(entries)
+        self.started = 0
+        self.stopped = 0
+        self.forced = 0
+        self.paused: list[bool] = []
+
+    def available(self) -> bool:
+        return self._available
+
+    def quota_rows(self) -> tuple[Any, ...]:
+        return self.rows
+
+    def start(self) -> None:
+        self.started += 1
+
+    def stop(self, timeout: float = 2.0) -> bool:
+        self.stopped += 1
+        return True
+
+    def pause(self, flag: bool) -> None:
+        self.paused.append(bool(flag))
+
+    def force_due(self) -> None:
+        self.forced += 1
+
+    def diagnostics(self) -> tuple[str, ...]:
+        return ("codex accounts: 2 tracked, 2 enabled, live quota on",)
+
+
+def _scanned_codex_row() -> Any:
+    """The transcript-derived Codex row, exactly as ``CodexIndexer`` emits it.
+
+    Built by hand with a VERBATIM reset string rather than scanned out of a
+    fixture corpus, because this test pins byte-for-byte output and a
+    clock-derived reset would make the expected strings move every run.
+    """
+    from cc_usage_widget.contracts import AccountRow
+
+    return AccountRow(
+        slot=CODEX_PSEUDO_ACCOUNT_SLOT,
+        alias="Codex",
+        email="",
+        is_active=False,
+        seven_day_pct=19.0,
+        seven_day_resets_at="Sep 12 14:00",
+        vendor=VENDOR_CODEX,
+        switchable=False,
+        plan_type="pro",
+        usage_age_seconds=60.0,
+        stale_after_seconds=7_200.0,
+    )
+
+
+def test_no_live_codex_source_renders_todays_exact_menu() -> None:
+    """With no live source — or one that is not available — nothing moves.
+
+    The rollback switch (SPEC-CODEX 6): zero credentials, ``codex_accounts.py``
+    missing, or ``codex_live_quota_enabled`` off must all leave the widget
+    byte-for-byte as it shipped. The expected strings below were captured from
+    the pre-SPEC-CODEX-6 code at ``HEAD`` before any of this was written, so
+    they are a pin against the old build and not a photograph of the new one:
+    a change to the header, the bar geometry, the note column, the label width
+    or the title fails here rather than being discovered in the menu bar.
+    """
+    from cc_usage_widget.app import (
+        _quota_row_label,
+        _window_label_width,
+        _quota_windows,
+    )
+
+    row = _scanned_codex_row()
+    plain = "Codex (pro)   weekly  19%  resets Sep 12 14:00"
+    drawn = "Codex (pro)\n   weekly ███▍░░░░░░░░░░░░░░  19%     resets Sep 12 14:00"
+
+    assert _quota_row_label(row) == plain, _quota_row_label(row)
+    assert _quota_windows(row) == [("weekly", 19.0, "resets Sep 12 14:00", False)]
+    assert _window_label_width((), (row,)) == 6
+
+    settings = normalize_settings(dict(SETTINGS_DEFAULTS))
+    settings.update({"title_show_icon": False, "title_show_cost": False})
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        snapshot = UiSnapshot(settings=settings, quota_rows=(row,))
+        assert app._visible_quota_rows(snapshot) == (row,)
+        items = app._quota_items(snapshot)
+        assert len(items) == 1 and str(items[0].title) == drawn, [
+            str(item.title) for item in items
+        ]
+        # The title component is off by default and unchanged when switched on:
+        # the transcript row still speaks for the active login when no
+        # identified row can (there is none here).
+        assert app.render_title(snapshot) == "⇄", app.render_title(snapshot)
+        on = replace(snapshot, settings={**settings, "title_show_codex_pct": True})
+        assert app.render_title(on) == "C19%", app.render_title(on)
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+    # ...and the same through the worker, with a live source wired but not
+    # available: the merge must return the collection untouched, not empty it.
+    with tempfile.TemporaryDirectory() as name:
+        base = Path(name)
+        (base / "projects").mkdir()
+
+        class _Scanned:
+            vendor = VENDOR_CODEX
+
+            def available(self) -> bool:
+                return True
+
+            def quota_rows(self) -> tuple[Any, ...]:
+                return (row,)
+
+        for live in (None, _FakeLiveCodexSource(available=False)):
+            sources: tuple[Any, ...] = (_Scanned(),) if live is None else (_Scanned(), live)
+            worker = BackgroundWorker(
+                publish=lambda _s: None,
+                snapshot=UiSnapshot(settings=normalize_settings(dict(SETTINGS_DEFAULTS))),
+                accounts=None,
+                indexer=None,
+                rollups=None,
+                pricing=None,
+                sources=sources,
+            )
+            assert worker._collect_quota_rows() == (row,), live
+            # An unavailable source is never asked for rows, and never counted
+            # as a present vendor by itself.
+            assert worker.available_vendors == (VENDOR_CODEX,), worker.available_vendors
+
+
+def test_refresh_and_the_vendor_toggle_reach_the_live_source() -> None:
+    """``Refresh now``, ``Codex tracking`` and quitting all reach the poller.
+
+    Each of the three is a promise the menu makes that only the source can
+    keep: "answer me now" must not wait out a 300 s period; switching the
+    vendor OFF must stop the REQUESTS, not merely hide the rows (a poller
+    running behind an OFF switch is the widget lying about what it is doing on
+    someone else's endpoint); and a quit must end the thread rather than leave
+    it fetching for a menu bar item that is gone.
+    """
+    from cc_usage_widget.app import _CMD_REFRESH, _CMD_SET_SETTING
+
+    live = _FakeLiveCodexSource(rows=(_scanned_codex_row(),))
+    worker = BackgroundWorker(
+        publish=lambda _s: None,
+        snapshot=UiSnapshot(settings=normalize_settings(dict(SETTINGS_DEFAULTS))),
+        accounts=None,
+        indexer=None,
+        rollups=None,
+        pricing=None,
+        sources=(live,),
+    )
+
+    worker.start()
+    try:
+        assert live.started == 1, live.started
+        worker.start()  # the liveness watchdog restarts the worker
+        assert live.started == 1, "a second poller would double the request rate"
+        # Starting applies the current vendor switch, which is ON by default -
+        # once, not once per restart.
+        assert live.paused == [False], live.paused
+
+        worker._handle_command((_CMD_REFRESH, None))
+        assert live.forced == 1, live.forced
+
+        worker._handle_command((_CMD_SET_SETTING, ("codex_tracking_enabled", False)))
+        assert live.paused[-1] is True, live.paused
+        worker._handle_command((_CMD_SET_SETTING, ("codex_tracking_enabled", True)))
+        assert live.paused[-1] is False, live.paused
+
+        # An unrelated setting must not touch the poller at all.
+        before = list(live.paused)
+        worker._handle_command((_CMD_SET_SETTING, ("lookback_days", 14)))
+        assert live.paused == before, live.paused
+    finally:
+        assert worker.stop(timeout=2.0)
+    assert live.stopped == 1, live.stopped
+
+    # The quit path signals rather than joins (SPEC 2.3) and must still reach it.
+    other = _FakeLiveCodexSource()
+    quitting = BackgroundWorker(
+        publish=lambda _s: None,
+        snapshot=UiSnapshot(settings=normalize_settings(dict(SETTINGS_DEFAULTS))),
+        accounts=None,
+        sources=(other,),
+    )
+    quitting.signal_stop()
+    assert other.stopped == 1, other.stopped
+
+
+def test_an_unavailable_source_gets_no_thread_until_it_is_available() -> None:
+    """No poller on a Claude-only machine (review, 2026-09-09): the worker
+    starts a source only once ``available()`` says so, re-checked every tick,
+    and never twice."""
+    live = _FakeLiveCodexSource(available=False)
+    worker = BackgroundWorker(
+        publish=lambda _s: None,
+        snapshot=UiSnapshot(settings=normalize_settings(dict(SETTINGS_DEFAULTS))),
+        accounts=None,
+        indexer=None,
+        rollups=None,
+        pricing=None,
+        sources=(live,),
+    )
+    worker.start()
+    try:
+        assert live.started == 0, "started while unavailable"
+        worker._collect_quota_rows()
+        assert live.started == 0
+        live._available = True
+        worker._collect_quota_rows()
+        assert live.started == 1, "started on the tick after it became available"
+        assert live.paused == [False], live.paused
+        worker._collect_quota_rows()
+        assert live.started == 1, "never twice"
+    finally:
+        assert worker.stop(timeout=2.0)
+
+
+def test_codex_accounts_submenu_appears_only_with_a_registry() -> None:
+    """No ``codex_accounts.json``, no live-quota controls anywhere in Settings.
+
+    The same rule ``test_absent_codex_corpus_offers_no_codex_settings`` defends
+    one layer down: a control that cannot change anything is worse than no
+    control, because it reads as a feature that is broken. Before onboarding
+    there is no registry, no credential and nothing to enable — so the Settings
+    menu is the pre-SPEC-CODEX-6 one, item for item.
+
+    The registry path is read through the module global (never captured), so
+    pointing it at a temporary directory is enough to exercise both states
+    without touching the real widget home.
+    """
+    row = _scanned_codex_row()
+    settings = normalize_settings(dict(SETTINGS_DEFAULTS))
+    entries = (
+        _FakeRegistryEntry("acct-aaaa1111", "acme", True),
+        _FakeRegistryEntry("acct-bbbb2222", "", False),
+    )
+    live = _FakeLiveCodexSource(rows=(), entries=entries)
+
+    original = app_mod.CODEX_ACCOUNTS_REGISTRY_PATH
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        app._worker._sources = (live,)
+        app._worker._collect_quota_rows()  # populates the main thread's cache
+        assert app._worker.codex_accounts == (
+            ("acct-aaaa1111", "acme", True),
+            ("acct-bbbb2222", "", False),
+        ), app._worker.codex_accounts
+
+        snapshot = UiSnapshot(settings=settings, quota_rows=(row,))
+        with tempfile.TemporaryDirectory() as name:
+            registry = Path(name) / "codex_accounts.json"
+            app_mod.CODEX_ACCOUNTS_REGISTRY_PATH = registry
+
+            absent = list(app._settings_submenu(snapshot).keys())
+            assert not any(t.startswith("Codex live quota") for t in absent), absent
+            assert "Codex accounts" not in absent, absent
+            # Nor a diagnostics line about a credential directory that is not
+            # there - the source object exists on every machine.
+            assert not any(t.startswith("codex accounts:") for t in absent), absent
+            # The pre-SPEC-CODEX-6 vendor switch is still there.
+            assert any(t.startswith("Codex tracking") for t in absent), absent
+
+            registry.write_text('{"version": 1, "accounts": []}', encoding="utf-8")
+            present = list(app._settings_submenu(snapshot).keys())
+            assert any(t.startswith("Codex live quota") for t in present), present
+            assert "Codex accounts" in present, present
+
+            children = list(app._settings_submenu(snapshot)["Codex accounts"].keys())
+            # One row per registry entry, the alias-less one named by the first
+            # 8 characters of its own id - not by an invented name.
+            assert "acme" in children, children
+            assert "acct-bbb" in children, children
+            assert any(title.startswith("Poll every") for title in children), children
+            assert "Reveal codex_accounts.json" in children, children
+
+            # The switch must not be its own precondition: with credentials
+            # but no corpus and no rows yet (live quota is OFF by default, so
+            # the source reports nothing), the only way to turn it on would
+            # otherwise be to hand-edit settings.json.
+            bare = list(app._settings_submenu(replace(snapshot, quota_rows=())).keys())
+            assert any(t.startswith("Codex live quota") for t in bare), bare
+            assert "Codex accounts" in bare, bare
+
+            # The checkbox reflects the registry, and a click goes to the
+            # worker rather than writing the file on the AppKit thread.
+            item = app._settings_submenu(snapshot)["Codex accounts"]["acme"]
+            assert item.state == 1, item.state
+            disabled = app._settings_submenu(snapshot)["Codex accounts"]["acct-bbb"]
+            assert disabled.state == 0, disabled.state
+            recorded: list[tuple[str, Any]] = []
+            app._worker.submit = lambda name, payload=None: recorded.append((name, payload))
+            item.callback(item)
+            assert recorded == [("set_codex_account", ("acct-aaaa1111", False))], recorded
+    finally:
+        app_mod.CODEX_ACCOUNTS_REGISTRY_PATH = original
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+def test_a_registry_toggle_is_written_once_on_the_worker_thread() -> None:
+    """The checkbox click lands on the registry, through the source that owns it.
+
+    Two writers over one atomic file take turns dropping each other's edits
+    (the trap ``state.settings_store()`` exists to avoid), so the menu never
+    opens ``codex_accounts.json`` itself: it enqueues a command and the worker
+    calls ``set_enabled`` on the source's own registry.
+    """
+    from cc_usage_widget.app import _CMD_SET_CODEX_ACCOUNT
+
+    entries = (_FakeRegistryEntry("acct-aaaa1111", "acme", True),)
+    live = _FakeLiveCodexSource(entries=entries)
+    published: list[UiSnapshot] = []
+    worker = BackgroundWorker(
+        publish=published.append,
+        snapshot=UiSnapshot(settings=normalize_settings(dict(SETTINGS_DEFAULTS))),
+        accounts=None,
+        sources=(live,),
+    )
+    worker._handle_command((_CMD_SET_CODEX_ACCOUNT, ("acct-aaaa1111", False)))
+    assert live._registry.set_calls == [("acct-aaaa1111", False)], live._registry.set_calls
+    assert published, "the rows must be republished so the checkmark can move"
+
+
+def test_source_diagnostics_reach_the_menu_without_touching_the_disk() -> None:
+    """The source's own diagnostics lines show up under Settings.
+
+    Read from the worker's cache, produced on the worker thread: a diagnostics
+    line that stats a credential directory while the menu is being assembled
+    would put I/O back on the AppKit thread (SPEC 2.3), which is the one thing
+    the whole snapshot design exists to prevent.
+    """
+    live = _FakeLiveCodexSource(rows=(_scanned_codex_row(),))
+    original = app_mod.CODEX_ACCOUNTS_REGISTRY_PATH
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        snapshot = UiSnapshot(settings=normalize_settings(dict(SETTINGS_DEFAULTS)))
+        app._worker._sources = (live,)
+        with tempfile.TemporaryDirectory() as name:
+            registry = Path(name) / "codex_accounts.json"
+            app_mod.CODEX_ACCOUNTS_REGISTRY_PATH = registry
+
+            # No registry: the feature is not in use and says nothing at all.
+            app._worker._collect_quota_rows()
+            assert not any(
+                "codex accounts" in str(item.title)
+                for item in app._diagnostic_items(snapshot)
+            ), "a Claude-only machine must gain no diagnostics line"
+
+            registry.write_text('{"version": 1, "accounts": []}', encoding="utf-8")
+            app._worker._collect_quota_rows()
+            titles = [str(item.title) for item in app._diagnostic_items(snapshot)]
+            assert any("codex accounts: 2 tracked" in title for title in titles), titles
+    finally:
+        app_mod.CODEX_ACCOUNTS_REGISTRY_PATH = original
+        app._running = False
+        app._worker.stop(timeout=2.0)
 
 
 def main() -> int:
@@ -1258,7 +4311,15 @@ def main() -> int:
     print(f"\n{total - len(failures)} passed, {len(failures)} failed, out of {total}")
     if failures:
         print("failed: " + ", ".join(failures))
-    return 1 if failures else 0
+    orphans = _uncollected_tests(tests)
+    if orphans:
+        # Fail loud: an all-green run that quietly skipped a test is the one
+        # outcome worse than a red one.
+        print(
+            f"ERROR: {len(orphans)} test(s) are defined in this file but were never "
+            f"collected — they sit below the `if __name__` guard: " + ", ".join(orphans)
+        )
+    return 1 if (failures or orphans) else 0
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ A macOS menu bar widget for Claude Code and Codex — live quota bars, reset tim
 and what your usage would cost at published API rates. Computed entirely on your
 own machine.
 
-[![tests](https://img.shields.io/badge/tests-53%20passing-success)](tests/)
+[![tests](https://img.shields.io/badge/tests-217%20passing-success)](tests/)
 [![platform](https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey)](#requirements)
 [![python](https://img.shields.io/badge/python-3.12%2B-blue)](#requirements)
 [![license](https://img.shields.io/badge/license-MIT-informational)](LICENSE)
@@ -62,6 +62,7 @@ auto-switch moves you off an account before it hits the wall.
 *Account features need [claude-swap](https://github.com/realiti4/claude-swap); everything else works without it.*
 
 **Codex** — your weekly subscription quota, read from the local rollout logs.
+Optionally, one live row **per Codex account** — see below.
 
 **Both** — notional per-model cost, computed by scanning your own transcripts.
 
@@ -79,6 +80,66 @@ cd cc-usage-widget
 Start at login: `./install.sh --launch-agent`
 Remove everything: `./uninstall.sh`
 
+## Optional: a live row for each of your Codex accounts
+
+Out of the box the Codex row is read from your local rollout logs. Those logs
+carry no account id, so the figure describes whichever login wrote them — fine
+for one account, useless for several (and two ChatGPT workspaces under one email
+are two accounts).
+
+If you run more than one Codex login, the widget can show **one row per
+account**, all of them live, with the login the CLI is currently using marked
+`· active`. It is **display only** — the widget never switches your Codex login,
+and never writes to `~/.codex`.
+
+This is the one feature that makes a network request, so it is **off by
+default**. Turning it on takes one login per account:
+
+```bash
+cd ~/.claude/cc-usage-widget                      # your install directory
+
+# 1. Log in once per account, each into its own CODEX_HOME.
+#    The browser flow shows a workspace picker — pick a different workspace
+#    each time if two of your accounts share an email.
+CODEX_HOME=$PWD/codex-accounts/new-1 codex login
+CODEX_HOME=$PWD/codex-accounts/new-2 codex login
+
+# 2. Adopt them. Offline: reads each token's own claims, renames the directory
+#    to the account id, fixes permissions, registers it. No network request.
+#    PY is the interpreter install.sh chose - the one named inside ./run.sh.
+PY=$(sed -n 's/.*exec "\(.*\)" -m cc_usage_widget.*/\1/p' run.sh)
+"$PY" -m cc_usage_widget.codex_accounts adopt
+
+# 3. Name them, then switch the feature on.
+open codex_accounts.json      # set "alias" per account: "work", "personal", …
+```
+
+Then in the menu: **Settings ▸ Codex accounts** — tick the accounts you want,
+and turn on the live quota. Useful checks:
+
+```bash
+"$PY" -m cc_usage_widget.codex_accounts list   # registry + which login ~/.codex holds
+"$PY" -m cc_usage_widget.codex_accounts probe work   # one request, raw numbers
+```
+
+Each command runs in its own process, so none of them interferes with the
+running widget.
+
+What to expect:
+
+* Each account is read every 5 minutes (configurable 1–60 min), spaced out and
+  sequentially — never four requests at once.
+* A row says what is wrong instead of showing a wrong number: `relogin`,
+  `no access`, `rate limited`, `endpoint error`, `offline`. A reading older than
+  6 hours drops its bars and keeps the reason.
+* Codex access tokens last about ten days and the widget **does not refresh
+  them**. Two days before one expires the row starts saying `relogin in 1d 4h`;
+  when it expires, run `CODEX_HOME=…/codex-accounts/<account_id> codex login`
+  again. Refreshing tokens ourselves could log you out of the account you are
+  working in, so it is not done until that is proven safe.
+* Delete `codex_accounts.json` (or untick every account) and the menu goes back
+  to exactly what it was.
+
 ## What it costs your machine
 
 Measured against a 1.4 GB Claude corpus and a 15 GB Codex corpus:
@@ -95,8 +156,20 @@ modification time, and only the bytes appended since last time are parsed.
 
 ## Privacy
 
-**Everything stays on your machine.** The widget makes no network calls of its
-own and has no telemetry, no analytics, and no update check.
+**Everything stays on your machine.** The widget has no telemetry, no analytics,
+and no update check, and by default it makes no network calls at all.
+
+There is exactly one exception, and you have to switch it on: the [live
+per-account Codex quota](#optional-a-live-row-for-each-of-your-codex-accounts)
+reads `https://chatgpt.com/backend-api/wham/usage` — your own account, with your
+own login, for your own quota numbers. Nothing is sent anywhere else, nothing is
+uploaded, and the request contains no transcript content. Your Codex access
+token is read from its file, used in that one request's `Authorization` header,
+and dropped: it is never logged, never written to any file the widget creates,
+and never shown in the menu. A credential file that other users can read is
+refused rather than used. There is a test that plants a canary token, runs a
+full poll cycle and asserts the canary reaches no file, no log line and no menu
+label — and a companion test proving that check can actually fail.
 
 Your transcripts contain your source code and possibly your secrets. Records are
 parsed as JSON — so content passes through memory, as it must for any parser —
@@ -113,6 +186,9 @@ State files are created `0600` in the install directory:
 | `scan_state.json`, `codex_scan_state.json` | absolute path, size, offset per transcript |
 | `codex_scan_state_quota.json` | your most recent Codex subscription quota |
 | `scan_state_dedup.json` | request IDs seen today, for de-duplication |
+| `codex_accounts.json` | *(live Codex quota only)* account ids, your aliases, order — no token |
+| `codex_quota_snapshots.json` | *(live Codex quota only)* the last quota reading per account — no token |
+| `codex-accounts/<id>/auth.json` | *(live Codex quota only)* one Codex login, written by `codex login`, **never by the widget** |
 | `settings.json` | your preferences |
 | `logs/widget.log` | only if you use `--launch-agent` |
 
@@ -132,6 +208,12 @@ for shows its token count at `$0` and is named in the menu.** Prices are never
 guessed — if you see an unpriced model, please
 [open an issue](../../issues/new?template=unpriced-model.yml) with a link to the
 published rate.
+
+Priced today (table re-verified 2026-09-09): Anthropic's Fable 5, Mythos 5,
+Opus 5, Opus 4.8, Sonnet 5, Sonnet 4.6 and Haiku 4.5; OpenAI's `gpt-6-astra`
+(the current Codex flagship), `gpt-5.6-sol` / `-terra` / `-luna`, `gpt-5.5`,
+`gpt-5.4` and `gpt-5.4-mini`. `codex-auto-review` has no published rate and
+stays at `$0` by design.
 
 ## Troubleshooting
 
