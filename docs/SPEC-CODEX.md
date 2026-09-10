@@ -161,9 +161,15 @@ Schedule: `codex_quota_interval_seconds` (default 300, clamped 60–3600) per
 account, ≥20 s between two accounts, ±15 % jitter from a hash of the account id
 (never `random`, so a scheduling bug reproduces).
 
-**Business Premium shape is UNVERIFIED.** No captured body exists, so no
-fixture claims to be one; the shape-level test is named `SYNTHETIC_*` and
-tests only what the mapper must survive (windows in the other order).
+**Business shape — captured 2026-09-10** (`plan_type: self_serve_business_prolite`,
+fixture `CAPTURED_business_body` in the tests): same envelope as Pro with four
+differences the mapper now handles — `rate_limit_reached_type` is an **object**
+(`{"type": "workspace_owner_credits_depleted", "details": null}`; the `type` is
+read, anything else yields a bare `capped`), `additional_rate_limits` is `null`,
+`credits.balance` is `null`, and a new `rate_limit_upsell` block is present and
+ignored. That workspace was at 100 % weekly with `allowed: false` — the capped
+row keeps its bar and names the type. Enterprise shapes remain unverified; the
+`SYNTHETIC_*` test still covers windows arriving in the other order.
 
 ### 6.3 Credential layout
 

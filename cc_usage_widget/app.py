@@ -1489,6 +1489,13 @@ class BackgroundWorker:
             out.append((getattr(self._indexer, "vendor", VENDOR_CLAUDE), self._indexer))
         codex_on = bool(self._settings().get("codex_tracking_enabled", True))
         for source in self._sources:
+            if not callable(getattr(source, "scan_once", None)):
+                # A quota-only source (SPEC-CODEX 6's live poller) has no
+                # corpus, no progress and nothing to scan: it is collected by
+                # _collect_quota_rows, never by the cost job. Including it
+                # here killed the cost job with AttributeError: 'progress'
+                # on the first tick after onboarding (2026-09-10).
+                continue
             vendor = getattr(source, "vendor", VENDOR_CODEX)
             if vendor != VENDOR_CLAUDE and not codex_on:
                 continue
@@ -4112,8 +4119,13 @@ class CCUsageWidgetApp(rumps.App):
         # worker's cache - the source produced these lines on its own thread,
         # and a diagnostics line must never be the thing that stats a
         # credential directory from the AppKit thread.
-        for line in self._worker.source_diagnostics:
-            items.append(_info(line))
+        # Gated again at render time (the worker gates at read time): the
+        # cache may predate a registry that was removed - or, in a test, a
+        # path that was redirected - and the menu must describe the machine
+        # as it is now, not as it was on the last tick.
+        if _codex_registry_present():
+            for line in self._worker.source_diagnostics:
+                items.append(_info(line))
         items.append(_info(f"State: {SCAN_STATE_PATH.parent}"))
         return items
 

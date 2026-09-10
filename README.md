@@ -98,9 +98,11 @@ default**. Turning it on takes one login per account:
 ```bash
 cd ~/.claude/cc-usage-widget                      # your install directory
 
-# 1. Log in once per account, each into its own CODEX_HOME.
+# 1. Log in once per account, each into its own CODEX_HOME. The directory
+#    must exist first: codex refuses a CODEX_HOME it cannot find.
 #    The browser flow shows a workspace picker — pick a different workspace
 #    each time if two of your accounts share an email.
+mkdir -p -m 700 codex-accounts/new-1 codex-accounts/new-2
 CODEX_HOME=$PWD/codex-accounts/new-1 codex login
 CODEX_HOME=$PWD/codex-accounts/new-2 codex login
 

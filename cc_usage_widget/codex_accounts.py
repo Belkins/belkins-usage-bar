@@ -312,6 +312,23 @@ def _to_str(value: Any) -> str:
     return value if isinstance(value, str) else ""
 
 
+def _reached_type(value: Any) -> str | None:
+    """``rate_limit_reached_type`` as a string, whichever shape it arrives in.
+
+    The Pro body carries a string or ``null``; a Business workspace was probed
+    on 2026-09-10 carrying ``{"type": "workspace_owner_credits_depleted",
+    "details": null}``. Read the ``type`` of the object form; anything else
+    is ``None`` (a note of ``capped`` with no type, never a dict rendered as
+    prose).
+    """
+    if isinstance(value, str):
+        return value or None
+    if isinstance(value, Mapping):
+        inner = value.get("type")
+        return inner if isinstance(inner, str) and inner else None
+    return None
+
+
 def _to_bool(value: Any, default: bool) -> bool:
     """A missing or junk flag is *unknown*, and unknown means the default —
     never ``False``. Reading a missing ``allowed`` as "not allowed" would put a
@@ -602,8 +619,11 @@ class CodexAccountQuota:
                     inner = entry.get("rate_limit")
                     if not isinstance(inner, Mapping):
                         continue
-                    candidates.append((name, inner.get("primary")))
-                    candidates.append((name, inner.get("secondary")))
+                    # The pools use the same window keys as the plan's own
+                    # rate_limit (probed 2026-09-09: primary_window /
+                    # secondary_window); the bare names are accepted too.
+                    candidates.append((name, inner.get("primary_window", inner.get("primary"))))
+                    candidates.append((name, inner.get("secondary_window", inner.get("secondary"))))
 
         five_hour: WindowSample | None = None
         seven_day: WindowSample | None = None
@@ -632,9 +652,9 @@ class CodexAccountQuota:
             taken.add(label)
             scoped.append((label, sample))
 
-        reached_type = _to_str(body.get("rate_limit_reached_type")) or None
+        reached_type = _reached_type(body.get("rate_limit_reached_type"))
         if reached_type is None and isinstance(rate_limit, Mapping):
-            reached_type = _to_str(rate_limit.get("rate_limit_reached_type")) or None
+            reached_type = _reached_type(rate_limit.get("rate_limit_reached_type"))
 
         return cls(
             account_id=credential_account_id,
@@ -2437,7 +2457,7 @@ def _cmd_probe(
                 (inner.get(key) or {}).get("limit_window_seconds")
                 if isinstance(inner.get(key), Mapping)
                 else None
-                for key in ("primary", "secondary")
+                for key in ("primary_window", "secondary_window")
             ]
             write(f"extra {entry.get('limit_name')!r}: widths={widths}\n")
     write(f"allowed={rate_limit.get('allowed')!r} limit_reached={rate_limit.get('limit_reached')!r}\n")

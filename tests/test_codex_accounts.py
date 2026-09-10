@@ -274,12 +274,12 @@ def verified_pro_body(
                 "limit_name": "GPT-5.3-Codex-Spark",
                 "metered_feature": "spark",
                 "rate_limit": {
-                    "primary": {
+                    "primary_window": {
                         "used_percent": 4,
                         "limit_window_seconds": 18000,
                         "reset_after_seconds": 900,
                     },
-                    "secondary": {
+                    "secondary_window": {
                         "used_percent": 8,
                         "limit_window_seconds": 604800,
                         "reset_after_seconds": 7200,
@@ -291,7 +291,7 @@ def verified_pro_body(
                 "limit_name": "gpt-reserve",
                 "metered_feature": "base_model_inference",
                 "rate_limit": {
-                    "primary": {
+                    "primary_window": {
                         "used_percent": 0,
                         "limit_window_seconds": 604800,
                         "reset_after_seconds": 7200,
@@ -1584,6 +1584,55 @@ def test_the_connect_budget_reaches_the_transport() -> None:
         write_credential(h.accounts_dir, PRO_ACCOUNT_ID, exp=BASE_NOW + 9 * 86_400)
         h.source.run_cycle_once()
     assert seen == [_CONNECT_TIMEOUT] and _CONNECT_TIMEOUT == 10.0, seen
+
+
+def CAPTURED_business_body() -> dict[str, Any]:
+    """The self_serve_business_prolite body as PROBED on this Mac 2026-09-10
+    (identity fields replaced; every other value verbatim). Differences from
+    the Pro body worth a test: ``rate_limit_reached_type`` is an OBJECT,
+    ``additional_rate_limits`` is ``null``, ``credits.balance`` is ``null``,
+    and the plan is capped with ``allowed: false``.
+    """
+    return {
+        "user_id": "user-biz", "account_id": "acct-biz", "email": "biz@example.test",
+        "plan_type": "self_serve_business_prolite",
+        "rate_limit": {"allowed": False, "limit_reached": True,
+                       "primary_window": {"used_percent": 100, "limit_window_seconds": 604800,
+                                          "reset_after_seconds": 462084, "reset_at": 1789497355},
+                       "secondary_window": None},
+        "code_review_rate_limit": None, "additional_rate_limits": None,
+        "model_usage": {"gpt-6-astra": {"available": False,
+                                        "available_at": "2026-09-15T18:35:56.051122Z",
+                                        "credits_would_enable": True}},
+        "credits": {"has_credits": False, "unlimited": False, "overage_limit_reached": False,
+                    "balance": None, "approx_local_messages": None, "approx_cloud_messages": None},
+        "spend_control": {"reached": False, "individual_limit": None},
+        "rate_limit_reached_type": {"type": "workspace_owner_credits_depleted", "details": None},
+        "promo": None, "rate_limit_reset_credits": {"available_count": 0, "applicable_available_count": 0},
+    }
+
+
+def test_captured_business_body_maps_to_a_capped_weekly_bar_with_its_type() -> None:
+    quota = CodexAccountQuota.from_response(
+        CAPTURED_business_body(), credential_account_id="acct-biz",
+        observed_at=BASE_NOW, include_extra=True,
+    )
+    assert quota is not None
+    assert quota.plan_type == "self_serve_business_prolite", "verbatim, never mapped"
+    assert quota.seven_day is not None and quota.seven_day.used_percent == 100.0
+    assert quota.five_hour is None and quota.scoped == (), "null extras are tolerated"
+    assert quota.allowed is False and quota.limit_reached is True
+    assert quota.reached_type == "workspace_owner_credits_depleted", "read from the object form"
+    assert quota.capped_note == "capped workspace_owner_credits_depleted"
+    row = quota.account_row(now=BASE_NOW, slot=-3, alias="work", is_active=False,
+                            note=quota.capped_note, note_kind="crit")
+    assert row.seven_day_pct == 100.0, "a capped plan keeps its evidence"
+    assert row.attention_kind == "crit" and "{" not in row.attention_note
+    # A dict that is not the {type: str} shape yields a bare "capped", never prose of a dict.
+    odd = CAPTURED_business_body(); odd["rate_limit_reached_type"] = {"details": None}
+    q2 = CodexAccountQuota.from_response(odd, credential_account_id="acct-biz",
+                                         observed_at=BASE_NOW, include_extra=False)
+    assert q2 is not None and q2.reached_type is None and q2.capped_note == "capped"
 
 
 # ---------------------------------------------------------------------------

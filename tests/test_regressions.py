@@ -4154,6 +4154,29 @@ def test_an_unavailable_source_gets_no_thread_until_it_is_available() -> None:
         assert worker.stop(timeout=2.0)
 
 
+def test_a_quota_only_source_is_never_handed_to_the_cost_job() -> None:
+    """The live poller has no corpus: it must not appear in _scanners().
+
+    On 2026-09-10 the first tick after onboarding killed the cost job with
+    ``AttributeError: 'CodexAccountsSource' object has no attribute
+    'progress'`` because _scanners() returned every available source.
+    """
+    live = _FakeLiveCodexSource(rows=(_scanned_codex_row(),))
+    assert not hasattr(live, "scan_once")
+    worker = BackgroundWorker(
+        publish=lambda _s: None,
+        snapshot=UiSnapshot(settings=normalize_settings(dict(SETTINGS_DEFAULTS))),
+        accounts=None,
+        indexer=None,
+        rollups=None,
+        pricing=None,
+        sources=(live,),
+    )
+    assert worker._scanners() == [], worker._scanners()
+    worker._run_cost_job()  # must not raise
+    assert worker._collect_quota_rows() == (_scanned_codex_row(),), "still collected as quota"
+
+
 def test_codex_accounts_submenu_appears_only_with_a_registry() -> None:
     """No ``codex_accounts.json``, no live-quota controls anywhere in Settings.
 
