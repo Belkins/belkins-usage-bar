@@ -37,6 +37,7 @@ import subprocess
 import sys
 import tempfile
 import traceback
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -52,12 +53,15 @@ from cc_usage_widget.codex_accounts import (  # noqa: E402
     NOTE_RELOGIN,
     CodexAccountQuota,
     CodexAccountsSource,
+    Credential,
     CredentialStore,
     HttpResponse,
     Registry,
     RegistryEntry,
+    TokenRefresher,
     decode_jwt_claims,
     main as accounts_main,
+    refresh_due,
 )
 from cc_usage_widget.contracts import (  # noqa: E402
     CODEX_FETCH_EXPIRE_SECONDS,
@@ -1623,16 +1627,1523 @@ def test_captured_business_body_maps_to_a_capped_weekly_bar_with_its_type() -> N
     assert quota.five_hour is None and quota.scoped == (), "null extras are tolerated"
     assert quota.allowed is False and quota.limit_reached is True
     assert quota.reached_type == "workspace_owner_credits_depleted", "read from the object form"
-    assert quota.capped_note == "capped workspace_owner_credits_depleted"
+    # roadmap 11: the reason is a CREDIT block, and the action is the sentence.
+    assert quota.capped_note == "out of credits · Add credits"
     row = quota.account_row(now=BASE_NOW, slot=-3, alias="work", is_active=False,
                             note=quota.capped_note, note_kind="crit")
     assert row.seven_day_pct == 100.0, "a capped plan keeps its evidence"
     assert row.attention_kind == "crit" and "{" not in row.attention_note
     # A dict that is not the {type: str} shape yields a bare "capped", never prose of a dict.
+    # `model_usage` is emptied so this control is about the reached_type SHAPE
+    # alone: left in place, its `credits_would_enable` would earn the row the
+    # `out of credits` verdict by the second route (roadmap 11), which is a
+    # different question and has its own test.
     odd = CAPTURED_business_body(); odd["rate_limit_reached_type"] = {"details": None}
+    odd["model_usage"] = {}
     q2 = CodexAccountQuota.from_response(odd, credential_account_id="acct-biz",
                                          observed_at=BASE_NOW, include_extra=False)
     assert q2 is not None and q2.reached_type is None and q2.capped_note == "capped"
+
+
+# ---------------------------------------------------------------------------
+# Credits, availability and the tier label (roadmap 11 + 12)
+# ---------------------------------------------------------------------------
+
+
+def test_the_business_body_credits_and_availability_become_facts_beside_the_bars() -> None:
+    """``credits N`` and ``<model> back Sep 15`` are info lines, not verdicts.
+
+    The captured Business body is the whole reason these fields are read: the
+    workspace is at 100 % of its week AND blocked on credits until Sep 15, and
+    before this the row said only ``capped
+    workspace_owner_credits_depleted`` - which reads as "wait for the reset"
+    when the reset is four days away and fixes nothing.
+
+    The model is named by its own slug (``gpt-6-astra``), the choice
+    ``pricing.MODEL_DISPLAY_NAMES`` already makes for every OpenAI model, so
+    one surface cannot call it Astra while the cost block calls it
+    gpt-6-astra.
+    """
+    quota = CodexAccountQuota.from_response(
+        CAPTURED_business_body(), credential_account_id="acct-biz",
+        observed_at=BASE_NOW, include_extra=True,
+    )
+    assert quota is not None
+    assert quota.credits_has is False and quota.credits_would_enable is True
+    assert quota.credits_balance is None, "null balance is not a zero balance"
+    assert [slug for slug, _when in quota.availability] == ["gpt-6-astra"]
+
+    row = quota.account_row(now=BASE_NOW, slot=-3, alias="work", is_active=False,
+                            note=quota.capped_note, note_kind="crit")
+    assert row.info_notes == ("gpt-6-astra back Sep 15",), row.info_notes
+    assert row.attention_note == "out of credits · Add credits"
+    assert row.seven_day_pct == 100.0, "the facts sit BESIDE the figure"
+
+
+def test_a_balance_renders_as_a_count_with_no_unit_and_no_invented_precision() -> None:
+    """``credits.balance`` arrives as a string on the probed Pro body and as a
+    number elsewhere; both are counts, and neither is a currency."""
+    body = verified_pro_body()
+    body["credits"] = {"has_credits": True, "unlimited": False, "balance": "12"}
+    quota = CodexAccountQuota.from_response(
+        body, credential_account_id=PRO_ACCOUNT_ID, observed_at=BASE_NOW, include_extra=False
+    )
+    assert quota is not None and quota.credits_balance == 12.0
+    row = quota.account_row(now=BASE_NOW, slot=-1, alias="pro", is_active=False)
+    assert row.info_notes == ("credits 12",), row.info_notes
+    assert "$" not in row.info_notes[0] and "." not in row.info_notes[0]
+
+    body["credits"]["balance"] = 12.5
+    fractional = CodexAccountQuota.from_response(
+        body, credential_account_id=PRO_ACCOUNT_ID, observed_at=BASE_NOW, include_extra=False
+    )
+    assert fractional is not None
+    assert fractional.account_row(now=BASE_NOW, slot=-1, alias="pro",
+                                  is_active=False).info_notes == ("credits 12.5",)
+
+    body["credits"]["balance"] = "not a number"
+    junk = CodexAccountQuota.from_response(
+        body, credential_account_id=PRO_ACCOUNT_ID, observed_at=BASE_NOW, include_extra=False
+    )
+    assert junk is not None and junk.credits_balance is None, "junk is silence, not zero"
+
+
+def test_has_credits_false_alone_is_not_out_of_credits() -> None:
+    """The probed Pro body reports ``has_credits: false`` and is perfectly
+    healthy. Reading that flag alone would print "out of credits" on an
+    account with 81 % of its week left - which is why the second, corroborating
+    half (a model saying ``credits_would_enable``) is required.
+    """
+    body = verified_pro_body()
+    body["rate_limit"]["limit_reached"] = True  # capped, but on the WINDOW
+    quota = CodexAccountQuota.from_response(
+        body, credential_account_id=PRO_ACCOUNT_ID, observed_at=BASE_NOW, include_extra=False
+    )
+    assert quota is not None
+    assert quota.credits_has is False and quota.credits_would_enable is False
+    assert quota.out_of_credits is False
+    assert quota.capped_note == "capped", quota.capped_note
+
+    # Add the corroboration and the verdict flips - and only then.
+    body["model_usage"] = {"gpt-6-astra": {"available": False, "credits_would_enable": True}}
+    corroborated = CodexAccountQuota.from_response(
+        body, credential_account_id=PRO_ACCOUNT_ID, observed_at=BASE_NOW, include_extra=False
+    )
+    assert corroborated is not None and corroborated.out_of_credits is True
+    assert corroborated.capped_note == "out of credits · Add credits"
+
+
+def test_an_available_at_that_has_passed_is_not_printed() -> None:
+    """A snapshot can be hours old, so "back Sep 15" must not still be on
+    screen on Sep 16 - the same bygone-reset bug SPEC-CODEX 6 fixed for
+    windows, in a new field."""
+    body = CAPTURED_business_body()
+    quota = CodexAccountQuota.from_response(
+        body, credential_account_id="acct-biz", observed_at=BASE_NOW, include_extra=False
+    )
+    assert quota is not None and quota.availability
+    when = quota.availability[0][1]
+    assert quota.info_notes(now=when - 60) == ("gpt-6-astra back Sep 15",)
+    assert quota.info_notes(now=when + 60) == (), "a bygone return date says nothing"
+
+
+def test_a_model_that_is_already_available_is_not_listed() -> None:
+    body = verified_pro_body()
+    body["model_usage"] = {
+        "gpt-6-astra": {"available": True, "available_at": "2026-09-01T00:00:00Z"},
+        "gpt-5.6-luna": {"available": False, "available_at": "2026-09-15T18:35:56.051122Z"},
+    }
+    quota = CodexAccountQuota.from_response(
+        body, credential_account_id=PRO_ACCOUNT_ID, observed_at=BASE_NOW, include_extra=False
+    )
+    assert quota is not None
+    assert [slug for slug, _when in quota.availability] == ["gpt-5.6-luna"]
+
+
+def test_the_new_fields_round_trip_and_a_legacy_sidecar_still_loads() -> None:
+    """A sidecar written before roadmap 11 has none of these keys, and must
+    read back as "not reported" rather than as False/0."""
+    quota = CodexAccountQuota.from_response(
+        CAPTURED_business_body(), credential_account_id="acct-biz",
+        observed_at=BASE_NOW, include_extra=False,
+    )
+    assert quota is not None
+    again = CodexAccountQuota.from_json(json.loads(json.dumps(quota.to_json())))
+    assert again is not None
+    assert again.credits_has is False and again.credits_would_enable is True
+    assert again.availability == quota.availability
+    assert again.capped_note == quota.capped_note
+
+    legacy = quota.to_json()
+    for key in ("credits_balance", "credits_has", "credits_would_enable", "availability"):
+        del legacy[key]
+    old = CodexAccountQuota.from_json(legacy)
+    assert old is not None
+    assert old.credits_has is None and old.credits_would_enable is False
+    assert old.availability == ()
+    # It still reaches the right verdict from the field it always had: the
+    # explicit reached_type is route one, and it does not need the new keys.
+    assert old.capped_note == "out of credits · Add credits"
+    assert old.info_notes(now=BASE_NOW) == (), "a legacy record has no facts to add"
+
+
+def test_a_withheld_row_withholds_its_facts_and_its_reset_too() -> None:
+    """Credits, a return date and a reset epoch were all read at ``fetched_at``.
+
+    A reading too old to show a percentage (SPEC-CODEX 6.6) is too old to show
+    any of them: a six-hour-old "credits 12" is the same class of lie as a
+    six-hour-old bar, and ``soonest_reset_at`` feeding the title's countdown
+    makes it worse - the bar would count down to a reset nobody re-read.
+    """
+    body = verified_pro_body()
+    body["credits"] = {"has_credits": True, "balance": 12}
+    quota = CodexAccountQuota.from_response(
+        body, credential_account_id=PRO_ACCOUNT_ID, observed_at=BASE_NOW, include_extra=False
+    )
+    assert quota is not None
+    fresh = quota.account_row(now=BASE_NOW + 60, slot=-1, alias="pro", is_active=False)
+    assert fresh.info_notes == ("credits 12",) and fresh.soonest_reset_at is not None
+
+    aged = quota.account_row(
+        now=BASE_NOW + CODEX_FETCH_EXPIRE_SECONDS + 60, slot=-1, alias="pro", is_active=False
+    )
+    assert aged.seven_day_pct is None, "the precondition: the bars are withheld"
+    assert aged.info_notes == () and aged.soonest_reset_at is None
+
+    sentinel = quota.account_row(now=BASE_NOW + 60, slot=-1, alias="pro", is_active=False,
+                                 note=NOTE_RELOGIN, note_kind="warn")
+    assert sentinel.info_notes == () and sentinel.soonest_reset_at is None
+
+
+def test_soonest_reset_at_is_the_earliest_of_every_window() -> None:
+    """The 5-hour bucket resets long before the week, and the title's countdown
+    must be to the first door that opens, not to the first one listed."""
+    body = SYNTHETIC_two_window_body(
+        account_id=PRO_ACCOUNT_ID, primary_seconds=604_800, secondary_seconds=18_000
+    )
+    quota = CodexAccountQuota.from_response(
+        body, credential_account_id=PRO_ACCOUNT_ID, observed_at=BASE_NOW, include_extra=False
+    )
+    assert quota is not None
+    # The fixture's weekly window resets in 600 s and the 5-hour one in 1200 s.
+    assert quota.seven_day is not None and quota.five_hour is not None
+    assert quota.soonest_reset_at == BASE_NOW + 600
+
+    empty = CodexAccountQuota(account_id="x", fetched_at=BASE_NOW)
+    assert empty.soonest_reset_at is None, "no reported reset means no reset"
+
+
+def test_the_pricing_tier_changes_the_label_and_never_a_number() -> None:
+    """roadmap 11: rollouts do not say which tier ran and this repo carries
+    standard rates only, so a non-standard tier says so instead of re-scaling
+    a figure nobody measured. Nothing else reads the setting.
+    """
+    from cc_usage_widget.codex_accounts import pricing_tier_note
+
+    assert pricing_tier_note({"codex_pricing_tier": "standard"}) == "(standard tier)"
+    assert pricing_tier_note({"codex_pricing_tier": "fast"}) == "(fast tier rates not loaded)"
+    assert pricing_tier_note({"codex_pricing_tier": "batch"}) == "(batch tier rates not loaded)"
+    # A junk or absent value is the default, exactly as `normalize_settings`
+    # would have made it - the label can never carry free text from the file.
+    assert pricing_tier_note({"codex_pricing_tier": "premium"}) == "(standard tier)"
+    assert pricing_tier_note({}) == "(standard tier)"
+    assert pricing_tier_note(None) == "(standard tier)"
+    assert normalize_settings({"codex_pricing_tier": "premium"})["codex_pricing_tier"] == "standard"
+    assert normalize_settings({"codex_pricing_tier": "fast"})["codex_pricing_tier"] == "fast"
+    assert SETTINGS_DEFAULTS["codex_pricing_tier"] == "standard"
+
+
+# ---------------------------------------------------------------------------
+# Pace forecast (roadmap 10)
+# ---------------------------------------------------------------------------
+
+
+def test_a_forecast_needs_three_samples_over_half_an_hour_and_a_rising_trend() -> None:
+    """The honest rule, and it is the whole feature: below it, no note.
+
+    ``used_percent`` is reported as a whole number, so two reads five minutes
+    apart routinely differ by one rounding step - a forecast built from that
+    "projects" the wall four hours out and then unprojects it on the next tick.
+    """
+    from cc_usage_widget.codex_accounts import PACE_MIN_SPAN_SECONDS, pace_note
+
+    rising = [(0.0, 10.0), (1_800.0, 20.0), (3_600.0, 30.0)]
+    assert pace_note(rising, now=3_600.0) == "at this pace: wall in 3h"
+
+    assert pace_note(rising[:2], now=1_800.0) == "", "two points are a line through noise"
+    short = [(0.0, 10.0), (600.0, 20.0), (1_200.0, 30.0)]
+    assert 1_200.0 < PACE_MIN_SPAN_SECONDS
+    assert pace_note(short, now=1_200.0) == "", "twenty minutes is not a trend"
+    flat = [(0.0, 30.0), (1_800.0, 30.0), (3_600.0, 30.0)]
+    assert pace_note(flat, now=3_600.0) == "", "an idle account is not heading anywhere"
+    falling = [(0.0, 30.0), (1_800.0, 25.0), (3_600.0, 20.0)]
+    assert pace_note(falling, now=3_600.0) == ""
+    assert pace_note([], now=0.0) == "" and pace_note([("x", None)], now=0.0) == ""
+
+
+def test_a_forecast_says_resets_first_when_the_window_refills_before_the_wall() -> None:
+    """A countdown the plan makes impossible is worse than no countdown: the
+    window reopens before the projection lands, so the wall is never reached.
+
+    (The build contract worded this branch ``wall before reset``; the roadmap's
+    own item 10 words it ``resets first``, which is the sentence that is true
+    in the branch it names. Flagged for the integrator.)
+    """
+    from cc_usage_widget.codex_accounts import pace_note
+
+    rising = [(0.0, 10.0), (1_800.0, 20.0), (3_600.0, 30.0)]
+    # The wall is 3 h out; a reset 1 h out gets there first.
+    assert pace_note(rising, now=3_600.0, reset_at=3_600.0 + 3_600) == \
+        "at this pace: resets first"
+    # ...and a reset AFTER the wall leaves the countdown standing.
+    assert pace_note(rising, now=3_600.0, reset_at=3_600.0 + 5 * 3_600) == \
+        "at this pace: wall in 3h"
+
+
+def test_a_capped_row_and_a_reset_inside_the_ring_never_forecast() -> None:
+    """Two silences that would otherwise produce nonsense.
+
+    A capped row has no projection to make - the wall is here. And a ring that
+    spans a reset (98 % -> 3 %) has no trend through the seam: the samples
+    before the drop describe a window that no longer exists, so the tail after
+    it is all that counts, and three samples of it are needed before anything
+    is said.
+    """
+    from cc_usage_widget.codex_accounts import pace_note
+
+    rising = [(0.0, 10.0), (1_800.0, 20.0), (3_600.0, 30.0)]
+    assert pace_note(rising, now=3_600.0, capped=True) == ""
+
+    across_a_reset = [(0.0, 90.0), (1_800.0, 95.0), (3_600.0, 3.0), (5_400.0, 6.0)]
+    assert pace_note(across_a_reset, now=5_400.0) == "", "two samples after the drop"
+    with_a_tail = across_a_reset + [(7_200.0, 9.0), (9_000.0, 12.0)]
+    assert pace_note(with_a_tail, now=9_000.0).startswith("at this pace: wall in ")
+
+    at_the_wall = [(0.0, 98.0), (1_800.0, 99.0), (3_600.0, 100.0)]
+    assert pace_note(at_the_wall, now=3_600.0) == "", "100 % is not a forecast"
+
+
+def test_a_forecast_whose_wall_is_already_behind_us_says_nothing() -> None:
+    """A stale ring must not count down to a moment that has passed.
+
+    The ring is a cache: a poll that stops (an offline laptop, a source that
+    errors for an hour) leaves the last three samples in place while the clock
+    runs on. The projection built from them then lands BEFORE ``now``, and
+    ``coarse_duration`` floors at ``"<1m"`` - so the row advertised
+    "at this pace: wall in <1m" indefinitely, a countdown to an instant that is
+    already behind us. SPEC 4.3: silence, not a fabricated moment.
+    """
+    from cc_usage_widget.codex_accounts import pace_note
+
+    rising = [(0.0, 10.0), (1_800.0, 20.0), (3_600.0, 30.0)]
+    # 20 points per 3_600 s from 30 % puts the wall at t = 16_200. Read a
+    # second later there is nothing left to forecast, and nothing is said -
+    # not even with a reset far enough away to leave the countdown standing.
+    wall = 16_200.0
+    assert pace_note(rising, now=wall + 1) == ""
+    assert pace_note(rising, now=wall + 86_400) == ""
+    assert pace_note(rising, now=wall + 1, reset_at=wall + 5 * 86_400) == ""
+    # Exactly at the wall is not a countdown either.
+    assert pace_note(rising, now=wall) == ""
+    # One second before it still is - the guard trims nothing it should not.
+    assert pace_note(rising, now=wall - 1).startswith("at this pace: wall in ")
+
+
+def test_the_sample_ring_is_bounded_persisted_and_survives_a_cold_start() -> None:
+    """The ring lives in the sidecar so a forecast does not have to rebuild an
+    hour of history after every launch, and it is bounded so the sidecar stays
+    a cache."""
+    from cc_usage_widget.codex_accounts import PACE_RING_SIZE
+
+    percentages = iter(range(10, 10 + 20))
+    def handler(account_id: str, attempt: int) -> Any:
+        return ok(verified_pro_body(used_percent=next(percentages)))
+
+    with temp_harness(accounts=[(PRO_ACCOUNT_ID, "a")], handler=handler) as h:
+        write_credential(h.accounts_dir, PRO_ACCOUNT_ID, exp=BASE_NOW + 9 * 86_400)
+        for _ in range(PACE_RING_SIZE + 4):
+            h.source.force_due()
+            h.source.run_cycle_once()
+            h.clock.advance(900)
+        ring = h.source._samples[PRO_ACCOUNT_ID]  # noqa: SLF001
+        assert len(ring) == PACE_RING_SIZE, len(ring)
+        assert [pct for _when, pct in ring] == sorted(pct for _when, pct in ring)
+
+        stored = json.loads(h.snapshots_path.read_text())
+        assert len(stored["accounts"][PRO_ACCOUNT_ID]["samples"]) == PACE_RING_SIZE
+        # A fresh source over the same files - what a restart looks like.
+        cold = h.build_source()
+        cold.quota_rows()
+        assert cold._samples[PRO_ACCOUNT_ID] == ring  # noqa: SLF001
+        # And it can speak on its first repaint, with no fetch of its own -
+        # which is the whole reason the ring is persisted. (Which of the two
+        # sentences it says is the Pro fixture's business: its window resets an
+        # hour after every read, so this account always resets first.)
+        assert cold.quota_rows()[0].info_notes[0].startswith("at this pace: ")
+
+
+def test_the_forecast_setting_gates_the_note_and_not_the_ring() -> None:
+    """Switching the forecast back on must not cost an hour of silence, so the
+    samples are recorded whatever the setting says - only the note is gated."""
+    percentages = iter(range(10, 40))
+    def handler(account_id: str, attempt: int) -> Any:
+        return ok(verified_pro_body(used_percent=next(percentages)))
+
+    with temp_harness(
+        accounts=[(PRO_ACCOUNT_ID, "a")],
+        handler=handler,
+        settings={"codex_pace_forecast_enabled": False},
+    ) as h:
+        write_credential(h.accounts_dir, PRO_ACCOUNT_ID, exp=BASE_NOW + 9 * 86_400)
+        for _ in range(4):
+            h.source.force_due()
+            h.source.run_cycle_once()
+            h.clock.advance(1_200)
+        assert len(h.source._samples[PRO_ACCOUNT_ID]) == 4  # noqa: SLF001
+        assert h.source.quota_rows()[0].info_notes == (), "the setting is off"
+        h.settings["codex_pace_forecast_enabled"] = True
+        note = h.source.quota_rows()[0].info_notes
+        assert note and note[0].startswith("at this pace: "), note
+
+
+# ---------------------------------------------------------------------------
+# Earliest reset: the title suffix and the Codex fleet line (roadmap 4)
+# ---------------------------------------------------------------------------
+
+
+def codex_row(
+    slot: int,
+    alias: str,
+    *,
+    pct: float | None,
+    reset_in: float | None = None,
+    note: str = "",
+    kind: str = "",
+    active: bool = False,
+) -> AccountRow:
+    """One live per-account Codex row, in the shape ``account_row`` emits."""
+    return AccountRow(
+        slot=slot,
+        alias=alias,
+        email="",
+        is_active=active,
+        seven_day_pct=pct,
+        seven_day_resets_at="Sep 12 14:00" if pct is not None else None,
+        vendor=VENDOR_CODEX,
+        switchable=False,
+        plan_type="pro",
+        usage_age_seconds=60.0,
+        stale_after_seconds=CODEX_FETCH_STALE_SECONDS,
+        attention_note=note,
+        attention_kind=kind,
+        soonest_reset_at=None if reset_in is None else BASE_NOW + reset_in,
+    )
+
+
+def test_the_title_countdown_is_never_wider_than_its_budget() -> None:
+    """Four characters is the whole width this component was given, and the
+    check is a sweep rather than three examples: a duration that rendered as
+    ``↺100d`` would silently cost the bar a neighbour (RCA 2026-08-17).
+    """
+    from cc_usage_widget.render import (
+        TITLE_RESET_SUFFIX_MAX,
+        coarse_duration,
+        title_reset_suffix,
+    )
+
+    for seconds in (30, 60, 3_599, 3_600, 86_399, 86_400, 4 * 86_400, 400 * 86_400):
+        suffix = title_reset_suffix(BASE_NOW + seconds, BASE_NOW)
+        assert suffix.startswith("↺") and len(suffix) <= TITLE_RESET_SUFFIX_MAX, (seconds, suffix)
+    assert title_reset_suffix(BASE_NOW + 4 * 86_400, BASE_NOW) == "↺4d"
+    assert title_reset_suffix(BASE_NOW + 18 * 3_600, BASE_NOW) == "↺18h"
+    assert title_reset_suffix(BASE_NOW + 35 * 60, BASE_NOW) == "↺35m"
+    # Rounding is DOWN: a countdown must never claim more time than was reported.
+    assert coarse_duration(2 * 86_400 - 1) == "1d" and coarse_duration(3_600 - 1) == "59m"
+    # No reset reported, and a reset already past: silence, never a bare glyph.
+    assert title_reset_suffix(None, BASE_NOW) == ""
+    assert title_reset_suffix(BASE_NOW - 60, BASE_NOW) == ""
+
+
+def test_the_title_shows_the_reset_only_on_a_capped_active_row() -> None:
+    """``C100%↺4d`` at the wall, ``C19%`` below it.
+
+    The countdown answers the one question left when the room is full. Below
+    the wall it is noise, and on a row whose source carried no epoch - every
+    claude-swap row, and the transcript-derived Codex row that a
+    live-quota-off machine shows - there is nothing to count down to, which is
+    what keeps that machine's title byte-for-byte today's.
+    """
+    from cc_usage_widget import app as app_mod
+    from cc_usage_widget.app import UiSnapshot
+
+    settings = normalize_settings(dict(SETTINGS_DEFAULTS))
+    settings.update({"title_show_icon": False, "title_show_cost": False,
+                     "title_show_fleet": False, "title_show_codex_pct": True})
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        def title(row: AccountRow) -> str:
+            return app.render_title(UiSnapshot(settings=settings, quota_rows=(row,)))
+
+        capped = codex_row(-1, "vlad", pct=100.0, reset_in=4 * 86_400,
+                           note="capped weekly", kind="crit", active=True)
+        rendered = app._title_reset(capped, expired=False, now=BASE_NOW)
+        assert rendered == "↺4d", rendered
+        assert title(capped).startswith("C100%")
+
+        # Below the wall: no countdown, whatever the reset says.
+        healthy = codex_row(-1, "vlad", pct=19.0, reset_in=4 * 86_400, active=True)
+        assert app._title_reset(healthy, expired=False, now=BASE_NOW) == ""
+        assert title(healthy) == "C19%"
+
+        # A source that carried no epoch adds nothing - today's title, exactly.
+        no_epoch = codex_row(-1, "vlad", pct=100.0, note="capped weekly",
+                             kind="crit", active=True)
+        assert app._title_reset(no_epoch, expired=False, now=BASE_NOW) == ""
+        assert title(no_epoch) == "C100%(!)", title(no_epoch)
+
+        # An ENDED window counts down to nothing: its reset is in the past.
+        assert app._title_reset(capped, expired=True, now=BASE_NOW) == ""
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+def test_the_codex_fleet_line_counts_rooms_and_names_the_next_one() -> None:
+    """``Codex 0/4 · next Sat 09:00 (vlad)`` - the twin of the Claude suffix.
+
+    Four accounts at 100 % is the state this widget was built for, and the two
+    questions at that moment are "is any of them free" and "when does one
+    open". The alias is part of the answer: a bare time does not say which
+    login to switch to.
+    """
+    from cc_usage_widget.app import _codex_fleet_heading
+
+    rows = (
+        codex_row(-1, "vlad", pct=100.0, reset_in=4 * 86_400 + 82_800, note="capped", kind="crit"),
+        codex_row(-2, "work", pct=100.0, reset_in=6 * 86_400, note="capped", kind="crit"),
+        codex_row(-3, "gmail", pct=100.0, reset_in=5 * 86_400, note="capped", kind="crit"),
+        codex_row(-4, "spare", pct=100.0, reset_in=None, note="capped", kind="crit"),
+    )
+    heading = _codex_fleet_heading(rows, now=BASE_NOW)
+    assert heading.startswith("Codex 0/4 · next "), heading
+    assert heading.endswith(" (vlad)"), "the soonest reset names its own account"
+
+    # One account with room: the count moves, and the "next" half still
+    # describes the capped ones - it is about the doors that are shut.
+    with_room = (codex_row(-1, "vlad", pct=42.0, reset_in=4 * 86_400),) + rows[1:]
+    assert _codex_fleet_heading(with_room, now=BASE_NOW).startswith("Codex 1/4 · next ")
+
+    # A withheld figure is NOT room: the last good number can be hours old, and
+    # advertising it would send the operator to a dead login.
+    sentinel = (codex_row(-1, "vlad", pct=None, note="relogin", kind="warn"),) + rows[1:]
+    assert _codex_fleet_heading(sentinel, now=BASE_NOW).startswith("Codex 0/4 · next ")
+
+    # Nor is an account blocked on CREDITS with most of its week unspent -
+    # the captured Business shape (roadmap 11). Its percentage looks like room
+    # and it is the one account that cannot run a session at all, so the count
+    # keys on the verdict's KIND, not on the number beside it.
+    blocked = (
+        codex_row(-1, "vlad", pct=40.0, reset_in=4 * 86_400,
+                  note="out of credits · Add credits", kind="crit"),
+    ) + rows[1:]
+    assert _codex_fleet_heading(blocked, now=BASE_NOW).startswith("Codex 0/4 · next ")
+
+    # Nothing capped: the count stands alone rather than inventing a "next".
+    free = tuple(codex_row(-(i + 1), f"a{i}", pct=10.0) for i in range(3))
+    assert _codex_fleet_heading(free, now=BASE_NOW) == "Codex 3/3"
+
+
+def test_the_fleet_line_never_advertises_a_reset_that_has_already_passed() -> None:
+    """"next" means the next door to open, not the last one that did not.
+
+    A capped row keeps the ``reset_at`` its source anchored at read time. If
+    the source stops polling - an offline laptop, an endpoint erroring - that
+    instant slides into the past while the row stays capped, and the fleet line
+    went on printing it: ``Codex 0/4 · next Sat 09:00 (vlad)`` over a Saturday
+    that has been and gone. That is worse than no line: it is a specific
+    instruction to go and wait for a door that is not going to open.
+
+    Both halves of the fix are asserted, because either alone would leave the
+    bug reachable: a past epoch is dropped BEFORE the ``min`` (so a stale row
+    cannot win the race and silence the accounts that do reopen), and
+    ``fleet_reset_label`` returns ``""`` for a past epoch on its own, matching
+    ``title_reset_suffix``.
+    """
+    from cc_usage_widget.app import _codex_fleet_heading
+    from cc_usage_widget.render import fleet_reset_label
+
+    # The label itself, first: the twin of `title_reset_suffix`'s rule.
+    assert fleet_reset_label(BASE_NOW - 60, BASE_NOW) == ""
+    assert fleet_reset_label(BASE_NOW, BASE_NOW) == ""
+    assert fleet_reset_label(None, BASE_NOW) == ""
+    assert fleet_reset_label(BASE_NOW + 3_600, BASE_NOW) != ""
+
+    # One capped account whose reset went by an hour ago: the count still
+    # describes the fleet, and the "next" half is simply absent.
+    stale = (
+        codex_row(-1, "vlad", pct=100.0, reset_in=-3_600, note="capped", kind="crit"),
+    )
+    assert _codex_fleet_heading(stale, now=BASE_NOW) == "Codex 0/1", (
+        _codex_fleet_heading(stale, now=BASE_NOW)
+    )
+
+    # And a stale row must not win the race for "soonest": with a real reset
+    # four days out beside it, the line names the account that really reopens.
+    mixed = stale + (
+        codex_row(-2, "work", pct=100.0, reset_in=4 * 86_400, note="capped", kind="crit"),
+    )
+    heading = _codex_fleet_heading(mixed, now=BASE_NOW)
+    assert heading.startswith("Codex 0/2 · next "), heading
+    assert heading.endswith(" (work)"), heading
+
+
+def test_the_fleet_line_is_absent_without_a_live_fleet_or_with_the_setting_off() -> None:
+    """A Codex-only machine with the live source off must lay out exactly as
+    it did: the transcript-derived row (slot 0) describes whichever login wrote
+    the logs and has no identity, so it is not a fleet of one."""
+    from cc_usage_widget import app as app_mod
+    from cc_usage_widget.app import UiSnapshot, _codex_fleet_heading
+
+    scanned = AccountRow(
+        slot=CODEX_PSEUDO_ACCOUNT_SLOT, alias="Codex", email="", is_active=False,
+        seven_day_pct=19.0, vendor=VENDOR_CODEX, switchable=False, plan_type="pro",
+        usage_age_seconds=60.0, stale_after_seconds=7_200.0,
+    )
+    claude = AccountRow(slot=1, alias="main", email="m@x", is_active=True, five_hour_pct=12.0)
+    assert _codex_fleet_heading((scanned, claude), now=BASE_NOW) == ""
+    assert _codex_fleet_heading((), now=BASE_NOW) == ""
+
+    settings = normalize_settings(dict(SETTINGS_DEFAULTS))
+    live = codex_row(-1, "vlad", pct=100.0, reset_in=86_400, note="capped", kind="crit")
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        on = app._quota_items(UiSnapshot(settings=settings, quota_rows=(live,)))
+        assert len(on) == 2 and str(on[0].title).startswith("Codex 0/1"), [str(i.title) for i in on]
+        off = dict(settings)
+        off["codex_fleet_line_enabled"] = False
+        items = app._quota_items(UiSnapshot(settings=off, quota_rows=(live,)))
+        assert len(items) == 1 and not str(items[0].title).startswith("Codex 0/1")
+        # And with only the scanned row the section is byte-for-byte the old one.
+        assert len(app._quota_items(UiSnapshot(settings=settings, quota_rows=(scanned,)))) == 1
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+def test_the_info_lines_reach_both_the_bar_block_and_the_plain_fallback() -> None:
+    """VoiceOver reads the plain label, so it must say what the block draws."""
+    from cc_usage_widget import app as app_mod
+    from cc_usage_widget.app import UiSnapshot, _quota_row_label
+
+    row = replace(
+        codex_row(-1, "work", pct=100.0, reset_in=86_400,
+                  note="out of credits · Add credits", kind="crit"),
+        info_notes=("gpt-6-astra back Sep 15",),
+    )
+    plain = _quota_row_label(row)
+    assert "out of credits · Add credits" in plain and "gpt-6-astra back Sep 15" in plain
+
+    settings = normalize_settings(dict(SETTINGS_DEFAULTS))
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        items = app._quota_items(UiSnapshot(settings=settings, quota_rows=(row,)))
+        drawn = str(items[-1].title)
+        assert "gpt-6-astra back Sep 15" in drawn, drawn
+        assert "100%" in drawn, "a fact never replaces the figure"
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+# ---------------------------------------------------------------------------
+# `best` and `link` (roadmap 5)
+# ---------------------------------------------------------------------------
+
+
+def run_cli(harness: "Harness", *argv: str, transport: Any = None) -> tuple[int, str]:
+    """The CLI over the harness's own files - registry, sidecar, settings.
+
+    *transport* is left ``None`` for every offline command (``best``, ``link``,
+    ``adopt``, ``list``), which is itself part of what those tests assert: a
+    command that reached the network would build a real ``UrllibTransport``.
+    """
+    settings_path = harness.root / "settings.json"
+    if not settings_path.exists():
+        settings_path.write_text(json.dumps(harness.settings))
+    out = _Out()
+    code = accounts_main(
+        list(argv),
+        accounts_dir=harness.accounts_dir,
+        registry_path=harness.registry_path,
+        auth_path=harness.auth_path,
+        transport=transport,
+        snapshots_path=harness.snapshots_path,
+        settings_path=settings_path,
+        clock=harness.clock.time,
+        out=out,
+    )
+    return code, out.text
+
+
+def seed_three_accounts(harness: "Harness", percentages: dict[str, float]) -> None:
+    """One healthy cycle per account, so the sidecar holds a real reading."""
+    for account_id in percentages:
+        write_credential(harness.accounts_dir, account_id, exp=BASE_NOW + 9 * 86_400)
+    harness.transport = FakeTransport(
+        lambda account_id, attempt: ok(
+            verified_pro_body(account_id=account_id, used_percent=percentages[account_id])
+        )
+    )
+    harness.source = harness.build_source()
+    harness.source.run_cycle_once()
+
+
+def test_best_prints_the_home_of_the_account_with_the_most_headroom() -> None:
+    """The ranking is the one a person makes by eye from the menu, so the CLI
+    and the menu can never disagree about which account is the good one."""
+    accounts = [("acct-a", "vlad"), ("acct-b", "work"), ("acct-c", "gmail")]
+    with temp_harness(accounts=accounts) as h:
+        seed_three_accounts(h, {"acct-a": 80.0, "acct-b": 12.0, "acct-c": 44.0})
+        code, text = run_cli(h, "best")
+        assert code == 0, text
+        assert text.strip() == str(h.accounts_dir / "acct-b"), text
+        # The path is a real directory, which is what makes it usable as
+        # CODEX_HOME - a registry entry with no credential dir is not a home.
+        assert Path(text.strip()).is_dir()
+
+    # The account with the LOWEST percentage is not the answer when it is
+    # blocked on credits: the captured Business workspace is at 100 % of its
+    # week today, but a credit block can stand over an unspent one, and the
+    # number would then read as the most room on the machine.
+    with temp_harness(accounts=[("acct-a", "vlad"), ("acct-b", "work")]) as h:
+        for account_id in ("acct-a", "acct-b"):
+            write_credential(h.accounts_dir, account_id, exp=BASE_NOW + 9 * 86_400)
+
+        def handler(account_id: str, attempt: int) -> Any:
+            if account_id == "acct-b":
+                body = CAPTURED_business_body()
+                body["account_id"] = account_id
+                body["rate_limit"]["primary_window"]["used_percent"] = 4
+                return ok(body)
+            return ok(verified_pro_body(account_id=account_id, used_percent=61))
+
+        h.transport = FakeTransport(handler)
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+        blocked = {row.alias: row for row in h.source.quota_rows()}["work"]
+        assert blocked.seven_day_pct == 4.0 and blocked.attention_kind == "crit"
+        code, text = run_cli(h, "best")
+        assert code == 0 and text.strip() == str(h.accounts_dir / "acct-a"), text
+
+
+def test_best_falls_back_to_the_soonest_reset_when_every_account_is_capped() -> None:
+    """Four accounts at 100 % is the ordinary state on this machine; the answer
+    then is not "none", it is "this one, in four days"."""
+    accounts = [("acct-a", "vlad"), ("acct-b", "work")]
+    with temp_harness(accounts=accounts) as h:
+        for account_id in ("acct-a", "acct-b"):
+            write_credential(h.accounts_dir, account_id, exp=BASE_NOW + 9 * 86_400)
+
+        def handler(account_id: str, attempt: int) -> Any:
+            body = verified_pro_body(account_id=account_id, used_percent=100)
+            body["rate_limit"]["limit_reached"] = True
+            body["rate_limit"]["allowed"] = False
+            # acct-b reopens first.
+            body["rate_limit"]["primary_window"]["reset_after_seconds"] = (
+                6 * 86_400 if account_id == "acct-a" else 4 * 86_400
+            )
+            return ok(body)
+
+        h.transport = FakeTransport(handler)
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+        code, text = run_cli(h, "best")
+        assert code == 0, text
+        assert text.strip() == str(h.accounts_dir / "acct-b"), text
+
+        code, payload = run_cli(h, "best", "--json")
+        parsed = json.loads(payload)
+        assert code == 0 and parsed["alias"] == "work"
+        assert parsed["reason"] == "all capped; soonest reset"
+        assert parsed["weekly_used_percent"] == 100.0
+        # Anchored to the instant of the READ, not to the start of the cycle:
+        # the poller spaces requests out, so acct-b was read a little after
+        # BASE_NOW and its reset is four days from THAT (SPEC-CODEX 6.5).
+        assert BASE_NOW + 4 * 86_400 <= parsed["reset_at"] < BASE_NOW + 4 * 86_400 + 300
+
+
+def test_best_exits_2_with_one_line_when_nothing_is_usable() -> None:
+    """``codexb`` propagates the code, so a refusal must fail loudly rather
+    than launch Codex with ``CODEX_HOME=`` (which silently means ~/.codex)."""
+    with temp_harness(accounts=[("acct-a", "vlad")]) as h:
+        # 1. The feature is off: nothing has been read, so nothing may be ranked.
+        h.settings["codex_live_quota_enabled"] = False
+        code, text = run_cli(h, "best")
+        assert code == 2 and "codex_live_quota_enabled" in text and text.count("\n") == 1
+
+    with temp_harness() as h:
+        # 2. No registry at all.
+        code, text = run_cli(h, "best")
+        assert code == 2 and "registry" in text, text
+
+    with temp_harness(accounts=[("acct-a", "vlad")]) as h:
+        # 3. A registered account whose credential is dead is not a place to
+        #    send work, and it is the only one: refuse rather than pick it.
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW - 60)
+        h.source.run_cycle_once()
+        assert h.source.quota_rows()[0].attention_note == NOTE_RELOGIN
+        code, text = run_cli(h, "best")
+        assert code == 2 and "attention" in text, text
+        code, payload = run_cli(h, "best", "--json")
+        assert code == 2 and json.loads(payload)["home"] is None
+
+
+def test_best_makes_no_request_even_when_the_sidecar_is_empty() -> None:
+    """It is a local answer to a local question. The source is built with a
+    transport that RAISES, so the promise is enforced by construction: a future
+    edit that reached the endpoint from this CLI would fail here, loudly."""
+    from cc_usage_widget.codex_accounts import _OfflineTransport
+
+    with temp_harness(accounts=[("acct-a", "vlad")]) as h:
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 9 * 86_400)
+        code, text = run_cli(h, "best")
+        assert code == 2, text  # no reading yet, and none was fetched to fix that
+        assert h.transport.calls == [], "best must not poll"
+        assert not h.snapshots_path.exists(), "and must not write the widget's sidecar"
+
+        # With a reading present, it still only reads: the sidecar is the
+        # running widget's file and a second process must not touch it.
+        h.transport = FakeTransport(lambda a, n: ok(verified_pro_body(account_id="acct-a")))
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+        before = h.snapshots_path.read_bytes()
+        assert run_cli(h, "best")[0] == 0
+        assert h.snapshots_path.read_bytes() == before
+    try:
+        _OfflineTransport().get("https://example.invalid", {}, 1.0)
+    except OSError as exc:
+        assert "no network request" in str(exc)
+    else:  # pragma: no cover - the guard is the test
+        raise AssertionError("the offline transport answered a request")
+
+
+def test_link_is_idempotent_and_never_overwrites_a_real_file() -> None:
+    """Each account home holds one file - auth.json - so a session started with
+    it sees none of the user's config. ``link`` mirrors the config in, and the
+    two things it must never do are overwrite something a user put there and
+    write anything at all under ~/.codex."""
+    from cc_usage_widget.codex_accounts import COPY_TARGETS, LINK_TARGETS
+
+    with temp_harness(accounts=[("acct-a", "vlad"), ("acct-b", "work")]) as h:
+        codex_home = h.auth_path.parent
+        codex_home.mkdir(parents=True, exist_ok=True)
+        (codex_home / "config.toml").write_text("model = 'gpt-6-astra'\n")
+        (codex_home / "AGENTS.md").write_text("# agents\n")
+        (codex_home / "skills").mkdir()
+        (codex_home / "skills" / "a.md").write_text("skill\n")
+        before = sorted(p.name for p in codex_home.iterdir())
+        for account_id in ("acct-a", "acct-b"):
+            write_credential(h.accounts_dir, account_id, exp=BASE_NOW + 9 * 86_400)
+        # A real file the user put in one home: it must survive untouched.
+        mine = h.accounts_dir / "acct-a" / "AGENTS.md"
+        mine.write_text("mine, not a link\n")
+
+        code, text = run_cli(h, "link")
+        assert code == 0, text
+        home = h.accounts_dir / "acct-a"
+        # The writable name is a COPY, never a link (see the next test).
+        assert not (home / "config.toml").is_symlink()
+        assert (home / "config.toml").read_text() == "model = 'gpt-6-astra'\n"
+        assert (home / "skills").is_symlink()
+        assert os.readlink(home / "skills") == str(codex_home / "skills")
+        assert not mine.is_symlink() and mine.read_text() == "mine, not a link\n"
+        # A name that does not exist upstream is skipped, not linked to nothing.
+        assert not (home / "plugins").exists()
+        assert sorted(p.name for p in codex_home.iterdir()) == before, "~/.codex untouched"
+
+        # Idempotent: a second run creates nothing and still exits 0.
+        code, again = run_cli(h, "link")
+        assert code == 0 and "linked 0" in again, again
+        assert ", copied" not in again, again  # nothing was copied a second time
+        assert (home / "config.toml").read_text() == "model = 'gpt-6-astra'\n"
+        assert set(LINK_TARGETS) >= {"AGENTS.md", "skills"}
+        assert set(COPY_TARGETS) == {"config.toml", "memories"}
+        assert not (set(LINK_TARGETS) & set(COPY_TARGETS)), "one name, one treatment"
+
+
+def test_a_writable_name_is_copied_so_codex_cannot_write_through_into_dot_codex() -> None:
+    """SPEC-CODEX 6.3, defended against a process this program does not run.
+
+    ``config.toml`` and ``memories/`` are the names Codex itself writes to. As
+    symlinks - which is what this command made until 2026-09-10 - the first
+    ``codex config set`` inside a ``codexb`` session rewrote ``~/.codex``
+    through the link: the widget's one hard promise about ``~/.codex`` broken
+    by a write the widget never makes and could never log.
+
+    The write below is the whole test: a real edit in the account home, and
+    then the upstream file asserted byte for byte.
+    """
+    with temp_harness(accounts=[("acct-a", "vlad")]) as h:
+        codex_home = h.auth_path.parent
+        codex_home.mkdir(parents=True, exist_ok=True)
+        (codex_home / "config.toml").write_text("model = 'gpt-6-astra'\n")
+        (codex_home / "memories").mkdir()
+        (codex_home / "memories" / "notes.md").write_text("shared note\n")
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 9 * 86_400)
+
+        assert run_cli(h, "link")[0] == 0
+        home = h.accounts_dir / "acct-a"
+        assert not (home / "config.toml").is_symlink(), "a writable name must be a copy"
+        assert not (home / "memories").is_symlink(), "a writable tree must be a copy"
+        assert (home / "memories" / "notes.md").read_text() == "shared note\n"
+
+        # What Codex does in that home, done by hand.
+        (home / "config.toml").write_text("model = 'gpt-5.6-sol'\n")
+        (home / "memories" / "notes.md").write_text("this account's note\n")
+
+        assert (codex_home / "config.toml").read_text() == "model = 'gpt-6-astra'\n", (
+            "the session wrote through into ~/.codex"
+        )
+        assert (codex_home / "memories" / "notes.md").read_text() == "shared note\n", (
+            "the session wrote through into ~/.codex"
+        )
+        # And a re-run keeps the per-account edit rather than restoring upstream.
+        assert run_cli(h, "link")[0] == 0
+        assert (home / "config.toml").read_text() == "model = 'gpt-5.6-sol'\n"
+
+
+def test_link_converts_a_write_through_symlink_left_by_the_old_version() -> None:
+    """A machine already linked is the machine most at risk, so it is migrated.
+
+    Replacing OUR link with a copy of the file it pointed at changes no content
+    and is the only way the fix reaches a home that was linked yesterday.
+    Somebody else's link, pointing anywhere else, is still left alone.
+    """
+    with temp_harness(accounts=[("acct-a", "vlad")]) as h:
+        codex_home = h.auth_path.parent
+        codex_home.mkdir(parents=True, exist_ok=True)
+        (codex_home / "config.toml").write_text("model = 'gpt-6-astra'\n")
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 9 * 86_400)
+        home = h.accounts_dir / "acct-a"
+        # Exactly what the previous version of `link` created.
+        os.symlink(codex_home / "config.toml", home / "config.toml")
+        elsewhere = h.root / "someone-elses-config.toml"
+        elsewhere.write_text("not ours\n")
+        os.symlink(elsewhere, home / "memories")
+
+        code, text = run_cli(h, "link")
+        assert code == 0, text
+        assert not (home / "config.toml").is_symlink(), "the write-through link survived"
+        assert (home / "config.toml").read_text() == "model = 'gpt-6-astra'\n"
+        assert (home / "memories").is_symlink(), "a link we did not make stays"
+        assert os.readlink(home / "memories") == str(elsewhere)
+        (home / "config.toml").write_text("model = 'gpt-5.6-sol'\n")
+        assert (codex_home / "config.toml").read_text() == "model = 'gpt-6-astra'\n"
+
+
+def test_unlink_removes_only_the_links_it_made() -> None:
+    with temp_harness(accounts=[("acct-a", "vlad")]) as h:
+        codex_home = h.auth_path.parent
+        codex_home.mkdir(parents=True, exist_ok=True)
+        (codex_home / "config.toml").write_text("model = 'gpt-6-astra'\n")
+        (codex_home / "rules").mkdir()
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 9 * 86_400)
+        home = h.accounts_dir / "acct-a"
+        elsewhere = h.root / "somewhere-else"
+        elsewhere.mkdir()
+        os.symlink(elsewhere, home / "agents")  # somebody else's link
+        (home / "AGENTS.md").write_text("mine\n")
+
+        assert run_cli(h, "link")[0] == 0
+        code, text = run_cli(h, "link", "--unlink")
+        assert code == 0, text
+        assert not (home / "rules").exists(), "the link it made is gone"
+        # The copy is that home's own file now - un-linking is not un-configuring.
+        assert (home / "config.toml").is_file() and not (home / "config.toml").is_symlink()
+        assert (home / "config.toml").read_text() == "model = 'gpt-6-astra'\n"
+        assert (home / "agents").is_symlink(), "a link we did not make stays"
+        assert (home / "AGENTS.md").read_text() == "mine\n"
+        assert (home / "auth.json").is_file(), "the credential is never touched"
+        assert (codex_home / "config.toml").read_text() == "model = 'gpt-6-astra'\n"
+
+
+# ---------------------------------------------------------------------------
+# Token refresh, default OFF (roadmap 13, SPEC-CODEX 6.4)
+# ---------------------------------------------------------------------------
+#
+# The feature this suite must be hardest on, because its failure mode is not a
+# wrong number on a menu — it is Vlad logged out of the account he is coding
+# in. Four properties are asserted rather than described:
+#
+#   off      with ``codex_refresh_enabled`` unset or False, NOT ONE POST is
+#            made. Proven by a transport whose ``post_form`` fails the test.
+#   order    the rotated tokens are on disk BEFORE the access token they carry
+#            authorises anything. Proven from inside the usage handler, which
+#            reads ``auth.json`` at the moment the GET is made.
+#   no replay
+#            the superseded refresh token is gone from the account directory —
+#            no ``.prev``, no backup, nothing to re-send by accident.
+#   silence  no token value reaches a log line, a diagnostics line or the
+#            sidecar. Same canary method as ``tests/test_privacy.py``.
+#
+# Everything runs over real files in a TemporaryDirectory with an injected
+# clock and transport; nothing here reaches the network or ``~/.codex``.
+
+REFRESH_CANARY = "SECRET_REFRESH_CANARY_7C2D9_do_not_leak"
+"""Planted as the stored refresh token and as the rotated one. Not a plausible
+value in a real ``auth.json``, so a substring hit cannot be a coincidence."""
+
+
+class RefreshingTransport(FakeTransport):
+    """A :class:`FakeTransport` that can also answer the grant POST.
+
+    Unlike ``get``, this one DOES record what it was given: the form body is
+    the thing under test — which refresh token was sent, and how many times —
+    and there is no other way to prove that a superseded token was never
+    replayed. The recording lives in the test process and never reaches a file
+    the widget writes, which is exactly what the canary test below asserts.
+    """
+
+    def __init__(
+        self,
+        handler: Callable[[str, int], Any],
+        grant: Callable[[dict, int], Any],
+    ) -> None:
+        super().__init__(handler)
+        self._grant = grant
+        self.posts: list[dict] = []
+
+    def post_form(self, url: str, data: Any, timeout: float) -> HttpResponse:
+        assert url == "https://auth.openai.com/oauth/token", url
+        body = dict(data)
+        self.posts.append(body)
+        result = self._grant(body, len(self.posts))
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+
+class NoPostTransport(FakeTransport):
+    """The off-state control: any POST at all fails the test on the spot."""
+
+    def post_form(self, url: str, data: Any, timeout: float) -> HttpResponse:
+        raise AssertionError(
+            "codex_refresh_enabled is off and a token request was made anyway"
+        )
+
+
+def grant_body(
+    *,
+    account_id: str,
+    exp: float,
+    refresh: str = "rotated-refresh-token",
+    access: str | None = None,
+    include_refresh: bool = True,
+) -> dict[str, Any]:
+    """The shape OpenAI's ``/oauth/token`` returns for a refresh_token grant."""
+    body: dict[str, Any] = {
+        "access_token": access
+        or access_token(account_id=account_id, email="who@example.test", plan="pro", exp=exp),
+        "id_token": "rotated-id-token",
+        "token_type": "Bearer",
+        "expires_in": 864_000,
+    }
+    if include_refresh:
+        body["refresh_token"] = refresh
+    return body
+
+
+def tokens_on_disk(harness: "Harness", account_id: str) -> dict[str, Any]:
+    auth = harness.accounts_dir / account_id / "auth.json"
+    return json.loads(auth.read_text())["tokens"]
+
+
+def test_the_refresh_switch_is_declared_and_defaults_off() -> None:
+    """A key only ``app.py`` knew about would be dropped on the next save, and
+    a default of True would ship the unproven behaviour to everyone."""
+    assert SETTINGS_DEFAULTS["codex_refresh_enabled"] is False
+    assert normalize_settings({})["codex_refresh_enabled"] is False
+    assert normalize_settings({"codex_refresh_enabled": True})["codex_refresh_enabled"] is True
+    assert normalize_settings({"codex_refresh_enabled": "yes"})["codex_refresh_enabled"] is False, (
+        "a hand-edited junk value must fall back to OFF, never to on"
+    )
+
+
+def test_refresh_due_needs_a_known_exp_and_covers_a_passed_one() -> None:
+    """A token we cannot date is never rotated on a guess; one that has already
+    expired IS rotated, because that is the last chance to avoid a browser."""
+    unknown = Credential(account_id="a", access_token="x", exp=None)
+    assert refresh_due(unknown, BASE_NOW) is False
+    far = Credential(account_id="a", access_token="x", exp=BASE_NOW + 9 * 86_400)
+    assert refresh_due(far, BASE_NOW) is False
+    near = Credential(account_id="a", access_token="x", exp=BASE_NOW + 23 * 3_600)
+    assert refresh_due(near, BASE_NOW) is True
+    gone = Credential(account_id="a", access_token="x", exp=BASE_NOW - 60)
+    assert refresh_due(gone, BASE_NOW) is True
+
+
+def test_the_switch_off_makes_not_one_token_request() -> None:
+    """The whole default state, asserted by construction: the transport fails
+    the test if it is ever asked to post, and the auth.json bytes must be
+    identical after a cycle over a token that is an hour from expiry."""
+    with temp_harness(accounts=[("acct-a", "vlad")]) as h:
+        auth = write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 3_600)
+        before = auth.read_bytes()
+        h.transport = NoPostTransport(
+            lambda account_id, attempt: ok(verified_pro_body(account_id=account_id))
+        )
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+
+        assert "codex_refresh_enabled" not in h.settings, "the harness runs the shipped default"
+        assert auth.read_bytes() == before, "the widget wrote to a credential file with refresh off"
+        assert h.rows_by_alias()["vlad"].seven_day_pct == 19.0, "the poll still happened"
+
+
+def test_a_401_with_the_switch_off_still_makes_no_token_request() -> None:
+    """The reactive path is gated on the same switch as the proactive one — a
+    401 must not become a back door into rotating a credential."""
+    with temp_harness(accounts=[("acct-a", "vlad")]) as h:
+        auth = write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 9 * 86_400)
+        before = auth.read_bytes()
+        h.transport = NoPostTransport(lambda account_id, attempt: json_response(401, {}))
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+
+        assert h.rows_by_alias()["vlad"].attention_note == NOTE_RELOGIN
+        assert auth.read_bytes() == before
+
+
+def test_a_token_inside_24h_is_rotated_and_persisted_before_it_is_used() -> None:
+    """Persist-before-use, asserted from inside the request it authorises.
+
+    The usage handler reads ``auth.json`` at the moment the GET is made: if the
+    rotation were applied after the request (or only in memory), the file would
+    still carry the old tokens here and this test would fail. That ordering is
+    the whole safety property — a crash between the POST and the write must
+    cost one grant, never the account.
+    """
+    new_access = access_token(
+        account_id="acct-a", email="who@example.test", plan="pro", exp=BASE_NOW + 10 * 86_400
+    )
+    seen: list[dict[str, Any]] = []
+    auth_holder: list[Any] = [None]
+
+    def handler(account_id: str, attempt: int) -> Any:
+        # Read the credential file AT THE MOMENT the authorised request is made.
+        seen.append(dict(json.loads(auth_holder[0].read_text())["tokens"]))
+        return ok(verified_pro_body(account_id=account_id))
+
+    with temp_harness(accounts=[("acct-a", "vlad")], settings={"codex_refresh_enabled": True}) as h:
+        auth_holder[0] = write_credential(
+            h.accounts_dir, "acct-a", exp=BASE_NOW + 3_600, refresh=REFRESH_CANARY
+        )
+        h.transport = RefreshingTransport(
+            handler,
+            lambda data, n: ok(grant_body(account_id="acct-a", exp=BASE_NOW + 10 * 86_400,
+                                          access=new_access)),
+        )
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+
+        assert len(h.transport.posts) == 1, "exactly one grant"
+        assert h.transport.posts[0] == {
+            "grant_type": "refresh_token",
+            "refresh_token": REFRESH_CANARY,
+            "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+        }
+        assert seen and seen[0]["access_token"] == new_access, (
+            "the usage request was made before the rotation reached the disk"
+        )
+        assert seen[0]["refresh_token"] == "rotated-refresh-token"
+        assert h.rows_by_alias()["vlad"].seven_day_pct == 19.0
+
+
+def test_the_superseded_refresh_token_is_gone_with_no_replay_copy() -> None:
+    """No ``.prev``, no backup, no temp file left behind: the only way to ask
+    OpenAI's reuse detector a question is to do it on purpose."""
+    with temp_harness(accounts=[("acct-a", "vlad")], settings={"codex_refresh_enabled": True}) as h:
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 3_600, refresh=REFRESH_CANARY)
+        h.transport = RefreshingTransport(
+            lambda account_id, attempt: ok(verified_pro_body(account_id=account_id)),
+            lambda data, n: ok(grant_body(account_id="acct-a", exp=BASE_NOW + 10 * 86_400)),
+        )
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+
+        home = h.accounts_dir / "acct-a"
+        assert sorted(p.name for p in home.iterdir()) == ["auth.json"], "a second file appeared"
+        assert tokens_on_disk(h, "acct-a")["refresh_token"] == "rotated-refresh-token"
+        for path in home.rglob("*"):
+            assert REFRESH_CANARY not in path.read_text(errors="replace"), (
+                f"the superseded refresh token survived in {path.name}"
+            )
+        assert (home / "auth.json").stat().st_mode & 0o777 == 0o600
+
+
+def test_a_rotation_keeps_every_other_key_the_codex_cli_wrote() -> None:
+    """A refresh that quietly dropped ``auth_mode`` would break the CLI for the
+    account it was trying to help, so the whole object is written back."""
+    with temp_harness(accounts=[("acct-a", "vlad")], settings={"codex_refresh_enabled": True}) as h:
+        auth = write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 3_600)
+        raw = json.loads(auth.read_text())
+        raw["some_future_key"] = {"kept": True}
+        auth.write_text(json.dumps(raw))
+        h.transport = RefreshingTransport(
+            lambda account_id, attempt: ok(verified_pro_body(account_id=account_id)),
+            lambda data, n: ok(grant_body(account_id="acct-a", exp=BASE_NOW + 10 * 86_400)),
+        )
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+
+        after = json.loads(auth.read_text())
+        assert after["some_future_key"] == {"kept": True}
+        assert after["auth_mode"] == "chatgpt"
+        assert after["tokens"]["account_id"] == "acct-a", "identity is never rewritten"
+        assert after["last_refresh"].endswith("Z")
+
+
+def test_a_grant_without_a_rotated_refresh_token_keeps_the_stored_one() -> None:
+    """Blanking it would turn the next proactive tick into a hard relogin."""
+    with temp_harness(accounts=[("acct-a", "vlad")], settings={"codex_refresh_enabled": True}) as h:
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 3_600, refresh="stored-refresh")
+        h.transport = RefreshingTransport(
+            lambda account_id, attempt: ok(verified_pro_body(account_id=account_id)),
+            lambda data, n: ok(
+                grant_body(account_id="acct-a", exp=BASE_NOW + 10 * 86_400, include_refresh=False)
+            ),
+        )
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+        assert tokens_on_disk(h, "acct-a")["refresh_token"] == "stored-refresh"
+
+
+def test_a_401_refreshes_exactly_once_and_re_reads_with_the_new_token() -> None:
+    """Reactive once: 401 → one grant → one retry. A second 401 in the same
+    poll must NOT buy a second grant, or a dead family becomes a POST loop."""
+    with temp_harness(accounts=[("acct-a", "vlad")], settings={"codex_refresh_enabled": True}) as h:
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 9 * 86_400)
+        h.transport = RefreshingTransport(
+            lambda account_id, attempt: (
+                json_response(401, {}) if attempt == 1 else ok(verified_pro_body(account_id=account_id))
+            ),
+            lambda data, n: ok(grant_body(account_id="acct-a", exp=BASE_NOW + 10 * 86_400)),
+        )
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+
+        assert len(h.transport.posts) == 1, "exactly one grant per poll"
+        assert h.transport.calls_for("acct-a") == 2, "the read was retried once"
+        row = h.rows_by_alias()["vlad"]
+        assert row.seven_day_pct == 19.0 and row.attention_note == ""
+
+
+def test_a_401_that_survives_the_refresh_relogins_without_a_second_grant() -> None:
+    with temp_harness(accounts=[("acct-a", "vlad")], settings={"codex_refresh_enabled": True}) as h:
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 9 * 86_400)
+        h.transport = RefreshingTransport(
+            lambda account_id, attempt: json_response(401, {}),
+            lambda data, n: ok(grant_body(account_id="acct-a", exp=BASE_NOW + 10 * 86_400)),
+        )
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+
+        assert len(h.transport.posts) == 1
+        assert h.transport.calls_for("acct-a") == 2
+        assert h.rows_by_alias()["vlad"].attention_note == NOTE_RELOGIN
+        assert h.state("acct-a").next_due_wall == BASE_NOW + 1_800
+
+
+def test_a_proactive_refresh_spends_the_polls_one_grant() -> None:
+    """The once-per-poll guard, from the other side: a token that was just
+    rotated and STILL gets a 401 must not buy a second grant in the same poll.
+    Two grants for one poll is how a dead family becomes a POST loop, and it is
+    also the shape that would trip reuse detection on a rotated token."""
+    with temp_harness(accounts=[("acct-a", "vlad")], settings={"codex_refresh_enabled": True}) as h:
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 3_600)
+        h.transport = RefreshingTransport(
+            lambda account_id, attempt: json_response(401, {}),
+            lambda data, n: ok(grant_body(account_id="acct-a", exp=BASE_NOW + 10 * 86_400)),
+        )
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+
+        assert len(h.transport.posts) == 1, "the proactive grant did not spend the poll's one try"
+        assert h.transport.calls_for("acct-a") == 1, "and there was nothing to retry with"
+        assert h.rows_by_alias()["vlad"].attention_note == NOTE_RELOGIN
+
+
+def test_the_refresher_refuses_a_world_readable_credential_on_its_own() -> None:
+    """Belt and braces, asserted directly on :class:`TokenRefresher`.
+
+    The poller happens to check the mode first (``CredentialStore.read`` runs
+    before any rotation), so this rule would be untested through the source -
+    and an untested rule in the ONE class with a write path to a credential
+    file is exactly the kind that quietly stops holding.
+    """
+    with temp_harness(accounts=[("acct-a", "vlad")]) as h:
+        auth = write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 3_600, mode=0o644)
+        before = auth.read_bytes()
+        transport = RefreshingTransport(
+            lambda account_id, attempt: ok(verified_pro_body(account_id=account_id)),
+            lambda data, n: ok(grant_body(account_id="acct-a", exp=BASE_NOW + 10 * 86_400)),
+        )
+        refresher = TokenRefresher(
+            transport,
+            CredentialStore(h.accounts_dir, auth_path=h.auth_path, clock=h.clock.time),
+            clock=h.clock.time,
+            log=h.logs.append,
+        )
+        outcome = refresher.refresh("acct-a", label="vlad")
+
+        assert outcome.status == "failed" and "refusing to rotate" in outcome.detail
+        assert transport.posts == [], "a leaky credential bought a grant anyway"
+        assert refresher.posts == 0
+        assert auth.read_bytes() == before
+
+
+def test_a_403_never_refreshes() -> None:
+    """A 403 is an answer about permissions: the token in hand is the one it
+    refused, and rotating it would spend a grant to be refused again."""
+    with temp_harness(accounts=[("acct-a", "vlad")], settings={"codex_refresh_enabled": True}) as h:
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 9 * 86_400)
+        h.transport = RefreshingTransport(
+            lambda account_id, attempt: json_response(403, {"detail": "no access"}),
+            lambda data, n: ok(grant_body(account_id="acct-a", exp=BASE_NOW + 10 * 86_400)),
+        )
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+
+        assert h.transport.posts == [], "a 403 bought a token request"
+        assert h.rows_by_alias()["vlad"].attention_note == NOTE_NO_ACCESS
+
+
+def test_invalid_grant_says_relogin_and_never_retries() -> None:
+    """The one terminal answer: the family is gone, so no retry, and no usage
+    request either — the access token it would carry is the dead one."""
+    with temp_harness(accounts=[("acct-a", "vlad")], settings={"codex_refresh_enabled": True}) as h:
+        auth = write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 3_600)
+        before = auth.read_bytes()
+        h.transport = RefreshingTransport(
+            lambda account_id, attempt: ok(verified_pro_body(account_id=account_id)),
+            lambda data, n: json_response(400, {"error": "invalid_grant"}),
+        )
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+
+        assert len(h.transport.posts) == 1, "one attempt, never a retry"
+        assert h.transport.calls == [], "no usage request with a token we know is dead"
+        assert h.rows_by_alias()["vlad"].attention_note == NOTE_RELOGIN
+        assert auth.read_bytes() == before, "a refused grant must not touch the file"
+
+
+def test_a_failed_refresh_changes_nothing_and_the_old_token_still_reads() -> None:
+    """5xx, offline, garbage: the stored token is valid until ``exp``, so a
+    failed rotation is a diagnostics line, not a sentinel."""
+    with temp_harness(accounts=[("acct-a", "vlad")], settings={"codex_refresh_enabled": True}) as h:
+        auth = write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 3_600)
+        before = auth.read_bytes()
+        h.transport = RefreshingTransport(
+            lambda account_id, attempt: ok(verified_pro_body(account_id=account_id)),
+            lambda data, n: json_response(503, {"error": "server_error"}),
+        )
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+
+        assert auth.read_bytes() == before
+        row = h.rows_by_alias()["vlad"]
+        assert row.seven_day_pct == 19.0, "the old token still worked"
+        assert row.attention_note.startswith(NOTE_RELOGIN + " in"), "the countdown is unchanged"
+        assert any("refresh failed" in line for line in h.source.diagnostics())
+
+
+def test_an_unreachable_token_endpoint_is_a_failure_not_a_relogin() -> None:
+    with temp_harness(accounts=[("acct-a", "vlad")], settings={"codex_refresh_enabled": True}) as h:
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 3_600)
+        h.transport = RefreshingTransport(
+            lambda account_id, attempt: ok(verified_pro_body(account_id=account_id)),
+            lambda data, n: OSError("ConnectionRefusedError"),
+        )
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+        assert h.rows_by_alias()["vlad"].seven_day_pct == 19.0
+        assert any("unreachable" in line for line in h.source.diagnostics())
+
+
+def test_a_rotation_that_cannot_be_persisted_is_never_used() -> None:
+    """The strict half of persist-before-use. With the home read-only the write
+    fails; the new access token must then be discarded, not used, because a
+    token no restart could ever find is worse than the expiry we already have.
+    """
+    with temp_harness(accounts=[("acct-a", "vlad")], settings={"codex_refresh_enabled": True}) as h:
+        auth = write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 3_600)
+        before = auth.read_bytes()
+        new_access = access_token(
+            account_id="acct-a", email="who@example.test", plan="pro", exp=BASE_NOW + 10 * 86_400
+        )
+        used: list[str] = []
+
+        class _Recording(RefreshingTransport):
+            def get(self, url: str, headers: Any, timeout: float) -> HttpResponse:
+                used.append(dict(headers).get("Authorization", ""))
+                return super().get(url, headers, timeout)
+
+        h.transport = _Recording(
+            lambda account_id, attempt: ok(verified_pro_body(account_id=account_id)),
+            lambda data, n: ok(
+                grant_body(account_id="acct-a", exp=BASE_NOW + 10 * 86_400, access=new_access)
+            ),
+        )
+        h.source = h.build_source()
+        os.chmod(h.accounts_dir / "acct-a", 0o500)
+        try:
+            h.source.run_cycle_once()
+        finally:
+            os.chmod(h.accounts_dir / "acct-a", 0o700)
+
+        assert auth.read_bytes() == before
+        assert used and new_access not in used[0], "an unpersisted token authorised a request"
+        assert any("could not be persisted" in line for line in h.source.diagnostics())
+
+
+def test_a_credential_other_users_can_read_is_never_rotated() -> None:
+    """Same rule as the read path: a token another user can read is one to
+    rotate by hand. Writing to it would only mint a second leaked token."""
+    with temp_harness(accounts=[("acct-a", "vlad")], settings={"codex_refresh_enabled": True}) as h:
+        auth = write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 3_600, mode=0o644)
+        before = auth.read_bytes()
+        h.transport = NoPostTransport(
+            lambda account_id, attempt: ok(verified_pro_body(account_id=account_id))
+        )
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+
+        assert auth.read_bytes() == before
+        assert h.rows_by_alias()["vlad"].attention_note == NOTE_NO_CREDENTIAL
+
+
+def test_our_own_rotation_does_not_look_like_a_fresh_login() -> None:
+    """A refresh rewrites ``auth.json``, which is exactly the signal the cycle
+    uses to spot a human running ``codex login`` under a standing sentinel. If
+    the signature were not re-stamped after our own write, the next cycle would
+    clear the verdict and cancel its hour of backoff — every single cycle."""
+    with temp_harness(accounts=[("acct-a", "vlad")], settings={"codex_refresh_enabled": True}) as h:
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 3_600)
+        h.transport = RefreshingTransport(
+            lambda account_id, attempt: json_response(403, {"detail": "no access"}),
+            lambda data, n: ok(grant_body(account_id="acct-a", exp=BASE_NOW + 10 * 86_400)),
+        )
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+        assert h.rows_by_alias()["vlad"].attention_note == NOTE_NO_ACCESS
+
+        h.clock.advance(300)
+        h.source.run_cycle_once()
+        assert h.transport.calls_for("acct-a") == 1, "the backoff was cancelled by our own write"
+        assert len(h.transport.posts) == 1
+        assert h.rows_by_alias()["vlad"].attention_note == NOTE_NO_ACCESS
+
+
+def test_no_token_value_from_a_refresh_reaches_a_log_or_the_sidecar() -> None:
+    """The canary method of ``tests/test_privacy.py``, applied to the second
+    secret this feature handles: the refresh token, before and after rotation.
+    """
+    with temp_harness(accounts=[("acct-a", "vlad")], settings={"codex_refresh_enabled": True}) as h:
+        auth = write_credential(
+            h.accounts_dir, "acct-a", exp=BASE_NOW + 3_600, refresh=REFRESH_CANARY
+        )
+        rotated = REFRESH_CANARY + "-rotated"
+        h.transport = RefreshingTransport(
+            lambda account_id, attempt: ok(verified_pro_body(account_id=account_id)),
+            lambda data, n: ok(
+                grant_body(account_id="acct-a", exp=BASE_NOW + 10 * 86_400, refresh=rotated)
+            ),
+        )
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+
+        assert REFRESH_CANARY in auth.read_text(), "the canary was not planted"
+        assert h.logs, "nothing was logged at all - the log check proves nothing"
+        assert any("refreshed" in line for line in h.logs), "the rotation must be logged"
+        haystack = list(h.logs) + list(h.source.diagnostics())
+        haystack.append(h.snapshots_path.read_text())
+        for line in haystack:
+            assert REFRESH_CANARY not in line, "a refresh token escaped"
+
+
+# ---------------------------------------------------------------------------
+# `probe-refresh` (SPEC-CODEX 6.4)
+# ---------------------------------------------------------------------------
+
+
+def test_probe_refresh_shows_the_rotation_and_proves_the_new_token() -> None:
+    """The command that produces the evidence for the switch: one grant, one
+    usage request, expiry before and after, and never a token on stdout."""
+    with temp_harness(accounts=[("acct-a", "gmail")]) as h:
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 3_600, refresh=REFRESH_CANARY)
+        transport = RefreshingTransport(
+            lambda account_id, attempt: ok(verified_pro_body(account_id=account_id)),
+            lambda data, n: ok(grant_body(account_id="acct-a", exp=BASE_NOW + 10 * 86_400)),
+        )
+        code, text = run_cli(h, "probe-refresh", "gmail", transport=transport)
+
+        assert code == 0, text
+        assert len(transport.posts) == 1 and transport.calls_for("acct-a") == 1
+        assert "before" in text and "after" in text
+        assert "2026-09-09 11:00" in text and "2026-09-19 10:00" in text
+        assert "HTTP 200" in text and "weekly 19.0%" in text
+        assert REFRESH_CANARY not in text and "rotated-refresh-token" not in text
+        assert tokens_on_disk(h, "acct-a")["refresh_token"] == "rotated-refresh-token"
+
+
+def test_probe_refresh_runs_with_the_switch_off() -> None:
+    """It is the probe that opens the switch, so requiring the switch would be
+    circular. The setting gates the widget's polling, never this command."""
+    with temp_harness(accounts=[("acct-a", "gmail")]) as h:
+        assert h.settings.get("codex_refresh_enabled", False) is False
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 9 * 86_400)
+        transport = RefreshingTransport(
+            lambda account_id, attempt: ok(verified_pro_body(account_id=account_id)),
+            lambda data, n: ok(grant_body(account_id="acct-a", exp=BASE_NOW + 10 * 86_400)),
+        )
+        code, text = run_cli(h, "probe-refresh", "gmail", transport=transport)
+        assert code == 0, text
+
+
+def test_probe_refresh_reports_a_refused_grant_and_exits_1() -> None:
+    with temp_harness(accounts=[("acct-a", "gmail")]) as h:
+        auth = write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 3_600)
+        before = auth.read_bytes()
+        transport = RefreshingTransport(
+            lambda account_id, attempt: ok(verified_pro_body(account_id=account_id)),
+            lambda data, n: json_response(400, {"error": "invalid_grant"}),
+        )
+        code, text = run_cli(h, "probe-refresh", "gmail", transport=transport)
+        assert code == 1
+        assert "invalid_grant" in text
+        assert transport.calls == [], "no usage request after a refused grant"
+        assert auth.read_bytes() == before
+
+
+def test_probe_refresh_fails_when_the_rotated_token_is_not_accepted() -> None:
+    """The half that matters for the soak: a grant can succeed and still mint a
+    token the API refuses, and the probe must say so rather than exit 0."""
+    with temp_harness(accounts=[("acct-a", "gmail")]) as h:
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 3_600)
+        transport = RefreshingTransport(
+            lambda account_id, attempt: json_response(401, {}),
+            lambda data, n: ok(grant_body(account_id="acct-a", exp=BASE_NOW + 10 * 86_400)),
+        )
+        code, text = run_cli(h, "probe-refresh", "gmail", transport=transport)
+        assert code == 1
+        assert "NOT accepted" in text
+
+
+def test_probe_refresh_needs_a_known_account() -> None:
+    with temp_harness(accounts=[("acct-a", "gmail")]) as h:
+        assert run_cli(h, "probe-refresh")[0] == 2
+        code, text = run_cli(h, "probe-refresh", "nobody")
+        assert code == 1 and "no registry entry" in text
 
 
 # ---------------------------------------------------------------------------

@@ -41,21 +41,31 @@ The four honesty rules this file exists to keep
    :class:`Credential` overrides ``__repr__`` for exactly that reason. Enforced
    by the canary test in ``tests/test_privacy.py``.
 
-Phase 1 never refreshes a token
-===============================
+Refreshing a token is OFF, and off means silent
+===============================================
 
 The stored ``access_token`` lives ~10 days; this module decodes its ``exp``
 locally (base64url payload, **no signature check** — display and scheduling
 only) and starts saying ``relogin in 1d 4h`` 48 h out, then ``relogin`` when it
-passes. It does **not** POST a refresh grant, because whether two ``codex
-login`` sessions under one public OAuth client share a refresh-token family is
-unverified, and a wrong guess logs Vlad out of the account he is coding in.
+passes.
 
-*Revisit trigger:* the phase-2 probe in the plan (a throwaway ``CODEX_HOME``,
-one refresh grant, 24 h soak, then a deliberate replay of the superseded token
-to see whether reuse detection revokes the family). Only a clean result opens
-``codex_refresh_enabled``. Until then a 10-day relogin is the shipped cost and
-it is stated on the row rather than hidden.
+:class:`TokenRefresher` (roadmap 13) can POST the OAuth refresh grant that
+would avoid that relogin, but ``codex_refresh_enabled`` defaults to **False**
+and while it is False the class is never called: not one token request is made,
+and ``auth.json`` is read and never written — which is the only reason this
+module is allowed to hold a write path to a credential file at all. Whether two
+``codex login`` sessions under one public OAuth client share a refresh-token
+family is still unverified, and a wrong guess logs Vlad out of the account he
+is coding in.
+
+*What opens the switch:* ``python -m cc_usage_widget.codex_accounts
+probe-refresh <alias>`` on a throwaway account — one grant, persisted, then one
+usage GET proving the new token works — followed by a 24 h soak confirming the
+other stores and ``~/.codex`` still work (SPEC-CODEX 6.4). Until that result
+exists the 10-day relogin is the shipped cost and it is stated on the row
+rather than hidden. There is deliberately **no replay path**: a superseded
+refresh token is overwritten in place, never kept in a ``.prev`` file, so the
+reuse-detection question can only be asked on purpose.
 
 Threading
 =========
@@ -77,8 +87,9 @@ intervals is a wake, and every account is marked due at once.
 CLI
 ===
 
-``python -m cc_usage_widget.codex_accounts adopt | list | probe <alias|id>`` —
-its own process, so onboarding never contends with the widget's flock.
+``python -m cc_usage_widget.codex_accounts adopt | list | probe <alias|id> |
+best | link | probe-refresh <alias|id>`` — its own process, so onboarding never
+contends with the widget's flock.
 """
 
 from __future__ import annotations
@@ -90,12 +101,14 @@ import hashlib
 import http.client
 import json
 import os
+import shutil
 import stat as stat_module
 import sys
 import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -114,13 +127,25 @@ from .contracts import (
     CODEX_WINDOW_SECONDS_FIVE_HOUR,
     CODEX_WINDOW_SECONDS_WEEKLY,
     SETTINGS_BOUNDS,
+    SETTINGS_CHOICES,
     SETTINGS_DEFAULTS,
+    SETTINGS_PATH,
     VENDOR_CODEX,
     AccountRow,
     Pct,
     Vendor,
+    normalize_settings,
 )
-from .render import window_minutes_label
+from .render import (
+    # Display formatters live in `render` because BOTH this module and `app`
+    # need them and `app` may never import this one: `__main__` imports
+    # `codex_accounts` inside a guard on purpose, so that a half-written file
+    # here costs one `!` line instead of the whole widget (SPEC-CODEX 6).
+    coarse_duration,
+    fleet_reset_label,
+    title_reset_suffix,
+    window_minutes_label,
+)
 
 __all__ = [
     "CodexAccountsSource",
@@ -134,8 +159,13 @@ __all__ = [
     "HttpResponse",
     "UsageTransport",
     "UrllibTransport",
+    "coarse_duration",
     "decode_jwt_claims",
+    "fleet_reset_label",
     "main",
+    "pace_note",
+    "pricing_tier_note",
+    "title_reset_suffix",
 ]
 
 
@@ -203,6 +233,22 @@ successful read followed by any outcome. ages-out: never. rehydrated: yes.
 producer off: frozen. (The poll rules in the plan do not name this case; a
 refused credential must still say *why* the row is not moving rather than sit
 on ``awaiting first reading`` forever.)"""
+
+NOTE_OUT_OF_CREDITS = "out of credits · Add credits"
+"""The plan is blocked on CREDITS, not on a spent window (roadmap 11).
+
+A ``crit`` note that stands in for ``capped <type>`` and, like it, sits beside
+the figures rather than replacing them: the week really is at whatever the bar
+says, and the reason the account cannot be used is a different one.
+
+set-by: :attr:`CodexAccountQuota.out_of_credits` on a capped 200 —
+``rate_limit_reached_type.type == "workspace_owner_credits_depleted"``, or
+``credits.has_credits false`` together with a model saying
+``credits_would_enable``. cleared-by: the next 200 that is not capped (adding
+credits, or the workspace's own reset). ages-out: never on its own; it is a
+property of the last reading, so an expired reading withholds it with the
+bars. rehydrated: yes, with the snapshot. producer off: frozen with the rest
+of the row."""
 
 KIND_INFO = "info"
 KIND_WARN = "warn"
@@ -312,6 +358,86 @@ def _to_str(value: Any) -> str:
     return value if isinstance(value, str) else ""
 
 
+def _to_number(value: Any) -> float | None:
+    """A count the body may send as a number **or** as a decimal string.
+
+    ``credits.balance`` arrives as ``null`` on the captured Business body and
+    as the string ``"0"`` on the probed Pro one, so a numbers-only reader would
+    silently drop a real figure. Only a plain decimal is accepted — no units,
+    no currency symbols, no exponent salad — because anything else is a shape
+    we have not seen and a guess about it would end up on a menu row.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        result = float(value)
+        return None if result != result else result
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            result = float(text)
+        except ValueError:
+            return None
+        return None if result != result or result in (float("inf"), float("-inf")) else result
+    return None
+
+
+def _parse_iso8601(text: str) -> float | None:
+    """``"2026-09-15T18:35:56.051122Z"`` -> epoch, or ``None``.
+
+    The ONE absolute instant this module accepts from a body (``available_at``;
+    every rate-limit reset is a duration we anchor ourselves). It is accepted
+    because there is no duration form of it and because it is rendered as a
+    DATE — ``back Sep 15`` — where a few seconds of server/client clock skew
+    cannot change the answer. A naive timestamp is read as UTC, which is what
+    the endpoint sends.
+    """
+    text = text.strip()
+    if not text:
+        return None
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        when = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=dt.timezone.utc)
+    try:
+        return when.timestamp()
+    except (OSError, OverflowError, ValueError):  # pragma: no cover - absurd year
+        return None
+
+
+def _model_availability(raw: Any) -> tuple[tuple[tuple[str, float], ...], bool]:
+    """``model_usage`` -> ``((slug, available_at epoch), …), credits_would_enable``.
+
+    Only models the body says are NOT available yet are listed: an
+    ``available_at`` beside ``available: true`` is a bygone instant, and
+    printing "back Sep 15" for a model that is already back is exactly the
+    kind of stale sentence SPEC 4.3 forbids. Sorted soonest first so the row
+    reads in the order the models return.
+    """
+    if not isinstance(raw, Mapping):
+        return (), False
+    entries: list[tuple[str, float]] = []
+    would_enable = False
+    for slug, info in raw.items():
+        if not isinstance(slug, str) or not slug or not isinstance(info, Mapping):
+            continue
+        if _to_bool(info.get("credits_would_enable"), False):
+            would_enable = True
+        if info.get("available") is True:
+            continue
+        when = _parse_iso8601(_to_str(info.get("available_at")))
+        if when is not None:
+            entries.append((slug, when))
+    entries.sort(key=lambda pair: (pair[1], pair[0]))
+    return tuple(entries), would_enable
+
+
 def _reached_type(value: Any) -> str | None:
     """``rate_limit_reached_type`` as a string, whichever shape it arrives in.
 
@@ -374,6 +500,150 @@ def _format_duration(seconds: float) -> str:
     if minutes:
         return f"{minutes}m"
     return "<1m"
+
+
+def pricing_tier_note(settings: Mapping[str, Any] | None = None) -> str:
+    """The Codex cost heading's tier suffix (roadmap 11).
+
+    ``"(standard tier)"`` when ``codex_pricing_tier`` is ``standard`` — which
+    is what ``pricing.py``'s OpenAI rows actually are — and ``"(fast tier
+    rates not loaded)"`` for any other tier.
+
+    The second is the whole point of the setting. A rollout does not say which
+    tier ran, and OpenAI's fast/batch multipliers are not in this repo; the
+    options were to invent a multiplier, to silently keep charging standard
+    rates under a heading that claims otherwise, or to say plainly that the
+    figure below is not this tier's. SPEC 4.3 picks the third. Nothing else in
+    the widget reads this setting: no dollar figure changes, because no rate
+    changed.
+    """
+    settings = settings if isinstance(settings, Mapping) else {}
+    choices = SETTINGS_CHOICES.get("codex_pricing_tier", ("standard",))
+    tier = settings.get("codex_pricing_tier", choices[0])
+    if not isinstance(tier, str) or tier not in choices:
+        tier = choices[0]
+    if tier == choices[0]:
+        return f"({tier} tier)"
+    return f"({tier} tier rates not loaded)"
+
+
+def _format_reset_date(epoch: float) -> str:
+    """``"Sep 15"`` — the date a model comes back, with no clock.
+
+    The clock is deliberately dropped: ``available_at`` is an instant computed
+    on the server, and the honest resolution of "when does Astra return" is the
+    day. Printing ``18:35`` would invite someone to wait for a minute we did
+    not measure.
+    """
+    try:
+        when = dt.datetime.fromtimestamp(epoch)
+    except (OSError, OverflowError, ValueError):  # pragma: no cover - absurd epoch
+        return ""
+    return f"{when:%b} {when.day}"
+
+
+def _format_count(value: float) -> str:
+    """``12`` / ``12.5`` — a count with no unit and no invented precision."""
+    if value == int(value):
+        return str(int(value))
+    return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+PACE_RING_SIZE = 12
+"""How many ``(fetched_at, weekly used_percent)`` samples the sidecar keeps
+per account. Twelve at the 5-minute default is an hour of history — long
+enough for a trend, short enough that the sidecar stays a cache."""
+
+PACE_MIN_SAMPLES = 3
+"""Two points are a line through noise: ``used_percent`` is reported as a
+whole number, so a single 1 % step between two reads five minutes apart
+"projects" the wall four hours out and then unprojects it on the next tick."""
+
+PACE_MIN_SPAN_SECONDS = 1_800.0
+"""And they must span half an hour. The honest rule from the roadmap: below
+this a forecast is an extrapolation of rounding."""
+
+
+def pace_note(
+    samples: Sequence[tuple[float, float]],
+    *,
+    now: float,
+    reset_at: float | None = None,
+    capped: bool = False,
+) -> str:
+    """``"at this pace: wall in 6h"`` / ``"at this pace: resets first"`` / ``""``.
+
+    Pure, and deliberately hard to make speak: it needs
+    :data:`PACE_MIN_SAMPLES` readings spanning :data:`PACE_MIN_SPAN_SECONDS`
+    with a strictly rising percentage, and it says nothing at all otherwise.
+    A forecast is the one figure on this row that is not a fact, so it earns
+    its place by being rare and by naming its assumption in its own wording —
+    *at this pace*.
+
+    Three silences worth stating:
+
+    * a **capped** row gets none: the wall is not a projection any more;
+    * a ring that spans a **reset** is trimmed to the samples after the drop,
+      because a week that went 98 % -> 3 % has no trend through the seam;
+    * a projection that lands at or beyond ``reset_at`` says ``resets first``
+      rather than a countdown, since the window refills before the wall is
+      reached and "wall in 5d" would be a number the plan makes impossible.
+
+    (The build contract worded that last case as ``wall before reset``; the
+    roadmap's own item 10 words it ``resets first``, which is the one that is
+    true in the branch it names. Flagged for the integrator.)
+    """
+    if capped:
+        return ""
+    trimmed = _rising_tail(samples)
+    if len(trimmed) < PACE_MIN_SAMPLES:
+        return ""
+    first_at, first_pct = trimmed[0]
+    last_at, last_pct = trimmed[-1]
+    span = last_at - first_at
+    if span < PACE_MIN_SPAN_SECONDS or last_pct <= first_pct or last_pct >= 100.0:
+        return ""
+    rate = (last_pct - first_pct) / span  # percent per second
+    if rate <= 0:  # pragma: no cover - guarded by the comparison above
+        return ""
+    wall_at = last_at + (100.0 - last_pct) / rate
+    if wall_at <= now:
+        # The projection has already expired: the newest sample is older than
+        # the wall it predicted, so the account either hit the wall (and the
+        # capped branch above will say so once the source re-reads) or the
+        # trend broke. `coarse_duration` floors at "<1m", so without this the
+        # row would advertise "at this pace: wall in <1m" for as long as the
+        # ring stayed stale - a countdown to a moment that is already behind us
+        # (SPEC 4.3: an age note, never a fabricated instant).
+        return ""
+    if reset_at is not None and reset_at <= wall_at:
+        return "at this pace: resets first"
+    return f"at this pace: wall in {coarse_duration(wall_at - now)}"
+
+
+def _rising_tail(samples: Sequence[tuple[float, float]]) -> list[tuple[float, float]]:
+    """The samples after the last percentage DROP, in time order.
+
+    A drop is a window reset (or a correction from the endpoint); everything
+    before it belongs to a window that no longer exists. Junk entries — a
+    non-numeric pair, a sample from the future of its successor — are dropped
+    rather than raising: this reads a hand-editable cache file.
+    """
+    clean: list[tuple[float, float]] = []
+    for pair in samples or ():
+        if not isinstance(pair, Sequence) or isinstance(pair, (str, bytes)) or len(pair) != 2:
+            continue
+        when = _to_float(pair[0])
+        pct = _to_pct(pair[1])
+        if when is None or pct is None:
+            continue
+        clean.append((when, pct))
+    clean.sort(key=lambda pair: pair[0])
+    start = 0
+    for index in range(1, len(clean)):
+        if clean[index][1] < clean[index - 1][1]:
+            start = index
+    return clean[start:]
 
 
 def _header(headers: Mapping[str, str] | None, name: str) -> str | None:
@@ -534,12 +804,19 @@ class CodexAccountQuota:
     missing row), same "render as an :class:`AccountRow`" discipline, same
     refusal to carry anything the menu will not honestly show.
 
-    Deliberately **not** carried: ``credits`` and ``spend_control`` (rendering
+    Deliberately **not** carried: ``spend_control`` (rendering
     ``individual_limit`` would imply a unit we have not verified — dollars?
     requests? — and a wrong unit next to a real number is worse than silence),
-    and ``model_usage`` (per-model token counts already come from the corpus,
-    priced by ``pricing.py``; a second, differently-defined source of the same
-    quantity is how two numbers for one thing get shipped).
+    and ``model_usage``'s per-model token counts (they already come from the
+    corpus, priced by ``pricing.py``; a second, differently-defined source of
+    the same quantity is how two numbers for one thing get shipped).
+
+    Two fields of ``model_usage`` and three of ``credits`` ARE carried
+    (roadmap 11/12), because each answers a question the bars cannot: *why* a
+    workspace is capped when its week is not spent, and *when* a model comes
+    back. They are counts and instants the endpoint stated, never a price and
+    never a unit we guessed — ``credits.balance`` renders as ``credits 12``
+    with no currency, and ``available_at`` as a date.
     """
 
     account_id: str
@@ -552,6 +829,22 @@ class CodexAccountQuota:
     allowed: bool = True
     reached_type: str | None = None
     fetched_at: float = 0.0
+    credits_balance: float | None = None
+    """``credits.balance`` as a number, or ``None`` when the endpoint sent
+    ``null`` (the captured Business body) or something unparseable. The unit is
+    deliberately unnamed on the row: the body calls them credits and so do we."""
+    credits_has: bool | None = None
+    """``credits.has_credits``. ``None`` = not reported, which is NOT False —
+    a missing flag must never turn a healthy cap into ``out of credits``."""
+    credits_would_enable: bool = False
+    """True when any ``model_usage`` entry says ``credits_would_enable``: buying
+    credits would lift this block. With ``credits_has is False`` it is the
+    second, corroborating route to the ``out of credits`` verdict."""
+    availability: tuple[tuple[str, float], ...] = ()
+    """``(model slug, available_at epoch)`` for every model the body says is
+    NOT available yet, soonest first. The slug is the vendor's own
+    (``gpt-6-astra``) — the same choice ``pricing.MODEL_DISPLAY_NAMES`` makes
+    for OpenAI models, and the name the user sees everywhere else in the menu."""
 
     # -- construction ------------------------------------------------------
 
@@ -656,6 +949,11 @@ class CodexAccountQuota:
         if reached_type is None and isinstance(rate_limit, Mapping):
             reached_type = _reached_type(rate_limit.get("rate_limit_reached_type"))
 
+        credits = body.get("credits")
+        credits = credits if isinstance(credits, Mapping) else {}
+        raw_has = credits.get("has_credits")
+        availability, would_enable = _model_availability(body.get("model_usage"))
+
         return cls(
             account_id=credential_account_id,
             email=_to_str(body.get("email")),
@@ -667,6 +965,10 @@ class CodexAccountQuota:
             allowed=allowed,
             reached_type=reached_type,
             fetched_at=observed_at,
+            credits_balance=_to_number(credits.get("balance")),
+            credits_has=raw_has if isinstance(raw_has, bool) else None,
+            credits_would_enable=would_enable,
+            availability=availability,
         )
 
     # -- persistence -------------------------------------------------------
@@ -685,6 +987,10 @@ class CodexAccountQuota:
             "allowed": self.allowed,
             "reached_type": self.reached_type,
             "fetched_at": self.fetched_at,
+            "credits_balance": self.credits_balance,
+            "credits_has": self.credits_has,
+            "credits_would_enable": self.credits_would_enable,
+            "availability": [[slug, when] for slug, when in self.availability],
         }
 
     @classmethod
@@ -712,6 +1018,21 @@ class CodexAccountQuota:
                 sample = WindowSample.from_json(pair[1])
                 if label and sample is not None:
                     scoped.append((label, sample))
+        availability: list[tuple[str, float]] = []
+        raw_availability = obj.get("availability")
+        if isinstance(raw_availability, Sequence) and not isinstance(
+            raw_availability, (str, bytes)
+        ):
+            for pair in raw_availability:
+                if not isinstance(pair, Sequence) or isinstance(pair, (str, bytes)):
+                    continue
+                if len(pair) != 2:
+                    continue
+                slug = _to_str(pair[0])
+                when = _to_float(pair[1])
+                if slug and when is not None:
+                    availability.append((slug, when))
+        raw_has = obj.get("credits_has")
         return cls(
             account_id=account_id,
             email=_to_str(obj.get("email")),
@@ -723,21 +1044,99 @@ class CodexAccountQuota:
             allowed=_to_bool(obj.get("allowed"), True),
             reached_type=_to_str(obj.get("reached_type")) or None,
             fetched_at=_to_float(obj.get("fetched_at")) or 0.0,
+            # A sidecar written before roadmap 11 simply has none of these keys,
+            # and reads back as "not reported" rather than as False/0 - the same
+            # forward/backward tolerance every other field here has.
+            credits_balance=_to_number(obj.get("credits_balance")),
+            credits_has=raw_has if isinstance(raw_has, bool) else None,
+            credits_would_enable=_to_bool(obj.get("credits_would_enable"), False),
+            availability=tuple(availability),
         )
 
     # -- rendering ---------------------------------------------------------
 
     @property
+    def out_of_credits(self) -> bool:
+        """True when the block is a CREDIT block, not a spent window.
+
+        Two routes, both from the captured Business body: the explicit
+        ``rate_limit_reached_type.type == "workspace_owner_credits_depleted"``,
+        and the corroborating pair ``credits.has_credits is False`` **with**
+        some model saying ``credits_would_enable``. The second needs both
+        halves: the probed Pro body also reports ``has_credits: false`` and is
+        not blocked by anything, so reading that flag alone would print "out of
+        credits" on a perfectly healthy plan.
+        """
+        if self.reached_type == "workspace_owner_credits_depleted":
+            return True
+        return self.credits_has is False and self.credits_would_enable
+
+    @property
     def capped_note(self) -> str:
-        """``"capped"`` / ``"capped <type>"`` when the PLAN is at its limit.
+        """``"capped"`` / ``"capped <type>"`` when the PLAN is at its limit,
+        or ``"out of credits · Add credits"`` when that limit is a credit one.
 
         Distinct from every transport note: this one sits *beside* the figures
         because they are still true — the account really is at 100 % of that
         window, and hiding the bar would hide the reason.
+
+        The credits wording is not decoration (roadmap 11): a bare ``capped
+        workspace_owner_credits_depleted`` reads as "wait for the reset", and
+        the reset is not the fix — the week resets in four days and the
+        workspace is still blocked until somebody adds credits. The action is
+        the sentence.
         """
         if self.allowed and not self.limit_reached:
             return ""
+        if self.out_of_credits:
+            return NOTE_OUT_OF_CREDITS
         return f"capped {self.reached_type}" if self.reached_type else "capped"
+
+    @property
+    def soonest_reset_at(self) -> float | None:
+        """The earliest reset instant this account reports, across every window.
+
+        ``None`` when no window reported one. Windows the endpoint did not
+        date simply do not compete; nothing is assumed about them.
+        """
+        candidates = [
+            sample.reset_at
+            for sample in (self.five_hour, self.seven_day, *(s for _n, s in self.scoped))
+            if sample is not None and sample.reset_at is not None
+        ]
+        return min(candidates) if candidates else None
+
+    def info_notes(self, *, now: float, pace_note: str = "") -> tuple[str, ...]:
+        """The dim lines under this row's header (roadmap 10/11/12).
+
+        Facts read at ``fetched_at``, in the order a person asks for them:
+        what is left (``credits 12``), when the blocked model returns
+        (``gpt-6-astra back Sep 15``), and where this is heading (``at this
+        pace: wall in 6h``, computed by the caller from the sample ring —
+        this object holds one reading and cannot know a trend).
+
+        A model whose ``available_at`` has PASSED is dropped here rather than
+        at mapping time: the snapshot may be hours old, and "back Sep 15"
+        printed on Sep 16 is the bygone-reset bug in a new place.
+        """
+        notes: list[str] = []
+        if self.credits_balance is not None and (
+            self.credits_balance > 0 or self.credits_has is True
+        ):
+            # A zero balance beside ``has_credits: false`` is the vendor saying
+            # "credits are not part of this plan" - the probed Pro body sends
+            # exactly that - and rendering it as ``credits 0`` would read as a
+            # resource at zero, i.e. as a problem, on an account with 81 % of
+            # its week left. When the zero IS the problem, `capped_note`
+            # already says ``out of credits``.
+            notes.append(f"credits {_format_count(self.credits_balance)}")
+        for slug, when in self.availability:
+            if when <= now:
+                continue
+            notes.append(f"{slug} back {_format_reset_date(when)}")
+        if pace_note:
+            notes.append(pace_note)
+        return tuple(notes)
 
     def account_row(
         self,
@@ -748,6 +1147,7 @@ class CodexAccountQuota:
         is_active: bool,
         note: str = "",
         note_kind: str = "",
+        pace_note: str = "",
     ) -> AccountRow:
         """Render as the menu row (SPEC-CODEX 6).
 
@@ -836,6 +1236,12 @@ class CodexAccountQuota:
             expired_windows=tuple(expired),
             attention_note=note,
             attention_kind=note_kind,
+            # Withheld with the bars, and for the same reason: a credit
+            # balance, a return date and a pace were all read at `fetched_at`,
+            # so a reading too old to show a percentage is too old to show
+            # these either (roadmap 10/11/12 under SPEC 4.3).
+            info_notes=() if withheld else self.info_notes(now=now, pace_note=pace_note),
+            soonest_reset_at=None if withheld else self.soonest_reset_at,
         )
 
     @property
@@ -1373,6 +1779,23 @@ class UsageTransport(Protocol):
         ...
 
 
+class RefreshTransport(Protocol):
+    """The *second*, optional half of the seam — one form POST (roadmap 13).
+
+    Deliberately a separate protocol rather than a method on
+    :class:`UsageTransport`: a quota reader needs only ``get``, and every
+    existing double in the suite is a legitimate transport that cannot post.
+    :class:`TokenRefresher` therefore probes for ``post_form`` with ``getattr``
+    and reports ``unsupported`` when it is absent, instead of raising an
+    ``AttributeError`` from inside a poll cycle.
+    """
+
+    def post_form(
+        self, url: str, data: Mapping[str, str], timeout: float
+    ) -> HttpResponse:  # pragma: no cover - protocol
+        ...
+
+
 class UrllibTransport:
     """Production transport: stdlib only, no redirects, bounded body.
 
@@ -1432,6 +1855,43 @@ class UrllibTransport:
             # Not an OSError subclass, but it means exactly what one means here.
             raise OSError(type(exc).__name__) from exc
 
+    def post_form(
+        self, url: str, data: Mapping[str, str], timeout: float
+    ) -> HttpResponse:
+        """One ``application/x-www-form-urlencoded`` POST — the refresh grant.
+
+        Same three rules as :meth:`get` and for the same reasons: no redirect
+        (a 3xx here would forward a *refresh* token, which is worse than
+        forwarding an access token), an HTTP status is a response and only an
+        unreachable endpoint raises, and the body is capped. The encoded body
+        holds the refresh token, so it is bound to a local, passed once and
+        dropped in ``finally`` — it is never put in a log line, an exception
+        message or a retry buffer.
+        """
+        payload = urllib.parse.urlencode(dict(data)).encode("ascii")
+        request = urllib.request.Request(url, data=payload, method="POST")
+        request.add_header("Content-Type", "application/x-www-form-urlencoded")
+        request.add_header("Accept", "application/json")
+        try:
+            with self._opener.open(request, timeout=timeout or self._connect_timeout) as resp:
+                return HttpResponse(
+                    status=int(getattr(resp, "status", 0) or 0),
+                    headers=dict(resp.headers.items()),
+                    body=resp.read(self._body_cap + 1)[: self._body_cap],
+                )
+        except urllib.error.HTTPError as exc:
+            # The error body is the whole point: ``invalid_grant`` there is the
+            # difference between "log in again" and "the network wobbled".
+            try:
+                body = exc.read(self._body_cap + 1)[: self._body_cap]
+            except Exception:  # pragma: no cover - body already consumed
+                body = b""
+            return HttpResponse(status=int(exc.code), headers=dict(exc.headers.items()), body=body)
+        except http.client.HTTPException as exc:
+            raise OSError(type(exc).__name__) from exc
+        finally:
+            del payload, request
+
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """Refuse every redirect; urllib then raises the 3xx as an ``HTTPError``."""
@@ -1461,6 +1921,223 @@ def _TwoPhaseHTTPSHandler(read_timeout: float) -> urllib.request.HTTPSHandler:  
             return self.do_open(_Connection, req, context=self._context)
 
     return _Handler()
+
+
+# ---------------------------------------------------------------------------
+# 4a. Token refresh — roadmap 13, DEFAULT OFF (SPEC-CODEX 6.4)
+# ---------------------------------------------------------------------------
+
+CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
+"""OpenAI's OAuth token endpoint. Only ever reached from
+:meth:`TokenRefresher.refresh`, which is only ever called when
+``codex_refresh_enabled`` is on."""
+
+CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+"""The Codex CLI's **public** OAuth client id — the same string that already
+sits in every ``auth.json`` this module reads. A public client id is not a
+secret (it identifies the app, it does not authorise anything), so unlike a
+token it may appear in source, in a log line and in this docstring."""
+
+REFRESH_PROACTIVE_SECONDS = 24 * 3600.0
+"""How far ahead of ``exp`` a healthy poll may rotate the token.
+
+24 h, not 48 h (the countdown threshold) and not 1 h: the countdown exists to
+tell a human to act, so a refresh that fired at the same moment would make the
+sentinel a liar; and an hour would leave no room for a machine that is asleep
+between the two polls. One day is roughly two hundred poll opportunities."""
+
+REFRESH_OK = "ok"
+REFRESH_RELOGIN = "relogin"
+REFRESH_FAILED = "failed"
+REFRESH_UNSUPPORTED = "unsupported"
+"""The four outcomes. ``relogin`` is reserved for ``invalid_grant`` — the one
+answer that means the family is gone and no retry can help; everything else
+(offline, 5xx, a body that is not JSON, an unwritable file) is ``failed``, and
+a failed refresh changes nothing: the old access token is still valid until
+``exp`` and the row keeps counting down to the manual relogin."""
+
+
+@dataclass(frozen=True, slots=True)
+class RefreshOutcome:
+    """What one grant attempt produced. ``credential`` is set only on ``ok``,
+    and it is re-read *from disk* — so holding one is proof the rotation was
+    persisted, not merely received."""
+
+    status: str
+    detail: str = ""
+    credential: Credential | None = None
+
+
+def refresh_due(credential: Credential, now: float) -> bool:
+    """Whether *credential* is inside the proactive window.
+
+    An unknown ``exp`` is **not** due: we would be guessing at a schedule, and
+    the 401 path already covers a token that turns out to be dead. An ``exp``
+    that has already passed IS due — a refresh token outlives the access token
+    it mints, so the last chance to avoid a browser login is exactly here.
+    """
+    if credential.exp is None:
+        return False
+    return (credential.exp - now) < REFRESH_PROACTIVE_SECONDS
+
+
+def _iso_utc(epoch: float) -> str:
+    """``2026-09-10T11:40:00Z`` — the shape ``codex login`` writes."""
+    return dt.datetime.fromtimestamp(epoch, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _read_auth_for_rotation(auth: Path) -> tuple[dict[str, Any] | None, str]:
+    """The whole ``auth.json`` as a dict, or ``(None, reason)``.
+
+    The whole file, because the rotation must write back every key the Codex
+    CLI put there (``OPENAI_API_KEY``, ``auth_mode``, anything a future version
+    adds) — a refresh that silently dropped a field would break the CLI for the
+    account it was trying to help. The same mode check as
+    :meth:`CredentialStore.read`: a credential another user can read is one to
+    rotate by hand, not one to rotate in place.
+    """
+    try:
+        st = auth.stat()
+    except OSError as exc:
+        return None, f"auth.json unreadable ({type(exc).__name__})"
+    if stat_module.S_IMODE(st.st_mode) & 0o077:
+        return None, f"auth.json is {stat_module.S_IMODE(st.st_mode):04o}, refusing to rotate it"
+    try:
+        raw = json.loads(auth.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError) as exc:
+        return None, f"auth.json unparseable ({type(exc).__name__})"
+    if not isinstance(raw, Mapping):
+        return None, "auth.json is not an object"
+    return dict(raw), ""
+
+
+class TokenRefresher:
+    """One OAuth refresh grant, persisted before it is used (roadmap 13).
+
+    The whole safety story is four rules, and each one is a test:
+
+    1. **Persist before use.** The rotated ``refresh_token`` /
+       ``access_token`` / ``id_token`` are written to the account's
+       ``auth.json`` (temp file + ``os.replace``, 0600) *before* this method
+       returns, and the :class:`Credential` it returns is then **re-read from
+       that file**. There is no code path in which a token that only exists in
+       memory authorises a request: a crash between the POST and the write
+       costs one grant, while the reverse order would cost the account.
+    2. **No replay, ever.** The superseded refresh token is overwritten in
+       place. No ``.prev`` file, no in-memory copy kept for a retry, no
+       "try the old one if the new one fails". If OpenAI's reuse detection is
+       armed on this client, the only way to trip it is to ask on purpose.
+    3. **``invalid_grant`` is terminal.** It means the family is gone; a retry
+       can only make it worse, so the outcome is ``relogin`` and the caller
+       shows the sentinel it would have shown anyway a day later.
+    4. **Nothing about a token is logged.** The refresh token goes from the
+       file into one form body and out of scope; log lines carry the alias, the
+       outcome and how much life the new token has — never a value, a length or
+       a prefix.
+
+    Constructed unconditionally by :class:`CodexAccountsSource` (it is three
+    references and no I/O) and called only while ``codex_refresh_enabled`` is
+    on. :attr:`posts` counts every POST it has made, which is how "off means
+    zero requests" is asserted rather than described.
+    """
+
+    def __init__(
+        self,
+        transport: Any,
+        credentials: CredentialStore,
+        *,
+        clock: Callable[[], float] = time.time,
+        log: Callable[[str], None] = _log,
+        url: str = CODEX_TOKEN_URL,
+        client_id: str = CODEX_OAUTH_CLIENT_ID,
+        timeout: float = _CONNECT_TIMEOUT,
+    ) -> None:
+        self._transport = transport
+        self._credentials = credentials
+        self._clock = clock
+        self._log = log
+        self._url = url
+        self._client_id = client_id
+        self._timeout = timeout
+        self.posts = 0
+        """POSTs attempted, including ones that raised. Never reset."""
+
+    def refresh(self, account_id: str, *, label: str = "") -> RefreshOutcome:
+        """Rotate one account's tokens. Never raises; returns the verdict."""
+        label = label or account_id[:8]
+        post = getattr(self._transport, "post_form", None)
+        if not callable(post):
+            return self._failed(label, "transport cannot post a form")
+
+        auth = Path(self._credentials.accounts_dir) / account_id / "auth.json"
+        raw, problem = _read_auth_for_rotation(auth)
+        if raw is None:
+            return self._failed(label, problem)
+        tokens = raw.get("tokens")
+        tokens = dict(tokens) if isinstance(tokens, Mapping) else {}
+        if not _to_str(tokens.get("refresh_token")):
+            return self._failed(label, "auth.json has no refresh token")
+
+        data = {
+            "grant_type": "refresh_token",
+            "refresh_token": _to_str(tokens.get("refresh_token")),
+            "client_id": self._client_id,
+        }
+        self.posts += 1
+        try:
+            response = post(self._url, data, self._timeout)
+        except OSError as exc:
+            # Type name only, exactly as the usage GET does: a URLError message
+            # can carry the host and, behind a proxy, the URL.
+            return self._failed(label, f"unreachable ({type(exc).__name__})")
+        finally:
+            del data
+
+        body = _decode_json(response.body)
+        if response.status != 200:
+            error = _to_str(body.get("error")) if isinstance(body, Mapping) else ""
+            if error == "invalid_grant":
+                self._log(f"codex {label}: refresh refused (invalid_grant) - relogin")
+                return RefreshOutcome(REFRESH_RELOGIN, "invalid_grant")
+            return self._failed(label, f"HTTP {response.status}" + (f" {error}" if error else ""))
+        if not isinstance(body, Mapping):
+            return self._failed(label, "grant body was not JSON")
+        if not _to_str(body.get("access_token")):
+            return self._failed(label, "grant carried no access_token")
+
+        tokens["access_token"] = _to_str(body.get("access_token"))
+        # A grant that rotates the refresh token replaces it; one that does not
+        # leaves the existing one in place. Never blank it: an empty
+        # refresh_token would turn the next proactive tick into a hard relogin.
+        if _to_str(body.get("refresh_token")):
+            tokens["refresh_token"] = _to_str(body.get("refresh_token"))
+        if _to_str(body.get("id_token")):
+            tokens["id_token"] = _to_str(body.get("id_token"))
+        payload = dict(raw)
+        payload["tokens"] = tokens
+        payload["last_refresh"] = _iso_utc(self._clock())
+        written = _atomic_write_json(auth, payload)
+        del payload, tokens, raw, body, response
+        if not written:
+            # The old refresh token is already spent and the new one could not
+            # be stored. Say so loudly: this is the one failure a person must
+            # fix by hand (a full disk, a read-only home), and pretending the
+            # refresh worked would use a token no restart could ever find.
+            return self._failed(label, "rotated tokens could not be persisted")
+
+        credential = self._credentials.read(account_id)
+        if credential is None:
+            return self._failed(
+                label, self._credentials.last_error or "auth.json unreadable after rotation"
+            )
+        remaining = credential.relogin_seconds(self._clock())
+        life = _format_duration(remaining) if remaining is not None else "unknown"
+        self._log(f"codex {label}: token refreshed, {life} of life")
+        return RefreshOutcome(REFRESH_OK, "", credential)
+
+    def _failed(self, label: str, detail: str) -> RefreshOutcome:
+        self._log(f"codex {label}: refresh failed ({detail})")
+        return RefreshOutcome(REFRESH_FAILED, detail)
 
 
 # ---------------------------------------------------------------------------
@@ -1542,6 +2219,7 @@ class CodexAccountsSource:
         monotonic: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], Any] | None = None,
         log: Callable[[str], None] = _log,
+        refresher: TokenRefresher | None = None,
     ) -> None:
         self._registry = registry
         self._credentials = credentials
@@ -1552,6 +2230,13 @@ class CodexAccountsSource:
         self._monotonic = monotonic
         self._sleeper = sleeper
         self._log = log
+        self._refresher = refresher or TokenRefresher(
+            transport, credentials, clock=clock, log=log
+        )
+        """Built unconditionally (three references, no I/O) and called only
+        while ``codex_refresh_enabled`` is on — see :meth:`_refresh_enabled`.
+        Constructing it here rather than on demand is what lets a test inject
+        one and count its POSTs, including the count that must stay zero."""
 
         self._lock = threading.RLock()
         self._stop = threading.Event()
@@ -1559,6 +2244,12 @@ class CodexAccountsSource:
         self._paused = False
         self._loaded = False
         self._snapshots: dict[str, CodexAccountQuota] = {}
+        self._samples: dict[str, list[tuple[float, float]]] = {}
+        """Per-account ring of ``(fetched_at, weekly used_percent)``, oldest
+        first, at most :data:`PACE_RING_SIZE` long (roadmap 10). Recorded on
+        every healthy 200 whatever ``codex_pace_forecast_enabled`` says — the
+        setting gates the NOTE, not the memory, so switching the forecast on
+        does not start an hour of silence."""
         self._states: dict[str, FetchState] = {}
         self._last_wall: float | None = None
         self._last_monotonic: float | None = None
@@ -1638,6 +2329,7 @@ class CodexAccountsSource:
                             is_active=is_active,
                             note=note,
                             note_kind=kind,
+                            pace_note=self._pace_note_locked(entry.account_id, snapshot, now),
                         )
                     )
             return tuple(rows)
@@ -1906,48 +2598,50 @@ class CodexAccountsSource:
 
     # -- one account -------------------------------------------------------
 
-    def _poll_account(self, entry: RegistryEntry, *, interval: float, include_extra: bool) -> None:
-        """Read one account: credential checks, one request, one verdict.
+    def _refresh_enabled(self) -> bool:
+        """``codex_refresh_enabled`` (roadmap 13), default False.
 
-        Order matters. The credential is read and its ``exp`` checked
-        **before** the transport is touched, so an expired token costs zero
-        requests — the endpoint would only answer 401 and we already know it.
+        Read on every poll rather than cached, for the same reason the live
+        switch is: turning it off in Settings must stop the next request, not
+        the next restart. While it answers False :class:`TokenRefresher` is
+        never called and no token request of any kind is made.
         """
-        account_id = entry.account_id
-        label = entry.alias or account_id[:8]
-        now = self._clock()
-        with self._lock:
-            state = self._states.setdefault(account_id, FetchState())
-            state.credential_sig = self._credential_sig(account_id)
+        try:
+            return bool(self._settings().get("codex_refresh_enabled", False))
+        except Exception as exc:  # a settings read must never break a poll
+            self.last_error = _describe(exc)
+            return False
 
-        credential = self._credentials.read(account_id)
-        if credential is None:
-            self._finish(
-                state,
-                account_id,
-                note=NOTE_NO_CREDENTIAL,
-                kind=KIND_WARN,
-                next_due=now + interval,
-            )
-            return
+    def _try_refresh(
+        self, state: FetchState, account_id: str, label: str, *, reason: str
+    ) -> RefreshOutcome:
+        """One grant attempt, plus the bookkeeping a rotation implies.
 
-        if credential.expired(now):
-            # No request: an expired token has exactly one outcome and making
-            # the call would only teach the endpoint our polling schedule.
-            self._finish(
-                state,
-                account_id,
-                note=NOTE_RELOGIN,
-                kind=KIND_WARN,
-                next_due=now + interval,
-            )
-            return
+        A successful rotation rewrites ``auth.json``, which moves the
+        ``(mtime_ns, size)`` signature the cycle uses to spot a fresh ``codex
+        login``. Without re-stamping it here, our own write would look like a
+        human logging in again and would clear a standing sentinel and cancel
+        its backoff on the very next cycle.
+        """
+        outcome = self._refresher.refresh(account_id, label=label)
+        if outcome.status == REFRESH_OK:
+            with self._lock:
+                state.credential_sig = self._credential_sig(account_id)
+        elif outcome.status != REFRESH_RELOGIN:
+            self._note(f"{label}: {reason} refresh failed ({outcome.detail})")
+        return outcome
 
-        remaining = credential.relogin_seconds(now)
-        countdown = ""
-        if remaining is not None and remaining <= CODEX_RELOGIN_WARN_SECONDS:
-            countdown = f"{NOTE_RELOGIN} in {_format_duration(remaining)}"
-
+    def _usage_request(
+        self,
+        credential: Credential,
+        *,
+        state: FetchState,
+        account_id: str,
+        label: str,
+        now: float,
+    ) -> HttpResponse | None:
+        """One authorised GET. ``None`` means the endpoint was unreachable and
+        the offline verdict has already been committed."""
         headers = {
             "Authorization": f"Bearer {credential.access_token}",
             "ChatGPT-Account-Id": account_id,
@@ -1970,13 +2664,106 @@ class CodexAccountsSource:
                 now=now,
                 status=None,
             )
-            return
+            return None
         finally:
             del headers, credential  # the token's lifetime ends here
         elapsed_ms = int(max(0.0, (self._monotonic() - started)) * 1000)
         self._log(f"codex {label}: {response.status} in {elapsed_ms} ms")
         with self._lock:
             self._requests += 1
+        return response
+
+    def _poll_account(self, entry: RegistryEntry, *, interval: float, include_extra: bool) -> None:
+        """Read one account: credential checks, one request, one verdict.
+
+        Order matters. The credential is read and its ``exp`` checked
+        **before** the transport is touched, so an expired token costs zero
+        requests — the endpoint would only answer 401 and we already know it.
+
+        With ``codex_refresh_enabled`` on (roadmap 13) two rotation points sit
+        inside that order and nowhere else: **proactive**, before the expiry
+        check, when the token is inside :data:`REFRESH_PROACTIVE_SECONDS` of
+        ``exp``; and **reactive exactly once**, when the endpoint answers 401.
+        A 403 never refreshes — it is an answer about permissions, and the
+        token in hand is the one it refused. ``attempted_refresh`` is one flag
+        for both points, so a poll can never make two grant requests.
+        """
+        account_id = entry.account_id
+        label = entry.alias or account_id[:8]
+        now = self._clock()
+        with self._lock:
+            state = self._states.setdefault(account_id, FetchState())
+            state.credential_sig = self._credential_sig(account_id)
+
+        credential = self._credentials.read(account_id)
+        if credential is None:
+            self._finish(
+                state,
+                account_id,
+                note=NOTE_NO_CREDENTIAL,
+                kind=KIND_WARN,
+                next_due=now + interval,
+            )
+            return
+
+        attempted_refresh = False
+        if self._refresh_enabled() and refresh_due(credential, now):
+            attempted_refresh = True
+            outcome = self._try_refresh(state, account_id, label, reason="proactive")
+            if outcome.status == REFRESH_RELOGIN:
+                self._finish(
+                    state, account_id, note=NOTE_RELOGIN, kind=KIND_WARN,
+                    next_due=now + interval,
+                )
+                return
+            if outcome.status == REFRESH_OK and outcome.credential is not None:
+                credential = outcome.credential
+
+        if credential.expired(now):
+            # No request: an expired token has exactly one outcome and making
+            # the call would only teach the endpoint our polling schedule.
+            self._finish(
+                state,
+                account_id,
+                note=NOTE_RELOGIN,
+                kind=KIND_WARN,
+                next_due=now + interval,
+            )
+            return
+
+        remaining = credential.relogin_seconds(now)
+        countdown = ""
+        if remaining is not None and remaining <= CODEX_RELOGIN_WARN_SECONDS:
+            countdown = f"{NOTE_RELOGIN} in {_format_duration(remaining)}"
+
+        response = self._usage_request(
+            credential, state=state, account_id=account_id, label=label, now=now
+        )
+        if response is None:
+            return
+
+        if response.status == 401 and self._refresh_enabled() and not attempted_refresh:
+            outcome = self._try_refresh(state, account_id, label, reason="401")
+            if outcome.status == REFRESH_RELOGIN:
+                with self._lock:
+                    state.consecutive_failures = 0
+                self._finish(
+                    state, account_id, note=NOTE_RELOGIN, kind=KIND_WARN,
+                    next_due=now + _UNAUTHORIZED_BACKOFF_SECONDS, status=401,
+                )
+                return
+            if outcome.status == REFRESH_OK and outcome.credential is not None:
+                credential = outcome.credential
+                remaining = credential.relogin_seconds(now)
+                countdown = ""
+                if remaining is not None and remaining <= CODEX_RELOGIN_WARN_SECONDS:
+                    countdown = f"{NOTE_RELOGIN} in {_format_duration(remaining)}"
+                response = self._usage_request(
+                    credential, state=state, account_id=account_id, label=label, now=now
+                )
+                if response is None:
+                    return
+        del credential  # the token's lifetime ends here
 
         self._handle_response(
             response,
@@ -2041,6 +2828,7 @@ class CodexAccountsSource:
                 return
             with self._lock:
                 self._snapshots[account_id] = quota
+                self._record_sample(account_id, quota)
                 state.consecutive_failures = 0
             note, kind = (quota.capped_note, KIND_CRIT) if quota.capped_note else (countdown, KIND_INFO)
             self._finish(
@@ -2188,6 +2976,13 @@ class CodexAccountsSource:
             quota = CodexAccountQuota.from_json(record.get("quota"))
             if quota is not None:
                 self._snapshots[account_id] = quota
+            # The ring survives a restart on purpose: a forecast that had to
+            # rebuild an hour of history after every launch would never speak
+            # on a laptop. `_rising_tail` is what keeps it honest across the
+            # gap - a window that reset while we were closed shows as a drop.
+            ring = _rising_tail(record.get("samples") or ())
+            if ring:
+                self._samples[account_id] = ring[-PACE_RING_SIZE:]
             note = _to_str(record.get("note"))
             kind = _to_str(record.get("note_kind"))
             if note:
@@ -2199,16 +2994,56 @@ class CodexAccountsSource:
         with self._lock:
             accounts: dict[str, Any] = {}
             known = {entry.account_id for entry in self._registry.entries()}
-            for account_id in (set(self._snapshots) | set(self._states)) & known:
+            for account_id in (
+                set(self._snapshots) | set(self._states) | set(self._samples)
+            ) & known:
                 quota = self._snapshots.get(account_id)
                 state = self._states.get(account_id)
                 accounts[account_id] = {
                     "quota": quota.to_json() if quota is not None else None,
                     "note": state.note if state else "",
                     "note_kind": state.note_kind if state else "",
+                    # The pace ring (roadmap 10). Percentages and instants
+                    # only - the same class of content the snapshot already
+                    # holds, so the sidecar's privacy story is unchanged.
+                    "samples": [[when, pct] for when, pct in self._samples.get(account_id, ())],
                 }
             payload = {"version": _SNAPSHOT_VERSION, "accounts": accounts}
         return _atomic_write_json(self._snapshots_path, payload)
+
+    def _record_sample(self, account_id: str, quota: CodexAccountQuota) -> None:
+        """Append this reading's weekly percentage to the account's ring.
+
+        Caller holds the lock. A reading with no weekly window (Pro before the
+        week starts reporting, a sentinel path) records nothing — a ring with
+        holes in it would forecast across a gap it cannot see. A repeat of the
+        same instant replaces rather than appends, so a forced refresh cannot
+        stack duplicates and shrink the ring's span to zero.
+        """
+        sample = quota.seven_day
+        if sample is None or sample.used_percent is None or not quota.fetched_at:
+            return
+        ring = self._samples.setdefault(account_id, [])
+        if ring and ring[-1][0] == quota.fetched_at:
+            ring[-1] = (quota.fetched_at, float(sample.used_percent))
+        else:
+            ring.append((quota.fetched_at, float(sample.used_percent)))
+        del ring[:-PACE_RING_SIZE]
+
+    def _pace_note_locked(self, account_id: str, quota: CodexAccountQuota, now: float) -> str:
+        """The forecast note for one account, or ``""``. Caller holds the lock."""
+        try:
+            if not bool(self._settings().get("codex_pace_forecast_enabled", True)):
+                return ""
+        except Exception as exc:  # pragma: no cover - a settings probe must not break a repaint
+            self.last_error = _describe(exc)
+            return ""
+        return pace_note(
+            self._samples.get(account_id, ()),
+            now=now,
+            reset_at=quota.seven_day.reset_at if quota.seven_day else None,
+            capped=bool(quota.capped_note),
+        )
 
     def _note(self, line: str) -> None:
         """Record a diagnostics line, newest last, bounded at 8."""
@@ -2249,7 +3084,304 @@ _USAGE = """usage: python -m cc_usage_widget.codex_accounts <command>
   probe <who>    one usage request for an alias or id; prints the plan and the
                  raw window widths so a new plan shape can be read before any
                  mapping code trusts it.
+  best [--json]  print the CODEX_HOME of the enabled account with the most
+                 weekly headroom (soonest reset when all are capped), read
+                 from the widget's own sidecar. No network request. Exit 2
+                 with a one-line reason when nothing is usable.
+  link [--unlink]
+                 give each account home your ~/.codex configuration: the names
+                 Codex WRITES to (config.toml, memories) are COPIED once, the
+                 read-mostly ones (AGENTS.md, skills, plugins, agents, rules)
+                 are symlinked. Idempotent; never overwrites a real file; never
+                 writes to ~/.codex - which is why the writable names are not
+                 symlinks. --unlink removes only the links it made; the copies
+                 are that home's own files and stay.
+  probe-refresh <who>
+                 ONE OAuth refresh grant on that account, persisted to its
+                 auth.json before use, then one usage request to prove the new
+                 access token works. Prints plan/email/expiry before and
+                 after; never a token. This is the SPEC-CODEX 6.4 probe that
+                 must run clean (and soak 24 h) before codex_refresh_enabled
+                 is worth turning on - it works whether or not it is on.
 """
+
+COPY_TARGETS: tuple[str, ...] = (
+    "config.toml",
+    "memories",
+)
+"""What ``link`` COPIES from ``~/.codex`` into each per-account home.
+
+These are the names Codex itself writes to: ``codex config set`` rewrites
+``config.toml``, and the memory tooling appends under ``memories/``. A symlink
+would make those writes land in ``~/.codex`` through the link, which is the one
+thing this program promises never to do (SPEC-CODEX 6.3: the widget reads
+``~/.codex`` and writes nothing into it) — and the promise would be broken by a
+process the widget does not even run, which is worse than breaking it directly
+because nothing here would ever log it.
+
+Copied ONCE, and only when the name is absent from the home: a copy the user
+has since edited is that home's configuration now, and re-copying over it on
+the next ``link`` would silently discard the per-account settings the copy
+exists to make possible."""
+
+LINK_TARGETS: tuple[str, ...] = (
+    "AGENTS.md",
+    "skills",
+    "plugins",
+    "agents",
+    "rules",
+)
+"""What ``link`` SYMLINKS from ``~/.codex`` into each per-account home.
+
+The per-account homes exist to hold ONE file — ``auth.json`` — so a session
+started with ``CODEX_HOME=<home>`` sees none of the user's configuration. These
+names are the read-mostly half of that configuration: you edit them in
+``~/.codex`` and every account sees the edit, which is the reason to link
+rather than copy. Each is linked only when it exists upstream, so a machine
+without ``skills/`` gets four links and no error. Deliberately NOT here:
+``auth.json`` (the whole point is that each home has its own),
+``sessions``/``history.jsonl``/``log`` (Codex writes those, and a symlink would
+braid four accounts' history into one file), and :data:`COPY_TARGETS`."""
+
+
+def _cmd_best(
+    accounts_dir: Path,
+    registry: Registry,
+    credentials: CredentialStore,
+    snapshots_path: Path,
+    settings: Mapping[str, Any],
+    *,
+    as_json: bool,
+    write: Callable[[str], Any],
+    now: float,
+) -> int:
+    """Print the ``CODEX_HOME`` to run the next Codex session in (roadmap 5).
+
+    Reads the registry and the widget's sidecar: no request, no credential
+    parse, no write. (One more read comes with reusing the source: the same
+    ``stat`` + ``tokens.account_id`` peek at ``~/.codex/auth.json`` the menu
+    makes to mark the active login. Read-only, as everywhere else.) The
+    ranking is the one a person makes by
+    eye from the menu — **lowest weekly percentage among the accounts that
+    still have room**, and when none has room, the one whose window reopens
+    first — so the CLI and the menu can never disagree about which account is
+    the good one.
+
+    Rows come from :meth:`CodexAccountsSource.quota_rows`, the same call the
+    worker makes, which is why a stale reading is not silently treated as
+    fresh: a row past ``CODEX_FETCH_EXPIRE_SECONDS`` has withheld its figures
+    upstream and lands here as "no reading", and a row carrying a ``warn``
+    sentinel (dead credential, no access, offline) is not a place to send a
+    session at all.
+
+    Exit 2, never 1, when there is nothing to print: the shell function in the
+    README propagates it, so ``codexb`` fails loudly instead of launching Codex
+    against ``CODEX_HOME=`` (which would silently use ``~/.codex``).
+    """
+
+    def refuse(reason: str) -> int:
+        if as_json:
+            write(json.dumps({"home": None, "reason": reason}) + "\n")
+        else:
+            write(reason + "\n")
+        return 2
+
+    if not bool(settings.get("codex_live_quota_enabled", False)):
+        return refuse(
+            "codex live quota is off (codex_live_quota_enabled); no account has been read"
+        )
+    if not registry.exists():
+        return refuse(f"no account registry at {registry.path}")
+    entries = registry.enabled_entries()
+    if not entries:
+        return refuse(f"no enabled accounts in {registry.path}")
+
+    source = CodexAccountsSource(
+        registry=registry,
+        credentials=credentials,
+        transport=_OfflineTransport(),
+        snapshots_path=snapshots_path,
+        settings=lambda: settings,
+        clock=lambda: now,
+    )
+    rows = source.quota_rows()
+    if len(rows) != len(entries):  # pragma: no cover - the contract of quota_rows
+        return refuse("registry changed while reading; try again")
+
+    candidates: list[tuple[RegistryEntry, AccountRow, Path]] = []
+    for entry, row in zip(entries, rows):
+        home = accounts_dir / entry.account_id
+        if not home.is_dir():
+            continue  # a registered account with no credential dir is not a home
+        if row.attention_kind == KIND_WARN:
+            continue  # relogin / no access / offline: not somewhere to send work
+        candidates.append((entry, row, home))
+    if not candidates:
+        return refuse("no usable account: every enabled one is missing a home or needs attention")
+
+    def emit(entry: RegistryEntry, row: AccountRow, home: Path, reason: str) -> int:
+        if as_json:
+            write(
+                json.dumps(
+                    {
+                        "home": str(home),
+                        "account_id": entry.account_id,
+                        "alias": entry.alias,
+                        "weekly_used_percent": row.seven_day_pct,
+                        "reset_at": row.soonest_reset_at,
+                        "usage_age_seconds": row.usage_age_seconds,
+                        "reason": reason,
+                    }
+                )
+                + "\n"
+            )
+        else:
+            write(f"{home}\n")
+        return 0
+
+    with_room = [
+        item
+        for item in candidates
+        if item[1].seven_day_pct is not None
+        and item[1].seven_day_pct < 100.0
+        and item[1].attention_kind != KIND_CRIT
+    ]
+    if with_room:
+        entry, row, home = min(
+            with_room, key=lambda item: (item[1].seven_day_pct, item[0].order, item[0].account_id)
+        )
+        return emit(entry, row, home, "lowest weekly usage with headroom")
+
+    resets = [item for item in candidates if item[1].soonest_reset_at is not None]
+    if resets:
+        entry, row, home = min(resets, key=lambda item: (item[1].soonest_reset_at, item[0].order))
+        return emit(entry, row, home, "all capped; soonest reset")
+
+    return refuse("no usable reading for any enabled account; is the widget running?")
+
+
+class _OfflineTransport:
+    """The transport ``best`` is built with: it refuses to be used.
+
+    ``best`` reuses the whole source so its ranking cannot drift from the
+    menu's, and a source needs a transport. Injecting one that raises is how
+    "this command makes no network request" is enforced by construction rather
+    than by reading the code — nothing here calls ``start()``, and if a future
+    edit did, the first cycle would fail loudly instead of quietly reaching the
+    endpoint from a CLI the user ran for a local answer.
+    """
+
+    def get(self, url: str, headers: Mapping[str, str], timeout: float) -> HttpResponse:
+        raise OSError("codex_accounts best makes no network request")
+
+    def post_form(self, url: str, data: Mapping[str, str], timeout: float) -> HttpResponse:
+        raise OSError("codex_accounts best makes no network request")
+
+
+def _cmd_link(
+    accounts_dir: Path,
+    registry: Registry,
+    codex_home: Path,
+    *,
+    unlink: bool,
+    write: Callable[[str], Any],
+) -> int:
+    """Mirror ``~/.codex``'s configuration into each account home (roadmap 5).
+
+    Four rules, and the whole safety story is in them:
+
+    1. **Never overwrite.** A name that already exists in the home — real file,
+       real directory, or somebody else's symlink — is left exactly as it is
+       and counted as ``kept``. This command can therefore be run any number of
+       times, and cannot lose a file a user put there on purpose.
+    2. **Never write to ``~/.codex``.** Every path created is inside
+       ``accounts_dir``; the upstream tree is only read. (The widget's one hard
+       promise about ``~/.codex`` — SPEC-CODEX 6.3.)
+    3. **What Codex writes to is copied, not linked** (:data:`COPY_TARGETS`).
+       A symlink at ``config.toml`` means the next ``codex config set`` in that
+       home rewrites ``~/.codex/config.toml`` through the link: rule 2 broken by
+       a process this program does not run and cannot log. A home whose
+       ``config.toml`` is already such a symlink — made by an earlier version of
+       this command — is CONVERTED: the link is replaced by a copy of the file
+       it pointed at, which changes no content and closes the hole on a machine
+       that is already linked.
+    4. **``--unlink`` removes only symlinks it made**: one whose target is the
+       matching name under ``~/.codex``. A real file of the same name — every
+       copy rule 3 made, and anything the user put there — or a link pointing
+       somewhere else, is left alone. Un-linking is not un-configuring.
+    """
+    entries = registry.entries()
+    if not entries:
+        write(f"no accounts in {registry.path}\n")
+        return 1
+    touched = 0
+    for entry in entries:
+        home = accounts_dir / entry.account_id
+        if not home.is_dir():
+            write(f"{entry.alias or entry.account_id[:8]}: no home at {home}\n")
+            continue
+        made: list[str] = []
+        copied: list[str] = []
+        kept: list[str] = []
+        missing: list[str] = []
+        for name in COPY_TARGETS + LINK_TARGETS:
+            target = codex_home / name
+            link = home / name
+            is_copy = name in COPY_TARGETS
+            try:
+                if unlink:
+                    if link.is_symlink() and os.readlink(link) == str(target):
+                        link.unlink()
+                        made.append(name)
+                    elif link.exists() or link.is_symlink():
+                        kept.append(name)
+                    continue
+                if is_copy and link.is_symlink() and os.readlink(link) == str(target):
+                    # Rule 3's migration: our own write-through link, replaced
+                    # by a copy of exactly what it pointed at.
+                    link.unlink()
+                elif link.exists() or link.is_symlink():
+                    kept.append(name)
+                    continue
+                if not target.exists():
+                    missing.append(name)
+                    continue
+                if is_copy:
+                    _copy_into_home(target, link)
+                    copied.append(name)
+                    continue
+                os.symlink(target, link)
+                made.append(name)
+            except OSError as exc:
+                write(f"{entry.alias or entry.account_id[:8]}: {name}: {type(exc).__name__}\n")
+                return 1
+        touched += len(made) + len(copied)
+        verb = "unlinked" if unlink else "linked"
+        parts = [f"{verb} {len(made)}"]
+        if copied:
+            parts.append(f"copied {len(copied)}")
+        if kept:
+            parts.append(f"kept {len(kept)}")
+        if missing:
+            parts.append(f"absent upstream {len(missing)}")
+        write(f"{entry.alias or entry.account_id[:8]}: {', '.join(parts)}\n")
+    write(f"{'unlinked' if unlink else 'linked/copied'} {touched} path(s) under {accounts_dir}\n")
+    return 0
+
+
+def _copy_into_home(target: Path, destination: Path) -> None:
+    """Copy one ``~/.codex`` name into an account home. File or directory.
+
+    The destination is always a REAL file or directory, never a link: a copy
+    that turned out to be a symlink would put the writes straight back where
+    they must not go. Links found *inside* a copied tree are copied as links
+    (``symlinks=True``) — that is the tree the user has, and rewriting it into
+    a deep copy would be this command inventing a layout.
+    """
+    if target.is_dir():
+        shutil.copytree(target, destination, symlinks=True)
+    else:
+        shutil.copy2(target, destination)
 
 
 def main(
@@ -2259,9 +3391,13 @@ def main(
     registry_path: os.PathLike[str] | str | None = None,
     auth_path: os.PathLike[str] | str | None = None,
     transport: UsageTransport | None = None,
+    snapshots_path: os.PathLike[str] | str | None = None,
+    settings_path: os.PathLike[str] | str | None = None,
+    clock: Callable[[], float] = time.time,
     out: Any = None,
 ) -> int:
-    """``adopt | list | probe`` — onboarding, in its own process.
+    """``adopt | list | probe | best | link`` — onboarding and launching, in
+    its own process.
 
     Its own entry point rather than a flag on the widget so it never contends
     with the single-instance flock: onboarding happens while the widget runs.
@@ -2285,13 +3421,53 @@ def main(
         return _cmd_adopt(store_dir, registry, write)
     if command == "list":
         return _cmd_list(registry, credentials, write)
+    if command == "best":
+        return _cmd_best(
+            store_dir,
+            registry,
+            credentials,
+            Path(snapshots_path) if snapshots_path is not None else CODEX_QUOTA_SNAPSHOTS_PATH,
+            _read_settings(
+                Path(settings_path) if settings_path is not None else SETTINGS_PATH
+            ),
+            as_json="--json" in args[1:],
+            write=write,
+            now=clock(),
+        )
+    if command == "link":
+        return _cmd_link(
+            store_dir,
+            registry,
+            credentials.auth_path.parent,
+            unlink="--unlink" in args[1:],
+            write=write,
+        )
     if command == "probe":
         if len(args) < 2:
             write("probe needs an alias or account id\n")
             return 2
         return _cmd_probe(args[1], registry, credentials, transport, write)
+    if command == "probe-refresh":
+        if len(args) < 2:
+            write("probe-refresh needs an alias or account id\n")
+            return 2
+        return _cmd_probe_refresh(args[1], registry, credentials, transport, write, clock=clock)
     write(_USAGE)
     return 2
+
+
+def _read_settings(path: Path) -> dict[str, Any]:
+    """``settings.json`` as the widget reads it, or the defaults.
+
+    Through :func:`normalize_settings` rather than raw, so the CLI and the
+    running widget agree about a hand-edited or half-written file: a junk value
+    is the default in both, not a crash in one of them.
+    """
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return dict(SETTINGS_DEFAULTS)
+    return normalize_settings(raw if isinstance(raw, Mapping) else None)
 
 
 def _cmd_adopt(accounts_dir: Path, registry: Registry, write: Callable[[str], Any]) -> int:
@@ -2461,6 +3637,111 @@ def _cmd_probe(
             ]
             write(f"extra {entry.get('limit_name')!r}: widths={widths}\n")
     write(f"allowed={rate_limit.get('allowed')!r} limit_reached={rate_limit.get('limit_reached')!r}\n")
+    return 0
+
+
+def _identity_line(label: str, credential: Credential, now: float) -> str:
+    """``gmail: plan pro, who@example.test, expires 2026-09-19 08:46 (in 9d)``.
+
+    Everything a person needs to see that a rotation happened, and nothing that
+    could be replayed: the plan and email come from the token's own claims, and
+    the expiry is a date. No token, no length, no prefix, no ``last_refresh``
+    string (which would say when — not what)."""
+    if credential.exp is None:
+        life = "expiry unknown"
+    else:
+        remaining = credential.relogin_seconds(now)
+        when = dt.datetime.fromtimestamp(credential.exp).strftime("%Y-%m-%d %H:%M")
+        life = f"expires {when}" + (f" (in {_format_duration(remaining)})" if remaining else " (passed)")
+    return (
+        f"{label}: plan {credential.plan_type or 'unknown'}, "
+        f"{credential.email or 'no email in claims'}, {life}"
+    )
+
+
+def _cmd_probe_refresh(
+    who: str,
+    registry: Registry,
+    credentials: CredentialStore,
+    transport: UsageTransport | None,
+    write: Callable[[str], Any],
+    *,
+    clock: Callable[[], float] = time.time,
+) -> int:
+    """The SPEC-CODEX 6.4 probe: one grant, then one GET that proves it.
+
+    Deliberately **not** gated on ``codex_refresh_enabled``: this command is
+    what produces the evidence that opens that switch, so requiring the switch
+    would be circular. It is also deliberately one-shot — no loop, no second
+    account, no retry — because the question it answers ("does rotating this
+    login break the others?") is answered by looking at the *other* stores 24 h
+    later, and every extra grant muddies that reading.
+
+    Exit 0 only when the rotation persisted **and** the new access token was
+    accepted by the usage endpoint. Anything else is 1 with one line saying
+    which half failed.
+    """
+    match = None
+    for entry in registry.entries():
+        if who in (entry.account_id, entry.alias) or entry.account_id.startswith(who):
+            match = entry
+            break
+    if match is None:
+        write(f"no registry entry matching {who!r}\n")
+        return 1
+    label = match.alias or match.account_id[:8]
+
+    before = credentials.read(match.account_id)
+    if before is None:
+        write(f"{credentials.last_error or 'credential unreadable'}\n")
+        return 1
+    now = clock()
+    write("before  " + _identity_line(label, before, now) + "\n")
+    del before
+
+    client = transport or UrllibTransport()
+    refresher = TokenRefresher(client, credentials, clock=clock, log=lambda line: None)
+    outcome = refresher.refresh(match.account_id, label=label)
+    if outcome.status != REFRESH_OK or outcome.credential is None:
+        write(f"refresh {outcome.status}: {outcome.detail or 'no detail'}\n")
+        return 1
+    after = outcome.credential
+    write("after   " + _identity_line(label, after, clock()) + "\n")
+    write(f"        rotated tokens persisted to {credentials.accounts_dir / match.account_id}/auth.json\n")
+
+    headers = {
+        "Authorization": f"Bearer {after.access_token}",
+        "ChatGPT-Account-Id": match.account_id,
+        "Accept": "application/json",
+    }
+    del after, outcome
+    try:
+        response = client.get(CODEX_USAGE_URL, headers, _CONNECT_TIMEOUT)
+    except OSError as exc:
+        write(f"usage request unreachable ({type(exc).__name__})\n")
+        return 1
+    finally:
+        del headers
+    body = _decode_json(response.body)
+    if response.status != 200 or not isinstance(body, Mapping):
+        write(f"usage   HTTP {response.status} - the new access token was NOT accepted\n")
+        return 1
+    quota = CodexAccountQuota.from_response(
+        body, credential_account_id=match.account_id, observed_at=clock(), include_extra=False
+    )
+    weekly = "no weekly window"
+    if quota is not None and quota.seven_day is not None:
+        window = quota.seven_day
+        weekly = (
+            f"weekly {window.used_percent:.1f}%"
+            if window.used_percent is not None
+            else "weekly limit reached"
+        )
+    write(f"usage   HTTP 200, plan {body.get('plan_type')!r}, {weekly}\n")
+    write(
+        "soak    leave the other stores alone for 24 h, then run `list` and check\n"
+        "        ~/.codex still works before turning codex_refresh_enabled on\n"
+    )
     return 0
 
 

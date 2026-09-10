@@ -69,6 +69,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+os.environ.setdefault("CC_USAGE_WIDGET_NO_REVEAL", "1")  # never open Finder from a test
 
 from cc_usage_widget.codex_indexer import CodexIndexer  # noqa: E402
 from cc_usage_widget.contracts import (  # noqa: E402
@@ -1384,6 +1385,10 @@ def _quota_settings(**overrides: Any) -> dict[str, Any]:
             "title_show_cost": False,
             "title_show_fleet": False,
             "title_show_codex_pct": True,
+            # Same intent as `title_show_fleet` above: the Codex block's own
+            # fleet heading (roadmap 4) is one more line these assertions are
+            # not about. It has its own coverage in `test_codex_accounts.py`.
+            "codex_fleet_line_enabled": False,
         }
     )
     settings.update(overrides)
@@ -1712,6 +1717,96 @@ def test_a_non_active_codex_warning_adds_exactly_one_bare_marker() -> None:
 
 
 # ---------------------------------------------------------------------------
+# The audit twin reads only what the LIVE scanner read (roadmap item 2 fix,
+# 2026-09-10). Codex's own read loop, because the cap lives in `_scan_file`
+# and a fix that only landed on the Claude side would be invisible here.
+# ---------------------------------------------------------------------------
+
+
+def test_the_codex_audit_twin_stops_at_the_live_offset() -> None:
+    """A rollout appended to after the live scan must not reach "fresh".
+
+    Otherwise the audit calls the un-read tail drift, the repair installs it,
+    and the next scan merges the same bytes again.
+    """
+    from cc_usage_widget.audit import SelfAudit
+
+    with tempfile.TemporaryDirectory() as name:
+        tmp = Path(name)
+        root = tmp / "sessions"
+        today = local_day_key(time.time())
+        # Distinct timestamps AND an advancing cumulative total: identical
+        # consecutive records are the duplicate the reader is right to drop,
+        # and would make this fixture index 1M rather than 10M.
+        base = _now_local()
+
+        def _turn(i: int) -> dict[str, Any]:
+            return token_count(
+                at=base + dt.timedelta(minutes=i),
+                input_tokens=1_000_000,
+                total={"input_tokens": (i + 1) * 1_000_000},
+            )
+
+        path = write_rollout(root, [turn_context(SOL)] + [_turn(i) for i in range(10)])
+        indexer = make_indexer(tmp, root)
+        store = DailyRollupStore(path=tmp / "rollups.json", keep_days=30)
+        for _ in range(20):
+            result = indexer.scan_once()
+            store.retract_rollups(result.retractions)
+            store.merge(result.deltas)
+            if indexer.progress().complete:
+                break
+        key = f"{VENDOR_CODEX}:{SOL}"
+        assert store.today(today).models[key].input == 10_000_000, store.today(today)
+
+        # The session writes five more turns the live scanner has not read.
+        with path.open("a", encoding="utf-8") as handle:
+            for i in range(10, 15):
+                handle.write(json.dumps(_turn(i)) + "\n")
+
+        verdict = SelfAudit.beside(store.path).run(
+            store, [(VENDOR_CODEX, indexer)], today=today
+        )
+        assert verdict.error is None, verdict.error
+        assert verdict.drifted == (), verdict.drifted
+        assert verdict.repairs == (), verdict.repairs
+
+        for _ in range(20):
+            result = indexer.scan_once()
+            store.retract_rollups(result.retractions)
+            store.merge(result.deltas)
+            if indexer.progress().complete:
+                break
+        assert store.today(today).models[key].input == 15_000_000, store.today(today)
+
+
+def test_codex_audit_offsets_describe_the_live_entries_only() -> None:
+    """What the twin is bounded BY: one entry per live rollout, with the days
+    its ledger names. A tombstone is not in it - its file is gone, so the twin
+    can only be skipped on it, and its usage reaches the audit through
+    ``tombstone_rollups`` instead."""
+    with tempfile.TemporaryDirectory() as name:
+        tmp = Path(name)
+        root = tmp / "sessions"
+        today = local_day_key(time.time())
+        path = write_rollout(
+            root, [turn_context(SOL), token_count(input_tokens=500_000)]
+        )
+        indexer = make_indexer(tmp, root)
+        for _ in range(20):
+            indexer.scan_once()
+            if indexer.progress().complete:
+                break
+        offsets = indexer.audit_offsets(since=today)
+        assert len(offsets) == 1, offsets
+        entry_path, inode, offset, days = offsets[0]
+        assert entry_path == str(path)
+        assert inode == os.stat(path).st_ino
+        assert offset == os.stat(path).st_size
+        assert days == (today,), days
+
+
+# ---------------------------------------------------------------------------
 # Runner (pytest is not installed in claude-swap's venv)
 # ---------------------------------------------------------------------------
 
@@ -1742,6 +1837,247 @@ def main() -> int:
     if failures:
         print("failed: " + ", ".join(failures))
     return 1 if failures else 0
+
+
+# ---------------------------------------------------------------------------
+# Roadmap item 1 - the per-file contribution ledger, Codex half
+#
+# The 1,650x inflation was measured on Codex cells: a rollout re-read from byte
+# 0 re-added its whole history because `RollupStore.merge` had no inverse. Each
+# case re-scans with a FRESH `CodexIndexer` over the same state file, which is
+# what a widget restart does and what makes the double count observable at all
+# (a live instance carries the TRAP 4 fingerprint that would mask it).
+# ---------------------------------------------------------------------------
+
+
+def apply_scan(store: DailyRollupStore, result: Any) -> None:
+    """Apply one scan the way the cost job must: retract, THEN merge."""
+    store.retract_rollups(result.retractions)
+    store.merge(result.deltas)
+
+
+def test_replacing_a_rollout_with_a_longer_copy_adds_only_the_new_turns() -> None:
+    """A new inode holding the old turns plus more must move the day by the
+    APPENDED turns only - not by the whole rollout a second time."""
+    with tempfile.TemporaryDirectory() as name:
+        tmp = Path(name)
+        root = tmp / "sessions"
+        records = [turn_context(SOL), token_count(input_tokens=1_000, output_tokens=100)]
+        path = write_rollout(root, records, name="rollout-2026-09-10T12-00-00-a.jsonl")
+        store = DailyRollupStore(path=tmp / "rollups.json", keep_days=30)
+        day = local_day_key(time.time())
+
+        apply_scan(store, make_indexer(tmp, root).scan_once())
+        assert store.today(day).total.input == 1_000, store.today(day)
+
+        # `os.replace` of a longer copy: a new inode at the same path, which is
+        # what a restore, a sync agent or a copy-then-move produces.
+        spare = write_rollout(
+            root,
+            records + [token_count(input_tokens=2_000, output_tokens=200)],
+            name="rollout-2026-09-10T12-00-00-a.jsonl.new",
+        )
+        os.replace(spare, path)
+
+        result = make_indexer(tmp, root).scan_once()
+        assert result.retractions, "a re-read from zero must retract what it replaces"
+        apply_scan(store, result)
+        assert store.today(day).total.input == 3_000, store.today(day)
+
+
+def test_a_shrunken_rollout_gives_its_old_contribution_back() -> None:
+    """Truncating a rollout leaves the day holding only what it still says."""
+    with tempfile.TemporaryDirectory() as name:
+        tmp = Path(name)
+        root = tmp / "sessions"
+        rollout = "rollout-2026-09-10T12-00-00-b.jsonl"
+        write_rollout(
+            root,
+            [
+                turn_context(SOL),
+                token_count(input_tokens=1_000, output_tokens=100),
+                token_count(input_tokens=2_000, output_tokens=200),
+                token_count(input_tokens=4_000, output_tokens=400),
+            ],
+            name=rollout,
+        )
+        store = DailyRollupStore(path=tmp / "rollups.json", keep_days=30)
+        day = local_day_key(time.time())
+        apply_scan(store, make_indexer(tmp, root).scan_once())
+        assert store.today(day).total.input == 7_000, store.today(day)
+
+        # Same inode, now smaller than the stored offset: the truncation guard.
+        write_rollout(
+            root,
+            [turn_context(SOL), token_count(input_tokens=1_000, output_tokens=100)],
+            name=rollout,
+        )
+        apply_scan(store, make_indexer(tmp, root).scan_once())
+        assert store.today(day).total.input == 1_000, store.today(day)
+
+
+def test_a_vanished_rollout_keeps_its_day_and_cannot_double_on_return() -> None:
+    """A deleted rollout keeps its money; a returning one does not double it.
+
+    Retracting on the vanish is the obvious reading and it is wrong: a corpus
+    prunes on a schedule of its own and the tokens then exist only in
+    ``rollups.json``. The tombstone keeps the ledger without keeping the claim
+    that the bytes are still there, so a path that comes back reads as a reset
+    and REPLACES its contribution.
+    """
+    with tempfile.TemporaryDirectory() as name:
+        tmp = Path(name)
+        root = tmp / "sessions"
+        write_rollout(
+            root,
+            [turn_context(SOL), token_count(input_tokens=1_000, output_tokens=100)],
+            name="rollout-2026-09-10T12-00-00-keep.jsonl",
+        )
+        gone = [turn_context(MINI), token_count(input_tokens=5_000, output_tokens=500)]
+        doomed = write_rollout(
+            root, gone, name="rollout-2026-09-10T12-00-00-doomed.jsonl"
+        )
+        store = DailyRollupStore(path=tmp / "rollups.json", keep_days=30)
+        day = local_day_key(time.time())
+        apply_scan(store, make_indexer(tmp, root).scan_once())
+        assert store.today(day).total.input == 6_000, store.today(day)
+
+        doomed.unlink()
+        result = make_indexer(tmp, root).scan_once()
+        assert result.retractions == (), "a pruned rollout must not be retracted"
+        apply_scan(store, result)
+        assert store.today(day).total.input == 6_000, store.today(day)
+
+        write_rollout(root, gone, name="rollout-2026-09-10T12-00-00-doomed.jsonl")
+        result = make_indexer(tmp, root).scan_once()
+        assert result.retractions, "a returning path must retract before it re-adds"
+        apply_scan(store, result)
+        assert store.today(day).total.input == 6_000, store.today(day)
+
+
+def test_an_appended_rollout_accumulates_its_ledger_instead_of_replacing_it() -> None:
+    """An incremental read must ADD to the ledger, never restate it.
+
+    Getting this backwards is silent: the next replacement would retract only
+    the last chunk and leave everything before it in the store for good.
+    """
+    with tempfile.TemporaryDirectory() as name:
+        tmp = Path(name)
+        root = tmp / "sessions"
+        rollout = "rollout-2026-09-10T12-00-00-c.jsonl"
+        records = [turn_context(SOL), token_count(input_tokens=1_000, output_tokens=100)]
+        path = write_rollout(root, records, name=rollout)
+        store = DailyRollupStore(path=tmp / "rollups.json", keep_days=30)
+        day = local_day_key(time.time())
+        apply_scan(store, make_indexer(tmp, root).scan_once())
+
+        appended = records + [token_count(input_tokens=2_000, output_tokens=200)]
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(appended[-1]) + "\n")
+        result = make_indexer(tmp, root).scan_once()
+        assert result.retractions == (), "an append is not a re-read"
+        apply_scan(store, result)
+        assert store.today(day).total.input == 3_000, store.today(day)
+
+        # Now replace it: the ledger must give back BOTH chunks.
+        spare = write_rollout(root, appended, name=rollout + ".new")
+        os.replace(spare, path)
+        apply_scan(store, make_indexer(tmp, root).scan_once())
+        assert store.today(day).total.input == 3_000, store.today(day)
+
+
+def test_the_ledger_survives_the_scan_state_round_trip_with_last_model() -> None:
+    """``last_model`` and ``ledger`` are two optional keys on one entry; adding
+    the second must not cost the first (the Codex resume hazard, TRAP 1b)."""
+    with tempfile.TemporaryDirectory() as name:
+        tmp = Path(name)
+        root = tmp / "sessions"
+        write_rollout(
+            root,
+            [turn_context(SOL), token_count(input_tokens=1_000, output_tokens=100)],
+            name="rollout-2026-09-10T12-00-00-d.jsonl",
+        )
+        make_indexer(tmp, root).scan_once()
+        raw = json.loads((tmp / "codex_scan_state.json").read_text(encoding="utf-8"))
+        entry = next(iter(raw.values()))
+        assert entry["last_model"] == SOL, entry
+        assert entry["ledger"] == {
+            local_day_key(time.time()): {f"codex:{SOL}": [1_000, 100, 0, 0, 0]}
+        }, entry
+
+
+def test_a_vanished_legacy_rollout_leaves_a_legacy_tombstone() -> None:
+    """A pre-ledger entry that vanishes must leave a flag, not nothing.
+
+    The entry keeps its offset and has no ledger, so the tombstone it becomes
+    carries nothing - and it used to be deleted outright. The tokens it credited
+    are still in ``rollups.json``, invisible to ``tombstone_rollups`` and
+    unreachable by any re-index, so the first self-audit read them as drift and
+    repaired them away. The flag is what makes the audit refuse.
+    """
+    with tempfile.TemporaryDirectory() as name:
+        tmp = Path(name)
+        root = tmp / "sessions"
+        write_rollout(
+            root,
+            [turn_context(SOL), token_count(input_tokens=1_000, output_tokens=100)],
+            name="rollout-2026-09-10T12-00-00-keep.jsonl",
+        )
+        doomed = write_rollout(
+            root,
+            [turn_context(MINI), token_count(input_tokens=5_000, output_tokens=500)],
+            name="rollout-2026-09-10T12-00-00-doomed.jsonl",
+        )
+        state_path = tmp / "codex_scan_state.json"
+        make_indexer(tmp, root).scan_once()
+        # Exactly the bytes a pre-ledger build wrote.
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        for entry in state.values():
+            entry.pop("ledger", None)
+            entry.pop("lv", None)
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        written = local_day_key(doomed.stat().st_mtime)
+
+        doomed.unlink()
+        indexer = make_indexer(tmp, root)
+        indexer.scan_once()
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        entry = state.get(str(doomed))
+        assert entry is not None, "a legacy entry was dropped, not tombstoned"
+        assert entry["inode"] == 0, entry
+        assert entry["legacy_day"] == written, entry
+        assert indexer.legacy_tombstone_days(since="2026-01-01") == (written,)
+        assert indexer.legacy_tombstone_days(since="2099-01-01") == ()
+
+
+def test_a_contribution_free_rollout_is_not_a_legacy_tombstone() -> None:
+    """Only an entry from before the ledger counts. A rollout that carried no
+    usage also has an empty ledger, and flagging those would stop the audit
+    repairing anything on a corpus that prunes."""
+    with tempfile.TemporaryDirectory() as name:
+        tmp = Path(name)
+        root = tmp / "sessions"
+        write_rollout(
+            root,
+            [turn_context(SOL), token_count(input_tokens=1_000, output_tokens=100)],
+            name="rollout-2026-09-10T12-00-00-keep.jsonl",
+        )
+        empty = write_rollout(
+            root, [turn_context(SOL)], name="rollout-2026-09-10T12-00-00-empty.jsonl"
+        )
+        indexer = make_indexer(tmp, root)
+        indexer.scan_once()
+        entry = json.loads(
+            (tmp / "codex_scan_state.json").read_text(encoding="utf-8")
+        )[str(empty)]
+        assert "ledger" not in entry, entry
+        assert entry["lv"] == 1, entry
+
+        empty.unlink()
+        indexer.scan_once()
+        assert indexer.legacy_tombstone_days(since="2026-01-01") == ()
+        state = json.loads((tmp / "codex_scan_state.json").read_text(encoding="utf-8"))
+        assert str(empty) not in state, "a contribution-free entry was tombstoned"
 
 
 if __name__ == "__main__":

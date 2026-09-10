@@ -74,7 +74,7 @@ from typing import Any, Callable, Final, Iterator, Sequence
 
 import rumps
 
-from . import fleet, render
+from . import fleet, notify as notify_mod, render, statebackup
 from .contracts import (
     ALERT_ACCOUNT_QUARANTINED,
     ALERT_ALL_EXHAUSTED,
@@ -91,6 +91,7 @@ from .contracts import (
     ROLLUPS_PATH,
     SCAN_STATE_PATH,
     SETTINGS_BOUNDS,
+    SETTINGS_CHOICES,
     SETTINGS_DEFAULTS,
     SETTINGS_PATH,
     TITLE_ICON,
@@ -119,6 +120,15 @@ try:  # single-sourced wording; a broken accounts.py must not stop app.py import
     from .accounts import ACCOUNTS_UNAVAILABLE
 except Exception:  # pragma: no cover - accounts.py is optional at import time
     ACCOUNTS_UNAVAILABLE = "accounts unavailable"
+
+try:  # roadmap 11: a tier LABEL, imported the same optional way
+    from .codex_accounts import pricing_tier_note as _pricing_tier_note
+except Exception:  # pragma: no cover - codex_accounts is optional at import time
+
+    def _pricing_tier_note(settings: Any = None) -> str:
+        """No module, no claim about a tier: the heading keeps its old shape."""
+        return ""
+
 
 __all__ = [
     "APP_NAME",
@@ -216,6 +226,16 @@ _TITLE_TOGGLES = (
     ("title_show_fleet", "Fleet headroom (when at limit)"),
 )
 
+_COMPACT_TITLE_LABEL = "Compact (V\u00b7C 100/100)"
+"""The Title submenu's name for ``title_compact``.
+
+Names the shape rather than the word "compact": the setting changes what the
+menu bar says, and one look at the example answers what it will look like."""
+
+_RESTORE_BACKUP_LABEL = "Restore last backup\u2026"
+"""The undo for ``Rebuild cost index`` (roadmap item 17). Ellipsis because it
+asks before it acts, the same promise the Export items make."""
+
 _TITLE_FLEET_THRESHOLD_DEFAULT = 85.0
 """Fallback for :attr:`UiSnapshot.autoswitch_threshold` — claude-swap's own
 documented ``autoswitch.threshold`` default. Used only to bucket accounts into
@@ -264,6 +284,28 @@ _CMD_WIRE_SOURCES = "wire_sources"
 _CMD_MAP_DIR = "map_dir"  # W3
 _CMD_UNMAP_DIR = "unmap_dir"  # W3
 _CMD_SET_CODEX_ACCOUNT = "set_codex_account"  # SPEC-CODEX 6
+_CMD_EXPORT_HISTORY = "export_history"  # roadmap item 8
+_CMD_OPEN_DASHBOARD = "open_dashboard"  # roadmap item 9
+_CMD_RESTORE_BACKUP = "restore_backup"  # roadmap item 17
+
+_HISTORY_OFF_NOTE = "history is off - nothing is being recorded"
+_HISTORY_EMPTY_NOTE = "nothing recorded yet"
+"""What the Cost section says INSTEAD of offering an export.
+
+One string, used by the menu line and by the worker's refusal, so the line the
+user reads before clicking and the line they read after cannot disagree."""
+
+_DESKTOP_REVEAL = "reveal"
+_DESKTOP_OPEN = "open"
+"""The two desktop hand-offs the worker may ASK for and never perform.
+
+``NSWorkspace`` is AppKit, and AppKit is documented main-thread-only: the fact
+that ``selectFile:`` and ``openURL:`` happen to return without crashing from a
+background thread is not a promise, it is today's luck (and the reason the
+first version of the export shipped calling them from the worker). So the
+worker parks ``(action, path)`` and the AppKit thread's own repaint tick makes
+the call - the same shape as ``_publish``, which hands a snapshot back rather
+than painting from the worker."""
 
 
 def _log(message: str) -> None:
@@ -271,6 +313,97 @@ def _log(message: str) -> None:
     stderr is the log."""
     sys.stderr.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] cc-usage-widget: {message}\n")
     sys.stderr.flush()
+
+
+_NO_REVEAL_ENV = "CC_USAGE_WIDGET_NO_REVEAL"
+"""Set (to anything) to make every Finder reveal a no-op. The test modules set
+it at import: the claude-swap venv HAS PyObjC, so a "test runner has no AppKit"
+assumption was false and export tests opened real Finder windows on the
+desktop (peer report, 2026-09-10 12:20)."""
+
+
+def _reveal_in_finder(path: Any) -> bool:
+    """Ask Finder to select *path*. Best effort, never fatal, never raises.
+
+    **AppKit thread only.** ``NSWorkspace`` is AppKit and AppKit is documented
+    main-thread-only; that ``selectFile:`` happens to return without crashing
+    from a background thread is today's luck, not a contract, and it is exactly
+    what the first version of the export did. A worker that wants a reveal
+    parks it with :meth:`BackgroundWorker._ask_desktop` and the repaint tick
+    calls this (see :data:`_DESKTOP_REVEAL`); the only other callers are the
+    Settings menu callbacks, which are already on that thread.
+
+    Returns True only when the hand-off was made; False when suppressed
+    (:data:`_NO_REVEAL_ENV`) or when AppKit is absent or refused, which is
+    logged and otherwise ignored.
+    """
+    if os.environ.get(_NO_REVEAL_ENV):
+        _log(f"reveal suppressed ({_NO_REVEAL_ENV}): {path}")
+        return False
+    try:
+        import AppKit
+
+        AppKit.NSWorkspace.sharedWorkspace().selectFile_inFileViewerRootedAtPath_(
+            str(path), str(getattr(path, "parent", path))
+        )
+        return True
+    except Exception as exc:
+        _log(f"could not reveal {path}: {exc!r}")
+        return False
+
+
+def _open_in_browser(path: Any) -> bool:
+    """Ask the default handler to open *path*. Best effort, never raises.
+
+    The sibling of :func:`_reveal_in_finder`, deliberately built to the same
+    shape and behind the SAME :data:`_NO_REVEAL_ENV` guard: both hand a local
+    file to the desktop, and a test run must open neither a Finder window nor a
+    browser tab. One env var covers both because "do not touch this desktop" is
+    one intention, and a second switch is a second thing to forget (the export
+    tests opened real Finder windows on 2026-09-10 for exactly that reason).
+
+    **AppKit thread only**, for the same reason and with the same seam:
+    ``openURL:`` is an ``NSWorkspace`` message, so the worker that rendered the
+    page parks ``(open, path)`` with :meth:`BackgroundWorker._ask_desktop` and
+    the repaint tick performs it (:data:`_DESKTOP_OPEN`). Calling it from the
+    worker looks identical to working - a browser tab does open - which is why
+    the rule is written down here rather than left to the crash that never
+    comes. Returns True only when the hand-off was accepted.
+    """
+    if os.environ.get(_NO_REVEAL_ENV):
+        _log(f"open suppressed ({_NO_REVEAL_ENV}): {path}")
+        return False
+    try:
+        import AppKit
+
+        url = AppKit.NSURL.fileURLWithPath_(str(path))
+        opened = bool(AppKit.NSWorkspace.sharedWorkspace().openURL_(url))
+    except Exception as exc:
+        _log(f"could not open {path}: {exc!r}")
+        return False
+    if not opened:
+        _log(f"could not open {path}: no handler accepted it")
+    return opened
+
+
+def _confirm(title: str, message: str, ok: str = "OK") -> bool:
+    """Modal yes/no in front of a destructive action. ``False`` = do nothing.
+
+    Suppressed - and answered "no" - under :data:`_NO_REVEAL_ENV`, for exactly
+    the reason Finder is: the claude-swap venv HAS AppKit, so a test that
+    reached this would put a real modal on the user's screen and block the run
+    until somebody clicked it. "No" is the only safe answer to a question
+    nobody was shown, and the seam a test should use is
+    ``CCUsageWidgetApp(confirm=...)`` rather than this fallback.
+    """
+    if os.environ.get(_NO_REVEAL_ENV):
+        _log(f"confirmation suppressed ({_NO_REVEAL_ENV}): {title}")
+        return False
+    try:
+        return bool(rumps.alert(title=title, message=message, ok=ok, cancel="Cancel"))
+    except Exception as exc:
+        _log(f"confirmation failed: {exc!r}")
+        return False
 
 
 _SEEN_FAILURES: dict[tuple[str, str, str], int] = {}
@@ -513,6 +646,14 @@ class UiSnapshot:
     settings: dict[str, Any] = field(default_factory=lambda: dict(SETTINGS_DEFAULTS))
     accounts_error: str | None = None
     cost_error: str | None = None
+    audit_note: str | None = None
+    """The daily self-audit's verdict, or ``None`` (roadmap item 2).
+
+    Set only when the audit found drift the store had to be repaired for, or
+    when it could not complete. A clean audit says nothing: a `!` line that is
+    always on is a `!` line nobody reads. Rendered in the Cost section, because
+    what drifted is money.
+    """
     wiring_errors: tuple[str, ...] = ()
     scan_note: str | None = None
     accounts_at: float = 0.0
@@ -609,6 +750,24 @@ def _title_pct(pct: float | None) -> str:
     :data:`ATTENTION_PCT` threshold so they cannot disagree about ``(!)``.
     """
     return f"{format_pct(pct)}{_attention(pct).strip()}"
+
+
+COMPACT_ATTENTION = "⚠"
+"""What a compact-title figure becomes when a note has replaced it.
+
+One glyph, no word: the compact title's whole premise is that it fits where
+``vlad ⚠ relogin`` does not, and the menu row carries the wording."""
+
+
+def _compact_pct(pct: float | None) -> str:
+    """``17.4`` -> ``"17"`` — a compact-title figure, no ``%`` sign.
+
+    Built on :func:`~cc_usage_widget.contracts.format_pct` rather than on
+    ``round()`` so the compact title inherits the 99-is-not-100 rule; the sign
+    is dropped because the two figures are already labelled by their initials
+    and ``V·C 100%/100%`` spends four characters saying so twice.
+    """
+    return format_pct(pct).rstrip("%")
 
 
 def _title_usd(value: float) -> str:
@@ -879,6 +1038,43 @@ edge as the model rows underneath it, instead of two constants drifting apart.
 """
 
 
+def _attribution_row_label(label: str, tokens: int, usd: float) -> str:
+    """``"  cc-usage-widget      41.2M tok    $8.90"`` (roadmap item 6).
+
+    Same right edge as :func:`_model_row_label` so the Cost section stays one
+    column, and a wider name field because a project or a session is named by a
+    human and a model is named by a vendor. Over-long names are cut with an
+    ellipsis rather than allowed to push the money off the edge - a truncated
+    name is readable, a wrapped row is not.
+    """
+    text = label if len(label) <= _ATTRIBUTION_NAME_WIDTH else (
+        label[: _ATTRIBUTION_NAME_WIDTH - 1] + "…"
+    )
+    return (
+        f"  {text:<{_ATTRIBUTION_NAME_WIDTH}}"
+        f"{format_tokens(tokens) + ' tok':>10}{format_usd(usd):>10}"
+    )
+
+
+_ATTRIBUTION_NAME_WIDTH = 24
+"""Characters of a project or session name a row shows.
+
+Wider than :func:`_model_row_label`'s 13 on purpose: ``5909f788 · cc-usage-widget``
+is 26 characters and a session row that cut it at a model column's width would
+show the id and lose the project, which is the half a person recognises.
+"""
+
+_ATTRIBUTION_ROW_WIDTH = 2 + _ATTRIBUTION_NAME_WIDTH + 10 + 10
+"""Rendered width of :func:`_attribution_row_label`, so its heading can align
+its subtotal on the same edge (the reason :data:`MODEL_ROW_WIDTH` exists)."""
+
+
+def _attribution_group_label(name: str, usd: float) -> str:
+    """``"  ── today by project ─────────         $15.44"`` (roadmap item 6)."""
+    left = f"  ── {name} ".ljust(_ATTRIBUTION_ROW_WIDTH - 10, "─")
+    return f"{left}{format_usd(usd):>10}"
+
+
 def _vendor_group_label(name: str, usd: float) -> str:
     """``"  ── Codex ──────────────────     $3.30"`` (SPEC-CODEX 5.2).
 
@@ -1025,7 +1221,82 @@ def _quota_row_label(row: AccountRow) -> str:
         # (`_decorate_quota_item` via `_quota_note`), so the fallback really
         # does say everything the bar block says.
         text = f"{text}  ({note})"
+    for line in getattr(row, "info_notes", ()) or ():
+        # The dim lines of the bar block, flattened (roadmap 10/11/12). They
+        # are facts, not verdicts, so they follow the note rather than
+        # competing with it - and VoiceOver reads the same sentence the
+        # attributed block draws.
+        text = f"{text}  · {line}"
     return text
+
+
+def _codex_fleet_heading(rows: Sequence[AccountRow], *, now: float) -> str:
+    """``Codex 0/4 · next Sat 09:00 (vlad)`` — the Codex block's fleet line.
+
+    The twin of the Claude title suffix (``_title_fleet``), and it answers the
+    same two questions at the moment they are asked: **how many of my logins
+    still have room**, and **when does the next one open**. Four accounts all
+    at 100 % is exactly the state this widget was built for, and before this
+    line the only way to answer either question was to read four bars.
+
+    Nothing is derived beyond the rows' own numbers (SPEC 4.3):
+
+    * ``N`` counts rows whose weekly percentage is **known** and below 100 and
+      which carry no ``warn``/``crit`` verdict. A withheld figure (stale past
+      6 h, or a sentinel) is not room: the last good number can be hours old,
+      and advertising it as a free account is how an operator gets sent to a
+      dead login. Such a row still counts in ``M`` — it exists, it just is not
+      room;
+    * ``next`` is the soonest **future** ``soonest_reset_at`` among the rows
+      that are at the wall, formatted by :func:`render.fleet_reset_label` from
+      the epoch the source anchored at its read. When no capped row reports a
+      reset still ahead of us the half is simply absent — there is no default
+      to fall back on, and a reset already in the past is not one;
+    * the alias is the row's own, so the answer is actionable: ``next Sat
+      09:00 (vlad)`` names the account to switch to, which a bare time does not.
+
+    Only LIVE per-account rows (negative slots) are counted. The
+    transcript-derived row (slot 0) describes whichever login wrote the logs
+    and has no identity, so counting it would put a "1/1" over a machine that
+    has no fleet at all — and it is what a Codex-only, live-quota-off install
+    shows, which must stay byte-for-byte as it was.
+    """
+    live = [row for row in rows if row.vendor != VENDOR_CLAUDE and row.slot < 0]
+    if not live:
+        return ""
+    room = sum(
+        1
+        for row in live
+        if getattr(row, "attention_kind", "") not in _ALARM_KINDS
+        and row.seven_day_pct is not None
+        and row.seven_day_pct < 100.0
+    )
+    heading = f"{vendor_label(live[0].vendor)} {room}/{len(live)}"
+    capped = [
+        row
+        for row in live
+        if getattr(row, "soonest_reset_at", None) is not None
+        # A reset instant that has already passed is not a door about to open:
+        # the source has simply not re-read that account yet, and "next Sat
+        # 09:00" over a Saturday that has been and gone sends the operator to a
+        # login that is still at the wall. Dropped here as well as in
+        # `render.fleet_reset_label` so the choice of the SOONEST row is made
+        # among rows that still have a future - otherwise a stale epoch would
+        # win the `min` and silence the line for the accounts that do reopen.
+        and row.soonest_reset_at > now
+        and (
+            getattr(row, "attention_kind", "") == "crit"
+            or (row.seven_day_pct is not None and row.seven_day_pct >= 100.0)
+        )
+    ]
+    if not capped:
+        return heading
+    soonest = min(capped, key=lambda row: row.soonest_reset_at)
+    clock = render.fleet_reset_label(soonest.soonest_reset_at, now)
+    if not clock:
+        return heading
+    alias = soonest.alias or vendor_label(soonest.vendor)
+    return f"{heading} · next {clock} ({alias})"
 
 
 _WINDOW_LABEL_MAX = 12
@@ -1089,6 +1360,27 @@ def _codex_registry_present() -> bool:
         return CODEX_ACCOUNTS_REGISTRY_PATH.exists()
     except OSError:  # pragma: no cover - an unreadable parent directory
         return False
+
+
+def _telegram_credentials_present() -> bool:
+    """Whether ``notify.json`` holds usable Telegram credentials (roadmap 7).
+
+    The gate on the Telegram toggle, and the same bargain as
+    :func:`_codex_registry_present`: one stat plus a sub-kilobyte read per menu
+    build, on a path that is a module constant, answering exactly the question
+    the control depends on. A file that is group- or world-readable counts as
+    ABSENT here, so the toggle stays greyed rather than offering to send from a
+    credential the whole machine can read - the refusal lives in
+    ``notify.load_telegram_credentials`` so the menu and the sender can never
+    disagree about what "configured" means.
+    """
+    try:
+        credentials, _reason = notify_mod.load_telegram_credentials(
+            notify_mod.NOTIFY_CREDENTIALS_PATH
+        )
+    except Exception:  # pragma: no cover - defensive; the loader never raises
+        return False
+    return credentials is not None
 
 
 def _codex_registry(sources: Sequence[Any]) -> Any | None:
@@ -1191,8 +1483,17 @@ class BackgroundWorker:
         persist_settings: Callable[[dict[str, Any]], None] | None = None,
         sources: Sequence[TranscriptSource] | None = None,
         source_factory: Callable[[dict[str, Any], Any], Sequence[Any]] | None = None,
+        notifier: Any | None = None,
     ) -> None:
         self._publish_cb = publish
+        self._notifier = notifier
+        """Transition notifier (roadmap 7), or ``None`` = notify nothing.
+
+        Defaults to ``None`` and is attached by :meth:`CCUsageWidgetApp.run`,
+        for the same reason the extra vendor sources are wired there: a widget
+        that is constructed but never run - every test in ``tests/`` - must
+        touch no file of the user's and post nothing to their Notification
+        Centre."""
         self._snapshot = snapshot
         self._accounts = accounts
         self._indexer = indexer
@@ -1224,6 +1525,39 @@ class BackgroundWorker:
         because a steady tick reads only one corpus: the other vendor's error
         is still true, it just was not re-observed this second."""
         self._lookback_applied: int | None = None
+        self._audit: Any = None
+        """The :class:`~cc_usage_widget.audit.SelfAudit` tick, built lazily on
+        the worker thread so importing this module costs nothing and a machine
+        with the feature switched off never constructs one."""
+        self._audit_note: str | None = None
+        """Last audit verdict, published on the NEXT cost tick rather than from
+        the audit thread. A plain attribute write is atomic in CPython; a
+        read-modify-write of ``self._snapshot`` from a second thread would race
+        the worker's own publishes."""
+        self._audit_repairs: tuple[Any, ...] = ()
+        """The audit's repair PLAN, waiting for the worker to apply it.
+
+        The audit thread computes and publishes plain data here; the store is
+        mutated only by ``_apply_audit_repairs`` on this thread, at the top of
+        the next cost job. Repairing from the audit's own thread - retract on
+        one thread while the worker retract-then-merges on the other - could
+        drop a whole tick's deltas, whose offsets are already durable and which
+        are therefore gone for good."""
+        self._audit_status: str | None = None
+        """``Last audit: 11:40 · 0 drift``, computed on THIS thread (the audit
+        sidecar is a file read) and handed to the AppKit thread as a string."""
+        self._audit_thread: threading.Thread | None = None
+        self._audit_lock = threading.Lock()
+        """Guards the hand-over of ``_audit_repairs`` / ``_audit_note``.
+
+        Two threads touch that pair: the audit's daemon thread publishes a plan,
+        the worker takes it. ``plan, self._audit_repairs = self._audit_repairs,
+        ()`` is a read followed by a write, and a plan published between the two
+        is overwritten by the ``()`` - lost silently, with the audit already
+        marked as done for the day, so the drift stands until tomorrow. The
+        note travels with the plan under the same lock, because a note whose
+        verdict describes a plan that is not the one in hand is worse than no
+        note at all."""
         # Extra vendors. `sources=None` means "nobody has decided yet", which
         # is what lets `_CMD_WIRE_SOURCES` autowire Codex on *this* thread; an
         # explicit sequence (including an empty one) is a decision and is never
@@ -1256,6 +1590,77 @@ class BackgroundWorker:
         """Extra vendors whose corpus actually exists, as of the last
         ``_collect_quota_rows``. Written on the worker thread, read on the main
         one, and the reason a Claude-only machine gets the pre-Codex menu."""
+        self._history: Any = None  # roadmap item 8
+        """The ``history.HistoryStore`` mirror, built lazily on this thread.
+
+        Lazily because constructing it is the first thing that would touch
+        ``history.sqlite``, and a widget with ``history_enabled`` off must never
+        create the file at all."""
+        self._history_errors: tuple[str, ...] = ()
+        """Last history failure, rendered as a ``!`` line. Held on the worker
+        for the same reason as :attr:`source_diagnostics`: the menu is built on
+        the AppKit thread and must not open a database there."""
+        self._history_note: str | None = None
+        """Where the last export landed, for the diagnostics block."""
+        self._history_rows: int = 0
+        """Cells the mirror holds, as of the last cost job. Counted on the
+        worker for the usual reason (the AppKit thread may not open sqlite),
+        and the menu's answer to "is there anything to export": with
+        ``history_enabled`` off since install, or before the first cost job has
+        ever run, the answer is 0 and the two Export items are not offered at
+        all. Offering them wrote a header-only CSV into ``~/Downloads`` and
+        revealed it - a file that says nothing, presented as a record."""
+        self._desktop: queue.Queue[tuple[str, Any]] = queue.Queue()
+        """Desktop hand-offs the worker has ASKED for, drained by the AppKit
+        thread (:meth:`CCUsageWidgetApp._drain_desktop_handoffs`). A queue, not
+        a snapshot field, because two exports in one repaint interval are two
+        files and the second must not silently replace the first."""
+        self._dashboard_note: str | None = None
+        """Where the last dashboard was written (roadmap item 9)."""
+        self._dashboard_error: str | None = None
+        """Why the last dashboard failed; a ``!`` line rather than silence."""
+        self._attribution: Any = None  # roadmap item 6
+        """The ``attribution.AttributionStore``, built lazily on this thread.
+
+        Lazily, and never at all while ``cost_by_project_enabled`` is off, so an
+        owner who turned the feature off has no ``attribution.json`` on disk."""
+        self._attribution_on: bool | None = None
+        """Last value pushed into the scanners, so the setting is applied once
+        rather than on every tick (the twin of ``_lookback_applied``)."""
+        self._cost_project_rows: tuple[Any, ...] = ()
+        """Today's top projects, computed on the worker and read by the menu -
+        the same cross-thread rule as :attr:`history_errors`: the AppKit thread
+        may not open a store."""
+        self._cost_session_rows: tuple[Any, ...] = ()
+        """Today's most expensive sessions, same rule."""
+        self._last_backup: Any = None  # roadmap item 17
+        """Newest ``backup-state-*`` directory, or ``None``.
+
+        Cached on the worker so ``Restore last backup`` can appear (or not)
+        without the AppKit thread listing a directory (SPEC 2.3). Refreshed
+        when the loop starts and after every backup or restore - the only two
+        things that can change the answer while the widget runs."""
+        self._restore_frozen: str | None = None
+        """Name of the backup whose files are on disk but not in memory.
+
+        set-by: a successful restore. cleared-by: a rebuild (a deliberate fresh
+        start) or a restart, which is when the restored files are read the
+        normal way. ages-out: never - a stale freeze is visible and harmless,
+        an expired one would resume writing over the restore. rehydrated: no,
+        deliberately: it exists only to stop THIS process overwriting files it
+        did not read. producer off: n/a.
+
+        While set, the cost job, the rollup save and the offset commit are all
+        skipped. The restored ``rollups.json`` is re-read into the live store,
+        but a scanner's offsets are loaded once and cached inside the indexer,
+        so this process's offsets are still the post-rebuild ones: letting it
+        scan would credit records the restored rollup already contains, and
+        letting it save would put the rebuild's state back on top of the
+        restore. Both are undercount/double-count bugs of the exact kind
+        `_reconcile_lost_scan_state` exists to prevent, so the honest move is
+        to stop writing and say so."""
+        self._restore_note: str | None = None
+        """One diagnostics line about the last restore, or ``None``."""
         self._rival_detector: Callable[[], Sequence[str]] | None = None  # W2
         """Injected process-table reader; ``None`` resolves ``__main__``'s on
         first use. A seam so the cadence can be tested without ``pgrep``."""
@@ -1296,6 +1701,12 @@ class BackgroundWorker:
         self._stop.set()
         self._commands.put(("__stop__", None))
         self._stop_sources(timeout)
+        # The audit runs on its own daemon thread and touches the store. Give it
+        # a moment to finish so a caller that tears its corpus down right after
+        # `stop()` is not racing a scan of it.
+        audit_thread, self._audit_thread = self._audit_thread, None
+        if audit_thread is not None and timeout > 0 and audit_thread.is_alive():
+            audit_thread.join(timeout=timeout)
         thread, self._thread = self._thread, None
         if thread is None:
             return True
@@ -1421,6 +1832,431 @@ class BackgroundWorker:
     def codex_accounts(self) -> tuple[tuple[str, str, bool], ...]:
         """``(account_id, alias, enabled)`` for the tracked Codex accounts."""
         return self._codex_accounts
+
+    # -- usage history (roadmap item 8) ------------------------------------
+
+    @property
+    def history_errors(self) -> tuple[str, ...]:
+        """History failures to render as ``!`` lines; ``()`` when healthy."""
+        return self._history_errors
+
+    @property
+    def history_note(self) -> str | None:
+        """One diagnostics line about the mirror, or ``None`` before first use."""
+        return self._history_note
+
+    @property
+    def history_rows(self) -> int:
+        """Cells the mirror held at the last cost job; ``0`` when it holds none.
+
+        Read by the menu on the AppKit thread to decide whether an export has
+        anything to export. Stale by at most one cost interval, which is the
+        right kind of wrong: it can only ever hide an export that has just
+        become possible, never offer one that would write an empty file.
+        """
+        return self._history_rows
+
+    def take_desktop_requests(self) -> tuple[tuple[str, Any], ...]:
+        """Drain the parked desktop hand-offs. **AppKit thread.**
+
+        Returns ``(action, path)`` pairs in the order they were parked, and
+        empties the queue: each request is performed exactly once, so a repaint
+        that happens to run twice cannot open two browser tabs on one dashboard.
+        """
+        out: list[tuple[str, Any]] = []
+        while True:
+            try:
+                out.append(self._desktop.get_nowait())
+            except queue.Empty:
+                break
+        return tuple(out)
+
+    def _ask_desktop(self, action: str, path: Any) -> None:
+        """Park one hand-off for the AppKit thread. **Worker thread.**
+
+        This is the whole of the worker's involvement with the desktop: it
+        never imports AppKit, never calls ``NSWorkspace``, and cannot be made
+        to by a settings flip. ``CC_USAGE_WIDGET_NO_REVEAL`` is honoured on the
+        other side, where the call actually is.
+        """
+        self._desktop.put((action, path))
+
+    # -- cost attribution (roadmap item 6) ---------------------------------
+
+    @property
+    def cost_project_rows(self) -> tuple[Any, ...]:
+        """Today's top projects, dearest first; ``()`` when off or empty."""
+        return self._cost_project_rows
+
+    @property
+    def cost_session_rows(self) -> tuple[Any, ...]:
+        """Today's most expensive sessions, dearest first; ``()`` when off or empty."""
+        return self._cost_session_rows
+
+    def _attribution_store(self) -> Any:
+        """The attribution cache, built on first use on the worker thread.
+
+        A missing or broken ``attribution.py`` is a missing FEATURE, not a
+        broken widget: the two menu blocks disappear and every dollar figure is
+        exactly what it was.
+        """
+        if self._attribution is not None:
+            return self._attribution
+        try:
+            from .attribution import AttributionStore, attribution_path_for
+
+            store = AttributionStore(
+                path=attribution_path_for(getattr(self._rollups, "path", None)),
+                logger=_log,
+            )
+            store.load()
+            self._attribution = store
+        except Exception as exc:
+            _log(f"attribution unavailable: {_describe(exc)}")
+            return None
+        return self._attribution
+
+    def _set_attribution(self, enabled: bool) -> None:
+        """Push ``cost_by_project_enabled`` into every scanner, once.
+
+        Switching off also drops the rows already published, so the menu loses
+        its two blocks on the same tick the setting changed rather than keeping
+        a stale copy of them until something else republishes.
+        """
+        if self._attribution_on == enabled:
+            return
+        self._attribution_on = enabled
+        for _vendor, scanner in self._all_scanners():
+            setter = getattr(scanner, "set_attribution", None)
+            if callable(setter):
+                try:
+                    setter(enabled)
+                except Exception as exc:
+                    _log(f"set_attribution({enabled}) failed: {_describe(exc)}")
+        if not enabled:
+            self._cost_project_rows = ()
+            self._cost_session_rows = ()
+            # Emptied, not just forgotten - the same thing `_rebuild_index`
+            # does to it, and for the same reason. The cache is a decomposition
+            # of days the scanners keep indexing while the feature is off, so a
+            # file left standing describes a window with a hole in it: turning
+            # the feature back on would show a project split that is missing
+            # everything read in between, beside day totals that are complete.
+            # Re-enabling has to start from nothing and re-attribute forwards.
+            store = self._attribution
+            if store is None and self._attribution_path_exists():
+                store = self._attribution_store()
+            if store is not None:
+                try:
+                    store.clear()
+                    store.save(force=True)
+                except Exception as exc:
+                    _log(f"attribution clear failed: {_describe(exc)}")
+            self._attribution = None
+
+    def _attribution_path_exists(self) -> bool:
+        """Whether ``attribution.json`` is on disk. No store is constructed.
+
+        The off switch must not CREATE the file it exists to prevent: a machine
+        that has never had the feature on has nothing to clear.
+        """
+        try:
+            from .attribution import attribution_path_for
+
+            return attribution_path_for(getattr(self._rollups, "path", None)).exists()
+        except Exception:  # pragma: no cover - defensive
+            return False
+
+    def _absorb_attribution(self, scanner: Any) -> None:
+        """Apply one scan's attributed pass - retract first, then add.
+
+        Called in the same loop iteration as ``rollups.merge`` and under the
+        same rule, because the two describe the same bytes: a pass whose
+        contribution went into the day totals but not into the project totals
+        would make the two disagree until the next rebuild.
+        """
+        if not self._attribution_on:
+            # The off switch has to stop the STORE being built, not only the
+            # scanners attributing: constructing it is what creates
+            # `attribution.json`, and off must mean off from every direction
+            # (the rule `history_enabled` already lives under).
+            return
+        store = self._attribution_store()
+        take = getattr(scanner, "take_attribution", None)
+        if store is None or not callable(take):
+            return
+        try:
+            result = take()
+        except Exception as exc:
+            _log(f"attribution drain failed: {_describe(exc)}")
+            return
+        if not getattr(result, "changed", False):
+            return
+        try:
+            store.apply(result)
+        except Exception as exc:
+            _log(f"attribution merge failed: {_describe(exc)}")
+
+    def _publish_attribution(self, today: str, keep_days: int) -> None:
+        """Prune, persist, and recompute the two menu blocks. Never raises."""
+        store = self._attribution
+        if store is None:
+            return
+        try:
+            store.prune(today=today, keep_days=keep_days)
+            store.save()
+            pricing = self._pricing
+            self._cost_project_rows = store.top_projects(today, pricing)
+            self._cost_session_rows = store.top_sessions(today, pricing)
+        except Exception as exc:
+            _log(f"attribution publish failed: {_describe(exc)}")
+            self._cost_project_rows = ()
+            self._cost_session_rows = ()
+
+    def _mirror_attribution(self, keep_days: int) -> None:
+        """Mirror the project decomposition into ``history.sqlite`` (item 6).
+
+        Gated on ``history_enabled`` exactly as the aggregate mirror is, and
+        run after it, so the long-term record can never hold a project row for
+        a day whose totals it has not recorded.
+        """
+        store = self._attribution
+        if store is None:
+            return
+        if not bool(self._settings().get("history_enabled", True)):
+            return
+        history = self._history_store()
+        if history is None:
+            return
+        upsert = getattr(history, "upsert_projects", None)
+        if not callable(upsert):
+            return
+        try:
+            upsert(store.project_rollups(), self._pricing)
+        except Exception as exc:
+            _log(f"attribution history mirror failed: {_describe(exc)}")
+            self._history_errors = (f"history: {_describe(exc)}",)
+
+    @property
+    def state_home(self) -> Any:
+        """Directory the state files live in, or ``None``. No I/O.
+
+        Read by the confirmation dialog so the path it promises is the path the
+        worker will actually write - ``SCAN_STATE_PATH.parent`` is the right
+        answer for the installed widget and the wrong one for any store built
+        somewhere else."""
+        return self._state_home()
+
+    @property
+    def last_state_backup(self) -> Any:
+        """Newest state backup directory, or ``None`` (roadmap item 17)."""
+        return self._last_backup
+
+    @property
+    def restore_note(self) -> str | None:
+        """One diagnostics line about the last restore, or ``None``."""
+        return self._restore_note
+
+    def _state_home(self) -> Any:
+        """The directory holding ``rollups.json`` and the scan states.
+
+        Taken from the store's own ``path`` rather than from
+        :data:`ROLLUPS_PATH`, for the same reason ``_backup_dir`` derives
+        claude-swap's root from the adapter: a store built on a temporary
+        directory (every test, and any future relocation) must back up ITS
+        files, not the installed widget's. No store, no home, no backups - and
+        the menu item stays absent rather than pointing somewhere wrong.
+        """
+        store = self._rollups
+        try:
+            path = getattr(store, "path", None) if store is not None else None
+            if path is None:
+                return None
+            return os.path.dirname(os.fspath(path)) or "."
+        except Exception as exc:
+            # A store whose `path` is not a path is not a store this feature
+            # can back up; it is not a reason for a click to fail, and the
+            # menu item simply stays absent.
+            _log(f"state home unavailable: {exc!r}")
+            return None
+
+    def _refresh_state_backups(self) -> None:
+        """Re-read which backups exist. Worker thread only; never raises."""
+        home = self._state_home()
+        if home is None:
+            self._last_backup = None
+            return
+        try:
+            self._last_backup = statebackup.latest_backup(home)
+        except Exception as exc:
+            self._last_backup = None
+            _log(f"could not list state backups: {_describe(exc)}")
+
+    def _history_store(self) -> Any:
+        """The mirror, constructed once, on this thread. ``None`` if unbuildable.
+
+        A missing or broken ``history.py`` is a missing FEATURE, not a broken
+        widget: the cost job carries on and the menu says so on a ``!`` line
+        rather than losing the numbers it just computed (Rule 12).
+        """
+        if self._history is not None:
+            return self._history
+        try:
+            from .history import HistoryStore, history_path_for
+
+            # Beside the aggregate it mirrors, so a redirected cache never
+            # appends to the installed widget's long-term record.
+            self._history = HistoryStore(
+                history_path_for(getattr(self._rollups, "path", None)), logger=_log
+            )
+        except Exception as exc:
+            self._history_errors = (f"history unavailable: {_describe(exc)}",)
+            return None
+        return self._history
+
+    def _mirror_history(self, rollups: Any, keep_days: int, today: str) -> None:
+        """Mirror every day in the store's window. Never raises (item 8).
+
+        Called at the end of a successful cost job, after the rollups are
+        durable: the mirror must never be ahead of the aggregate it mirrors.
+        The whole window goes every time rather than only the days that
+        changed, which is what makes the first run a 30-day backfill and what
+        lets a rebuild or an audit repair propagate; unchanged cells are not
+        rewritten, so the steady-state cost is one SELECT.
+        """
+        if not bool(self._settings().get("history_enabled", True)):
+            return
+        store = self._history_store()
+        if store is None:
+            return
+        try:
+            days = rollups.last_n_days(keep_days, today=today)
+        except Exception as exc:
+            self._history_errors = (f"history: {_describe(exc)}",)
+            return
+        written = store.upsert_days(days, self._pricing)
+        self._history_errors = store.errors
+        # Refresh the menu's "is there anything to export" answer, but only
+        # when it can have changed: a steady-state tick writes nothing and
+        # already knows the mirror is non-empty, so this costs one COUNT on the
+        # ticks that matter and nothing on the ones that do not.
+        if written or not self._history_rows:
+            self._history_rows = store.count()
+
+    def _export_history(self, fmt: str) -> None:
+        """Write the export and ASK for a reveal. Worker thread; never raises.
+
+        The file I/O and the sqlite read happen here rather than in the menu
+        callback (SPEC 2.3 keeps the AppKit thread free). The reveal does not:
+        ``NSWorkspace`` is AppKit, so this parks the path (:meth:`_ask_desktop`)
+        and the repaint tick makes the call on the thread AppKit documents.
+
+        **Nothing is written when there is nothing to write.** The menu already
+        hides the items in that state; this is the belt to that braces, because
+        a command can be enqueued from a menu painted before ``history_enabled``
+        was turned off, and the failure mode is not a harmless no-op: it is a
+        header-only CSV in ``~/Downloads``, revealed in Finder, that reads as a
+        record of a month in which nothing was spent.
+        """
+        if not bool(self._settings().get("history_enabled", True)):
+            self._history_errors = (f"history: {_HISTORY_OFF_NOTE}",)
+            _log(f"history: export skipped - {_HISTORY_OFF_NOTE}")
+            return
+        store = self._history_store()
+        if store is None:
+            return
+        self._history_rows = store.count()
+        if not self._history_rows:
+            self._history_errors = (f"history: {_HISTORY_EMPTY_NOTE}",)
+            _log(f"history: export skipped - {_HISTORY_EMPTY_NOTE}")
+            return
+        try:
+            from .history import DEFAULT_EXPORT_DIR, export_history
+
+            path = export_history(
+                store, self._pricing, directory=DEFAULT_EXPORT_DIR, fmt=fmt
+            )
+        except Exception as exc:
+            message = f"export failed: {_describe(exc)}"
+            _log(f"history: {message}")
+            self._history_errors = (f"history: {message}",)
+            return
+        self._history_errors = store.errors
+        self._history_note = f"Exported: {path}"
+        _log(f"history: exported {path}")
+        self._ask_desktop(_DESKTOP_REVEAL, path)
+
+    # -- local dashboard (roadmap item 9) ----------------------------------
+
+    @property
+    def dashboard_note(self) -> str | None:
+        """Where the last dashboard was written, or ``None`` before the first."""
+        return self._dashboard_note
+
+    @property
+    def dashboard_error(self) -> str | None:
+        """Why the last dashboard failed, or ``None`` when it did not."""
+        return self._dashboard_error
+
+    def _open_dashboard(self) -> None:
+        """Render the dashboard, write it 0600, ASK for it to be opened.
+
+        **Worker thread**, and all of the work: the sqlite read, the 90-day
+        fold and the file write are real work and SPEC 2.3 keeps that off the
+        AppKit thread. The open is not work - it is an AppKit call, and it is
+        parked for the repaint tick exactly as ``_export_history`` parks its
+        reveal.
+
+        Never raises: a dashboard that could not be built is a ``!`` line, not
+        a dead worker (Rule 12 - it says so rather than going quiet).
+
+        **The first index gets a banner, not silence.** Opened before the first
+        scan finishes, the page would otherwise draw a half-read corpus as
+        finished charts while the menu beside it still says ``indexing…`` -
+        SPEC 4.3's honesty rule broken in the one artifact that gets kept and
+        re-read. The condition and the wording are the menu's own
+        (``_cost_items``: no breakdown, or a partial one), so the two cannot
+        drift apart, and the page is stamped rather than refused: half a corpus
+        is a real measurement of half a corpus once it says so.
+        """
+        if not bool(self._settings().get("dashboard_enabled", True)):
+            _log("dashboard: disabled by settings")
+            return
+        try:
+            from .dashboard import build_dashboard, dashboard_path_for
+
+            snapshot = self._snapshot
+            cost = snapshot.cost
+            indexing: str | None = None
+            if bool(self._settings().get("cost_tracking_enabled", True)) and (
+                cost is None or cost.is_partial
+            ):
+                # `cost.progress` is the breakdown's own view; `snapshot.progress`
+                # is what the last tick published when there is no breakdown yet.
+                progress = cost.progress if cost is not None else snapshot.progress
+                indexing = _progress_label(progress) or "indexing…"
+            path = build_dashboard(
+                self._history_store(),
+                self._rollups,
+                snapshot.quota_rows,
+                snapshot.accounts,
+                now=time.time(),
+                pricing=self._pricing,
+                indexing=indexing,
+                # Beside the store it describes, so a redirected cache never
+                # writes into the installed widget's home (history_path_for's
+                # rule, for the same reason).
+                path=dashboard_path_for(getattr(self._rollups, "path", None)),
+            )
+        except Exception as exc:
+            message = f"dashboard failed: {_describe(exc, 'dashboard')}"
+            _log(f"dashboard: {message}")
+            self._dashboard_error = message
+            return
+        self._dashboard_error = None
+        self._dashboard_note = f"Dashboard: {path}"
+        _log(f"dashboard: wrote {path}")
+        self._ask_desktop(_DESKTOP_OPEN, path)
 
     def _set_codex_account_enabled(self, account_id: str, flag: bool) -> None:
         """Flip one registry entry's ``enabled``. **Worker thread only.**
@@ -1667,12 +2503,27 @@ class BackgroundWorker:
 
     # -- publishing --------------------------------------------------------
 
+    def attach_notifier(self, notifier: Any | None) -> None:
+        """Wire (or clear) the transition notifier. Idempotent."""
+        self._notifier = notifier
+
     def _publish(self, snapshot: UiSnapshot) -> None:
+        previous = self._snapshot
         self._snapshot = snapshot
         try:
             self._publish_cb(snapshot)
         except Exception as exc:  # never let the UI hand-off kill the loop
             _log(f"publish failed: {exc!r}")
+        notifier = self._notifier
+        if notifier is None:
+            return
+        # After the UI hand-off, never before: a repaint must not queue behind
+        # a ledger write. The notifier itself does the sending on its own
+        # daemon thread, so nothing here can block this tick (roadmap 7).
+        try:
+            notifier.notify(previous, snapshot)
+        except Exception as exc:  # a notifier must never kill the worker
+            _log(f"notify failed: {exc!r}")
 
     def _settings(self) -> dict[str, Any]:
         return self._snapshot.settings
@@ -1728,6 +2579,10 @@ class BackgroundWorker:
     # -- the loop ----------------------------------------------------------
 
     def _loop(self) -> None:
+        # Which backups exist is read HERE, on the worker thread, exactly once
+        # per worker: the menu asks for it on the AppKit thread (SPEC 2.3), and
+        # the answer only changes when this same thread makes or restores one.
+        self._refresh_state_backups()
         next_ui = 0.0
         next_cost = 0.0
         # The engine's own deadline (SPEC 3.5: "claude-swap's own cadence").
@@ -1941,6 +2796,12 @@ class BackgroundWorker:
         lost. Saving here closes that window at quit; ``save`` is a no-op when
         the store is clean.
         """
+        if self._restore_frozen:
+            # The files on disk are the restored ones and this process never
+            # read the offsets that go with them; a "helpful" last save here
+            # would undo the restore at the exact moment nobody is watching.
+            _log(f"flush skipped: state restored from {self._restore_frozen}")
+            return
         store = self._rollups
         if store is not None and self._rollups_loaded:
             try:
@@ -2041,8 +2902,11 @@ class BackgroundWorker:
                 self._switch_best()
                 return True, False
             if name == _CMD_REBUILD_INDEX:
-                self._rebuild_index()
+                self._rebuild_index(str(payload) if payload else None)
                 return False, True
+            if name == _CMD_RESTORE_BACKUP:  # roadmap item 17
+                self._restore_backup(str(payload) if payload else None)
+                return True, False
             if name == _CMD_WIRE_SOURCES:
                 self._wire_sources()
                 return True, True
@@ -2058,6 +2922,12 @@ class BackgroundWorker:
             if name == _CMD_SET_CODEX_ACCOUNT:  # SPEC-CODEX 6
                 account_id, flag = payload
                 self._set_codex_account_enabled(str(account_id), bool(flag))
+                return True, False
+            if name == _CMD_EXPORT_HISTORY:  # roadmap item 8
+                self._export_history(str(payload))
+                return True, False
+            if name == _CMD_OPEN_DASHBOARD:  # roadmap item 9
+                self._open_dashboard()
                 return True, False
         except Exception as exc:
             self._publish(replace(self._snapshot, accounts_error=_describe(exc)))
@@ -2176,18 +3046,42 @@ class BackgroundWorker:
             error = _describe(exc)
         self._run_accounts_job(force=True, error_override=error)
 
-    def _rebuild_index(self) -> None:
+    def _rebuild_index(self, backup_name: str | None = None) -> None:
         """Empty the rollup store and reset **every** scanner, then re-index.
 
         All-or-nothing across vendors on purpose: the store is shared, so
         emptying it while resetting only one vendor would drop the other
         vendor's days without re-reading them (its offsets still say
         "consumed") - a permanent, invisible undercount.
+
+        **The snapshot comes first** (roadmap item 17). A rebuild is not
+        idempotent against a shrinking corpus: Claude Code prunes
+        ``~/.claude/projects`` on ``cleanupPeriodDays``, so a day the store
+        recorded three weeks ago may have no transcript left to re-read, and
+        what the rebuild produces can legitimately be *worse* than what it
+        destroyed. :func:`statebackup.create_backup` therefore runs before the
+        first ``clear()``, inside the same ``try`` - a snapshot that raises
+        aborts the rebuild with the store intact, which is the whole point of
+        taking it. *backup_name* is the directory name the confirmation dialog
+        already showed the user, so the alert and the disk agree.
         """
         scanners = self._all_scanners()
         if not scanners or self._rollups is None:
             return
         try:
+            home = self._state_home()
+            if home is not None:
+                created = statebackup.create_backup(home, name=backup_name)
+                self._refresh_state_backups()
+                _log(
+                    f"state backed up to {created}"
+                    if created is not None
+                    else "nothing to back up before rebuild"
+                )
+            # A rebuild is a deliberate fresh start and re-reads everything
+            # from offset 0, so the restore freeze - which exists only to stop
+            # this process writing over files it never read - is answered by it.
+            self._restore_frozen = None
             for name in ("clear", "reset", "drop_all"):
                 method = getattr(self._rollups, name, None)
                 if callable(method):
@@ -2195,8 +3089,27 @@ class BackgroundWorker:
                     break
             else:
                 raise RuntimeError("rollup store cannot be emptied; refusing to re-index")
+            # Any audit plan in flight describes the store that was just
+            # destroyed. `clear()` bumps the store's generation, which is what
+            # makes the refusal survive a restart; dropping the plan here is
+            # what makes it survive THIS process. Both, because the plan can be
+            # published by the audit thread a moment after the clear.
+            self._drop_audit_plan("the cost index was rebuilt")
             for _vendor, scanner in scanners:
                 scanner.reset()
+            # The attribution cache is a decomposition OF the store that was
+            # just emptied. Left standing it would be re-added on top of itself
+            # by the re-index, which is the exact double count roadmap item 1
+            # exists to prevent - one dimension lower.
+            attribution = self._attribution
+            if attribution is not None:
+                try:
+                    attribution.clear()
+                    attribution.save(force=True)
+                except Exception as exc:
+                    _log(f"attribution clear failed: {_describe(exc)}")
+            self._cost_project_rows = ()
+            self._cost_session_rows = ()
             # Deliberately emptied, so no vendor may later be diagnosed as
             # having "lost" its offsets and have its rows dropped a second time.
             self._reconciled.update(vendor for vendor, _scanner in scanners)
@@ -2221,6 +3134,87 @@ class BackgroundWorker:
             )
         except Exception as exc:
             self._publish(replace(self._snapshot, cost_error=_describe(exc)))
+
+    def _restore_backup(self, name: str | None = None) -> None:
+        """Copy a backup's files back over the live state (roadmap item 17).
+
+        The undo for ``Rebuild cost index``, and it is deliberately the same
+        thing the operator did by hand on 2026-09-10: put the files back. What
+        it does NOT do is pretend the running process can carry on as if
+        nothing happened - see :attr:`_restore_frozen`. The rollup store is
+        re-read (``load()`` is public and replaces the store wholesale), the
+        cost side stops scanning and stops saving, and the menu says so until
+        the widget is relaunched. Half a restore - restored days against
+        post-rebuild offsets - would be an invisible undercount, which is the
+        one outcome worse than asking for a relaunch.
+        """
+        home = self._state_home()
+        if home is None:
+            return
+        target = os.path.join(home, name) if name else statebackup.latest_backup(home)
+        if target is None:
+            self._publish(replace(self._snapshot, cost_error="no state backup to restore"))
+            return
+        try:
+            restored = statebackup.restore_backup(target, home)
+        except Exception as exc:
+            self._publish(replace(self._snapshot, cost_error=_describe(exc)))
+            return
+        label = os.path.basename(os.fspath(target))
+        self._restore_frozen = label
+        _log(f"restored {statebackup.describe(restored)} from {target}")
+        if self._rollups is not None:
+            try:
+                self._rollups.load()
+                self._rollups_loaded = True
+            except Exception as exc:
+                _log(f"rollup reload after restore failed: {_describe(exc)}")
+            # A restore replaces the days wholesale with other bytes, which is
+            # exactly as fatal to an outstanding plan as a rebuild: `observed`
+            # describes figures nobody holds any more. `load()` does not bump
+            # the generation (it is a read), so this does.
+            bump = getattr(self._rollups, "bump_generation", None)
+            if callable(bump):
+                try:
+                    bump()
+                except Exception as exc:  # pragma: no cover - defensive
+                    _log(f"generation bump after restore failed: {_describe(exc)}")
+        self._drop_audit_plan("the cost index was restored")
+        self._refresh_state_backups()
+        self._restore_note = (
+            f"Restored {len(restored)} state file(s) from {label} - "
+            "relaunch the widget to resume indexing"
+        )
+        self._publish(replace(self._snapshot, cost=self._restored_breakdown()))
+
+    def _restored_breakdown(self) -> Any:
+        """Today's figures from the just-restored store, or ``None``.
+
+        Published instead of ``cost=None`` because the Cost section renders a
+        missing breakdown as ``indexing…`` - which, on a widget that has just
+        frozen its cost side, would be the one thing SPEC 4.3 forbids: a label
+        claiming work that is not happening and will not happen until a
+        relaunch.
+
+        ``complete=True`` is a statement about the BREAKDOWN, not about the
+        scanners: it means "these numbers are the whole of what this store
+        holds", which is exactly true of a file that was captured whole. What
+        the scanners think is a different question, and the diagnostics line
+        answers it in words.
+        """
+        rollups = self._rollups
+        pricing = self._pricing
+        if rollups is None or pricing is None:
+            return None
+        try:
+            return rollups.cost_breakdown(
+                pricing,
+                today=local_day_key(time.time()),
+                progress=IndexProgress(complete=True),
+            )
+        except Exception as exc:
+            _log(f"cost recompute after restore failed: {_describe(exc)}")
+            return None
 
     def _apply_lookback(self, days: int) -> None:
         """Push a changed ``lookback_days`` into the seams that cache it.
@@ -2582,6 +3576,392 @@ class BackgroundWorker:
             f" · {result.records_counted:,} records"
         )
 
+    def audit_status_label(self) -> str | None:
+        """``Last audit: 11:40 · 0 drift`` for the Settings menu, or ``None``.
+
+        Read on the AppKit thread, so it must not touch the disk: the label is
+        computed on the worker (``_maybe_run_audit``, which runs every cost tick
+        and has already loaded the sidecar there) and cached in
+        ``_audit_status``. ``None`` before the first audit of this process,
+        which is what keeps a machine that has never audited from claiming that
+        it has. The docstring used to say "cached" while the reader went
+        straight to ``SelfAudit.status_label`` - a sidecar read on the AppKit
+        thread (fixed 2026-09-10).
+        """
+        return self._audit_status
+
+    def _publish_audit_plan(
+        self, repairs: Sequence[Any], note: str | None
+    ) -> None:
+        """Hand a finished audit's plan and note to the worker. **Audit thread.**
+
+        The only writer of the pair from that thread, and it writes both at
+        once: see ``_audit_lock``.
+        """
+        with self._audit_lock:
+            self._audit_repairs = tuple(repairs)
+            self._audit_note = note
+
+    def _take_audit_plan(self) -> tuple[tuple[Any, ...], str | None]:
+        """Take the outstanding plan and the note it was published with,
+        leaving none behind. **Worker thread.** The note travels with the plan
+        so the verdict written after the apply can only ever land on THIS
+        plan's note, never on one the audit thread published meanwhile."""
+        with self._audit_lock:
+            plan, self._audit_repairs = self._audit_repairs, ()
+            return tuple(plan), self._audit_note
+
+    def _drop_audit_plan(self, reason: str) -> None:
+        """Throw away any outstanding repair plan. **Worker thread.**
+
+        Called by every path that replaces the store's contents wholesale
+        (``_rebuild_index``, ``_restore_backup``). The plan is a correction
+        against days that no longer exist, and the note must stop claiming a
+        rebuild it will now never do.
+        """
+        with self._audit_lock:
+            had = bool(self._audit_repairs)
+            self._audit_repairs = ()
+        if not had:
+            # Nothing was pending, so nothing is being refused. A note left
+            # from an audit that already applied its plan told the truth about
+            # what happened to it, and rewriting it here would take that back.
+            return
+        _log(f"audit: repair plan dropped ({reason})")
+        self._set_audit_note_tail(f"NOT rebuilt - {reason}")
+
+    def _set_audit_note_tail(self, tail: str, expected: str | None = None) -> str | None:
+        """Rewrite the published verdict of the current audit note.
+
+        With *expected* (the note a plan was taken with), the rewrite happens
+        only while that exact note is still the published one - a note the
+        audit thread published mid-apply keeps its own pending tail.
+
+        SPEC 3.2a: the note's tail is a claim about what happened to the plan,
+        and only this thread knows. ``rebuilt`` is published *after* the repair
+        landed; every other exit rewrites it to ``NOT rebuilt - <reason>``.
+        Leaving the audit thread's optimistic wording standing is what let a
+        dropped plan report a rebuild that never happened.
+        """
+        note = expected if expected is not None else self._audit_note
+        if not note:
+            return None
+        try:
+            from .audit import note_with_tail
+        except Exception:  # pragma: no cover - defensive
+            return None
+        with self._audit_lock:
+            if self._audit_note != note:
+                return None
+            self._audit_note = note_with_tail(note, tail)
+            return self._audit_note
+
+    def _maybe_run_audit(
+        self,
+        rollups: Any,
+        scanners: Sequence[tuple[Vendor, Any]],
+        *,
+        today: str,
+        settings: dict[str, Any],
+        progress: IndexProgress,
+    ) -> None:
+        """Start today's self-audit if it is due, on a thread of its own.
+
+        Four gates, each for its own reason:
+
+        * ``self_audit_enabled`` off - the feature has an off switch like every
+          other (house rule), and off means no corpus is re-read at all.
+        * the first index is still running - the live store is *known* partial,
+          so every cell would "drift" and the repair would fight the indexer.
+        * one already running - the audit is idempotent but two of them would
+          repair the same day twice against each other.
+        * not due today - the sidecar remembers the day, so a restart at 09:00
+          does not re-audit what 08:00 already did.
+
+        The thread is a daemon and mutates nothing: it leaves its verdict in
+        ``_audit_note`` and its repair PLAN in ``_audit_repairs``, and the next
+        cost tick applies the one and publishes the other (SPEC 3.2a).
+        """
+        if not settings.get("self_audit_enabled", SETTINGS_DEFAULTS["self_audit_enabled"]):
+            # Off means the note goes too. Leaving the last verdict standing
+            # would keep a `!` line on the Cost section for a feature the owner
+            # has switched off, with nothing left that could ever clear it
+            # (lifecycle checklist: set / cleared / aged / rehydrated /
+            # DISABLED).
+            self._publish_audit_plan((), None)
+            return
+        if self._stop.is_set():
+            return
+        if not progress.complete:
+            return
+        thread = self._audit_thread
+        if thread is not None and thread.is_alive():
+            return
+        if self._audit is None:
+            try:
+                from .audit import SelfAudit
+            except Exception as exc:  # pragma: no cover - defensive
+                _log(f"self-audit unavailable: {_describe(exc)}")
+                return
+            store_path = getattr(rollups, "path", None)
+            self._audit = (
+                SelfAudit.beside(store_path) if store_path is not None else SelfAudit()
+            )
+        audit = self._audit
+        # The Settings line, refreshed on THIS thread every cost tick - before
+        # the due check, so the label is current even on the ~287 ticks a day
+        # that stop right there. `status_label` reads the sidecar from disk and
+        # the AppKit thread must never do that.
+        try:
+            self._audit_status = audit.status_label()
+        except Exception:  # pragma: no cover - a label must never raise
+            self._audit_status = None
+        try:
+            if not audit.due(today=today):
+                return
+        except Exception as exc:
+            _log(f"self-audit due check failed: {_describe(exc)}")
+            return
+        # Everything the audit needs from the LIVE scanners is read here, on the
+        # worker thread, under their scan locks. The thread below then works
+        # from frozen data - it used to call `tombstone_rollups` (and through it
+        # `_ensure_states_loaded`) on the live scanners while a scan was in
+        # flight.
+        try:
+            sources = audit.snapshot_scanners(tuple(scanners), today=today)
+        except Exception as exc:
+            _log(f"self-audit could not read scan state: {_describe(exc)}")
+            return
+
+        def _run() -> None:
+            try:
+                result = audit.run(rollups, sources, today=today)
+                _log(result.log_line)
+                # Data only, and both halves at once. `_apply_audit_repairs`
+                # puts it into the store on the worker thread, at the top of
+                # the next cost job, and rewrites the note's tail with what
+                # actually happened to it.
+                self._publish_audit_plan(result.repairs, result.note)
+                audit.mark_ran(result, today=today)
+            except Exception as exc:  # an audit must never kill the widget
+                _log(f"self-audit failed: {_describe(exc)}")
+
+        thread = threading.Thread(target=_run, name="cc-usage-audit", daemon=True)
+        self._audit_thread = thread
+        thread.start()
+
+    def _apply_audit_repairs(self, rollups: Any) -> None:
+        """Apply the audit's repair plan. **Worker thread**, never raises.
+
+        The other half of the audit's split (roadmap item 2, hardened
+        2026-09-10): the daemon thread computes, this applies. Each
+        ``(day, vendor)`` goes in through ONE atomic
+        ``replace_day_for_vendor`` - retract and re-add under a single
+        acquisition of the store lock - and the plan carries what the audit
+        OBSERVED as well as what it found, so a delta this worker merged while
+        the audit was running is carried across instead of being overwritten by
+        a stale absolute figure. Those deltas are bytes the indexer has already
+        consumed; overwriting them loses them permanently.
+
+        Runs before this tick's scans so the repaired day is what the merge
+        lands on, and saves once for the whole plan: a crash between here and
+        the next save would otherwise leave the inflated cells on disk with the
+        audit already marked as done for today.
+        """
+        plan, taken_note = self._take_audit_plan()
+        if not plan:
+            return
+        generation = int(getattr(rollups, "generation", 0) or 0)
+        stale = [item for item in plan if int(getattr(item, "generation", 0)) != generation]
+        if stale:
+            # The store was rebuilt (or restored) between the plan and this
+            # tick. The plan is a CORRECTION - current - observed + fresh - so
+            # applying it now subtracts an `observed` that describes days
+            # nobody holds any more: `max(0, 1M - 50M + 1M)` is 0, and the day
+            # the re-index had just put back is silently zeroed. The older
+            # guard only caught an EMPTY store, which a rebuild stops being on
+            # its first delta; the generation catches it however far the
+            # re-index has got.
+            _log(
+                "audit: repair plan dropped (the cost index was rebuilt: plan "
+                f"generation {stale[0].generation}, store {generation})"
+            )
+            self._set_audit_note_tail("NOT rebuilt - the cost index was rebuilt since", expected=taken_note)
+            return
+        if not rollups.days():
+            # Belt to the generation's braces: a store emptied by something
+            # that does not bump the generation (a reconcile that dropped every
+            # vendor's rows) still must not have a correction applied to it.
+            _log("audit: repair plan dropped (the store was rebuilt)")
+            self._set_audit_note_tail("NOT rebuilt - the store was emptied", expected=taken_note)
+            return
+        replace_day = getattr(rollups, "replace_day_for_vendor", None)
+        if not callable(replace_day):
+            _log(
+                f"{len(plan)} audited day(s) could not be repaired: this store "
+                "has no replace_day_for_vendor; rebuild the cost index"
+            )
+            self._set_audit_note_tail("NOT rebuilt - this store cannot repair a day", expected=taken_note)
+            return
+        repaired: list[str] = []
+        pairs: list[tuple[str, str]] = []
+        for item in plan:
+            try:
+                replace_day(
+                    item.day,
+                    item.vendor,
+                    item.fresh_models,
+                    observed=item.observed_models,
+                )
+            except Exception as exc:  # one bad day must not cost the tick
+                _log(f"self-audit repair failed for {item.day}: {_describe(exc)}")
+                continue
+            pairs.append((item.day, item.vendor))
+            if item.day not in repaired:
+                repaired.append(item.day)
+        if not repaired:
+            self._set_audit_note_tail("NOT rebuilt - every repair failed", expected=taken_note)
+            return
+        try:
+            rollups.save(force=True)
+        except Exception as exc:
+            _log(f"self-audit repair not saved: {_describe(exc)}")
+        _log(f"audit: repaired {len(repaired)} day(s) on the worker")
+        published = self._set_audit_note_tail("rebuilt", expected=taken_note)
+        self._mirror_audit_repair(rollups, repaired)
+        self._reset_repaired_projects(pairs, expected=published)
+
+    def _reset_repaired_projects(
+        self, pairs: Sequence[tuple[str, str]], expected: str | None = None
+    ) -> None:
+        """Drop the per-project split of every repaired ``(day, vendor)``.
+
+        A repair rebuilds a day's AGGREGATE from the corpus. The attribution
+        cache and ``history.daily_project`` are decompositions OF that
+        aggregate, and nothing in the plan says how to decompose it - the plan
+        is per ``(day, model)``. Left standing they keep quoting a split of a
+        figure the aggregate has already disowned, and the two numbers disagree
+        about that day for ever (the aggregate mirror had this fixed in
+        ``_mirror_audit_repair``; this is the same fix one dimension along).
+
+        So both are dropped for that day and vendor, and the note SAYS SO -
+        "(project split for 2026-09-09 reset)" - because an empty decomposition
+        with no explanation reads as a bug in the menu rather than as the
+        deliberate consequence of a repair. The next scan re-attributes
+        whatever it reads; a day whose transcripts are gone simply has no
+        split any more, which is the honest answer.
+        """
+        if not pairs:
+            return
+        settings = self._settings()
+        # Built here rather than read from `_attribution`, which is None until
+        # the first `_absorb_attribution` of this process: on the tick after a
+        # restart the stale split is still on disk, and skipping it because
+        # nothing has loaded it yet is how it would survive the repair. Off
+        # still means off - the store is never constructed then, so
+        # `attribution.json` is never created (the rule the feature ships under).
+        store = (
+            self._attribution_store()
+            if bool(settings.get("cost_by_project_enabled", True))
+            else None
+        )
+        days: list[str] = []
+        for day, vendor in pairs:
+            dropped = 0
+            if store is not None:
+                drop = getattr(store, "drop_day_for_vendor", None)
+                if callable(drop):
+                    try:
+                        dropped += int(drop(day, vendor) or 0)
+                    except Exception as exc:
+                        _log(f"attribution: repaired day not reset: {_describe(exc)}")
+            if bool(settings.get("history_enabled", True)):
+                history = self._history_store()
+                drop_rows = getattr(history, "drop_project_day", None)
+                if history is not None and callable(drop_rows):
+                    try:
+                        dropped += int(drop_rows(day, vendor) or 0)
+                    except Exception as exc:
+                        _log(f"history: repaired day not reset: {_describe(exc)}")
+            if dropped and day not in days:
+                days.append(day)
+        if not days:
+            return
+        if store is not None:
+            # Durable before the note claims it: the drop is the only thing
+            # that makes the empty decomposition true, and a crash between the
+            # two would leave the menu quoting the old split under a note that
+            # says it was reset.
+            try:
+                store.save(force=True)
+            except Exception as exc:  # pragma: no cover - defensive
+                _log(f"attribution: save after repair failed: {_describe(exc)}")
+            self._cost_project_rows = ()
+            self._cost_session_rows = ()
+        self._set_audit_note_tail(
+            f"rebuilt (project split for {', '.join(days)} reset)", expected=expected
+        )
+
+    def _mirror_audit_repair(self, rollups: Any, days: Sequence[str]) -> None:
+        """Push repaired days into the long-term record (roadmap item 8).
+
+        ``history.sqlite`` mirrors the store's days, so a day the audit rebuilt
+        must be REPLACED there rather than merged into - otherwise the mirror
+        keeps the inflated figure for ever and the dashboard reads from it.
+        Discovered by name (``replace_day``) so this works whichever way the
+        two features merged, and silent when the feature is off or the store
+        does not offer it.
+        """
+        if not bool(self._settings().get("history_enabled", True)):
+            return
+        store = self._history_store()
+        if store is None:
+            return
+        replace_day = getattr(store, "replace_day", None)
+        if not callable(replace_day):
+            return
+        for day in days:
+            rollup = rollups.get(day)
+            if rollup is None:
+                continue
+            try:
+                replace_day(day, rollup, self._pricing)
+            except Exception as exc:
+                _log(f"history: audit repair not mirrored: {_describe(exc)}")
+                self._history_errors = (f"history: {_describe(exc)}",)
+                return
+
+    @staticmethod
+    def _retract(rollups: Any, result: Any) -> None:
+        """Apply one scan's :attr:`ScanResult.retractions` to the store.
+
+        ``retract_rollups`` is an *optional* capability of
+        ``contracts.RollupStore``, discovered by name like ``clear`` and
+        ``drop_vendors``. A store without it that is handed a non-empty
+        retraction is the one case worth shouting about: the pass is about to
+        re-add a contribution that nothing took out, which is the double count
+        the ledger exists to prevent.
+        """
+        retractions = getattr(result, "retractions", ())
+        if not retractions:
+            return
+        retract = getattr(rollups, "retract_rollups", None)
+        if not callable(retract):
+            _log(
+                f"{len(retractions)} day(s) of re-read usage could not be retracted: "
+                "this store has no retract_rollups; rebuild the cost index"
+            )
+            return
+        try:
+            clamped = retract(retractions)
+        except Exception as exc:  # a broken retraction must not kill the tick
+            _log(f"retraction failed: {_describe(exc, 'cost')}")
+            return
+        if clamped:
+            # The ledger described more than the store held - pruned, rebuilt,
+            # or partially lost. Not fatal, but never silent (Rule 12).
+            _log(f"retraction clamped {clamped} cell(s) at zero")
+
     def _run_cost_job(self) -> float:
         """One incremental scan per vendor + cost recompute. Returns the next due time.
 
@@ -2592,6 +3972,12 @@ class BackgroundWorker:
         (SPEC-CODEX 5.2).
         """
         interval = self._cost_interval()
+        if self._restore_frozen:
+            # A restore put files on disk that this process has not read
+            # (roadmap item 17). Scanning would credit records the restored
+            # rollup already contains; saving would put the rebuild's state
+            # back on top of the restore. Neither, until a relaunch.
+            return time.monotonic() + interval
         settings = self._settings()
         if not settings.get("cost_tracking_enabled", True):
             if self._snapshot.cost is not None:
@@ -2620,11 +4006,22 @@ class BackgroundWorker:
             # own first merge to reconcile. Cheap - a no-op set membership test
             # once every vendor has been seen.
             self._reconcile_lost_scan_state(scanners, rollups)
+            # The audit's plan from a previous tick, applied HERE - on this
+            # thread, before anything is merged - so the repaired day is what
+            # this tick's deltas land on and no reader ever sees a day with its
+            # cells taken out and not yet put back (roadmap item 2).
+            self._apply_audit_repairs(rollups)
 
             keep_days = int(
                 settings.get("lookback_days", SETTINGS_DEFAULTS["lookback_days"])
             )
             self._apply_lookback(keep_days)
+            # Roadmap item 6. Read every tick and pushed only on a change, so
+            # flipping the setting takes effect on the next tick without the
+            # scanners paying for a getattr sweep in steady state.
+            self._set_attribution(
+                bool(settings.get("cost_by_project_enabled", True))
+            )
 
             before = [scanner.progress() for _v, scanner in scanners]
             was_partial = any(not item.complete for item in before)
@@ -2668,17 +4065,31 @@ class BackgroundWorker:
             for _vendor, scanner in due:
                 result = scanner.scan_once(deadline=time.monotonic() + share)
                 results.append(result)
+                # RETRACT BEFORE MERGE (roadmap item 1). A pass that re-read a
+                # file from byte 0 hands back that file's recorded contribution;
+                # taking it out first is what turns an add-only store into an
+                # idempotent one. The other order would re-add the contribution
+                # and then subtract it again, leaving the day short.
+                self._retract(rollups, result)
                 if result.deltas:
                     rollups.merge(result.deltas)
+                # The same bytes, attributed. Same tick, same order (roadmap
+                # item 6), so the project totals cannot drift from the day
+                # totals they decompose.
+                self._absorb_attribution(scanner)
 
             today = local_day_key(time.time())
             rollups.prune(today=today, keep_days=keep_days)
+            self._publish_attribution(today, keep_days)
 
             # Combined over EVERY scanner, not just the ones that ran: one
             # vendor still indexing must keep the dollar figures behind the
             # `indexing…` label (SPEC 4.3, SPEC-CODEX 5.2).
             progress = IndexProgress.combined(scanner.progress() for _v, scanner in scanners)
-            any_deltas = any(result.deltas for result in results)
+            any_deltas = any(
+                result.deltas or getattr(result, "retractions", ())
+                for result in results
+            )
             if any_deltas:
                 # Unthrottled on purpose. The old 5 s throttle left up to five
                 # seconds of merged deltas in memory while the indexer's offsets
@@ -2692,6 +4103,12 @@ class BackgroundWorker:
             # must never reach disk before the tokens they contained. One save
             # covers both vendors, so neither may commit before it.
             self._commit_scan_state()
+
+            # Integrity tick (roadmap item 2). After the merge and the commit,
+            # so it audits the state a restart would find; on its own daemon
+            # thread, so a slow corpus cannot starve the accounts tick.
+            self._maybe_run_audit(rollups, scanners, today=today, settings=settings,
+                                  progress=progress)
 
             breakdown = rollups.cost_breakdown(pricing, today=today, progress=progress)
             note = " | ".join(
@@ -2716,6 +4133,12 @@ class BackgroundWorker:
                 _forget_failures("cost")
             else:
                 warning = f"{len(errors)} file(s) unreadable: {errors[0]}"[:MAX_ERROR_CHARS]
+            # Mirror the window into history.sqlite (roadmap item 8). AFTER the
+            # rollups and the offsets are durable, so the long-term record can
+            # never be ahead of the aggregate it mirrors, and traps its own
+            # errors so a history failure cannot cost us this tick's numbers.
+            self._mirror_history(rollups, keep_days, today)
+            self._mirror_attribution(keep_days)
             self._publish(
                 replace(
                     self._snapshot,
@@ -2724,6 +4147,7 @@ class BackgroundWorker:
                     quota_rows=self._collect_quota_rows(),
                     cost_error=warning,
                     scan_note=note,
+                    audit_note=self._audit_note,
                     cost_at=time.time(),
                 )
             )
@@ -2841,9 +4265,16 @@ class CCUsageWidgetApp(rumps.App):
         persist_settings: Callable[[dict[str, Any]], None] | None = None,
         wiring_errors: Sequence[str] = (),
         sources: Sequence[TranscriptSource] | None = None,
+        confirm: Callable[[str, str], bool] | None = None,
         name: str = APP_NAME,
     ) -> None:
         super().__init__(name, title=TITLE_ICON, quit_button=None)
+        self._confirm_cb = confirm or _confirm
+        """Modal used in front of the two destructive menu actions.
+
+        Injected rather than patched so a test can answer the question without
+        a window ever existing; the default (:func:`_confirm`) answers "no"
+        under ``CC_USAGE_WIDGET_NO_REVEAL`` for the same reason."""
         normalized = normalize_settings(settings)
         self._lock = threading.Lock()
         self._snapshot = UiSnapshot(
@@ -2884,6 +4315,9 @@ class CCUsageWidgetApp(rumps.App):
         """
         _apply_activation_policy()
         self._running = True
+        self._worker.attach_notifier(
+            notify_mod.build_notifier(settings=lambda: self.snapshot().settings, log=_log)
+        )
         self._worker.submit(_CMD_WIRE_SOURCES, None)
         self._worker.start()
         self._sync_timer.start()
@@ -2991,6 +4425,9 @@ class CCUsageWidgetApp(rumps.App):
         """
         try:
             self._supervise_worker()
+            # The worker's desktop hand-offs, performed HERE because this is
+            # the AppKit thread and NSWorkspace is AppKit (see _DESKTOP_REVEAL).
+            self._drain_desktop_handoffs()
             with self._lock:
                 dirty, self._dirty = self._dirty, False
                 snapshot = self._snapshot
@@ -2998,6 +4435,39 @@ class CCUsageWidgetApp(rumps.App):
                 self.rebuild_menu(snapshot)
         except Exception as exc:  # pragma: no cover - defensive
             _log(f"repaint failed: {_describe(exc)}")
+
+    def _desktop_handoff(self, action: str, path: Any) -> bool:
+        """Perform ONE hand-off to the desktop. **AppKit thread.**
+
+        The single place this process talks to ``NSWorkspace`` about a file the
+        worker produced, and a **seam**: tests replace it on the instance and
+        record what they were asked to do, which is how "the worker never calls
+        AppKit" is asserted without patching a module function that the
+        settings-reveal callbacks also use.
+
+        Both branches honour ``CC_USAGE_WIDGET_NO_REVEAL`` inside the helpers
+        themselves, so a test that forgets to install the seam still opens
+        nothing.
+        """
+        if action == _DESKTOP_OPEN:
+            return _open_in_browser(path)
+        return _reveal_in_finder(path)
+
+    def _drain_desktop_handoffs(self) -> int:
+        """Perform every hand-off the worker parked. Returns how many.
+
+        Never raises: a Finder that refuses is a log line, not a dead repaint
+        tick - and a dead repaint tick freezes every figure in the menu, which
+        is a far worse outcome than an export the user has to find themselves.
+        """
+        done = 0
+        for action, path in self._worker.take_desktop_requests():
+            try:
+                self._desktop_handoff(action, path)
+            except Exception as exc:  # pragma: no cover - defensive
+                _log(f"desktop hand-off failed: {_describe(exc)}")
+            done += 1
+        return done
 
     MAX_WORKER_RESTARTS = 5
     """Restarts attempted before the widget stops trying and just says so."""
@@ -3064,6 +4534,8 @@ class CCUsageWidgetApp(rumps.App):
         """
         snapshot = snapshot or self.snapshot()
         settings = snapshot.settings
+        if settings.get("title_compact", False):
+            return self._compact_title(snapshot)
         parts: list[str] = []
         if settings.get("title_show_icon", True):
             parts.append(TITLE_ICON)
@@ -3136,6 +4608,60 @@ class CCUsageWidgetApp(rumps.App):
         # bar without evicting a neighbour — RCA 2026-08-17). The glyph fallback
         # only guards the case where the image could not be installed, because
         # an item with neither image nor title is zero-width and invisible.
+        return "" if getattr(self, "_icon_image_set", False) else TITLE_ICON
+
+    def _compact_title(self, snapshot: UiSnapshot) -> str:
+        """``"V·C 100/100"`` — the narrow-bar title (roadmap item 16).
+
+        A different title, not another component: with ``title_compact`` on,
+        every ``title_show_*`` toggle is ignored, because none of those
+        components is rendered. What survives the cut is the pair of figures
+        the operator actually acts on — how much of the active Claude account's
+        5-hour window is gone, and how much of the active Codex account's week
+        — under the initials that say whose they are
+        (:func:`render.compact_title`).
+
+        The honesty rules do not get compacted with the text. A standing note
+        on either row REPLACES that row's number with ``⚠`` rather than
+        showing a percentage the account can no longer support (SPEC 4.3, the
+        same rule as :func:`_title_note`); the engine's standing verdict keeps
+        its glyph, which is the one exception the full title makes too; and an
+        unreported window contributes nothing at all rather than a zero. With
+        neither figure the item falls back exactly as the full title does — an
+        icon-only status item, or the glyph when no image could be installed.
+
+        Width: :data:`render.COMPACT_TITLE_MAX` for the figures, plus the
+        standing-problem glyph, which is deliberately outside the budget for
+        the same reason it is exempt from the toggles.
+        """
+        figures: list[tuple[str, str]] = []
+        active = snapshot.active
+        if active is not None:
+            # The alias's initial here, unlike `_title_vendor_pct`'s vendor
+            # initial: on the Claude side the alias IS what the operator
+            # switches between, and it is the only per-account identity the
+            # compact title has room for.
+            initial = _display_name(active)[:1].upper()
+            note = snapshot.account_notes.get(active.slot)
+            if note:
+                figures.append((initial, COMPACT_ATTENTION))
+            elif active.five_hour_pct is not None:
+                figures.append((initial, _compact_pct(active.five_hour_pct)))
+        row = self._active_quota_row(snapshot) or self._transcript_quota_row(snapshot)
+        if row is not None:
+            initial = vendor_label(row.vendor)[:1].upper()
+            if _quota_alarm(row):
+                figures.append((initial, COMPACT_ATTENTION))
+            elif row.seven_day_pct is not None:
+                figures.append((initial, _compact_pct(row.seven_day_pct)))
+        title = render.compact_title(figures)
+        if snapshot.alert is not None:
+            # The glyph only - `_title_alert` also carries a word, which is
+            # wider than everything else in this title put together.
+            glyph = _title_alert(snapshot.alert[0]).split(" ", 1)[0]
+            title = f"{title} {glyph}".strip()
+        if title:
+            return title
         return "" if getattr(self, "_icon_image_set", False) else TITLE_ICON
 
     def _title_fleet(
@@ -3343,7 +4869,38 @@ class CCUsageWidgetApp(rumps.App):
         else:
             _label, pct, _note, expired = windows[0]
         text = format_pct(pct) if expired else _title_pct(pct)
-        return f"{initial}{text}"
+        return f"{initial}{text}{self._title_reset(row, expired=expired)}"
+
+    @staticmethod
+    def _title_reset(row: AccountRow, *, expired: bool, now: float | None = None) -> str:
+        """``"↺4d"`` on a CAPPED Codex row, else ``""`` (roadmap 4).
+
+        At the wall the only question left is when the room reopens, and it is
+        the one question the menu bar can answer in four characters —
+        :data:`render.TITLE_RESET_SUFFIX_MAX`, which is the whole width
+        budget this component was given. Below the wall it renders nothing: a
+        countdown next to ``C19%`` is noise, and the menu already prints the
+        reset clock on the row.
+
+        "Capped" is read the way the rest of this file reads it — the ``crit``
+        kind (``capped``, ``out of credits``) or a percentage that has reached
+        100 — never the wording. An **expired** window is excluded on purpose:
+        its reset is in the past, so the honest countdown is none at all, and
+        `title_reset_suffix` returns "" for it anyway. A row whose source did
+        not carry an epoch (claude-swap, the transcript-derived Codex row)
+        leaves ``soonest_reset_at`` ``None`` and gets no suffix — which is what
+        keeps a Codex-only machine's title byte-for-byte today's.
+        """
+        if expired:
+            return ""
+        capped = getattr(row, "attention_kind", "") == "crit" or (
+            row.seven_day_pct is not None and row.seven_day_pct >= 100.0
+        )
+        if not capped:
+            return ""
+        return render.title_reset_suffix(
+            getattr(row, "soonest_reset_at", None), time.time() if now is None else now
+        )
 
     def _active_quota_row(self, snapshot: UiSnapshot) -> AccountRow | None:
         """The visible quota row for the login that is active right now."""
@@ -3623,6 +5180,14 @@ class CCUsageWidgetApp(rumps.App):
             return []
         label_width = _window_label_width(snapshot.accounts, rows)
         items: list[rumps.MenuItem] = []
+        # The fleet line, when there is a fleet to describe (roadmap 4). It is
+        # a heading, so it goes above the rows, and it is absent - not empty -
+        # whenever the setting is off or no live row exists, which keeps the
+        # pre-roadmap block byte-for-byte.
+        if snapshot.settings.get("codex_fleet_line_enabled", True):
+            heading = _codex_fleet_heading(rows, now=time.time())
+            if heading:
+                items.append(_info(heading))
         for row in rows:
             # `callback=None` is what makes AppKit render it disabled, which is
             # the requirement: a Codex quota must not look clickable, because
@@ -3670,6 +5235,14 @@ class CCUsageWidgetApp(rumps.App):
                         expired=expired,
                     )
                 )
+            # Facts read at the same instant as the bars, under them
+            # (roadmap 10/11/12): a credit balance, when a blocked model
+            # returns, where the burn rate is heading. Dim and unmarked - they
+            # are not verdicts, and the header's one note stays the headline.
+            # Indented to the bars' own column so the block reads as one thing.
+            for line in getattr(row, "info_notes", ()) or ():
+                segments.append(("\n", None))
+                segments.append((f"   {line}", "dim"))
             render.apply_attributed(item, segments)
         except Exception:
             pass  # plain label stands
@@ -3766,23 +5339,141 @@ class CCUsageWidgetApp(rumps.App):
             ),
             _info(_cost_row_label(cost.last_30d.label or "Last 30d", _usd_label(cost.last_30d))),
         ]
-        items.extend(self._model_items(cost))
-        if cost.unknown_models or cost.last_30d.unpriced_tokens:
-            # SPEC 3.3 trap 5: show the actual unrecognised name, priced at $0
-            # — and the magnitude, so "+" totals above are quantified here.
-            names = ", ".join(cost.unknown_models[:3])
-            if len(cost.unknown_models) > 3:
-                names = f"{names}, +{len(cost.unknown_models) - 3} more"
-            scale = (
-                f" ({format_tokens(cost.last_30d.unpriced_tokens)} tok/30d)"
-                if cost.last_30d.unpriced_tokens
-                else ""
-            )
-            suffix = f": {names}" if names else ""
-            items.append(_info(f"  unpriced at $0{scale}{suffix}"))
+        items.extend(self._model_items(cost, snapshot.settings))
+        items.extend(self._unpriced_items(cost))
+        items.extend(self._attribution_items(snapshot))
+        if snapshot.audit_note:
+            # The daily integrity tick found the store disagreeing with the
+            # corpus, or could not check. Money that drifted belongs next to
+            # the money, not buried in Settings (roadmap item 2).
+            items.append(_info(f"! {snapshot.audit_note}"))
+        items.extend(self._dashboard_items(snapshot))
+        items.extend(self._export_items(snapshot))
         return items
 
-    def _model_items(self, cost: CostBreakdown) -> list[rumps.MenuItem]:
+    def _attribution_items(self, snapshot: UiSnapshot) -> list[rumps.MenuItem]:
+        """``Today by project`` and ``Most expensive sessions today`` (item 6).
+
+        **Byte-for-byte absent** in three situations, which is the whole
+        contract of the off switch: the setting is off, the store holds nothing
+        for today (a fresh install, a machine that has not worked today), or the
+        attribution module could not be built. No empty heading, no "no data"
+        line - the Cost section a Claude-only machine with the feature off draws
+        is character-identical to the one it drew before this feature existed.
+
+        The rows are read off the worker, which computed them on its own thread
+        while it had the store open (SPEC 2.3): the AppKit thread does not open
+        a cache to draw a menu.
+        """
+        if not snapshot.settings.get("cost_by_project_enabled", True):
+            return []
+        items: list[rumps.MenuItem] = []
+        for heading, rows in (
+            ("today by project", self._worker.cost_project_rows),
+            ("today's top sessions", self._worker.cost_session_rows),
+        ):
+            if not rows:
+                continue
+            items.append(
+                _info(_attribution_group_label(heading, sum(row.usd for row in rows)))
+            )
+            for row in rows:
+                items.append(
+                    _info(
+                        _attribution_row_label(row.label, row.total_tokens, row.usd)
+                    )
+                )
+        return items
+
+    @staticmethod
+    def _unpriced_line(tokens: int, names: Sequence[str], *, prefix: str = "") -> str:
+        """One ``unpriced at $0`` line: magnitude and names, never a dollar.
+
+        SPEC 3.3 trap 5 requires the *actual* unrecognised names, and the 2026-08-25
+        incident requires the magnitude beside them - the ``+`` on the window
+        totals says "this is a floor" and this line says by how much.
+        """
+        shown = ", ".join(names[:3])
+        if len(names) > 3:
+            shown = f"{shown}, +{len(names) - 3} more"
+        scale = f" ({format_tokens(tokens)} tok/30d)" if tokens else ""
+        suffix = f": {shown}" if shown else ""
+        return f"  {prefix}unpriced at $0{scale}{suffix}"
+
+    def _unpriced_items(self, cost: CostBreakdown) -> list[rumps.MenuItem]:
+        """The unpriced-volume line(s) (roadmap item 3).
+
+        ``codex-auto-review`` is 916M tokens a week that OpenAI publishes no
+        rate for; at $0 and unnamed it hid a fifth of the Codex corpus behind a
+        clean-looking total. The names have been here since the incident - what
+        this adds is **whose** they are.
+
+        With one vendor in the 30-day window the line is unchanged, byte for
+        byte: a Claude-only or Codex-only machine has nothing to attribute and
+        a prefix would only be noise. With both, one line per vendor that has
+        unpriced tokens, so the magnitude sits under the section whose section
+        it is.
+        """
+        window = cost.last_30d
+        if not (cost.unknown_models or window.unpriced_tokens):
+            return []
+        vendors = tuple(vendor for vendor, _usd in window.vendor_usd)
+        if len(vendors) <= 1 or not window.vendor_unpriced:
+            return [_info(self._unpriced_line(window.unpriced_tokens, cost.unknown_models))]
+        return [
+            _info(
+                self._unpriced_line(
+                    tokens,
+                    cost.unknown_models_for_vendor(vendor),
+                    prefix=f"{vendor_label(vendor)} ",
+                )
+            )
+            for vendor, tokens in window.vendor_unpriced
+        ]
+
+    def _export_items(self, snapshot: UiSnapshot) -> list[rumps.MenuItem]:
+        """``Export usage (CSV/JSON)…`` (roadmap item 8), when there is usage.
+
+        Enabled callbacks, not info lines: they are the only two clickable
+        items in the Cost section, and they enqueue - the sqlite read and the
+        file write happen on the worker (SPEC 2.3).
+
+        Three states, and only the first offers a click:
+
+        * the mirror holds cells -> the two items;
+        * ``history_enabled`` is **off** -> nothing at all. Off means the file
+          is never opened or created, so the Cost section is byte-for-byte the
+          one this widget drew before roadmap item 8 existed - the same
+          contract ``_dashboard_items`` and ``_attribution_items`` keep;
+        * on, but the mirror is empty (a fresh install, or the first cost job
+          has not finished) -> one ``!`` line saying so. Offering the export
+          here wrote a header-only CSV to ``~/Downloads`` and revealed it in
+          Finder: a file with no rows is not an empty answer, it is a wrong
+          one, and SPEC 4.3 would rather say "nothing recorded yet".
+        """
+        if not snapshot.settings.get("history_enabled", True):
+            return []
+        if not self._worker.history_rows:
+            return [_info(f"! history: {_HISTORY_EMPTY_NOTE}")]
+        return [
+            rumps.MenuItem("Export usage (CSV)…", callback=self._on_export_csv),
+            rumps.MenuItem("Export usage (JSON)…", callback=self._on_export_json),
+        ]
+
+    def _dashboard_items(self, snapshot: UiSnapshot) -> list[rumps.MenuItem]:
+        """``Open dashboard`` (roadmap item 9), or nothing at all when off.
+
+        Nothing at all, rather than a greyed line: with ``dashboard_enabled``
+        false the Cost section must be byte-for-byte what it was before this
+        feature existed, which a disabled placeholder would not be.
+        """
+        if not snapshot.settings.get("dashboard_enabled", True):
+            return []
+        return [rumps.MenuItem("Open dashboard", callback=self._on_open_dashboard)]
+
+    def _model_items(
+        self, cost: CostBreakdown, settings: dict[str, Any] | None = None
+    ) -> list[rumps.MenuItem]:
         """Today's per-model rows, grouped by vendor when there is more than one.
 
         With one vendor this is byte-for-byte the pre-Codex section: a single
@@ -3812,7 +5503,14 @@ class CCUsageWidgetApp(rumps.App):
                 continue
             group = cost.vendor_row(vendor)
             subtotal = group.usd if group is not None else sum(row.usd for row in rows)
-            items.append(_info(_vendor_group_label(vendor_label(vendor), subtotal)))
+            name = vendor_label(vendor)
+            if vendor == VENDOR_CODEX:
+                # Roadmap 11: the heading, not the figure. `pricing.py` holds
+                # OpenAI's standard rates only, so on any other tier this says
+                # the rows below are not that tier's rather than re-scaling
+                # them by a multiplier nobody measured.
+                name = f"{name} {_pricing_tier_note(settings)}".strip()
+            items.append(_info(_vendor_group_label(name, subtotal)))
             items.extend(
                 _info(_model_row_label(row.display_name, row.total_tokens, row.usd))
                 for row in rows
@@ -3915,6 +5613,14 @@ class CCUsageWidgetApp(rumps.App):
             items.append(_info(f"! accounts: {snapshot.accounts_error}"))
         if snapshot.cost_error:
             items.append(_info(f"! cost: {snapshot.cost_error}"))
+        # The history mirror is a feature, not the widget: its failures are
+        # lines here, never an exception in the cost job (roadmap item 8).
+        for text in self._worker.history_errors:
+            items.append(_info(f"! {text[:MAX_ERROR_CHARS]}"))
+        # Same rule for the dashboard: a page the user asked for and did not
+        # get says why (roadmap item 9).
+        if self._worker.dashboard_error:
+            items.append(_info(f"! {self._worker.dashboard_error[:MAX_ERROR_CHARS]}"))
         return items
 
     def _switch_account_submenu(self, snapshot: UiSnapshot) -> rumps.MenuItem:
@@ -3947,7 +5653,20 @@ class CCUsageWidgetApp(rumps.App):
         # no Codex was being offered a "Codex tracking" switch, a "Codex weekly
         # percentage" title toggle and a diagnostics path that does not exist.
         has_vendors = bool(snapshot.quota_rows) or bool(self._worker.available_vendors)
-        title_children = [
+        compact_on = bool(settings.get("title_compact", SETTINGS_DEFAULTS["title_compact"]))
+        title_children: list[Any] = [
+            # First, and separated from the component list below it, because it
+            # is not a component: with compact on, every one of those toggles
+            # is inert (roadmap item 16).
+            _check(
+                rumps.MenuItem(
+                    _COMPACT_TITLE_LABEL, callback=self._make_setting_toggle("title_compact")
+                ),
+                compact_on,
+            ),
+            None,
+        ]
+        title_children += [
             _check(
                 rumps.MenuItem(label, callback=self._make_setting_toggle(key)),
                 bool(settings.get(key, SETTINGS_DEFAULTS.get(key, True))),
@@ -4010,6 +5729,7 @@ class CCUsageWidgetApp(rumps.App):
                     codex_on,
                 )
             )
+            codex_children.append(self._codex_tier_submenu(settings))
         # The live per-account controls (SPEC-CODEX 6) appear once the registry
         # file exists - i.e. once `codex_accounts adopt` has run. Before that
         # there is nothing for them to act on: a "Codex live quota" switch with
@@ -4034,15 +5754,175 @@ class CCUsageWidgetApp(rumps.App):
                     live_on,
                 )
             )
+            fleet_on = bool(
+                settings.get(
+                    "codex_fleet_line_enabled", SETTINGS_DEFAULTS["codex_fleet_line_enabled"]
+                )
+            )
+            codex_children.append(
+                _check(
+                    rumps.MenuItem(
+                        self._switch_label("Codex fleet line", fleet_on),
+                        callback=self._make_setting_toggle("codex_fleet_line_enabled"),
+                    ),
+                    fleet_on,
+                )
+            )
+            pace_on = bool(
+                settings.get(
+                    "codex_pace_forecast_enabled",
+                    SETTINGS_DEFAULTS["codex_pace_forecast_enabled"],
+                )
+            )
+            codex_children.append(
+                _check(
+                    rumps.MenuItem(
+                        self._switch_label("Codex pace forecast", pace_on),
+                        callback=self._make_setting_toggle("codex_pace_forecast_enabled"),
+                    ),
+                    pace_on,
+                )
+            )
             codex_children.append(self._codex_accounts_submenu(snapshot))
         # Directly under `Title`, where the vendor switch has always been.
         children[1:1] = codex_children
+        audit_on = bool(
+            settings.get("self_audit_enabled", SETTINGS_DEFAULTS["self_audit_enabled"])
+        )
+        children.append(
+            _check(
+                rumps.MenuItem(
+                    self._switch_label("Self-audit", audit_on),
+                    callback=self._make_setting_toggle("self_audit_enabled"),
+                ),
+                audit_on,
+            )
+        )
+        # Worker-cached, never a disk read on the AppKit thread (SPEC 2.3), and
+        # absent until an audit has actually run - a line claiming an audit that
+        # never happened would be worse than no line.
+        audit_status = self._worker.audit_status_label()
+        if audit_status:
+            children.append(_info(f"  {audit_status}"))
+        # Roadmap item 6. This one is a PRIVACY control, not a convenience: it
+        # is the only feature that writes a name out of a transcript (one path
+        # component) to disk, and a default-on switch a user can only reach by
+        # hand-editing settings.json is not a switch they have.
+        by_project_on = bool(
+            settings.get(
+                "cost_by_project_enabled", SETTINGS_DEFAULTS["cost_by_project_enabled"]
+            )
+        )
+        children.append(
+            _check(
+                rumps.MenuItem(
+                    self._switch_label("Cost by project", by_project_on),
+                    callback=self._make_setting_toggle("cost_by_project_enabled"),
+                ),
+                by_project_on,
+            )
+        )
+        # Next to Self-audit because it is the other cost-side switch, and
+        # gated on the same thing the Export items are: with no scanner, store
+        # or price table there is nothing to mirror, and a machine that shows
+        # "cost modules are not wired" must not also offer to switch off a
+        # mirror of them (roadmap item 8's off switch, given a control).
+        if self._worker.cost_available:
+            history_on = bool(
+                settings.get("history_enabled", SETTINGS_DEFAULTS["history_enabled"])
+            )
+            children.append(
+                _check(
+                    rumps.MenuItem(
+                        self._switch_label("History (beyond lookback)", history_on),
+                        callback=self._make_setting_toggle("history_enabled"),
+                    ),
+                    history_on,
+                )
+            )
+        children.append(self._notifications_submenu(snapshot))
         if self._worker.supports_index_rebuild():
             children.append(rumps.MenuItem("Rebuild cost index", callback=self._on_rebuild_index))
+        # Only with a backup on disk to restore (roadmap item 17). The answer
+        # comes from the worker's cache, never from a directory listing on the
+        # AppKit thread, and an item that cannot act is not drawn at all - the
+        # menu's standing rule.
+        if self._worker.last_state_backup is not None:
+            children.append(
+                rumps.MenuItem(_RESTORE_BACKUP_LABEL, callback=self._on_restore_backup)
+            )
         children.append(rumps.MenuItem("Reveal settings.json", callback=self._on_reveal_settings))
         children.append(None)
         children.extend(self._diagnostic_items(snapshot))
         return _submenu("Settings", children)
+
+    def _codex_tier_submenu(self, settings: dict[str, Any]) -> rumps.MenuItem:
+        """``Pricing tier ▸ standard / fast / batch`` (roadmap item 11).
+
+        The one setting in this menu that changes no number anywhere. A rollout
+        does not record which tier ran and ``pricing.py`` carries OpenAI's
+        standard rates only, so picking ``fast`` cannot re-scale a figure -
+        what it does is make the Codex cost heading say the rates below are not
+        this tier's (:func:`codex_accounts.pricing_tier_note`). That is the
+        honest half of the feature, and the reason the choices are an enum in
+        :data:`SETTINGS_CHOICES` rather than free text.
+        """
+        current = settings.get("codex_pricing_tier", SETTINGS_DEFAULTS["codex_pricing_tier"])
+        choices = SETTINGS_CHOICES.get("codex_pricing_tier", ("standard",))
+        return _submenu(
+            f"Pricing tier: {current}",
+            [
+                _check(
+                    rumps.MenuItem(
+                        tier, callback=self._make_setting_value("codex_pricing_tier", tier)
+                    ),
+                    current == tier,
+                )
+                for tier in choices
+            ],
+        )
+
+    def _notifications_submenu(self, snapshot: UiSnapshot) -> rumps.MenuItem:
+        """``Notifications ▸`` — the master switch and the Telegram switch.
+
+        The Telegram item is **greyed** (``callback=None``) rather than hidden
+        when ``notify.json`` is absent: hiding it would make an unconfigured
+        machine look like a build without the feature, and the line itself is
+        the instruction for how to configure it.
+        """
+        settings = snapshot.settings
+        on = bool(settings.get("notifications_enabled", SETTINGS_DEFAULTS["notifications_enabled"]))
+        children: list[Any] = [
+            _check(
+                rumps.MenuItem(
+                    self._switch_label("Notifications", on),
+                    callback=self._make_setting_toggle("notifications_enabled"),
+                ),
+                on,
+            )
+        ]
+        telegram_on = bool(
+            settings.get(
+                "telegram_notifications_enabled",
+                SETTINGS_DEFAULTS["telegram_notifications_enabled"],
+            )
+        )
+        if _telegram_credentials_present():
+            children.append(
+                _check(
+                    rumps.MenuItem(
+                        self._switch_label("Telegram", telegram_on),
+                        callback=self._make_setting_toggle("telegram_notifications_enabled"),
+                    ),
+                    telegram_on,
+                )
+            )
+        else:
+            children.append(_info("Telegram: run `notify setup` (no notify.json)"))
+        children.append(
+            _info(f"  alert at {int(settings.get('notification_threshold_pct', 85))}%")
+        )
+        return _submenu("Notifications", children)
 
     def _codex_accounts_submenu(self, snapshot: UiSnapshot) -> rumps.MenuItem:
         """``Codex accounts ▸`` - one checkbox per tracked account, plus the
@@ -4127,6 +6007,18 @@ class CCUsageWidgetApp(rumps.App):
             for line in self._worker.source_diagnostics:
                 items.append(_info(line))
         items.append(_info(f"State: {SCAN_STATE_PATH.parent}"))
+        note = self._worker.history_note
+        if note:
+            items.append(_info(note))
+        dashboard_note = self._worker.dashboard_note
+        if dashboard_note:
+            items.append(_info(dashboard_note))
+        # A restore leaves this process deliberately frozen (roadmap item 17),
+        # and a widget that has stopped indexing must say so where the rest of
+        # the evidence is - a silent freeze reads as "nothing is happening".
+        restored = self._worker.restore_note
+        if restored:
+            items.append(_info(f"! {restored}"))
         return items
 
     # -- callbacks (main thread; they only enqueue work) -------------------
@@ -4206,19 +6098,64 @@ class CCUsageWidgetApp(rumps.App):
         self._worker.submit(_CMD_REFRESH, None)
 
     def _on_rebuild_index(self, _sender: Any) -> None:
-        self._worker.submit(_CMD_REBUILD_INDEX, None)
+        """Confirm, naming the backup, then hand the rebuild to the worker.
+
+        The dialog is here rather than on the worker because ``rumps.alert``
+        is AppKit and this is the AppKit thread; the *name* it promises is
+        computed here for the same reason (``strftime`` is not I/O) and sent
+        with the command, so the directory the worker creates is the one the
+        user was just shown. Cancelling enqueues nothing at all - the backup
+        is taken by the rebuild, so a cancelled rebuild leaves no litter.
+        """
+        name = statebackup.backup_dir_name()
+        home = self._worker.state_home or str(SCAN_STATE_PATH.parent)
+        if not self._confirm_cb(
+            "Rebuild cost index?",
+            "Every day is re-read from the transcripts that still exist. Days whose "
+            "transcripts have since been pruned cannot come back.\n\n"
+            f"The current state is copied to:\n{os.path.join(home, name)}",
+        ):
+            _log("rebuild cancelled")
+            return
+        self._worker.submit(_CMD_REBUILD_INDEX, name)
+
+    def _on_restore_backup(self, _sender: Any) -> None:
+        """Confirm, then ask the worker to copy the newest backup back.
+
+        The name is read from the worker's cache (the same one that decided
+        whether to draw this item), so the dialog names the directory that will
+        actually be restored rather than whatever is newest at the moment the
+        worker gets round to it.
+        """
+        backup = self._worker.last_state_backup
+        if backup is None:
+            return
+        label = os.path.basename(os.fspath(backup))
+        if not self._confirm_cb(
+            "Restore last backup?",
+            f"{label} replaces the current rollups and scan state.\n\n"
+            "Indexing stops until the widget is relaunched, so the restored "
+            "files are not overwritten by what is in memory now.",
+        ):
+            _log("restore cancelled")
+            return
+        self._worker.submit(_CMD_RESTORE_BACKUP, label)
+
+    def _on_export_csv(self, _sender: Any) -> None:
+        """Roadmap item 8. The worker reads sqlite and writes ~/Downloads."""
+        self._worker.submit(_CMD_EXPORT_HISTORY, "csv")
+
+    def _on_export_json(self, _sender: Any) -> None:
+        self._worker.submit(_CMD_EXPORT_HISTORY, "json")
+
+    def _on_open_dashboard(self, _sender: Any) -> None:
+        """Roadmap item 9. The worker renders, writes 0600 and opens it."""
+        self._worker.submit(_CMD_OPEN_DASHBOARD, None)
 
     def _on_reveal_settings(self, _sender: Any) -> None:
         """Reveal settings.json in Finder. Hands off to NSWorkspace, so the
         main thread is not doing the work."""
-        try:
-            import AppKit
-
-            AppKit.NSWorkspace.sharedWorkspace().selectFile_inFileViewerRootedAtPath_(
-                str(SETTINGS_PATH), str(SETTINGS_PATH.parent)
-            )
-        except Exception as exc:
-            _log(f"could not reveal {SETTINGS_PATH}: {exc!r}")
+        _reveal_in_finder(SETTINGS_PATH)
 
     def _on_reveal_codex_accounts(self, _sender: Any) -> None:
         """Reveal ``codex_accounts.json`` in Finder (SPEC-CODEX 6).
@@ -4229,14 +6166,7 @@ class CCUsageWidgetApp(rumps.App):
         why revealing it is safe.
         """
         path = CODEX_ACCOUNTS_REGISTRY_PATH
-        try:
-            import AppKit
-
-            AppKit.NSWorkspace.sharedWorkspace().selectFile_inFileViewerRootedAtPath_(
-                str(path), str(path.parent)
-            )
-        except Exception as exc:
-            _log(f"could not reveal {path}: {exc!r}")
+        _reveal_in_finder(path)
 
     def _on_quit(self, _sender: Any) -> None:
         self.shutdown()

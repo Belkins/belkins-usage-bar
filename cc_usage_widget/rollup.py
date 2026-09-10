@@ -55,16 +55,19 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 import math
 import os
 import tempfile
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
+from typing import Final
 
 from .contracts import (
+    COUNTER_FIELDS,
     ROLLUPS_PATH,
     SETTINGS_BOUNDS,
     SETTINGS_DEFAULTS,
@@ -83,6 +86,7 @@ from .contracts import (
     VendorCostRow,
     VendorModelKey,
     WindowCost,
+    ZERO_USAGE,
     day_keys_back,
     local_day_key,
     make_vendor_key,
@@ -125,6 +129,17 @@ read exactly as SPEC 4.2 shows them.
 _CENTS = Decimal("0.01")
 _ZERO = Decimal("0")
 
+_LOG = logging.getLogger(__name__)
+
+RETRACT_LOG_LIMIT: int = 5
+"""How many clamped retractions one call may log before it stops.
+
+A clamp is a real accounting event and must be visible (Rule 12), but a store
+that has lost its rollups while keeping its scan state can produce one per
+``(day, model)`` cell. Five lines name the problem; the count in the return
+value quantifies it.
+"""
+
 
 def _dec(value: object) -> Decimal:
     """Capture a pricing ``float`` as an exact :class:`Decimal`.
@@ -143,6 +158,26 @@ def _dec(value: object) -> Decimal:
 def _to_cents(value: Decimal) -> Usd:
     """Quantise an exact Decimal total to cents and hand back a float."""
     return float(value.quantize(_CENTS, rounding=ROUND_HALF_UP))
+
+
+GENERATION_KEY: Final[str] = "#generation"
+"""Reserved non-day key holding :attr:`DailyRollupStore.generation`.
+
+``#`` cannot begin a ``YYYY-MM-DD`` key, so :func:`rollups_from_json` skips it
+as malformed - which is exactly the behaviour every older build already has for
+a key it does not understand. Sorting puts it first in the file, out of the way
+of the days.
+"""
+
+
+def _generation_from_json(parsed: object) -> int:
+    """The persisted generation, or ``0`` for a file that has none."""
+    if not isinstance(parsed, Mapping):
+        return 0
+    value = parsed.get(GENERATION_KEY)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return max(0, value)
 
 
 def _clamp_keep_days(value: object) -> int:
@@ -262,6 +297,24 @@ def _vendor_split(totals: dict[Vendor, Decimal]) -> tuple[tuple[Vendor, Usd], ..
     return tuple((vendor, _to_cents(amount)) for vendor, amount in known + extra)
 
 
+def _vendor_order(mapping: dict[Vendor, object]) -> list[Vendor]:
+    """Vendors present in *mapping*, in :data:`VENDORS` order then alphabetical."""
+    known = [v for v in VENDORS if v in mapping]
+    return known + sorted(v for v in mapping if v not in VENDORS)
+
+
+def _unpriced_split(totals: dict[Vendor, int]) -> tuple[tuple[Vendor, int], ...]:
+    """``WindowCost.vendor_unpriced`` for one window, in :data:`VENDORS` order.
+
+    Only non-zero counts are emitted, so an absent vendor reads as "nothing
+    unpriced" rather than needing a zero row the renderer would have to hide
+    (the same convention :func:`_vendor_split` uses for dollars).
+    """
+    return tuple(
+        (vendor, totals[vendor]) for vendor in _vendor_order(totals) if totals[vendor]
+    )
+
+
 class DailyRollupStore:
     """The daily token aggregate, satisfying ``contracts.RollupStore``.
 
@@ -296,6 +349,7 @@ class DailyRollupStore:
         self._progress = IndexProgress()
         self._dirty = False
         self._revision = 0
+        self._generation = 0
         self._cache: tuple[tuple[object, ...], CostBreakdown] | None = None
 
     # -- introspection ----------------------------------------------------
@@ -309,6 +363,41 @@ class DailyRollupStore:
     def keep_days(self) -> int:
         """The lookback window, in days."""
         return self._keep_days
+
+    @property
+    def generation(self) -> int:
+        """How many times this store has been EMPTIED, ever (roadmap item 2).
+
+        The identity of the day series, not of its contents: :meth:`clear` -
+        ``Rebuild cost index``, and a restore that puts other bytes in place -
+        bumps it, and nothing else does. It is persisted with the days, so a
+        plan computed before a rebuild is still recognisable as stale after the
+        widget has been relaunched.
+
+        Why the audit needs it: a repair is a *correction*, ``current -
+        observed + fresh``, so applying a plan to a store that was rebuilt in
+        between subtracts an ``observed`` that describes days nobody holds any
+        more. The pre-existing guard only refused an EMPTY store, which a
+        rebuild stops being the moment its re-index merges its first delta -
+        one tick, after which ``max(0, 1M - 50M + 1M)`` silently zeroed the
+        day. Comparing generations refuses that plan whatever the re-index has
+        already put back.
+        """
+        with self._lock:
+            return self._generation
+
+    def bump_generation(self) -> int:
+        """Invalidate every outstanding audit plan. Returns the new generation.
+
+        For the owner's own destructive paths that do not go through
+        :meth:`clear` - ``_restore_backup`` replaces ``rollups.json`` on disk
+        and re-``load()``s it, which is exactly as fatal to a plan computed
+        against the previous contents.
+        """
+        with self._lock:
+            self._generation += 1
+            self._dirty = True
+            return self._generation
 
     def set_keep_days(self, keep_days: int) -> None:
         """Change the lookback window (e.g. the user edited settings).
@@ -390,8 +479,13 @@ class DailyRollupStore:
                 model: list(usage.as_counters())
                 for model, usage in rollup.models.items()
             }
+        generation = _generation_from_json(parsed)
         with self._lock:
             self._days = days
+            # Never backwards: an unreadable or pre-generation file reads as 0,
+            # and taking that would make a plan computed against generation 3
+            # look current again after one corrupt load.
+            self._generation = max(self._generation, generation)
             self._dirty = False
             self._invalidate()
 
@@ -423,6 +517,13 @@ class DailyRollupStore:
                     for day, models in self._days.items()
                 }
             )
+            if self._generation:
+                # Written only once the store has actually been emptied, so a
+                # widget that never rebuilds keeps `rollups.json` byte-identical
+                # to what every previous build wrote. The key is not a day, so
+                # `rollups_from_json` skips it (`parse_day_key` refuses it) and
+                # an older build reads this file exactly as it always did.
+                payload[GENERATION_KEY] = self._generation  # type: ignore[assignment]
             _atomic_write_json(self._path, payload)
             self._dirty = False
 
@@ -467,6 +568,181 @@ class DailyRollupStore:
             if changed:
                 self._invalidate()
 
+    def retract(
+        self, day: DayKey, model: ModelKey, usage: ModelUsage
+    ) -> ModelUsage:
+        """Subtract *usage* from ``(day, model)``, clamped at zero.
+
+        The inverse of :meth:`add`, and the half that makes this store
+        idempotent under a re-read (roadmap item 1). The indexer records what
+        each file contributed to each ``(day, model)`` cell in its
+        :attr:`~cc_usage_widget.contracts.FileScanState.ledger`; when that file
+        has to be read again from byte 0 - a new inode, a truncation, a lost
+        state entry - the ledger comes back here first, so the re-read replaces
+        the contribution instead of adding a second copy of it. Without this
+        the store was add-only and live cells were inflated up to 1,650x.
+
+        **Clamped, never negative.** A counter that would go below zero stops
+        at zero and the shortfall is logged: the ledger can describe more than
+        the store holds (the store was pruned, rebuilt, or partially lost), and
+        a negative token count is not a state any consumer can render.
+
+        Returns:
+            The usage **actually** removed, which is smaller than *usage*
+            exactly when something was clamped.
+
+        Raises:
+            ValueError: if *day* is not a ``YYYY-MM-DD`` local day key.
+            TypeError: if *usage* is not a :class:`ModelUsage`.
+        """
+        parse_day_key(day)
+        if not isinstance(usage, ModelUsage):
+            raise TypeError(f"retract expects ModelUsage, got {type(usage)!r}")
+        with self._lock:
+            removed, clamped = self._retract_locked(day, str(model), usage)
+            if clamped:
+                _LOG.warning(
+                    "rollup retract clamped at zero: %s %s wanted %s, removed %s",
+                    day,
+                    model,
+                    usage.total_tokens,
+                    removed.total_tokens,
+                )
+            if not removed.is_zero or clamped:
+                self._invalidate()
+        return removed
+
+    def retract_rollups(self, rollups: Iterable[DayRollup]) -> int:
+        """Retract a whole ledger, one :class:`DayRollup` per day.
+
+        The bulk form of :meth:`retract`, and what an owner calls with
+        :attr:`~cc_usage_widget.contracts.ScanResult.retractions` **before**
+        merging that pass's deltas.
+
+        Returns:
+            The number of ``(day, model)`` cells that had to be clamped - ``0``
+            in the healthy case, and a number worth logging in any other.
+        """
+        clamped_cells = 0
+        logged = 0
+        changed = False
+        with self._lock:
+            for rollup in rollups:
+                if not isinstance(rollup, DayRollup):
+                    raise TypeError(
+                        f"retract_rollups expects DayRollup values, got {type(rollup)!r}"
+                    )
+                parse_day_key(rollup.day)
+                for model, usage in rollup.models.items():
+                    removed, clamped = self._retract_locked(
+                        rollup.day, str(model), usage
+                    )
+                    if not removed.is_zero:
+                        changed = True
+                    if clamped:
+                        clamped_cells += 1
+                        changed = True
+                        if logged < RETRACT_LOG_LIMIT:
+                            logged += 1
+                            _LOG.warning(
+                                "rollup retract clamped at zero: %s %s wanted %s, "
+                                "removed %s",
+                                rollup.day,
+                                model,
+                                usage.total_tokens,
+                                removed.total_tokens,
+                            )
+            if changed:
+                self._invalidate()
+        return clamped_cells
+
+    def replace_day_for_vendor(
+        self,
+        day: DayKey,
+        vendor: Vendor,
+        models: Mapping[ModelKey, ModelUsage],
+        *,
+        observed: Mapping[ModelKey, ModelUsage] | None = None,
+    ) -> int:
+        """Install *models* as *vendor*'s cells for *day*, atomically.
+
+        The self-audit's repair, and the ONLY way it may touch this store
+        (roadmap item 2, hardened 2026-09-10). The audit computes on a daemon
+        thread of its own; the worker thread merges scan deltas into the same
+        store. The old repair did retract-then-merge from the audit thread, so
+        a merge landing between the two halves could be taken back out by the
+        second half, or the store could be published mid-repair with a day
+        emptied. Here retraction and re-add happen under one acquisition of the
+        store lock: no reader and no merger can observe the half-way state.
+
+        Other vendors' cells on that day are never touched - a machine where
+        only Claude was audited must not have its Codex rows rewritten.
+
+        Args:
+            day: the local day to repair.
+            vendor: the only vendor whose cells may change.
+            models: what that vendor's cells should hold, per key.
+            observed: what they held when *models* was computed. **Pass it**
+                whenever the plan was computed elsewhere or earlier: the change
+                is then applied as a CORRECTION (``current − observed +
+                models``, clamped at zero per counter) so deltas merged in the
+                meantime survive the repair. Those deltas are records the
+                indexer has already consumed - their offsets are durable - so
+                overwriting them with a stale absolute figure would lose them
+                for good. ``None`` means "*models* is the whole truth right
+                now" and installs it verbatim.
+
+        Returns:
+            The number of ``(day, model)`` cells that ended up non-zero.
+
+        Raises:
+            ValueError: if *day* is not a ``YYYY-MM-DD`` local day key.
+            TypeError: if a value is not a :class:`ModelUsage`.
+        """
+        parse_day_key(day)
+        for source in (models, observed or {}):
+            for key, usage in source.items():
+                if not isinstance(usage, ModelUsage):
+                    raise TypeError(
+                        f"replace_day_for_vendor expects ModelUsage, got "
+                        f"{type(usage)!r} for {key!r}"
+                    )
+        with self._lock:
+            current = {
+                key: list(counters)
+                for key, counters in self._days.get(day, {}).items()
+                if vendor_of_key(key) == vendor
+            }
+            keys = set(current) | {
+                key
+                for key in set(models) | set(observed or {})
+                if vendor_of_key(key) == vendor
+            }
+            target: dict[ModelKey, list[int]] = {}
+            for key in keys:
+                wanted = list(models.get(key, ZERO_USAGE).as_counters())
+                if observed is not None:
+                    was = observed.get(key, ZERO_USAGE).as_counters()
+                    now = current.get(key, [0] * len(COUNTER_FIELDS))
+                    wanted = [
+                        max(0, now[i] - was[i] + wanted[i])
+                        for i in range(len(COUNTER_FIELDS))
+                    ]
+                if any(wanted):
+                    target[key] = wanted
+            if target == current:
+                return len(target)
+            models_map = self._days.get(day)
+            if models_map is not None:
+                for key in current:
+                    models_map.pop(key, None)
+                if not models_map:
+                    del self._days[day]
+            for key, counters in target.items():
+                self._add_locked(day, key, ModelUsage.from_counters(counters))
+            self._invalidate()
+            return len(target)
+
     def prune(self, *, today: DayKey, keep_days: int) -> None:
         """Drop days outside the ``keep_days`` window ending on *today*.
 
@@ -506,8 +782,16 @@ class DailyRollupStore:
             self._invalidate()
 
     def clear(self) -> None:
-        """Drop every day. Pairs with ``TranscriptIndexer.reset()``."""
+        """Drop every day. Pairs with ``TranscriptIndexer.reset()``.
+
+        Always bumps :attr:`generation`, even when there was nothing to drop:
+        the point of the counter is that everything computed against the
+        previous contents is stale, and "the store happened to be empty" does
+        not make a stale plan any safer to apply.
+        """
         with self._lock:
+            self._generation += 1
+            self._dirty = True
             if not self._days:
                 return
             self._days = {}
@@ -656,6 +940,40 @@ class DailyRollupStore:
         for i, value in enumerate(usage.as_counters()):
             counters[i] += value
 
+    def _retract_locked(
+        self, day: DayKey, model: ModelKey, usage: ModelUsage
+    ) -> tuple[ModelUsage, bool]:
+        """Subtract one ``(day, model)`` pair. Caller holds the lock.
+
+        Returns ``(actually removed, clamped)``. A cell driven to all-zero is
+        deleted rather than kept as a row of zeros, and a day left with no
+        models goes with it - the same shape :meth:`drop_vendors` leaves
+        behind, so ``rollups.json`` cannot accumulate empty scaffolding.
+        """
+        models = self._days.get(day)
+        wanted = usage.as_counters()
+        if models is None:
+            return (ModelUsage(), any(wanted))
+        counters = models.get(model)
+        if counters is None:
+            return (ModelUsage(), any(wanted))
+        removed = [0] * len(COUNTER_FIELDS)
+        clamped = False
+        for i, value in enumerate(wanted):
+            if value <= 0:
+                continue
+            available = counters[i]
+            if value > available:
+                clamped = True
+                value = available
+            counters[i] -= value
+            removed[i] = value
+        if not any(counters):
+            del models[model]
+            if not models:
+                del self._days[day]
+        return (ModelUsage.from_counters(removed), clamped)
+
     def _invalidate(self) -> None:
         """Mark the aggregate changed. Caller holds the lock."""
         self._revision += 1
@@ -718,6 +1036,13 @@ class DailyRollupStore:
             today_unpriced = 0
             today_rows: dict[VendorModelKey, _ModelAcc] = {}
             unknown_raw: set[str] = set()
+            unknown_by_vendor: dict[Vendor, set[str]] = {}
+            # Per-vendor unpriced token counts per window (roadmap item 3).
+            # `codex-auto-review` is 916M tokens a week at $0; the window
+            # totals already carry the sum, these say whose it is.
+            long_unpriced_by_vendor: dict[Vendor, int] = {}
+            short_unpriced_by_vendor: dict[Vendor, int] = {}
+            today_unpriced_by_vendor: dict[Vendor, int] = {}
             # Per-vendor USD per window (SPEC-CODEX 5.2). The window headers
             # stay cross-vendor totals; these are the breakdown *behind* them.
             long_by_vendor: dict[Vendor, Decimal] = {}
@@ -754,9 +1079,22 @@ class DailyRollupStore:
                         # string the user could look up.
                         if name != UNKNOWN_MODEL:
                             unknown_raw.add(name)
+                            unknown_by_vendor.setdefault(vendor, set()).add(name)
                         # Named-unpriced or sentinel alike: these tokens
                         # contribute $0, so the window totals are floors.
                         day_unpriced += usage.total_tokens
+                        tokens = usage.total_tokens
+                        long_unpriced_by_vendor[vendor] = (
+                            long_unpriced_by_vendor.get(vendor, 0) + tokens
+                        )
+                        if day_key in short_window:
+                            short_unpriced_by_vendor[vendor] = (
+                                short_unpriced_by_vendor.get(vendor, 0) + tokens
+                            )
+                        if is_today:
+                            today_unpriced_by_vendor[vendor] = (
+                                today_unpriced_by_vendor.get(vendor, 0) + tokens
+                            )
                     day_usd += cost
                     day_tokens += usage.total_tokens
                     long_by_vendor[vendor] = long_by_vendor.get(vendor, _ZERO) + cost
@@ -811,6 +1149,7 @@ class DailyRollupStore:
                     window_days=WINDOW_TODAY_DAYS,
                     days_counted=1 if today_tokens else 0,
                     unpriced_tokens=today_unpriced,
+                    vendor_unpriced=_unpriced_split(today_unpriced_by_vendor),
                     vendor_usd=_vendor_split(today_by_vendor),
                 ),
                 last_7d=WindowCost(
@@ -820,6 +1159,7 @@ class DailyRollupStore:
                     window_days=short_days,
                     days_counted=short_days_counted,
                     unpriced_tokens=short_unpriced,
+                    vendor_unpriced=_unpriced_split(short_unpriced_by_vendor),
                     vendor_usd=_vendor_split(short_by_vendor),
                 ),
                 last_30d=WindowCost(
@@ -829,6 +1169,7 @@ class DailyRollupStore:
                     window_days=long_days,
                     days_counted=long_days_counted,
                     unpriced_tokens=long_unpriced,
+                    vendor_unpriced=_unpriced_split(long_unpriced_by_vendor),
                     vendor_usd=_vendor_split(long_by_vendor),
                 ),
                 by_model=rows,
@@ -836,6 +1177,10 @@ class DailyRollupStore:
                 progress=progress,
                 generated_at=time.time(),
                 by_vendor=by_vendor,
+                unknown_models_by_vendor=tuple(
+                    (vendor, tuple(sorted(unknown_by_vendor[vendor])))
+                    for vendor in _vendor_order(unknown_by_vendor)
+                ),
             )
             self._cache = (cache_key, breakdown)
             return breakdown

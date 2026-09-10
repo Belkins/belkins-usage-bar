@@ -9,9 +9,35 @@ settings.json
 settings.local.json
 widget.lock
 run.sh
+# Half-written files from an atomic write (mkstemp + os.replace). Both
+# shapes are in use: `<name>.tmp.<pid>` (indexer, audit) and
+# `.<name>.<rand>.tmp.json` (notify, state, rollups). A SIGKILL between
+# the two syscalls leaks one, and some of them hold a credential.
 *.tmp.*
+*.tmp
 .DS_Store
 # Live Codex account credentials + fetched-quota state (SPEC-CODEX 6). Never commit.
 codex-accounts/
 codex_accounts.json
 codex_quota_snapshots.json
+audit_state.json
+# Notification credentials + the once-per-transition ledger (roadmap 7).
+# notify.json holds a Telegram bot token. Never commit.
+notify.json
+notify_state.json
+# Long-term usage history (roadmap item 8). Local record, never committed.
+history.sqlite
+history.sqlite-wal
+history.sqlite-shm
+history.sqlite.corrupt
+# The rendered local dashboard (roadmap item 9). Regenerated on every open,
+# 0600, and a record of spend. Never committed.
+dashboard.html
+dashboard.html.tmp
+# Per-project / per-session token counts (roadmap item 6). Holds one path
+# component per project. Local cache, never committed.
+attribution.json
+# Snapshots taken before "Rebuild cost index" (roadmap item 17). Each holds a
+# copy of rollups.json and the scan states - i.e. real spend and real file
+# paths - so the directory is as un-committable as the originals above.
+backup-state-*/

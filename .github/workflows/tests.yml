@@ -1,0 +1,90 @@
+# Runs the whole suite on a machine that has neither corpus.
+#
+# That is the entire point (roadmap item 18). Every "byte for byte" promise in
+# this repo - a Claude-only machine sees the pre-Codex menu, an absent corpus
+# is silence rather than an error row, no network request is made with the live
+# quota off - is a claim about a machine with no `~/.claude` and no `~/.codex`.
+# A GitHub macOS runner is exactly that machine, so a test that quietly depends
+# on the author's home directory fails here and nowhere else.
+#
+# Public-repo layout (REPO-PLAN §2): the SPECs live under `docs/`, the package
+# is `cc_usage_widget/`, the suites are `tests/test_*.py`. Nothing below reads
+# a SPEC, so the move costs this workflow nothing - it is named here only so
+# the next person does not go looking for a docs step that never existed.
+
+name: tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    # macOS because the widget is a macOS status-bar app: rumps and pyobjc
+    # only install here, and `render.py` builds real NSAttributedStrings.
+    runs-on: macos-14
+    timeout-minutes: 20
+    env:
+      # The runner has a window server, and the claude-swap venv proved that
+      # "the test host has no AppKit" is a false assumption: without this the
+      # export tests would ask Finder to open windows on a CI machine, and the
+      # two destructive menu actions would wait for a click that never comes.
+      CC_USAGE_WIDGET_NO_REVEAL: "1"
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install runtime dependencies
+        # The two the app imports, and nothing else: the suites use no test
+        # framework (they are script runners with their own main()), so a
+        # dependency added here would be a dependency the widget does not have.
+        run: python -m pip install --upgrade pip && python -m pip install rumps pyobjc-framework-Cocoa
+
+      - name: Prove the machine has neither corpus
+        # Evidence in the log, not an assumption in a comment. If a future
+        # runner image ships one of these, the guarantee under test is gone and
+        # this line is where it becomes visible.
+        run: |
+          for dir in "$HOME/.claude" "$HOME/.codex"; do
+            if [ -e "$dir" ]; then
+              echo "::error::$dir exists on the runner; the no-corpus guarantee is untested"
+              exit 1
+            fi
+            echo "absent: $dir"
+          done
+
+      # claude-swap is NOT installed here. It is an optional dependency (the
+      # account features), it is not on PyPI, and the widget degrades without
+      # it - so CI is the right place to check that degradation. Four tests in
+      # tests/test_fleet.py exercise upstream's own helpers and report as
+      # `skip` in the log with a counted summary line; they are never counted
+      # as passes. Everything else must be green.
+      - name: Run every test module
+        # One process per module, because each is its own runner and exits
+        # non-zero on a failure or an uncollected test. `set -e` is not enough:
+        # the loop must remember a failure and still run the rest, so one red
+        # module cannot hide the state of the others.
+        run: |
+          status=0
+          for module in tests/test_*.py; do
+            echo "::group::$module"
+            if ! python "$module"; then
+              status=1
+              echo "::error file=$module::$module failed"
+            fi
+            echo "::endgroup::"
+          done
+          exit $status

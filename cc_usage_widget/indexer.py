@@ -50,9 +50,10 @@ import json
 import os
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from typing import Any, Final
 
+from .attribution import AttributionCollector, AttributionPass, claude_scope
 from .contracts import (
     PROJECTS_DIR,
     SCAN_STATE_PATH,
@@ -65,10 +66,14 @@ from .contracts import (
     ModelKey,
     ModelUsage,
     PricingTable,
+    LedgerEntry,
     ScanResult,
     day_keys_back,
+    ledger_from_counters,
+    legacy_day_for_vanished,
     local_day_key,
     local_day_key_from_iso,
+    merge_ledgers,
     parse_day_key,
     scan_state_from_json,
     scan_state_to_json,
@@ -115,6 +120,16 @@ _DEDUP_PERSIST_LIMIT: Final[int] = 50_000
 """Cap on the number of request IDs written to the dedup sidecar. One day of
 traffic on the measured corpus is ~2.5k entries; the cap only exists so a
 pathological day cannot turn the sidecar into a multi-megabyte write."""
+
+_DEDUP_SCHEMA: Final[int] = 2
+"""Shape of ``*_dedup.json``. Bump on ANY change to what the file must carry.
+
+Version 2 carries ``owners`` beside ``requests``. A sidecar without a matching
+version is discarded whole rather than read for the parts we recognise: the
+requests map suppresses re-reads and the owners map is the only thing that can
+un-suppress them, so half of the pair is not a cache, it is a file-day silently
+counted as $0 (see :meth:`Indexer._load_dedup`).
+"""
 
 _EXCLUDED_DIR_NAMES: Final[frozenset[str]] = frozenset(
     {".git", "node_modules", "__pycache__", ".venv", "venv"}
@@ -257,6 +272,82 @@ def _increment_over(prior: list[int], counts: list[int]) -> list[int] | None:
     return delta if grew else None
 
 
+def _fold_counters(
+    target: dict[DayKey, dict[ModelKey, list[int]]],
+    source: dict[DayKey, dict[ModelKey, list[int]]],
+) -> None:
+    """Field-wise add *source* into *target*, both ``{day: {model: [5]}}``.
+
+    One file's counters folded into the pass's. Files are scanned into their
+    OWN dict so the pass can tell what each one contributed (roadmap item 1);
+    this is the step that puts the pass total back together.
+    """
+    for day, models in source.items():
+        bucket = target.get(day)
+        if bucket is None:
+            target[day] = {model: list(row) for model, row in models.items()}
+            continue
+        for model, row in models.items():
+            acc = bucket.get(model)
+            if acc is None:
+                bucket[model] = list(row)
+                continue
+            for i, value in enumerate(row):
+                acc[i] += value
+
+
+def _fold_ledger(
+    target: dict[DayKey, dict[ModelKey, list[int]]],
+    entries: Iterable[LedgerEntry],
+    *,
+    since: DayKey,
+) -> None:
+    """Add a file's ledger into the pass's pending retractions.
+
+    Entries older than *since* are dropped: the store's own window is the same
+    length, so retracting a day it has already pruned would clamp at zero and
+    log a shortfall that is not one.
+    """
+    for entry in entries:
+        if entry.day < since:
+            continue
+        bucket = target.setdefault(entry.day, {})
+        row = bucket.get(entry.model)
+        if row is None:
+            bucket[entry.model] = list(entry.counters)
+            continue
+        for i, value in enumerate(entry.counters):
+            row[i] += value
+
+
+def _windowed_ledger(
+    entries: tuple[LedgerEntry, ...], *, since: DayKey
+) -> tuple[LedgerEntry, ...]:
+    """Drop ledger rows for days the store no longer keeps.
+
+    Bounds the scan-state file: without it a long-lived transcript would
+    accumulate one ledger row per day it was ever appended to.
+    """
+    kept = tuple(entry for entry in entries if entry.day >= since)
+    return entries if len(kept) == len(entries) else kept
+
+
+def _rollups_from_counters(
+    counters: dict[DayKey, dict[ModelKey, list[int]]],
+) -> tuple[DayRollup, ...]:
+    """``{day: {model: [5]}}`` as sorted :class:`DayRollup` values."""
+    return tuple(
+        DayRollup(
+            day=day,
+            models={
+                model: ModelUsage.from_counters(counter)
+                for model, counter in sorted(models.items())
+            },
+        )
+        for day, models in sorted(counters.items())
+    )
+
+
 def _local_midnight_epoch(day: dt.date) -> float:
     """POSIX timestamp of local midnight starting *day*."""
     return dt.datetime.combine(day, dt.time.min).timestamp()
@@ -289,6 +380,7 @@ class Indexer:
         state_saver: Callable[[Mapping[str, Any]], bool | None] | None = None,
         dedup_within_file: bool = True,
         defer_state_commit: bool = False,
+        audit_limits: Mapping[str, tuple[int, int]] | None = None,
     ) -> None:
         self._projects_dir = os.path.abspath(os.fspath(projects_dir))
         self._state_path = os.fspath(state_path)
@@ -330,6 +422,23 @@ class Indexer:
         # whole (double-count).
         self._dedup_day: DayKey | None = None
         self._dedup_usage: dict[str, list[int]] = {}
+        self._dedup_owners: dict[str, set[str]] = {}
+        """Which path first credited each of today's request ids.
+
+        The dedup map is the ledger's mirror image and the two have to agree.
+        When a file is re-read from byte 0 its ledger contribution is RETRACTED,
+        so the records it holds must be counted again - but every one of today's
+        requests is already in ``_dedup_usage`` at its full size, so
+        ``_increment_over`` sees no growth and contributes nothing. That file's
+        whole contribution to TODAY silently went to zero (found 2026-09-10;
+        the ledger tests all dated their records to yesterday, where the dedup
+        map is file-scoped and dies with the file handle).
+
+        Keyed by path so a restart can drop exactly that file's ids and nobody
+        else's: a request whose id first arrived in some other transcript stays
+        credited there, and that file's own ledger still describes it.
+        Cleared with ``_dedup_usage`` at every day rollover, so it is bounded by
+        one day of traffic exactly as the map it annotates is."""
         self._dedup_loaded = False
         self._dedup_path = f"{os.path.splitext(self._state_path)[0]}_dedup.json"
         """Sidecar holding the *current local day's* dedup counters. Written by
@@ -346,6 +455,64 @@ class Indexer:
         # dropped the moment a file is read to completion, so at most the
         # in-flight transcript is held (SPEC 2.2).
         self._resume_ids: dict[str, dict[str, list[int]]] = {}
+
+        # --- attribution (roadmap item 6) -----------------------------------
+        # Off unless the owner switches it on, so a machine with
+        # `cost_by_project_enabled` false does not resolve one scope, and the
+        # privacy fixtures that build an Indexer directly keep their exact
+        # previous behaviour. It rides on the SAME two decision points as the
+        # rollup ledger, because a transcript belongs to one project and one
+        # session for its whole life.
+        self._attribution: AttributionCollector | None = None
+        self._file_cwd: str | None = None
+        """The working directory the file currently being read reported.
+
+        Claude records carry `cwd` themselves, and that is the only honest
+        source for a project NAME: the `~/.claude/projects/<dir>` segment is the
+        cwd with every `/` *and* every space flattened to `-`, which cannot be
+        decoded back without guessing. Held per file, reset by `_scan_file`, and
+        only ever written while attribution is on."""
+
+        self._audit_limits: dict[str, tuple[int, int]] | None = (
+            None
+            if audit_limits is None
+            else {
+                str(key): (int(pair[0]), int(pair[1]))
+                for key, pair in audit_limits.items()
+            }
+        )
+        """Per-file ceiling for an AUDIT TWIN: ``path -> (inode, offset)`` as the
+        LIVE scanner had it (roadmap item 2, 2026-09-10).
+
+        ``None`` on every real scanner, and the whole of the difference on a
+        twin. Without it a twin re-read each file **to its current end** while
+        the live scanner had consumed only part of it, so the audit's "fresh"
+        total counted bytes the store does not hold yet: the repair installed
+        them, and the same cost tick then merged the very same tail again.
+        Measured on the probe that found it - 10M indexed, 5M appended, audit
+        and apply gave 15M, the next scan took it to 20M, and the truth was 15M.
+
+        With it the twin reads exactly the bytes the store was built from, so a
+        disagreement between "fresh" and "live" is real drift. A file the
+        snapshot does not name is skipped: the live scanner has no offset for
+        it, so nothing it holds is in the store either, and the two still agree.
+        A file whose inode has CHANGED since the snapshot is skipped as well,
+        but that one is *unusable* rather than merely absent - the store holds
+        the old file's contribution and no index of the new one can reproduce
+        it - so its days are reported as not comparable instead of repaired."""
+        self._audit_unusable: set[str] = set()
+        """Snapshotted paths this twin could not read as they were snapshotted.
+
+        Read by the audit through :meth:`audit_unusable_paths` after the drain,
+        and turned into the ``(day, vendor)`` pairs the plan must leave alone."""
+        self._audit_seen: set[str] = set()
+        """Every path this twin's walk has laid eyes on, across passes.
+
+        A snapshotted path that never turns up is a file DELETED between the
+        snapshot and the audit: the store still holds what it contributed (the
+        live scanner has not tombstoned it yet, so ``tombstone_rollups`` does
+        not carry it either) and this index cannot read it. Not comparable, and
+        counted as unusable for that reason."""
 
         # --- progress -------------------------------------------------------
         self._complete = False
@@ -381,6 +548,183 @@ class Indexer:
         self._files_done = 0
         self._files_total = 0
         self._publish_progress(scanning=False)
+
+    def set_attribution(self, enabled: bool) -> None:
+        """Switch per-project/per-session attribution on or off (roadmap item 6).
+
+        Idempotent, and switching OFF drops the accumulator: a widget whose
+        owner turned the setting off must not keep resolving scopes or holding
+        project names in memory. Switching ON starts from empty - attribution
+        of the days already in the store is not reconstructed, because the
+        offsets that consumed them are already durable and re-reading them
+        would double-count the money. It fills in from the next appended
+        bytes, exactly as the ledger does for a legacy scan-state entry.
+        """
+        if bool(enabled) == (self._attribution is not None):
+            return
+        self._attribution = (
+            AttributionCollector(lambda path, hint: claude_scope(path, hint))
+            if enabled
+            else None
+        )
+
+    @property
+    def attribution_enabled(self) -> bool:
+        """True when this scanner is attributing its reads."""
+        return self._attribution is not None
+
+    def take_attribution(self) -> AttributionPass:
+        """Drain what the last scan attributed. Empty when the feature is off.
+
+        Deliberately a pull rather than a field on
+        :class:`~cc_usage_widget.contracts.ScanResult`: that shape is shared
+        contract between two indexers, the audit and four test modules, and a
+        display feature has no business widening it.
+        """
+        collector = self._attribution
+        return AttributionPass() if collector is None else collector.take()
+
+    def tombstone_rollups(self, *, since: DayKey) -> tuple[DayRollup, ...]:
+        """What transcripts that no longer exist contributed, from *since* on.
+
+        The self-audit's reconciliation term (roadmap item 2). A fresh index
+        reads only what is on disk **now**; the live store also holds the
+        contribution of files that have since been deleted, and that is
+        deliberate - Claude Code prunes ``~/.claude/projects`` on its own
+        ``cleanupPeriodDays``, and the tokens then survive only in
+        ``rollups.json``. Without this the audit would read every such day as
+        drift and "repair" it by deleting real, unrecoverable usage.
+
+        Only tombstoned entries are reported: a file still on disk is the
+        twin's business, not this one's.
+
+        **Takes the scan lock.** It reads (and, on a cold indexer, loads) the
+        same ``_states`` dict a scan rewrites entry by entry, and the audit used
+        to call it from its own thread while a scan was in flight - a read of a
+        dict another thread is mutating, and a concurrent ``_ensure_states_loaded``
+        that could replace the live offsets with a re-read of the file.
+        """
+        with self._scan_lock:
+            self._ensure_states_loaded()
+            by_day: dict[DayKey, dict[str, ModelUsage]] = {}
+            for state in self._states.values():
+                if not state.is_tombstone:
+                    continue
+                for entry in state.ledger:
+                    if entry.day < since:
+                        continue
+                    bucket = by_day.setdefault(entry.day, {})
+                    bucket[entry.model] = (
+                        bucket.get(entry.model, ModelUsage()) + entry.usage
+                    )
+            return tuple(
+                DayRollup(day=day, models=by_day[day]) for day in sorted(by_day)
+            )
+
+    def legacy_tombstone_days(self, *, since: DayKey) -> tuple[DayKey, ...]:
+        """Days from *since* on where a **legacy** tombstone stands (item 2 fix).
+
+        A legacy tombstone marks a vanished file whose ledger never described
+        its whole contribution: tokens are in ``rollups.json`` that neither a
+        fresh index nor :meth:`tombstone_rollups` can account for. The audit
+        must therefore refuse to repair this vendor while one stands in the
+        window - the "drift" it measures may be exactly that unaccountable
+        usage, and repairing it would delete real money for good.
+
+        Days rather than paths: the caller puts this in a log line and a menu
+        note, and a transcript path is nobody's business there.
+        """
+        with self._scan_lock:
+            self._ensure_states_loaded()
+            days = {
+                state.legacy_day
+                for state in self._states.values()
+                if state.is_legacy_tombstone and state.legacy_day is not None
+                and state.legacy_day >= since
+            }
+        return tuple(sorted(days))
+
+    def audit_offsets(
+        self, *, since: DayKey
+    ) -> tuple[tuple[str, int, int, tuple[DayKey, ...]], ...]:
+        """``(path, inode, offset, in-window ledger days)`` per live entry.
+
+        What the audit twin is allowed to read (roadmap item 2, 2026-09-10).
+        Tombstones are left out: their file is gone, so a twin can only be
+        skipped on them, and their contribution reaches the audit through
+        :meth:`tombstone_rollups` instead.
+
+        The days come from the ledger because they are the precise answer to
+        "which cells of the store would become unaccountable if this file could
+        not be re-read": the entry's own contribution, per day, already
+        recorded. Days before *since* are dropped - they are outside anything
+        the audit compares.
+
+        **Takes the scan lock**, for the same reason :meth:`tombstone_rollups`
+        does: it reads the dict a scan rewrites entry by entry.
+        """
+        with self._scan_lock:
+            self._ensure_states_loaded()
+            out: list[tuple[str, int, int, tuple[DayKey, ...]]] = []
+            for path, state in self._states.items():
+                if state.is_tombstone:
+                    continue
+                days = tuple(
+                    sorted({entry.day for entry in state.ledger if entry.day >= since})
+                )
+                out.append((str(path), int(state.inode), int(state.offset), days))
+        return tuple(sorted(out))
+
+    def audit_unusable_paths(self) -> tuple[str, ...]:
+        """Snapshotted paths this twin could not read as snapshotted.
+
+        Empty on a real scanner (which has no snapshot to honour) and on a twin
+        whose corpus did not move under it. Every entry is a path whose live
+        offset describes a file this index cannot reproduce - the inode changed
+        under it, it shrank below the offset, or it is gone altogether - so the
+        store holds a contribution the comparison cannot account for. The audit
+        marks those days not comparable and never repairs them.
+        """
+        if self._audit_limits is None:
+            return ()
+        vanished = set(self._audit_limits) - self._audit_seen
+        return tuple(sorted(self._audit_unusable | vanished))
+
+    def clone_for_audit(
+        self,
+        state_dir: os.PathLike[str] | str,
+        *,
+        lookback_days: int,
+        limits: Mapping[str, tuple[int, int]] | None = None,
+    ) -> Indexer:
+        """A throwaway twin over the SAME corpus with its state in *state_dir*.
+
+        The seam the daily self-audit (roadmap item 2) re-indexes through: same
+        class, same parser, same clock, a short window and a scan state that
+        lives and dies inside a ``TemporaryDirectory``. Reusing the real class
+        rather than a second implementation is the point - an audit that agrees
+        with a different reader proves nothing about this one.
+
+        The twin gets **no** ``state_loader`` / ``state_saver``: it must start
+        from zero offsets, and it must never write where the live indexer
+        writes. It is read-only with respect to the corpus, like every scan.
+
+        *limits* is :meth:`audit_offsets` from the live scanner, snapshotted on
+        the worker thread. It is what makes the twin describe the bytes the
+        STORE holds rather than the bytes on disk right now; see
+        ``_audit_limits``. Passing ``None`` re-reads every file whole, which is
+        only ever right for a caller that has no live store to compare with.
+        """
+        return Indexer(
+            projects_dir=self._projects_dir,
+            state_path=os.path.join(os.fspath(state_dir), "audit_scan_state.json"),
+            lookback_days=lookback_days,
+            pricing=self._pricing,
+            chunk_files=self._chunk_files,
+            now=self._now,
+            dedup_within_file=self._dedup_within_file,
+            audit_limits=limits,
+        )
 
     @property
     def dedup_size(self) -> int:
@@ -494,19 +838,47 @@ class Indexer:
 
     # -- dedup sidecar --------------------------------------------------
 
-    def _load_dedup(self) -> tuple[DayKey | None, dict[str, list[int]]]:
-        """Read the dedup sidecar, or ``(None, {})`` when there is nothing usable."""
+    def _load_dedup(
+        self,
+    ) -> tuple[DayKey | None, dict[str, list[int]], dict[str, set[str]]]:
+        """Read the dedup sidecar, or ``(None, {}, {})`` when nothing is usable.
+
+        **The whole file is versioned, and an unrecognised version is
+        discarded** - requests included (2026-09-10). ``owners`` arrived after
+        the requests map did, and treating a pre-owners sidecar as merely
+        "requests with no owners" restored ids that nothing can ever hand back:
+        ``_forget_dedup_for_path`` un-credits exactly the ids a path owns, so a
+        file re-read from byte 0 whose ids have no owner keeps every one of them
+        suppressed and its whole contribution to TODAY reads as zero - the same
+        silent zeroing the owners map was introduced to prevent.
+
+        Discarding the requests instead over-credits, once, every request that
+        was still streaming at the moment of the upgrade restart: the amount
+        already credited to it is credited again with its next snapshot
+        (measured: 1,000 credited before, a 3,000 snapshot after -> 4,000 for a
+        true 3,000). Bounded by the sessions open at that instant, one-off, and
+        real drift - the next daily self-audit clears it - which is strictly
+        less bad than a file-day of $0. The two maps only make sense together,
+        exactly as the dedup sidecar and the offsets do in
+        :meth:`_ensure_states_loaded`.
+        """
         try:
             with open(self._dedup_path, "rb") as fh:
                 raw = json.load(fh)
         except (FileNotFoundError, OSError, ValueError):
-            return None, {}
+            return None, {}, {}
         if not isinstance(raw, Mapping):
-            return None, {}
+            return None, {}, {}
+        version = raw.get("v")
+        if isinstance(version, bool) or version != _DEDUP_SCHEMA:
+            # A sidecar from a build whose shape we cannot reason about. The
+            # cost of ignoring it is bounded and one-off; the cost of
+            # misreading it is a zeroed file-day.
+            return None, {}, {}
         day = raw.get("day")
         requests = raw.get("requests")
         if not isinstance(day, str) or not isinstance(requests, Mapping):
-            return None, {}
+            return None, {}, {}
         out: dict[str, list[int]] = {}
         for key, value in requests.items():
             if not isinstance(value, list) or len(value) != 5:
@@ -515,7 +887,16 @@ class Indexer:
                 out[str(key)] = [_to_int(item) for item in value]
             except (TypeError, ValueError):  # pragma: no cover - _to_int is total
                 continue
-        return day, out
+        owners: dict[str, set[str]] = {}
+        raw_owners = raw.get("owners")
+        if isinstance(raw_owners, Mapping):
+            for path, ids in raw_owners.items():
+                if not isinstance(ids, list):
+                    continue
+                kept = {str(item) for item in ids if str(item) in out}
+                if kept:
+                    owners[str(path)] = kept
+        return day, out, owners
 
     def flush_dedup(self) -> None:
         """Persist the current day's dedup counters (call at shutdown).
@@ -533,17 +914,52 @@ class Indexer:
         usage = self._dedup_usage
         if len(usage) > _DEDUP_PERSIST_LIMIT:
             return
+        owners = {
+            path: sorted(ids) for path, ids in self._dedup_owners.items() if ids
+        }
         tmp = f"{self._dedup_path}.tmp.{os.getpid()}"
         try:
             os.makedirs(os.path.dirname(self._dedup_path) or ".", exist_ok=True)
             with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump({"day": day, "requests": usage}, fh, separators=(",", ":"))
+                json.dump(
+                    {
+                        "v": _DEDUP_SCHEMA,
+                        "day": day,
+                        "requests": usage,
+                        "owners": owners,
+                    },
+                    fh,
+                    separators=(",", ":"),
+                )
             os.replace(tmp, self._dedup_path)
         except OSError:
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
+
+    def _forget_dedup_for_path(self, path: str) -> None:
+        """Un-credit everything *path* contributed to today's dedup state.
+
+        The other half of a retraction (roadmap item 1). ``_scan_locked`` hands
+        this file's ledger back to the store and is about to read it again from
+        byte 0; both caches that would suppress that re-read have to go with it:
+
+        * today's request ids that this path first credited - otherwise every
+          record it holds reads as an exact duplicate and the file's whole
+          contribution to today becomes zero;
+        * the mid-file resume snapshots for this path - they describe bytes of a
+          file that no longer exists.
+
+        Ids first credited by some OTHER file are left alone: that file's ledger
+        still describes them, so dropping them here would let the same request
+        be counted twice.
+        """
+        ids = self._dedup_owners.pop(path, None)
+        if ids:
+            for request_id in ids:
+                self._dedup_usage.pop(request_id, None)
+        self._resume_ids.pop(path, None)
 
     def _drop_dedup_file(self) -> None:
         try:
@@ -715,13 +1131,15 @@ class Indexer:
             return
         if not self._dedup_loaded:
             self._dedup_loaded = True
-            stored_day, stored_usage = self._load_dedup()
+            stored_day, stored_usage, stored_owners = self._load_dedup()
             if stored_day == today:
                 self._dedup_day = today
                 self._dedup_usage = stored_usage
+                self._dedup_owners = stored_owners
                 return
         self._dedup_day = today
         self._dedup_usage = {}
+        self._dedup_owners = {}
 
     # ------------------------------------------------------------------
     # The scan
@@ -785,10 +1203,17 @@ class Indexer:
         self._states_dirty = False
         self._dedup_day = None
         self._dedup_usage = {}
+        self._dedup_owners = {}
         # A reset re-reads from offset 0, so the sidecar would suppress exactly
         # the records the rebuild is meant to re-credit.
         self._dedup_loaded = True
         self._resume_ids = {}
+        self._file_cwd = None
+        if self._attribution is not None:
+            # A rebuild empties the attribution store too (app.py), so a
+            # collector still holding this pass's adds would put a
+            # contribution back that the re-read is about to make again.
+            self._attribution.forget()
         self._drop_dedup_file()
         self._complete = False
         self._files_done = 0
@@ -831,10 +1256,30 @@ class Indexer:
         files_seen = 0
         skipped_unchanged = 0
         skipped_out_of_window = 0
+        limits = self._audit_limits
         for record in self._iter_transcripts(errors):
-            path, size, mtime, _inode = record
+            path, size, mtime, inode = record
             files_seen += 1
             seen.add(path)
+            if limits is not None:
+                # AUDIT TWIN ONLY. Read this file exactly as far as the LIVE
+                # scanner had read it when the snapshot was taken, or not at
+                # all - see `_audit_limits` for the double count that comes of
+                # reading further.
+                bound = limits.get(path)
+                if bound is None:
+                    continue
+                snapshot_inode, ceiling = bound
+                if inode != snapshot_inode or size < ceiling:
+                    # The file the live offset describes is not the file on
+                    # disk: its contribution is in the store and nothing here
+                    # can reproduce it. Reported, never repaired.
+                    self._audit_unusable.add(path)
+                    continue
+                if ceiling <= 0:
+                    continue
+                size = ceiling
+                record = (path, size, mtime, inode)
             prev = states.get(path)
             # STEP 2 - the hot exit. 3,160 of 3,210 files stop right here
             # (measured), and nothing above this line touched the file beyond
@@ -861,6 +1306,8 @@ class Indexer:
                 skipped_out_of_window += 1
                 continue
             work.append(record)
+        if limits is not None:
+            self._audit_seen |= seen
         return work, seen, files_seen, skipped_unchanged, skipped_out_of_window
 
     def _scan_locked(self, *, deadline: float | None) -> ScanResult:
@@ -876,6 +1323,10 @@ class Indexer:
         errors: list[str] = []
         stats = _Stats()
         counters: dict[DayKey, dict[ModelKey, list[int]]] = {}
+        # What this pass must take back OUT of the store before its deltas go
+        # in (roadmap item 1): the recorded contribution of every file being
+        # re-read from byte 0, and of every file that has vanished.
+        retractions: dict[DayKey, dict[ModelKey, list[int]]] = {}
 
         self._publish_progress(scanning=True)
 
@@ -898,6 +1349,20 @@ class Indexer:
             if deadline is not None and time.monotonic() >= deadline:
                 interrupted = True
                 break
+            prev = self._states.get(path)
+            # The one predicate that decides whether this read REPLACES the
+            # file's contribution or APPENDS to it. It has to be evaluated here,
+            # before `_scan_file` overwrites the entry, and it is deliberately
+            # the same test `_scan_file` uses to decide its own offset - a
+            # divergence between the two would either double-count (append after
+            # a reset) or under-count (retract on a resume).
+            restarted = prev is None or prev.needs_reset(size, inode)
+            if restarted:
+                # Retraction and re-read must be SYMMETRIC. The ledger below
+                # gives the store its tokens back; this gives the dedup map its
+                # request ids back, so the re-read can actually re-credit them.
+                self._forget_dedup_for_path(path)
+            file_counters: dict[DayKey, dict[ModelKey, list[int]]] = {}
             new_state, stopped_early = self._scan_file(
                 path,
                 size=size,
@@ -905,13 +1370,77 @@ class Indexer:
                 inode=inode,
                 today=today,
                 window_start_key=window_start_key,
-                counters=counters,
+                counters=file_counters,
                 stats=stats,
                 errors=errors,
                 deadline=deadline,
             )
+            _fold_counters(counters, file_counters)
             if new_state is not None:
-                self._states[path] = new_state
+                if self._attribution is not None:
+                    # The scope this path's tokens went INTO, as persisted by
+                    # whichever process put them there. Seeded before anything
+                    # is attributed, because the retraction below has to land
+                    # in that project and not in whatever the file on disk says
+                    # now (`FileScanState.scope`).
+                    if prev is not None and prev.scope:
+                        self._attribution.remember(path, prev.scope)
+                    # Roadmap item 6 rides on roadmap item 1's events, in the
+                    # same order (retract, then add) and off the same
+                    # `restarted` predicate, so the project totals are
+                    # reversible for exactly the reason the day totals are.
+                    if restarted and prev is not None and prev.ledger:
+                        self._attribution.retract(
+                            path,
+                            _windowed_ledger(prev.ledger, since=window_start_key),
+                            hint=self._file_cwd,
+                        )
+                    self._attribution.add(path, file_counters, hint=self._file_cwd)
+                if restarted and prev is not None and prev.ledger:
+                    # A new inode or a shrink: everything this path put in
+                    # before belonged to a file that no longer exists, and the
+                    # bytes about to be re-read will put it in again.
+                    _fold_ledger(retractions, prev.ledger, since=window_start_key)
+                base: tuple[LedgerEntry, ...] = (
+                    ()
+                    if restarted or prev is None
+                    else _windowed_ledger(prev.ledger, since=window_start_key)
+                )
+                # A read from byte 0 leaves a ledger that describes EVERYTHING
+                # this entry has contributed; an append inherits whatever the
+                # previous entry could say, so a legacy entry stays legacy until
+                # it is re-read whole. Nothing else can clear the flag - the
+                # rows appended to a legacy ledger still do not cover the bytes
+                # that were consumed before the ledger existed.
+                complete = (
+                    True
+                    if (restarted or prev is None)
+                    else prev.ledger_complete
+                )
+                # Carried across every pass, and only ever written while
+                # attribution is on: switching the feature off must not erase
+                # the scope of tokens that are already in the cache, or
+                # switching it back on would retract them into the wrong place.
+                scope_key = prev.scope if prev is not None else None
+                if self._attribution is not None:
+                    scope_key = self._attribution.scope_for(
+                        path, self._file_cwd
+                    ).session_key
+                self._states[path] = new_state.advanced(
+                    inode=new_state.inode,
+                    size=new_state.size,
+                    mtime=new_state.mtime,
+                    offset=new_state.offset,
+                    ledger_complete=complete,
+                    scope=scope_key,
+                    ledger=merge_ledgers(
+                        base,
+                        _windowed_ledger(
+                            ledger_from_counters(file_counters),
+                            since=window_start_key,
+                        ),
+                    ),
+                )
                 self._states_dirty = True
             processed += 1
             if not self._complete:
@@ -930,22 +1459,52 @@ class Indexer:
                 # a clean full pass — a transient scandir error must not be
                 # allowed to evict live entries.
                 for gone in [p for p in self._states if p not in seen_paths]:
-                    del self._states[gone]
-                    self._states_dirty = True
+                    # The file is gone. Its contribution is NOT retracted:
+                    # Claude Code transcripts are pruned on a schedule of their own, so an
+                    # aged-out file's money survives only in `rollups.json` and
+                    # zeroing it there is permanent and unrecoverable. What the
+                    # entry becomes instead is a TOMBSTONE carrying its ledger,
+                    # so a path that ever comes back (a restore, a sync agent,
+                    # a re-created id) reads as a reset and REPLACES that
+                    # contribution rather than doubling it.
+                    stale = self._states[gone]
+                    kept = _windowed_ledger(stale.ledger, since=window_start_key)
+                    legacy_day = legacy_day_for_vanished(
+                        stale, window_start=window_start_key
+                    )
+                    if self._attribution is not None:
+                        # The file is gone; so is the reason to keep its scope
+                        # in memory. What a returning path needs is on the
+                        # tombstone below, not in a cache that would otherwise
+                        # hold every transcript this process ever saw.
+                        self._attribution.forget_path(gone)
+                    if not kept and legacy_day is None:
+                        # Nothing left to protect: every day it touched has aged
+                        # out of the window. This is what bounds the state file.
+                        del self._states[gone]
+                        self._states_dirty = True
+                        continue
+                    replacement = FileScanState.tombstone(
+                        kept, legacy_day=legacy_day, scope=stale.scope
+                    )
+                    if replacement != stale:
+                        self._states[gone] = replacement
+                        self._states_dirty = True
             if not self._complete:
                 self._complete = True
                 self._files_done = self._files_total
 
-        deltas = tuple(
-            DayRollup(
-                day=day,
-                models={
-                    model: ModelUsage.from_counters(counter)
-                    for model, counter in sorted(models.items())
-                },
-            )
-            for day, models in sorted(counters.items())
-        )
+        if self._dedup_owners:
+            # Every file this pass OPENED got an owner set, most of them empty
+            # (a transcript whose new bytes are not today's). Only the ones that
+            # actually credited a request need to survive the pass: the map is
+            # per local day, and 3,200 empty sets is memory the SPEC 2.2 budget
+            # does not have.
+            self._dedup_owners = {
+                owner: ids for owner, ids in self._dedup_owners.items() if ids
+            }
+
+        deltas = _rollups_from_counters(counters)
         unknown = self._unknown_models(counters)
         # STEP 8, deliberately AFTER the deltas exist. Persisting "these bytes
         # are consumed" before the caller has the tokens they contained turns any
@@ -960,6 +1519,7 @@ class Indexer:
         )
         return ScanResult(
             deltas=deltas,
+            retractions=_rollups_from_counters(retractions),
             progress=self._progress,
             files_seen=files_seen,
             files_skipped_unchanged=skipped_unchanged,
@@ -1017,6 +1577,9 @@ class Indexer:
         file look fully consumed and silently lose its tail.
         """
         prev = self._states.get(path)
+        # One file, one working directory. Cleared here so a transcript that
+        # reports none cannot inherit the previous file's project.
+        self._file_cwd = None
 
         # STEP 4 - truncation / rotation guard.
         offset = 0
@@ -1035,6 +1598,11 @@ class Indexer:
         fallback_day = local_day_key(mtime)
 
         dedup_today = self._dedup_usage
+        # Which of today's ids THIS file is the first to credit, so a later
+        # re-read from byte 0 can hand exactly those back (`_forget_dedup_for_path`).
+        dedup_owned = self._dedup_owners.get(path)
+        if dedup_owned is None:
+            dedup_owned = self._dedup_owners[path] = set()
         # Bounded extra safety for days other than today: the real corpus
         # repeats requestIds on historical days too (measured: 5,922 exact
         # repeats in the 12 largest transcripts). Scoped to the file currently
@@ -1078,8 +1646,19 @@ class Indexer:
                 # growth on the raw line iteration, not on JSON or dedup.
                 buf = bytearray()
                 eof = False
+                # AUDIT TWIN ONLY: `size` has been clamped to the live
+                # scanner's offset by `_collect`, and the read must stop
+                # there - the bytes past it are exactly the ones the store
+                # does not hold yet.
+                remaining = None if self._audit_limits is None else max(0, size - offset)
                 while not eof:
-                    chunk = fh.read(_READ_BUFFER)
+                    if remaining is None:
+                        chunk = fh.read(_READ_BUFFER)
+                    elif remaining <= 0:
+                        chunk = b""
+                    else:
+                        chunk = fh.read(min(_READ_BUFFER, remaining))
+                        remaining -= len(chunk)
                     if chunk:
                         buf += chunk
                     else:
@@ -1108,6 +1687,7 @@ class Indexer:
                                 counters=counters,
                                 stats=stats,
                                 dedup_today=dedup_today,
+                                dedup_owned=dedup_owned,
                                 file_ids=file_ids,
                             )
                         start = end
@@ -1158,6 +1738,7 @@ class Indexer:
         counters: dict[DayKey, dict[ModelKey, list[int]]],
         stats: _Stats,
         dedup_today: dict[str, list[int]],
+        dedup_owned: set[str],
         file_ids: dict[str, list[int]] | None,
     ) -> None:
         """Parse one candidate line and fold it into the mutable counters.
@@ -1217,6 +1798,11 @@ class Indexer:
                 prior = seen.get(request_id)
                 if prior is None:
                     seen[request_id] = list(counts)
+                    if seen is dedup_today:
+                        # This file is the first to credit that request today,
+                        # so it is the one whose re-read must be allowed to
+                        # credit it again (`_forget_dedup_for_path`).
+                        dedup_owned.add(request_id)
                 else:
                     stats.records_duplicate += 1
                     is_increment = True
@@ -1235,6 +1821,16 @@ class Indexer:
         model = message.get("model")
         if not isinstance(model, str) or not model:
             model = UNKNOWN_MODEL
+
+        if self._attribution is not None and self._file_cwd is None:
+            # Roadmap item 6, and the ONLY field this scanner reads that is not
+            # a token count, a model name or a timestamp. Taken from a record
+            # that is actually contributing usage, so a stray `cwd` in some
+            # other payload cannot name the project - and only its BASENAME is
+            # ever stored (see `attribution.claude_scope`).
+            cwd = record.get("cwd")
+            if isinstance(cwd, str) and cwd:
+                self._file_cwd = cwd
 
         day_bucket = counters.get(day)
         if day_bucket is None:

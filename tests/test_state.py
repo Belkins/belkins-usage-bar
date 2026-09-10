@@ -215,5 +215,76 @@ def main() -> int:
     return 1 if failures else 0
 
 
+# ---------------------------------------------------------------------------
+# Roadmap item 2 - the self-audit's off switch has to survive the round trip
+# ---------------------------------------------------------------------------
+
+
+def test_self_audit_setting_defaults_on_and_survives_normalisation() -> None:
+    """Every feature needs an off switch, and an undeclared key is DROPPED.
+
+    ``normalize_settings`` keeps only what ``SETTINGS_DEFAULTS`` declares, so a
+    toggle added to the menu but not to the defaults would silently revert on
+    every save - the switch would appear to work and then not.
+    """
+    from cc_usage_widget.contracts import normalize_settings
+
+    assert SETTINGS_DEFAULTS["self_audit_enabled"] is True
+    assert normalize_settings({})["self_audit_enabled"] is True
+    off = normalize_settings({**SETTINGS_DEFAULTS, "self_audit_enabled": False})
+    assert off["self_audit_enabled"] is False
+    # And it round-trips through the real settings file, not a dict.
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "settings.json"
+        store = state_mod.SettingsStore(path)
+        store.load()
+        assert store.get("self_audit_enabled") is True
+        assert store.set("self_audit_enabled", False) is True
+        assert state_mod.SettingsStore(path).load()["self_audit_enabled"] is False
+
+
+def test_the_scan_state_ledger_round_trips_through_the_real_store() -> None:
+    """The ledger rides in the same file the double-count fix guards.
+
+    A ledger that did not survive ``ScanStateStore`` would leave every entry
+    unable to retract, which is the add-only behaviour it exists to end - and
+    it would fail silently, because a missing ledger is a legal legacy entry.
+    """
+    from cc_usage_widget.contracts import (
+        FileScanState,
+        LedgerEntry,
+        scan_state_from_json,
+        scan_state_to_json,
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        store = state_mod.ScanStateStore(Path(tmp) / "scan_state.json")
+        entry = FileScanState(
+            inode=7,
+            size=100,
+            mtime=1_780_000_000.0,
+            offset=100,
+            last_model="codex:gpt-5.6-sol",
+            ledger=(
+                LedgerEntry(
+                    day="2026-09-09",
+                    model="codex:gpt-5.6-sol",
+                    counters=(1, 2, 3, 4, 5),
+                ),
+            ),
+        )
+        assert store.save_json(scan_state_to_json({"/a/r.jsonl": entry})) is True
+        back = scan_state_from_json(store.load_json())
+        assert back["/a/r.jsonl"] == entry, back
+
+        # A legacy entry - the four SPEC 3.2 keys and nothing else - still
+        # loads, keeps its offset, and simply has nothing to retract.
+        legacy = {"/a/old.jsonl": {"inode": 1, "size": 2, "mtime": 3.0, "offset": 2}}
+        assert store.save_json(legacy) is True
+        loaded = scan_state_from_json(store.load_json())["/a/old.jsonl"]
+        assert loaded.offset == 2 and loaded.ledger == ()
+        assert loaded.to_json() == legacy["/a/old.jsonl"], loaded.to_json()
+
+
 if __name__ == "__main__":
     raise SystemExit(main())

@@ -82,6 +82,8 @@ __all__ = [
     "DayRollup",
     # scan-state shapes
     "FileScanState",
+    "LedgerEntry",
+    "legacy_day_for_vanished",
     "IndexProgress",
     "ScanResult",
     # cost shapes
@@ -102,6 +104,7 @@ __all__ = [
     # settings
     "SETTINGS_DEFAULTS",
     "SETTINGS_BOUNDS",
+    "SETTINGS_CHOICES",
     "normalize_settings",
     # constants
     "TITLE_ICON",
@@ -117,6 +120,7 @@ __all__ = [
     "SETTINGS_PATH",
     "SCAN_STATE_PATH",
     "ROLLUPS_PATH",
+    "HISTORY_DB_PATH",
     "PROJECTS_DIR",
     "CODEX_SCAN_STATE_PATH",
     "CODEX_SESSIONS_DIR",
@@ -127,6 +131,7 @@ __all__ = [
     "CODEX_ACCOUNTS_DIR",
     "CODEX_ACCOUNTS_REGISTRY_PATH",
     "CODEX_QUOTA_SNAPSHOTS_PATH",
+    "AUDIT_STATE_PATH",
     "CODEX_AUTH_PATH",
     "CODEX_USAGE_URL",
     "CODEX_WINDOW_SECONDS_WEEKLY",
@@ -510,6 +515,40 @@ re-index."""
 ROLLUPS_PATH: Final[Path] = WIDGET_HOME / "rollups.json"
 """Daily token rollups (SPEC 2.2). Pure cache - safe to delete, costs one
 re-index."""
+
+AUDIT_STATE_PATH: Final[Path] = WIDGET_HOME / "audit_state.json"
+"""Sidecar for the daily self-audit tick (roadmap item 2).
+
+Holds ``{"last_audit_day": "YYYY-MM-DD", "last_audit_at": epoch,
+"last_drift_cells": n}`` and nothing else. Pure cache: deleting it costs one
+extra audit pass. Deliberately **not** part of ``scan_state.json`` - that file
+is per-file offsets and is rewritten by two indexers on two threads.
+"""
+
+HISTORY_DB_PATH: Final[Path] = _env_path(
+    "CC_USAGE_WIDGET_HISTORY_DB", WIDGET_HOME / "history.sqlite"
+)
+"""Append-only long-term mirror of the daily rollups (roadmap item 8).
+
+NOT a cache. :data:`ROLLUPS_PATH` is pruned to ``lookback_days`` on every save
+and ``~/.claude/projects`` is pruned by Claude Code on its own schedule, so a
+day that ages out is unreconstructible: this file is the only record of it.
+Deleting it therefore costs history rather than correctness - the widget renders
+the same menu without it - but the loss is permanent, which is why it is the one
+state file the widget never rewrites wholesale.
+
+Written by ``history.py`` only, 0600, and git-ignored (the widget home is a git
+checkout). Holds day keys, :data:`VendorModelKey` strings, integer token
+counters and a notional dollar figure - no prompt, completion, tool result, git
+branch or file path ever reaches it.
+
+With ``cost_by_project_enabled`` on (roadmap item 6) the second table,
+``daily_project``, additionally holds a **project name**: one path component,
+the basename of the working directory a session ran in, capped at 64
+characters. That is the only string in this file that came out of a transcript
+rather than out of a model name, it is named in ``history.PROJECT_COLUMNS`` and
+asserted there, and the setting switches it off entirely.
+"""
 
 PROJECTS_DIR: Final[Path] = _env_path(
     "CC_USAGE_WIDGET_PROJECTS_DIR", Path.home() / ".claude" / "projects"
@@ -1090,6 +1129,134 @@ _KEEP: Final[_Keep] = _Keep()
 
 
 @dataclass(frozen=True, slots=True)
+class LedgerEntry:
+    """One ``(day, model) -> counters`` contribution made by a single file.
+
+    The unit of the **per-file contribution ledger** (roadmap item 1). Before
+    it existed, ``RollupStore.merge`` was a plain addition and the scan state
+    remembered only *how far* a file had been read - so any re-read from byte 0
+    (an inode change, a truncation, a lost state entry) added that file's whole
+    history on top of what the store already held. Live day/model cells were
+    inflated up to 1,650x by exactly that path.
+
+    Recording what each file put in makes the addition reversible: the store
+    can be told to :meth:`RollupStore.retract` a file's remembered contribution
+    before the re-read adds it again.
+
+    ``counters`` is in :data:`COUNTER_FIELDS` order, i.e. the wire order of
+    :meth:`ModelUsage.as_counters`. A tuple, not a list, because
+    :class:`FileScanState` is frozen **and hashable** and a mutable member
+    would break both.
+    """
+
+    day: DayKey
+    model: ModelKey
+    counters: tuple[int, int, int, int, int]
+
+    @property
+    def usage(self) -> ModelUsage:
+        """The contribution as a :class:`ModelUsage`."""
+        return ModelUsage.from_counters(self.counters)
+
+
+def ledger_from_counters(
+    counters: Mapping[DayKey, Mapping[ModelKey, Sequence[int]]],
+) -> tuple[LedgerEntry, ...]:
+    """Build a ledger from the indexer's mutable ``{day: {model: [5]}}`` shape.
+
+    Zero rows are dropped: a contribution of nothing is not worth a byte on
+    disk and retracting it is a no-op anyway. Sorted, so two runs that counted
+    the same thing serialise identically.
+    """
+    out: list[LedgerEntry] = []
+    for day in sorted(counters):
+        models = counters[day]
+        for model in sorted(models):
+            values = tuple(int(v) for v in models[model])
+            if len(values) != len(COUNTER_FIELDS) or not any(values):
+                continue
+            out.append(LedgerEntry(day=str(day), model=str(model), counters=values))  # type: ignore[arg-type]
+    return tuple(out)
+
+
+def merge_ledgers(
+    base: Sequence[LedgerEntry], extra: Sequence[LedgerEntry]
+) -> tuple[LedgerEntry, ...]:
+    """Field-wise sum of two ledgers, keyed by ``(day, model)``.
+
+    Used when a file is read *incrementally*: the bytes appended since the last
+    pass are a further contribution by the same file, not a replacement for
+    what it contributed before.
+    """
+    acc: dict[tuple[str, str], list[int]] = {}
+    for entry in list(base) + list(extra):
+        key = (entry.day, entry.model)
+        row = acc.get(key)
+        if row is None:
+            acc[key] = list(entry.counters)
+            continue
+        for i, value in enumerate(entry.counters):
+            row[i] += value
+    out: list[LedgerEntry] = []
+    for (day, model) in sorted(acc):
+        values = tuple(acc[(day, model)])
+        if not any(values):
+            continue
+        out.append(LedgerEntry(day=day, model=model, counters=values))  # type: ignore[arg-type]
+    return tuple(out)
+
+
+def ledger_to_json(
+    entries: Sequence[LedgerEntry],
+) -> dict[str, dict[str, list[int]]]:
+    """Nested ``{day: {model: [5 counters]}}`` - the compact on-disk form."""
+    out: dict[str, dict[str, list[int]]] = {}
+    for entry in entries:
+        out.setdefault(entry.day, {})[entry.model] = list(entry.counters)
+    return out
+
+
+def ledger_from_json(obj: Any) -> tuple[LedgerEntry, ...]:
+    """Parse a ledger, **skipping** malformed rows rather than raising.
+
+    Leniency is deliberate and asymmetric with the rest of
+    :meth:`FileScanState.from_json`: a rejected *entry* costs a re-read from
+    offset 0 with nothing to retract - which is the double-count this ledger
+    exists to prevent - so a ledger we cannot read degrades to "this file has
+    contributed nothing we can take back", never to "drop the offset too".
+    """
+    if not isinstance(obj, Mapping):
+        return ()
+    rows: dict[tuple[str, str], list[int]] = {}
+    for day, models in obj.items():
+        if not isinstance(models, Mapping):
+            continue
+        try:
+            parse_day_key(str(day))
+        except ValueError:
+            continue
+        for model, counters in models.items():
+            if not isinstance(counters, Sequence) or isinstance(counters, (str, bytes)):
+                continue
+            if len(counters) != len(COUNTER_FIELDS):
+                continue
+            values: list[int] = []
+            ok = True
+            for value in counters:
+                if isinstance(value, bool) or not isinstance(value, int):
+                    ok = False
+                    break
+                values.append(value if value > 0 else 0)
+            if not ok or not any(values):
+                continue
+            rows[(str(day), str(model))] = values
+    return tuple(
+        LedgerEntry(day=day, model=model, counters=tuple(rows[(day, model)]))  # type: ignore[arg-type]
+        for day, model in sorted(rows)
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class FileScanState:
     """Where the scanner left off in one transcript file (SPEC 3.2).
 
@@ -1119,6 +1286,152 @@ class FileScanState:
     mtime: float
     offset: int
     last_model: str | None = None
+    ledger: tuple[LedgerEntry, ...] = ()
+    """What this file has contributed to the rollup store, per
+    ``(day, model)`` (roadmap item 1).
+
+    The sixth, **optional** key. Empty means "nothing to take back", which is
+    the honest reading for two different situations and the reason no separate
+    flag distinguishes them:
+
+    * a **legacy** entry, written before this field existed. It keeps its
+      offset - re-reading a 36 MB transcript to learn what it once contributed
+      would be strictly worse than the double count it might one day avoid -
+      and starts a ledger from its next appended bytes. **The ledger cannot
+      retract what it never saw**: a legacy entry whose file is then replaced
+      re-adds its whole history exactly as before, once, and is correct from
+      then on.
+    * a file that genuinely contributed no usage.
+
+    :meth:`to_json` omits the key when it is empty, so a Claude entry for a
+    transcript with no in-window usage keeps its exact previous byte shape.
+
+    Which of the two an empty ledger means is answered by
+    :attr:`ledger_complete`, not by the ledger itself.
+    """
+    ledger_complete: bool = False
+    """True when :attr:`ledger` accounts for **everything** this entry ever put
+    into the store (roadmap item 1, 2026-09-10 fix).
+
+    An entry created by a read from byte 0 is complete even when its ledger is
+    empty - the file genuinely contributed nothing. A **legacy** entry written
+    before the ledger existed is not: it keeps its offset, so the tokens it
+    credited before the upgrade are in ``rollups.json`` with nothing on this
+    side describing them. Appending to a legacy entry does not make it complete,
+    because the new rows still do not cover the old bytes; only a re-read from
+    zero does.
+
+    Two consumers depend on the distinction, and both were silently wrong while
+    an empty ledger meant either thing:
+
+    * a vanished legacy entry must become a *legacy* tombstone rather than be
+      deleted, or the audit reads the pruned file's real contribution as drift;
+    * the audit must refuse to repair a vendor whose scanner still holds a
+      legacy tombstone in the audited window, because the fresh index cannot
+      reconstruct what no ledger describes.
+
+    On disk it is the key ``"lv": 1``, written only when True and omitted
+    otherwise, so an entry from an older build reads as legacy exactly as it
+    should and shipping this still costs no re-index.
+    """
+    scope: str | None = None
+    """The attribution scope this file's tokens went into (roadmap item 6).
+
+    The eighth, **optional** key: ``attribution.Attribution.session_key`` -
+    ``vendor\x1fproject\x1fsession``, each component already capped at 64
+    characters by ``attribution.py``. Written only while
+    ``cost_by_project_enabled`` is on, omitted from :meth:`to_json` when
+    ``None``, so a machine with the feature off keeps its scan state
+    byte-identical.
+
+    Why it is persisted at all: a retraction has to go back to the project the
+    original contribution went INTO. The collector caches that per path, but
+    the cache dies with the process, and the first thing a replaced transcript
+    does after a restart is retract its old ledger - resolved, with nothing
+    remembered, from the file that is on disk now. This is the same fact as
+    :attr:`ledger`, one dimension along, and it is stored in the same place for
+    the same reason.
+    """
+    legacy_day: DayKey | None = None
+    """For a **legacy tombstone**: the local day its file was last written.
+
+    Set only by :meth:`tombstone` on a vanished entry whose ledger did not
+    describe its whole contribution. It is the honest upper bound on the days
+    that contribution can have landed in - records are written on the day they
+    are timestamped - so the flag can age out with the window instead of
+    disabling the audit's repair for ever. ``None`` on every other entry.
+    """
+
+    @classmethod
+    def tombstone(
+        cls,
+        ledger: tuple[LedgerEntry, ...],
+        *,
+        legacy_day: DayKey | None = None,
+        scope: str | None = None,
+    ) -> FileScanState:
+        """A state entry for a path whose file is **gone**, keeping its ledger.
+
+        Deleting the entry outright and retracting its contribution was the
+        obvious reading of "a file vanishing", and it is wrong: Claude Code
+        prunes ``~/.claude/projects`` on its own ``cleanupPeriodDays``, so an
+        aged-out transcript's money survives *only* in ``rollups.json`` and
+        zeroing it there is permanent (the regression
+        ``test_lost_codex_scan_state_keeps_claude_history`` was written for
+        exactly that loss).
+
+        Keeping the ledger under a tombstone satisfies both halves: the day
+        keeps its history, and if the path ever comes back - a restore, a sync
+        agent, a re-created session id - the new file cannot match
+        ``inode 0 / size 0 / mtime 0``, so it is a reset, the old contribution
+        is retracted, and the re-read replaces it instead of doubling it.
+
+        The tombstone is dropped once every day in its ledger has aged out of
+        the lookback window, which is what bounds the scan-state file.
+
+        Args:
+            ledger: what the vanished file is known to have contributed.
+            legacy_day: set when that ledger is **not** the whole story - a
+                pre-ledger entry, or one that only started a ledger part way
+                through its life. Such a tombstone is kept even with an empty
+                ledger (it is the only remaining evidence that the store holds
+                something no index can rebuild) and is dropped when that day
+                leaves the window.
+        """
+        return cls(
+            inode=0,
+            size=0,
+            mtime=0.0,
+            offset=0,
+            ledger=ledger,
+            ledger_complete=legacy_day is None,
+            legacy_day=legacy_day,
+            # Carried, not dropped: if this path ever comes back it is a reset,
+            # and the retraction of the ledger above must be attributed to the
+            # project the tokens actually went into.
+            scope=scope,
+        )
+
+    @property
+    def is_tombstone(self) -> bool:
+        """True for an entry that stands in for a file that no longer exists."""
+        return (
+            self.inode == 0
+            and self.size == 0
+            and self.mtime == 0.0
+            and self.offset == 0
+        )
+
+    @property
+    def is_legacy_tombstone(self) -> bool:
+        """True for a tombstone whose ledger cannot describe its contribution.
+
+        The audit's refusal gate: a vendor still holding one of these has usage
+        in ``rollups.json`` that a fresh index cannot reproduce and no ledger
+        can account for, so any "drift" it sees may be that usage and repairing
+        would destroy it.
+        """
+        return self.is_tombstone and self.legacy_day is not None
 
     def unchanged(self, size: int, mtime: float) -> bool:
         """True when ``(size, mtime)`` match - the 3,162-of-~3,200 fast path.
@@ -1145,24 +1458,59 @@ class FileScanState:
         mtime: float,
         offset: int,
         last_model: str | None | _Keep = _KEEP,
+        ledger: tuple[LedgerEntry, ...] | _Keep = _KEEP,
+        ledger_complete: bool | _Keep = _KEEP,
+        scope: str | None | _Keep = _KEEP,
     ) -> FileScanState:
         """Return a new state after reading up to *offset*.
 
-        ``last_model`` defaults to **keeping** the stored value, so the
-        pre-existing Claude call sites - which pass only the four original
-        keyword arguments - cannot accidentally erase a Codex resume model.
-        Pass it explicitly (including ``None``) to change it.
+        ``last_model``, ``ledger`` and ``ledger_complete`` default to
+        **keeping** the stored value, so the pre-existing Claude call sites -
+        which pass only the four original keyword arguments - cannot
+        accidentally erase a Codex resume model or a file's contribution
+        ledger. Pass any of them explicitly (including ``None`` / ``()`` /
+        ``False``) to change it.
         """
         resolved = self.last_model if isinstance(last_model, _Keep) else last_model
+        entries = self.ledger if isinstance(ledger, _Keep) else tuple(ledger)
+        complete = (
+            self.ledger_complete
+            if isinstance(ledger_complete, _Keep)
+            else bool(ledger_complete)
+        )
+        where = self.scope if isinstance(scope, _Keep) else scope
         return FileScanState(
-            inode=inode, size=size, mtime=mtime, offset=offset, last_model=resolved
+            inode=inode,
+            size=size,
+            mtime=mtime,
+            offset=offset,
+            last_model=resolved,
+            ledger=entries,
+            ledger_complete=complete,
+            scope=where,
+        )
+
+    def ledger_map(self) -> dict[DayKey, dict[ModelKey, list[int]]]:
+        """The ledger as the indexer's mutable ``{day: {model: [5]}}`` shape."""
+        out: dict[DayKey, dict[ModelKey, list[int]]] = {}
+        for entry in self.ledger:
+            out.setdefault(entry.day, {})[entry.model] = list(entry.counters)
+        return out
+
+    def ledger_rollups(self) -> tuple[DayRollup, ...]:
+        """The ledger as :class:`DayRollup` values - what ``retract`` consumes."""
+        by_day: dict[DayKey, dict[ModelKey, ModelUsage]] = {}
+        for entry in self.ledger:
+            by_day.setdefault(entry.day, {})[entry.model] = entry.usage
+        return tuple(
+            DayRollup(day=day, models=by_day[day]) for day in sorted(by_day)
         )
 
     def to_json(self) -> dict[str, float | int | str]:
         """On-disk form: the four keys from SPEC 3.2, plus ``last_model``
         **only when it is set**, so a Claude entry is byte-identical to what
         previous builds wrote."""
-        out: dict[str, float | int | str] = {
+        out: dict[str, Any] = {
             "inode": self.inode,
             "size": self.size,
             "mtime": self.mtime,
@@ -1170,6 +1518,18 @@ class FileScanState:
         }
         if self.last_model is not None:
             out["last_model"] = self.last_model
+        if self.ledger:
+            out["ledger"] = ledger_to_json(self.ledger)
+        if self.ledger_complete:
+            # Two bytes of key per entry, and the only way a later build can
+            # tell "this file contributed nothing" from "this file's history
+            # predates the ledger". Omitted when False so an entry written by
+            # an older build keeps reading as legacy, which is what it is.
+            out["lv"] = 1
+        if self.legacy_day is not None:
+            out["legacy_day"] = self.legacy_day
+        if self.scope:
+            out["sc"] = self.scope
         return out
 
     @classmethod
@@ -1200,13 +1560,65 @@ class FileScanState:
         raw_model = obj.get("last_model")
         if raw_model is not None and not isinstance(raw_model, str):
             raise ValueError(f"FileScanState.from_json: bad last_model {raw_model!r}")
+        # Lenient like the ledger itself: an unreadable flag reads as "legacy",
+        # which is the conservative side - it can cost the audit a repair, never
+        # a day's real usage.
+        raw_scope = obj.get("sc")
+        raw_day = obj.get("legacy_day")
+        legacy_day: DayKey | None = None
+        if isinstance(raw_day, str) and raw_day:
+            try:
+                parse_day_key(raw_day)
+            except ValueError:
+                legacy_day = None
+            else:
+                legacy_day = raw_day  # type: ignore[assignment]
         return cls(
             inode=_as_int(obj["inode"], "inode"),
             size=_as_int(obj["size"], "size"),
             mtime=float(mtime),
             offset=_as_int(obj["offset"], "offset"),
             last_model=raw_model,
+            # Lenient on purpose - see `ledger_from_json`. An unreadable ledger
+            # must never cost the entry its offset.
+            ledger=ledger_from_json(obj.get("ledger")),
+            ledger_complete=bool(obj.get("lv")),
+            legacy_day=legacy_day,
+            # Lenient like every other optional key: a scope that is not a
+            # string is simply not remembered, which costs one re-resolution.
+            scope=raw_scope if isinstance(raw_scope, str) and raw_scope else None,
         )
+
+
+def legacy_day_for_vanished(
+    state: FileScanState, *, window_start: DayKey
+) -> DayKey | None:
+    """The ``legacy_day`` a tombstone for *state* must carry, or ``None``.
+
+    One rule, in one place, because both scanners apply it and a divergence
+    between them would be invisible: an entry whose ledger does not describe its
+    whole contribution (:attr:`FileScanState.ledger_complete` False) leaves
+    behind usage in ``rollups.json`` that no fresh index can reproduce, so its
+    disappearance must be *tombstoned as legacy* rather than deleted - deleting
+    it is what let the first self-audit read that usage as drift and repair it
+    away.
+
+    The day is the file's last-written local day (already stored on a legacy
+    tombstone, taken from ``mtime`` the first time), which is the honest upper
+    bound on the days its records can belong to. Once that day leaves the
+    window the flag is dropped: the un-ledgered contribution can no longer be
+    inside anything the audit compares, and a tombstone nothing needs is a
+    tombstone that must not grow the state file for ever.
+    """
+    if state.is_tombstone:
+        day = state.legacy_day
+    elif state.ledger_complete:
+        day = None
+    else:
+        day = local_day_key(state.mtime)
+    if day is not None and day < window_start:
+        return None
+    return day
 
 
 @dataclass(frozen=True, slots=True)
@@ -1313,6 +1725,21 @@ class ScanResult:
     unknown_models: tuple[str, ...] = ()
     errors: tuple[str, ...] = ()
     duration_ms: float = 0.0
+    retractions: tuple[DayRollup, ...] = ()
+    """Contributions the store must SUBTRACT before ``deltas`` are added
+    (roadmap item 1).
+
+    Non-empty only when a file this pass re-read from byte 0 (inode change,
+    truncation, ``offset > size``) or a file that vanished had a recorded
+    :attr:`FileScanState.ledger`. The owner must apply these **before**
+    :meth:`RollupStore.merge` and in the same tick, or the day briefly reads
+    low; applying them in the other order is worse still, since the re-added
+    contribution would be taken straight back out.
+
+    A pass that resumes a file mid-read retracts **nothing**: the earlier
+    chunk's contribution is still valid and the ledger accumulates on top of
+    it. Retracting per chunk would take out tokens that were never re-added.
+    """
     vendor: Vendor = VENDOR_CLAUDE
     """Which source produced this pass. Defaults to :data:`VENDOR_CLAUDE` so
     the pre-existing indexer needs no change.
@@ -1325,6 +1752,11 @@ class ScanResult:
     def changed(self) -> bool:
         """True when anything new was counted - gates a UI refresh."""
         return bool(self.deltas)
+
+    @property
+    def corrected(self) -> bool:
+        """True when this pass took something back out of the store."""
+        return bool(self.retractions)
 
 
 # ---------------------------------------------------------------------------
@@ -1541,6 +1973,15 @@ class WindowCost:
     (the 2026-08-25 incident: 18.9M unpriced tokens invisible behind a
     clean-looking "Today" figure)."""
 
+    vendor_unpriced: tuple[tuple[Vendor, int], ...] = ()
+    """Per-vendor split of :attr:`unpriced_tokens`, in :data:`VENDORS` order.
+
+    Only vendors with a **non-zero** count appear, so an empty tuple means
+    "nothing unpriced anywhere in this window" and a missing vendor means zero
+    (roadmap item 3: 916M ``codex-auto-review`` tokens a week at $0 are Codex's,
+    and saying so is the whole point of the line).
+    """
+
     vendor_usd: tuple[tuple[Vendor, Usd], ...] = ()
     """Optional per-vendor split of :attr:`usd`, in :data:`VENDORS` order.
 
@@ -1564,6 +2005,19 @@ class WindowCost:
             if name == vendor:
                 return amount
         return None
+
+    def unpriced_for_vendor(self, vendor: Vendor) -> int:
+        """This window's unpriced tokens for one vendor - ``0`` when none.
+
+        Unlike :meth:`usd_for_vendor` this returns a number rather than
+        ``None``: an absent entry here genuinely means "this vendor had no
+        unpriced tokens in this window", because the producer only records
+        vendors whose count is non-zero.
+        """
+        for name, count in self.vendor_unpriced:
+            if name == vendor:
+                return count
+        return 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1640,6 +2094,21 @@ class CostBreakdown:
     progress: IndexProgress = IndexProgress()
     generated_at: float = 0.0
     by_vendor: tuple[VendorCostRow, ...] = ()
+    unknown_models_by_vendor: tuple[tuple[Vendor, tuple[str, ...]], ...] = ()
+    """:attr:`unknown_models`, attributed - over the SAME (30-day) window.
+
+    ``unknown_models`` is flat because the names are what the user must see;
+    this is the same set split by vendor so the menu can name them under the
+    section whose tokens they are. Raw names, no vendor prefix - the tuple
+    already states the vendor. Vendors with no unpriced model are absent.
+    """
+
+    def unknown_models_for_vendor(self, vendor: Vendor) -> tuple[str, ...]:
+        """Raw unpriced model names for one vendor over the 30-day window."""
+        for name, models in self.unknown_models_by_vendor:
+            if name == vendor:
+                return models
+        return ()
 
     @property
     def last_7d_avg_per_day(self) -> Usd:
@@ -1806,6 +2275,27 @@ class AccountRow:
     ``"info"`` (dim, e.g. a countdown or ``awaiting first reading``),
     ``"warn"`` (a dead credential, no access, offline past the grace) or
     ``"crit"`` (plan capped). Renderers colour on this and only this."""
+    info_notes: tuple[str, ...] = ()
+    """Extra dim lines under this row's header, each a FACT the source read
+    (roadmap 10/11/12): ``credits 12``, ``Astra back Sep 15``, ``at this pace:
+    wall in 6h``.
+
+    Distinct from :attr:`attention_note`, which is the single standing verdict
+    that REPLACES the figures. These sit *beside* the bars, never instead of
+    them, and a source that withholds its bars (a stale reading, a warn
+    sentinel) must withhold these too - they were read at the same instant.
+    Empty for every claude-swap row and for the transcript-derived Codex row,
+    so those render byte-for-byte as before."""
+    soonest_reset_at: float | None = None
+    """Epoch of the soonest reset instant this row reports, or ``None``.
+
+    The one NUMERIC reset on the row: :attr:`five_hour_resets_at` and its
+    siblings are display strings a source already formatted (a clock, never a
+    full date), so nothing downstream can order two rows by reset or count
+    down to one. Only a source that holds the reset as an epoch (Codex, which
+    anchors ``reset_after_seconds`` once at the read instant) sets this;
+    claude-swap rows leave it ``None``, and every renderer must read ``None``
+    as "not reported" rather than as "now"."""
 
     @property
     def is_pseudo(self) -> bool:
@@ -2086,6 +2576,11 @@ class RollupStore(Protocol):
     ``clear()``
         Drop every day. Its presence is what makes ``Rebuild cost index``
         appear at all - rebuilding without emptying would double-count.
+    ``retract(day, model, usage) -> ModelUsage`` / ``retract_rollups(rollups)``
+        Subtract a previously merged contribution, clamped at zero. Its
+        presence is what makes :attr:`ScanResult.retractions` mean anything;
+        an owner holding a store without it must treat a non-empty
+        ``retractions`` as a reason to rebuild rather than silently ignore it.
     ``drop_vendors(vendors) -> int``
         Drop only those vendors' rows (matched with :func:`vendor_of_key`),
         deleting any day left with no models, and return how many rows went.
@@ -2265,10 +2760,26 @@ SETTINGS_DEFAULTS: dict[str, Any] = {
     # --- feature switches (top-level menu items, per SPEC 4.2) -------------
     "autoswitch_enabled": False,
     "cost_tracking_enabled": True,
+    "history_enabled": True,
     # --- vendors (SPEC-CODEX) ---------------------------------------------
     "codex_tracking_enabled": True,
     "codex_live_quota_enabled": False,
     "codex_show_extra_limits": False,
+    # --- integrity (roadmap item 2) ---------------------------------------
+    "self_audit_enabled": True,
+    # --- local dashboard (roadmap item 9; dashboard.py) -------------------
+    "dashboard_enabled": True,
+    # --- attribution (roadmap item 6; attribution.py) ---------------------
+    "cost_by_project_enabled": True,
+    # --- notifications (roadmap 7; notify.py) -----------------------------
+    "notifications_enabled": True,
+    "telegram_notifications_enabled": False,
+    "notification_threshold_pct": 85,
+    "codex_fleet_line_enabled": True,
+    "codex_pace_forecast_enabled": True,
+    "codex_pricing_tier": "standard",
+    # --- token refresh (roadmap 13; SPEC-CODEX 6.4) -----------------------
+    "codex_refresh_enabled": False,
     # --- scan / cadence (SPEC 3.5); all intervals live here ---------------
     "lookback_days": 30,
     "ui_interval_seconds": 60,
@@ -2282,6 +2793,7 @@ SETTINGS_DEFAULTS: dict[str, Any] = {
     "title_show_cost": True,
     "title_show_codex_pct": False,
     "title_show_fleet": True,
+    "title_compact": False,
 }
 """Full ``settings.json`` schema with defaults.
 
@@ -2311,9 +2823,82 @@ Vendor keys (SPEC-CODEX):
 ``codex_quota_interval_seconds``
     Per-account poll period for the live source. Clamped by
     :data:`SETTINGS_BOUNDS`; the floor protects the endpoint, not the CPU.
+``cost_by_project_enabled``
+    Defaults ``True``. Whether the indexers attribute what they read to a
+    project and a session (``attribution.py``, roadmap item 6). Off = no scope
+    is resolved, ``attribution.json`` is never written, no project name reaches
+    ``history.sqlite``, and the Cost section is byte-for-byte what it was before
+    the feature existed.
+``history_enabled``
+    Defaults ``True``. Whether each cost job mirrors the store's days into
+    :data:`HISTORY_DB_PATH`. Off = the file is never opened or created, the
+    Export items still work against whatever is already recorded, and the menu
+    is byte-for-byte unchanged. This is the off switch for roadmap item 8.
 ``codex_show_extra_limits``
     Defaults ``False``. Whether ``additional_rate_limits`` (per-model buckets
     such as a Spark or reserve pool) render as extra bars under each account.
+``codex_fleet_line_enabled``
+    Defaults ``True``. The Codex block's fleet heading (``Codex 0/4 · next
+    Sat 09:00 (vlad)``) - rooms with headroom and when the next one opens, the
+    twin of the Claude title suffix. Off = the block is exactly the per-account
+    rows, byte-for-byte the pre-roadmap layout. It draws only when a LIVE row
+    exists, so a machine with the live source off never sees it either way.
+``codex_pace_forecast_enabled``
+    Defaults ``True``. Whether a rising weekly window earns the ``at this
+    pace: wall in 6h`` info note from the sidecar's per-account sample ring
+    (roadmap 10). Off = no note; the samples are still recorded, because the
+    ring is what makes the note honest the moment it is switched back on.
+``codex_pricing_tier``
+    One of ``standard`` / ``fast`` / ``batch``, default ``standard``. The ONLY
+    thing it changes is the notional-cost label: rollouts do not say which tier
+    ran, and ``pricing.py`` carries standard rates only, so a non-standard tier
+    makes the Codex cost heading say ``fast tier rates not loaded`` rather than
+    re-scaling a figure nobody measured (roadmap 11).
+``codex_refresh_enabled``
+    Defaults ``False``, and it is the only setting whose default is a *safety*
+    decision rather than a taste one. On, the live source may POST an OAuth
+    refresh grant for an account whose access token is inside 24 h of expiry
+    (and exactly once more on a 401), persisting the rotated tokens to that
+    account's ``auth.json`` before using them. Off, **not one token request is
+    ever made** — the widget only ever reads that file, and a token near expiry
+    shows ``relogin in 1d 4h`` exactly as before. It stays off until the
+    SPEC-CODEX 6.4 probe (``probe-refresh``, then a 24 h soak) shows that
+    rotating one login does not revoke another under the same public OAuth
+    client; a wrong guess logs the user out of the account they are coding in.
+
+Notification keys (roadmap item 7, ``notify.py``):
+
+``notifications_enabled``
+    Defaults ``True``: the off switch for the whole feature, macOS and Telegram
+    alike. With it off, ``Notifier.notify`` returns before it reads the ledger,
+    so a disabled feature costs no I/O and leaves no state behind.
+``telegram_notifications_enabled``
+    Defaults ``False``. Telegram needs a bot token, which only exists once
+    ``python -m cc_usage_widget.notify setup`` has written ``notify.json``; a
+    default of True would be a switch that cannot work. The Settings item stays
+    greyed out until that file is present and 0600.
+``notification_threshold_pct``
+    The percentage a window must cross UPWARD to notify, 50-100 (default 85).
+    100 is always notified separately as a wall, and a window that then falls
+    below ``notify.RECOVERY_PCT`` notifies once as "back" — so this key sets one
+    edge, never a band the widget re-interprets.
+
+``dashboard_enabled``
+    Defaults ``True``. Whether the Cost section offers ``Open dashboard``
+    (roadmap item 9, ``dashboard.py``). Off = the item is absent and no
+    ``dashboard.html`` is ever rendered, written or opened, so the menu is
+    byte-for-byte the pre-roadmap layout. The page is built only on a click -
+    never on a tick - so the switch costs nothing either way; it exists so an
+    operator who does not want a spend record sitting on disk can say so.
+
+``title_compact``
+    Defaults ``False`` (roadmap 16). A different title, not another component:
+    when on, the bar shows the two active figures and nothing else (``V·C
+    100/100`` - the active Claude alias's initial and 5h percentage, the Codex
+    vendor initial and the active account's weekly percentage), and every
+    ``title_show_*`` toggle above is ignored because none of those components
+    is rendered. Off = the SPEC 4.1 title, byte for byte. The budget is
+    ``render.COMPACT_TITLE_MAX``.
 
 ``title_show_fleet``
     Defaults ``True``, and unlike the other title components it costs nothing
@@ -2333,12 +2918,23 @@ SETTINGS_BOUNDS: dict[str, tuple[int, int]] = {
     "ui_interval_seconds": (15, 3600),
     "cost_interval_seconds": (30, 86_400),
     "codex_quota_interval_seconds": (60, 3600),
+    "notification_threshold_pct": (50, 100),
 }
 """Inclusive clamps for the integer settings.
 
 Floors exist to protect the SPEC 2.1 idle-CPU budget: a 1-second cost tick
 would defeat the whole design.
 """
+
+SETTINGS_CHOICES: dict[str, tuple[str, ...]] = {
+    "codex_pricing_tier": ("standard", "fast", "batch"),
+}
+"""Allowed values for the string settings, first entry = the default.
+
+A string setting is an enum or it is not a setting: free text in
+``settings.json`` would reach a label, and :func:`normalize_settings` has no
+way to judge prose. A value outside its tuple falls back to the default
+exactly as an out-of-range int is clamped."""
 
 
 def normalize_settings(raw: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -2373,6 +2969,13 @@ def normalize_settings(raw: Mapping[str, Any] | None) -> dict[str, Any]:
                 continue
             low, high = SETTINGS_BOUNDS[key]
             out[key] = min(max(int(value), low), high)
+            continue
+        if isinstance(default, str):
+            # An enum, never free text: a value outside the tuple falls back to
+            # the default, the string twin of clamping an out-of-range int.
+            choices = SETTINGS_CHOICES.get(key, ())
+            if isinstance(value, str) and value in choices:
+                out[key] = value
     return out
 
 
@@ -2383,7 +2986,7 @@ def normalize_settings(raw: Mapping[str, Any] | None) -> dict[str, Any]:
 
 def scan_state_to_json(
     states: Mapping[str, FileScanState],
-) -> dict[str, dict[str, float | int]]:
+) -> dict[str, dict[str, Any]]:
     """Serialise the scan-state file: ``{abs path: entry}`` (SPEC 3.2)."""
     return {path: state.to_json() for path, state in states.items()}
 

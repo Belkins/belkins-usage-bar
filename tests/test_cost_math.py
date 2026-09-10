@@ -884,5 +884,567 @@ def test_gpt_5_5_is_priced() -> None:
     assert abs(cost - (5.00 + 30.00 + 0.50)) < 1e-9, cost
 
 
+# ---------------------------------------------------------------------------
+# Roadmap item 1: the per-file contribution ledger makes `merge` reversible
+#
+# The incident these encode: `DailyRollupStore.merge` was a plain addition and
+# the scan state remembered only HOW FAR a file had been read. Any re-read from
+# byte 0 - a new inode, a truncation, a lost entry - added that file's whole
+# history a second time, and live day/model cells were inflated up to 1,650x.
+#
+# Every case below re-scans with a FRESH `Indexer` over the same state file,
+# which is what a widget restart does. It also matters for the test itself: the
+# same instance holds today's requestIds in its dedup map and would suppress a
+# double count that a restarted process cannot see. The records are dated
+# YESTERDAY for the same reason - today's dedup map is persistent, every other
+# day's is file-scoped and dies with the file handle.
+# ---------------------------------------------------------------------------
+
+
+def _apply(store: DailyRollupStore, result: Any) -> None:
+    """Apply one scan the way the cost job must: retract, THEN merge.
+
+    The order is not cosmetic. Merging first and retracting after would take
+    the freshly re-added contribution straight back out again.
+    """
+    store.retract_rollups(result.retractions)
+    store.merge(result.deltas)
+
+
+def _replace_file(path: Path, records: list[Any]) -> None:
+    """Swap *path* for a brand-new file holding *records* (a NEW inode).
+
+    `os.replace` is what a copy-then-move, a restore, or a sync agent does, and
+    it is the exact shape of the "re-read from zero" that inflated the store.
+    """
+    spare = path.with_suffix(path.suffix + ".new")
+    _write(spare, records)
+    os.replace(spare, path)
+
+
+def test_replacing_a_transcript_with_a_longer_copy_adds_only_the_new_records() -> None:
+    """A new inode holding the old records plus more must move the day by the
+    APPENDED records only - not by the whole file a second time."""
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        clock = _epoch(2026, 9, 5)
+        day = "2026-09-04"
+        stamp = _epoch(2026, 9, 4, 10)
+        first = [
+            _record(f"r{i}", FABLE, {"input_tokens": 1_000}, epoch=stamp)
+            for i in range(3)
+        ]
+        target = root / "projects" / "p" / "a.jsonl"
+        _write(target, first)
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        _apply(store, _indexer(root, now=clock).scan_once())
+        assert store.today(day).total.input == 3_000, store.today(day)
+
+        _replace_file(
+            target,
+            first + [_record("r3", FABLE, {"input_tokens": 1_000}, epoch=stamp)],
+        )
+        result = _indexer(root, now=clock).scan_once()
+        assert result.retractions, "a re-read from zero must retract what it replaces"
+        _apply(store, result)
+        assert store.today(day).total.input == 4_000, store.today(day)
+
+
+def test_a_shrunken_transcript_gives_its_old_contribution_back() -> None:
+    """Truncating a file to fewer records leaves the day holding ONLY what the
+    file still says - the retraction covers the records that went away."""
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        clock = _epoch(2026, 9, 5)
+        day = "2026-09-04"
+        stamp = _epoch(2026, 9, 4, 10)
+        target = root / "projects" / "p" / "a.jsonl"
+        _write(
+            target,
+            [
+                _record(f"r{i}", FABLE, {"input_tokens": 1_000}, epoch=stamp)
+                for i in range(4)
+            ],
+        )
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        _apply(store, _indexer(root, now=clock).scan_once())
+        assert store.today(day).total.input == 4_000
+
+        # Same inode, smaller than the stored offset: SPEC 3.2 step 4's
+        # truncation guard, which re-reads from 0.
+        _write(target, [_record("r0", FABLE, {"input_tokens": 1_000}, epoch=stamp)])
+        result = _indexer(root, now=clock).scan_once()
+        _apply(store, result)
+        assert store.today(day).total.input == 1_000, store.today(day)
+
+
+def test_a_vanished_transcript_keeps_its_day_and_cannot_double_on_return() -> None:
+    """A deleted transcript keeps its money, and a returning one does not double it.
+
+    Both halves matter and they pull in opposite directions. Claude Code prunes
+    ``~/.claude/projects`` on its own ``cleanupPeriodDays``, so an aged-out
+    transcript's tokens exist ONLY in ``rollups.json`` - retracting them on the
+    vanish would be permanent, unrecoverable loss (the same incident
+    ``test_lost_codex_scan_state_keeps_claude_history`` guards). But a path that
+    comes back - a restore, a sync agent, a re-created session id - is read from
+    byte 0 and would be added on top of a contribution nothing had taken out.
+
+    The tombstone entry answers both: it holds the ledger, so the day survives,
+    and it can never match a real file's ``(inode, size, mtime)``, so the return
+    reads as a reset and replaces the contribution.
+    """
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        clock = _epoch(2026, 9, 5)
+        day = "2026-09-04"
+        stamp = _epoch(2026, 9, 4, 10)
+        keep = root / "projects" / "p" / "keep.jsonl"
+        doomed = root / "projects" / "p" / "doomed.jsonl"
+        gone_records = [_record("d0", FABLE, {"input_tokens": 5_000}, epoch=stamp)]
+        _write(keep, [_record("k0", FABLE, {"input_tokens": 1_000}, epoch=stamp)])
+        _write(doomed, gone_records)
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        _apply(store, _indexer(root, now=clock).scan_once())
+        assert store.today(day).total.input == 6_000
+
+        doomed.unlink()
+        result = _indexer(root, now=clock).scan_once()
+        assert result.retractions == (), "a pruned transcript must not be retracted"
+        _apply(store, result)
+        assert store.today(day).total.input == 6_000, store.today(day)
+
+        _write(doomed, gone_records)
+        result = _indexer(root, now=clock).scan_once()
+        assert result.retractions, "a returning path must retract before it re-adds"
+        _apply(store, result)
+        assert store.today(day).total.input == 6_000, store.today(day)
+
+
+def test_a_tombstone_is_dropped_once_its_ledger_ages_out_of_the_window() -> None:
+    """The tombstone is bounded: it exists to protect a day, and goes when the
+    day does. Without this the scan state would grow by one entry per file the
+    corpus has ever held."""
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        stamp = _epoch(2026, 9, 4, 10)
+        keep = root / "projects" / "p" / "keep.jsonl"
+        doomed = root / "projects" / "p" / "doomed.jsonl"
+        _write(keep, [_record("k0", FABLE, {"input_tokens": 1_000}, epoch=stamp)])
+        _write(doomed, [_record("d0", FABLE, {"input_tokens": 5_000}, epoch=stamp)])
+        _indexer(root, now=_epoch(2026, 9, 5)).scan_once()
+        doomed.unlink()
+        _indexer(root, now=_epoch(2026, 9, 5)).scan_once()
+        state = json.loads((root / "scan_state.json").read_text(encoding="utf-8"))
+        assert str(doomed) in state, state
+        assert state[str(doomed)]["inode"] == 0, state[str(doomed)]
+
+        # Forty days on, the day it protected is outside every window.
+        _indexer(root, now=_epoch(2026, 10, 15)).scan_once()
+        state = json.loads((root / "scan_state.json").read_text(encoding="utf-8"))
+        assert str(doomed) not in state, state
+
+
+def test_widening_the_lookback_does_not_double_count() -> None:
+    """Widening the window admits older FILES without re-adding the ones the
+    narrow window already counted."""
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        clock = _epoch(2026, 9, 5)
+        recent_day = "2026-09-04"
+        old_day = "2026-08-20"
+        recent = root / "projects" / "p" / "recent.jsonl"
+        old = root / "projects" / "p" / "old.jsonl"
+        _write(
+            recent,
+            [
+                _record(
+                    "r0", FABLE, {"input_tokens": 1_000}, epoch=_epoch(2026, 9, 4, 10)
+                )
+            ],
+        )
+        _write(
+            old,
+            [
+                _record(
+                    "o0", FABLE, {"input_tokens": 7_000}, epoch=_epoch(2026, 8, 20, 10)
+                )
+            ],
+        )
+        # The old FILE is out of a 3-day window and therefore untracked, which
+        # is what makes widening pick it up at all (`Indexer._collect`).
+        os.utime(old, (_epoch(2026, 8, 20, 10), _epoch(2026, 8, 20, 10)))
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+
+        _apply(store, _indexer(root, now=clock, lookback_days=3).scan_once())
+        assert store.today(recent_day).total.input == 1_000
+        assert store.today(old_day).total.input == 0
+
+        _apply(store, _indexer(root, now=clock, lookback_days=30).scan_once())
+        assert store.today(recent_day).total.input == 1_000, store.today(recent_day)
+        assert store.today(old_day).total.input == 7_000, store.today(old_day)
+
+        # And again, to prove the widened pass is itself idempotent.
+        _apply(store, _indexer(root, now=clock, lookback_days=30).scan_once())
+        assert store.today(recent_day).total.input == 1_000
+        assert store.today(old_day).total.input == 7_000
+
+
+def test_a_legacy_scan_state_entry_keeps_its_offset_and_starts_a_ledger() -> None:
+    """A pre-ledger ``scan_state.json`` loads, keeps its offset, and begins
+    recording from its next appended bytes.
+
+    The documented cost: the ledger cannot retract what it never saw, so a
+    legacy entry whose file is then replaced re-adds its history ONCE. That is
+    strictly better than re-reading every 36 MB transcript at upgrade time, and
+    it is self-healing - the entry is correct from the first append onwards.
+    """
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        clock = _epoch(2026, 9, 5)
+        day = "2026-09-04"
+        stamp = _epoch(2026, 9, 4, 10)
+        target = root / "projects" / "p" / "a.jsonl"
+        _write(target, [_record("r0", FABLE, {"input_tokens": 1_000}, epoch=stamp)])
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        _apply(store, _indexer(root, now=clock).scan_once())
+
+        # Rewrite the state file in the pre-ledger shape: the four SPEC 3.2
+        # keys and nothing else.
+        state_path = root / "scan_state.json"
+        raw = json.loads(state_path.read_text(encoding="utf-8"))
+        legacy = {
+            path: {k: entry[k] for k in ("inode", "size", "mtime", "offset")}
+            for path, entry in raw.items()
+        }
+        assert legacy, "the scan wrote no state to downgrade"
+        state_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+        with target.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    _record("r1", FABLE, {"input_tokens": 500}, epoch=stamp)
+                )
+                + "\n"
+            )
+        result = _indexer(root, now=clock).scan_once()
+        assert result.retractions == (), "a legacy entry has nothing to retract"
+        _apply(store, result)
+        # The offset survived: only the appended record was counted.
+        assert store.today(day).total.input == 1_500, store.today(day)
+
+        upgraded = json.loads(state_path.read_text(encoding="utf-8"))
+        entry = next(iter(upgraded.values()))
+        assert entry["ledger"] == {day: {FABLE: [500, 0, 0, 0, 0]}}, entry
+
+
+def test_retract_clamps_at_zero_and_reports_the_shortfall() -> None:
+    """A ledger can describe more than the store holds (a pruned or partially
+    lost store). The clamp must hold and must be reported, not swallowed."""
+    with tempfile.TemporaryDirectory() as name:
+        store = DailyRollupStore(path=Path(name) / "rollups.json", keep_days=30)
+        store.add("2026-09-04", FABLE, ModelUsage(input=100, output=10))
+        removed = store.retract("2026-09-04", FABLE, ModelUsage(input=250, output=4))
+        assert removed == ModelUsage(input=100, output=4), removed
+        day = store.get("2026-09-04")
+        assert day is not None and day.models[FABLE] == ModelUsage(output=6), day
+
+        clamped = store.retract_rollups(
+            [DayRollup(day="2026-09-04", models={FABLE: ModelUsage(output=99)})]
+        )
+        assert clamped == 1, clamped
+        # A cell driven to zero is deleted, not kept as a row of zeros.
+        assert store.get("2026-09-04") is None, store.get("2026-09-04")
+
+
+def test_retracting_a_day_the_store_never_had_is_a_no_op() -> None:
+    """Retraction must never invent a negative cell or a phantom day."""
+    with tempfile.TemporaryDirectory() as name:
+        store = DailyRollupStore(path=Path(name) / "rollups.json", keep_days=30)
+        clamped = store.retract_rollups(
+            [DayRollup(day="2026-09-04", models={FABLE: ModelUsage(input=5)})]
+        )
+        assert clamped == 1, clamped
+        assert store.days() == (), store.days()
+
+
+# ---------------------------------------------------------------------------
+# Roadmap item 1, second half (2026-09-10): a retraction has to give the DEDUP
+# map back what it gives the store back.
+#
+# The ledger tests above all date their records to *yesterday*, where dedup is
+# file-scoped and dies with the file handle. On TODAY the map is persistent and
+# process-wide: a file re-read from byte 0 had its contribution retracted and
+# then found every one of its requests already credited, contributed nothing,
+# and silently took the day to zero. These cases keep ONE indexer across both
+# scans, which is what makes them today's-map tests rather than yesterday's.
+# ---------------------------------------------------------------------------
+
+
+def test_replacing_a_todays_transcript_keeps_the_records_it_still_holds() -> None:
+    """A new inode holding today's records plus more must move today by the
+    APPENDED records - not to zero, and not by the whole file again."""
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        clock = _epoch(2026, 9, 5, 18)
+        day = "2026-09-05"
+        stamp = _epoch(2026, 9, 5, 10)
+        first = [
+            _record(f"t{i}", FABLE, {"input_tokens": 1_000}, epoch=stamp)
+            for i in range(3)
+        ]
+        target = root / "projects" / "p" / "a.jsonl"
+        _write(target, first)
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        indexer = _indexer(root, now=clock)
+        _apply(store, indexer.scan_once())
+        assert store.today(day).total.input == 3_000, store.today(day)
+
+        _replace_file(
+            target,
+            first + [_record("t3", FABLE, {"input_tokens": 1_000}, epoch=stamp)],
+        )
+        result = indexer.scan_once()
+        assert result.retractions, "a re-read from zero must retract what it replaces"
+        _apply(store, result)
+        # Before the fix this was 1_000: the retraction took 3_000 back out and
+        # the dedup map refused to let the re-read put any of it back.
+        assert store.today(day).total.input == 4_000, store.today(day)
+
+
+def test_shrinking_a_todays_transcript_leaves_what_it_still_holds() -> None:
+    """The truncation half of the same fix, and the negative control beside it:
+    the OTHER transcript's contribution to today must not move at all."""
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        clock = _epoch(2026, 9, 5, 18)
+        day = "2026-09-05"
+        stamp = _epoch(2026, 9, 5, 10)
+        target = root / "projects" / "p" / "a.jsonl"
+        keep = root / "projects" / "p" / "keep.jsonl"
+        _write(
+            target,
+            [
+                _record(f"t{i}", FABLE, {"input_tokens": 1_000}, epoch=stamp)
+                for i in range(4)
+            ],
+        )
+        _write(keep, [_record("k0", FABLE, {"input_tokens": 500}, epoch=stamp)])
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        indexer = _indexer(root, now=clock)
+        _apply(store, indexer.scan_once())
+        assert store.today(day).total.input == 4_500, store.today(day)
+
+        # Same inode, smaller than the stored offset: SPEC 3.2 step 4.
+        _write(target, [_record("t0", FABLE, {"input_tokens": 1_000}, epoch=stamp)])
+        _apply(store, indexer.scan_once())
+        # 1_000 of the shrunken file + the untouched 500 of the other one.
+        assert store.today(day).total.input == 1_500, store.today(day)
+
+
+def test_a_restart_does_not_uncredit_another_transcripts_requests() -> None:
+    """Only the restarting file's own request ids may be handed back.
+
+    Two transcripts holding the same requestId is the copied-session case
+    cross-file dedup exists for: the second file contributed nothing for it, so
+    its ledger has nothing to retract and dropping the id would let the request
+    be counted a second time.
+    """
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        clock = _epoch(2026, 9, 5, 18)
+        day = "2026-09-05"
+        stamp = _epoch(2026, 9, 5, 10)
+        shared = _record("shared", FABLE, {"input_tokens": 1_000}, epoch=stamp)
+        original = root / "projects" / "p" / "a.jsonl"
+        copy = root / "projects" / "p" / "b.jsonl"
+        _write(original, [shared])
+        _write(copy, [shared])
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        indexer = _indexer(root, now=clock)
+        _apply(store, indexer.scan_once())
+        assert store.today(day).total.input == 1_000, "the copy was double counted"
+
+        _replace_file(
+            copy,
+            [shared, _record("fresh", FABLE, {"input_tokens": 1_000}, epoch=stamp)],
+        )
+        _apply(store, indexer.scan_once())
+        assert store.today(day).total.input == 2_000, store.today(day)
+
+
+# ---------------------------------------------------------------------------
+# Roadmap item 2, second half (2026-09-10): a vanished LEGACY entry must leave
+# a tombstone the audit can see.
+#
+# A pre-ledger entry keeps its offset and has no ledger, so when its file is
+# pruned there is nothing to carry - and the entry was simply deleted. The
+# tokens it credited are still in rollups.json, invisible to `tombstone_rollups`
+# and unreachable by any re-index, so the first self-audit read them as drift
+# and repaired them away. The tombstone has to stand even when it is empty.
+# ---------------------------------------------------------------------------
+
+
+def _strip_ledger(state_path: Path) -> dict[str, Any]:
+    """Rewrite a scan state as a pre-ledger build would have written it."""
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    for entry in state.values():
+        entry.pop("ledger", None)
+        entry.pop("lv", None)
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    return state
+
+
+def test_a_vanished_legacy_entry_leaves_a_legacy_tombstone() -> None:
+    """It is tombstoned, flagged, reported - and bounded by the window."""
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        clock = _epoch(2026, 9, 5, 18)
+        stamp = _epoch(2026, 9, 5, 10)
+        keep = root / "projects" / "p" / "keep.jsonl"
+        doomed = root / "projects" / "p" / "doomed.jsonl"
+        _write(keep, [_record("k0", FABLE, {"input_tokens": 1_000}, epoch=stamp)])
+        _write(doomed, [_record("d0", FABLE, {"input_tokens": 5_000}, epoch=stamp)])
+        state_path = root / "scan_state.json"
+        _indexer(root, now=clock).scan_once()
+        _strip_ledger(state_path)
+        # The day the entry is flagged with is the file's last WRITE day - the
+        # honest upper bound on the days its records can belong to - which is
+        # the real mtime, not the injected clock.
+        written = local_day_key(doomed.stat().st_mtime)
+
+        doomed.unlink()
+        indexer = _indexer(root, now=clock)
+        indexer.scan_once()
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        entry = state.get(str(doomed))
+        assert entry is not None, "a legacy entry was dropped, not tombstoned"
+        assert entry["inode"] == 0, entry
+        assert entry["legacy_day"] == written, entry
+        assert "lv" not in entry, entry
+        assert indexer.legacy_tombstone_days(since="2026-09-04") == (
+            written,
+        ), indexer.legacy_tombstone_days(since="2026-09-04")
+        # It is bounded like every other tombstone: once the day it protects is
+        # out of the window there is nothing left to protect.
+        assert indexer.legacy_tombstone_days(since="2099-01-01") == ()
+
+        _indexer(root, now=_epoch(2026, 10, 15)).scan_once()
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        assert str(doomed) not in state, state
+
+
+def test_an_entry_this_build_wrote_is_never_mistaken_for_a_legacy_one() -> None:
+    """The flag has to be precise or the audit stops repairing anything.
+
+    A transcript with no usage at all also has an empty ledger, and there are
+    plenty of those. Only an entry written before the ledger existed - no
+    ``lv`` marker - counts as legacy.
+    """
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        clock = _epoch(2026, 9, 5, 18)
+        stamp = _epoch(2026, 9, 5, 10)
+        keep = root / "projects" / "p" / "keep.jsonl"
+        empty = root / "projects" / "p" / "empty.jsonl"
+        _write(keep, [_record("k0", FABLE, {"input_tokens": 1_000}, epoch=stamp)])
+        _write(empty, [{"type": "user", "message": {"role": "user"}}])
+        indexer = _indexer(root, now=clock)
+        indexer.scan_once()
+        entry = json.loads(
+            (root / "scan_state.json").read_text(encoding="utf-8")
+        )[str(empty)]
+        assert "ledger" not in entry, entry
+        assert entry["lv"] == 1, entry
+
+        empty.unlink()
+        indexer.scan_once()
+        assert indexer.legacy_tombstone_days(since="2026-09-04") == ()
+        state = json.loads((root / "scan_state.json").read_text(encoding="utf-8"))
+        assert str(empty) not in state, "a contribution-free entry was tombstoned"
+
+
+# ---------------------------------------------------------------------------
+# The dedup sidecar and the owners map are ONE cache (2026-09-10)
+#
+# `owners` arrived after `requests` did. A sidecar written before it was read
+# for the parts we recognised - requests, no owners - and that is worse than
+# not reading it at all: `_forget_dedup_for_path` un-credits exactly the ids a
+# path owns, so a file re-read from byte 0 whose ids have no owner keeps every
+# one of them suppressed and its whole contribution to TODAY reads as zero.
+# ---------------------------------------------------------------------------
+
+
+def test_a_pre_owners_dedup_sidecar_is_discarded_whole() -> None:
+    """An unversioned sidecar must not suppress a re-read it cannot undo."""
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        clock = _epoch(2026, 9, 5, 18)
+        day = "2026-09-05"
+        stamp = _epoch(2026, 9, 5, 10)  # TODAY on this clock: the persistent map
+        target = root / "projects" / "p" / "a.jsonl"
+        first = [
+            _record(f"t{i}", FABLE, {"input_tokens": 1_000}, epoch=stamp)
+            for i in range(2)
+        ]
+        _write(target, first)
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        indexer = _indexer(root, now=clock)
+        _apply(store, indexer.scan_once())
+        assert store.today(day).total.input == 2_000, store.today(day)
+        indexer.flush_dedup()
+
+        sidecar = root / "scan_state_dedup.json"
+        raw = json.loads(sidecar.read_text(encoding="utf-8"))
+        assert raw["requests"], "the fixture wrote no dedup sidecar"
+        assert raw["owners"], "this build writes owners; the test is stale"
+        # ...as a build from before the owners map would have written it.
+        raw.pop("owners")
+        raw.pop("v")
+        sidecar.write_text(json.dumps(raw), encoding="utf-8")
+
+        # A restart, and the transcript is replaced by a longer copy - a new
+        # inode, so its whole contribution is retracted and re-read.
+        restarted = _indexer(root, now=clock)
+        _replace_file(
+            target,
+            first + [_record("t2", FABLE, {"input_tokens": 1_000}, epoch=stamp)],
+        )
+        _apply(store, restarted.scan_once())
+        # Before the fix: 1_000. The retraction took 2_000 out and the adopted
+        # requests map refused to let the re-read put any of it back, because
+        # nothing said which path owned those ids.
+        assert store.today(day).total.input == 3_000, store.today(day)
+
+
+def test_a_versioned_dedup_sidecar_is_still_honoured() -> None:
+    """The negative control: this build's own sidecar must keep working, or
+    the fix above would be "discard everything" wearing a version number."""
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        clock = _epoch(2026, 9, 5, 18)
+        day = "2026-09-05"
+        stamp = _epoch(2026, 9, 5, 10)
+        target = root / "projects" / "p" / "a.jsonl"
+        _write(target, [_record("t0", FABLE, {"input_tokens": 1_000}, epoch=stamp)])
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        indexer = _indexer(root, now=clock)
+        _apply(store, indexer.scan_once())
+        indexer.flush_dedup()
+
+        # A restart that APPENDS a larger streaming snapshot of the same
+        # request: only its growth may be credited, which is what the sidecar
+        # is for.
+        restarted = _indexer(root, now=clock)
+        with target.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    _record("t0", FABLE, {"input_tokens": 1_500}, epoch=stamp)
+                )
+                + "\n"
+            )
+        _apply(store, restarted.scan_once())
+        assert store.today(day).total.input == 1_500, store.today(day)
+
+
 if __name__ == "__main__":
     raise SystemExit(main())

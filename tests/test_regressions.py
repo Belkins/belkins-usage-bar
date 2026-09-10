@@ -68,6 +68,16 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+os.environ.setdefault("CC_USAGE_WIDGET_NO_REVEAL", "1")  # never open Finder from a test
+
+try:  # an OPTIONAL dependency (README: "account features need claude-swap")
+    import claude_swap as _claude_swap  # noqa: E402
+except Exception:  # pragma: no cover - a clean machine, and CI
+    _claude_swap = None  # type: ignore[assignment]
+
+_CLAUDE_SWAP_PRESENT = _claude_swap is not None
+"""Whether upstream is importable. Read by exactly one assertion below, where
+the widget's own behaviour legitimately DIFFERS without it."""
 
 from cc_usage_widget import app as app_mod  # noqa: E402
 from cc_usage_widget import indexer as indexer_mod  # noqa: E402
@@ -82,9 +92,13 @@ from cc_usage_widget.contracts import (  # noqa: E402
     ALERT_KINDS,
     ALERT_NO_TARGET,
     SETTINGS_DEFAULTS,
+    VENDOR_CLAUDE,
     VENDOR_CODEX,
+    DayRollup,
     IndexProgress,
     ModelUsage,
+    ScanResult,
+    format_tokens,
     local_day_key,
     normalize_settings,
 )
@@ -232,6 +246,10 @@ def test_lost_scan_state_does_not_double_count() -> None:
 # ---------------------------------------------------------------------------
 # 1b. ... and the cure must be per vendor, because the trigger is
 # ---------------------------------------------------------------------------
+
+
+_EMPTY_SCAN = ScanResult()
+"""A scan that read nothing - the shape a stalled twin keeps returning."""
 
 
 def _codex_rollout(root: Path, records: list[dict[str, Any]]) -> Path:
@@ -780,6 +798,58 @@ def test_dedup_sidecar_survives_a_restart() -> None:
         for rollup in result.deltas:
             total += rollup.total.total_tokens
         assert total == 207, f"restart re-credited the snapshot: {total} (want 207)"
+
+
+def test_the_dedup_sidecar_remembers_which_file_credited_what() -> None:
+    """A restart must still be able to un-credit ONE file's requests.
+
+    The sidecar is what makes today's dedup survive a restart, and after the
+    restart a transcript replaced from a copy has to be able to hand its own ids
+    back or its whole contribution to today goes to zero (the retraction removes
+    it, the dedup map refuses to let the re-read put it back). So the sidecar
+    carries the owning path beside the counters.
+    """
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        now = time.time()
+        today = local_day_key(now)
+        path = root / "projects" / "p" / "a.jsonl"
+        first_record = _record("req-a", now, input_tokens=1_000)
+        _write(path, [first_record])
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+
+        first = Indexer(
+            projects_dir=root / "projects",
+            state_path=root / "scan_state.json",
+            lookback_days=30,
+            pricing=DEFAULT_PRICING,
+        )
+        result = first.scan_once()
+        store.retract_rollups(result.retractions)
+        store.merge(result.deltas)
+        first.flush_dedup()
+        assert store.today(today).total.input == 1_000, store.today(today)
+        sidecar = json.loads(
+            (root / "scan_state_dedup.json").read_text(encoding="utf-8")
+        )
+        assert sidecar["owners"] == {str(path): ["req-a"]}, sidecar
+
+        # A copy-then-move: same records plus one, brand-new inode.
+        spare = path.with_suffix(".jsonl.new")
+        _write(spare, [first_record, _record("req-b", now, input_tokens=1_000)])
+        os.replace(spare, path)
+
+        second = Indexer(
+            projects_dir=root / "projects",
+            state_path=root / "scan_state.json",
+            lookback_days=30,
+            pricing=DEFAULT_PRICING,
+        )
+        result = second.scan_once()
+        assert result.retractions, "the replacement was not retracted"
+        store.retract_rollups(result.retractions)
+        store.merge(result.deltas)
+        assert store.today(today).total.input == 2_000, store.today(today)
 
 
 def test_lost_scan_state_also_drops_the_dedup_sidecar() -> None:
@@ -2838,8 +2908,13 @@ def test_switch_best_delegates_the_pick_to_claude_swap() -> None:
         call = source.switcher.calls[0]
         assert call["strategy"] == "best"
         assert call["json_output"] is True
-        # Deduped, first spelling wins - upstream's own parse of autoswitch.model.
-        assert call["models"] == ("Fable", "Opus"), call["models"]
+        # Deduped, first spelling wins - upstream's own parse of
+        # autoswitch.model. Without claude-swap installed there is no parser,
+        # and `accounts.py` degrades to "no model limits" with a log line
+        # rather than guessing a split - so both answers are pinned here and
+        # neither machine gets to skip the assertion.
+        expected = ("Fable", "Opus") if _CLAUDE_SWAP_PRESENT else ()
+        assert call["models"] == expected, (call["models"], _CLAUDE_SWAP_PRESENT)
         assert source.refreshed == 1, "the new active row was not re-read"
         # W1's external-switch detector calls any active-slot change it cannot
         # explain a ghost flip. `best` picks its own target, so the expectation
@@ -4177,6 +4252,17 @@ def test_a_quota_only_source_is_never_handed_to_the_cost_job() -> None:
     assert worker._collect_quota_rows() == (_scanned_codex_row(),), "still collected as quota"
 
 
+def test_a_reveal_is_suppressed_by_the_env_guard_and_never_reaches_finder() -> None:
+    """The claude-swap venv has PyObjC, so a reveal from a test really opens
+    Finder on the desktop (peer report 2026-09-10). Every test module sets the
+    guard at import; this pins that the guard is honoured."""
+    from cc_usage_widget.app import _NO_REVEAL_ENV, _reveal_in_finder
+
+    assert os.environ.get(_NO_REVEAL_ENV), "the test module must set the guard at import"
+    with tempfile.TemporaryDirectory() as name:
+        assert _reveal_in_finder(Path(name) / "export.csv") is False
+
+
 def test_codex_accounts_submenu_appears_only_with_a_registry() -> None:
     """No ``codex_accounts.json``, no live-quota controls anywhere in Settings.
 
@@ -4343,6 +4429,2147 @@ def main() -> int:
             f"collected — they sit below the `if __name__` guard: " + ", ".join(orphans)
         )
     return 1 if (failures or orphans) else 0
+
+
+# ---------------------------------------------------------------------------
+# Roadmap item 3 - unpriced volume, attributed
+# ---------------------------------------------------------------------------
+
+
+def _breakdown_with_unpriced(root: Path, *, claude: bool) -> Any:
+    """A finished breakdown holding 500k unpriced Codex tokens, +/- Claude."""
+    today = local_day_key(time.time())
+    models: dict[str, ModelUsage] = {
+        f"{VENDOR_CODEX}:gpt-5.6-sol": ModelUsage(input=1_000_000, output=100_000),
+        f"{VENDOR_CODEX}:codex-auto-review": ModelUsage(input=500_000),
+    }
+    if claude:
+        models["claude-fable-5"] = ModelUsage(input=1_000_000, output=100_000)
+    store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+    store.merge([DayRollup(day=today, models=models)])
+    return store.cost_breakdown(
+        DEFAULT_PRICING, today=today, progress=IndexProgress(complete=True)
+    )
+
+
+def test_unpriced_volume_is_attributed_to_its_vendor_when_both_are_present() -> None:
+    """``codex-auto-review`` is 916M tokens a week that OpenAI publishes no rate
+    for. Priced at $0 and unattributed it read as "someone's" - on a two-vendor
+    machine the line must say whose, and must still never print a dollar.
+
+    A one-vendor machine keeps the pre-existing line byte for byte: there is
+    nothing to attribute and a prefix would be noise.
+    """
+    scale = f" ({format_tokens(500_000)} tok/30d)"
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        app = app_mod.CCUsageWidgetApp()
+        try:
+            both = app._unpriced_items(_breakdown_with_unpriced(root, claude=True))
+            lines = [str(item.title) for item in both]
+            assert lines == [
+                f"  Codex unpriced at $0{scale}: codex-auto-review"
+            ], lines
+
+            codex_only = app._unpriced_items(
+                _breakdown_with_unpriced(root / "solo", claude=False)
+            )
+            solo = [str(item.title) for item in codex_only]
+            assert solo == [f"  unpriced at $0{scale}: codex-auto-review"], solo
+            for line in lines + solo:
+                assert "$0" in line and "$0." not in line, line
+        finally:
+            app._running = False
+            app._worker.stop(timeout=2.0)
+
+
+def test_a_fully_priced_window_renders_no_unpriced_line_at_all() -> None:
+    """The line is a floor marker, not a permanent row: nothing unpriced,
+    nothing rendered - on one vendor or on two."""
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        today = local_day_key(time.time())
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        store.merge(
+            [
+                DayRollup(
+                    day=today,
+                    models={
+                        "claude-fable-5": ModelUsage(input=1_000_000),
+                        f"{VENDOR_CODEX}:gpt-5.6-sol": ModelUsage(input=1_000_000),
+                    },
+                )
+            ]
+        )
+        breakdown = store.cost_breakdown(
+            DEFAULT_PRICING, today=today, progress=IndexProgress(complete=True)
+        )
+        assert breakdown.last_30d.vendor_unpriced == ()
+        assert breakdown.unknown_models_by_vendor == ()
+        app = app_mod.CCUsageWidgetApp()
+        try:
+            assert app._unpriced_items(breakdown) == []
+        finally:
+            app._running = False
+            app._worker.stop(timeout=2.0)
+
+
+def test_unpriced_tokens_split_per_vendor_and_per_window() -> None:
+    """The split is per window, not one number reused: a model unpriced only
+    yesterday must not show up in ``Today``."""
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        today = local_day_key(time.time())
+        yesterday = local_day_key(time.time() - 86_400)
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        store.merge(
+            [
+                DayRollup(
+                    day=yesterday,
+                    models={
+                        f"{VENDOR_CODEX}:codex-auto-review": ModelUsage(input=500_000)
+                    },
+                ),
+                DayRollup(
+                    day=today,
+                    models={"claude-quantum-9": ModelUsage(input=7_000)},
+                ),
+            ]
+        )
+        breakdown = store.cost_breakdown(
+            DEFAULT_PRICING, today=today, progress=IndexProgress(complete=True)
+        )
+        assert breakdown.today.vendor_unpriced == ((VENDOR_CLAUDE, 7_000),)
+        assert breakdown.last_30d.vendor_unpriced == (
+            (VENDOR_CLAUDE, 7_000),
+            (VENDOR_CODEX, 500_000),
+        ), breakdown.last_30d.vendor_unpriced
+        assert breakdown.today.unpriced_for_vendor(VENDOR_CODEX) == 0
+        assert breakdown.last_30d.unpriced_for_vendor(VENDOR_CODEX) == 500_000
+        assert breakdown.unknown_models_for_vendor(VENDOR_CODEX) == (
+            "codex-auto-review",
+        )
+        assert breakdown.unknown_models_for_vendor(VENDOR_CLAUDE) == ("claude-quantum-9",)
+
+
+# ---------------------------------------------------------------------------
+# Roadmap item 2 - the daily self-audit tick
+#
+# The store is an aggregate nothing re-derives. Before the ledger it was
+# add-only and a re-read doubled a cell; live figures were inflated up to
+# 1,650x for WEEKS with nothing in the widget noticing. This is the part that
+# notices: once a day, re-index the last two days of every corpus into a
+# TemporaryDirectory with the same indexer classes, compare cell by cell, and
+# repair what disagrees.
+#
+# Every case here builds a REAL corpus - the record shapes the cost and Codex
+# suites already use - and runs the real indexers over it.
+# ---------------------------------------------------------------------------
+
+
+def _audit_fixture(root: Path) -> tuple[Any, list[tuple[str, Any]], str]:
+    """A both-vendor corpus, indexed once. Returns (store, scanners, today)."""
+    now = time.time()
+    _write(
+        root / "projects" / "p" / "session.jsonl",
+        [
+            _record("req-a", now, input_tokens=400_000, output_tokens=20_000),
+            _record("req-b", now, input_tokens=100_000, output_tokens=5_000),
+        ],
+    )
+    _codex_rollout(root / "sessions", _codex_turns("gpt-5.6-sol", 40, tokens=20_000))
+    indexer = Indexer(
+        projects_dir=root / "projects",
+        state_path=root / "scan_state.json",
+        lookback_days=30,
+        pricing=DEFAULT_PRICING,
+    )
+    codex = CodexIndexer(
+        sessions_dir=root / "sessions",
+        state_path=root / "codex_scan_state.json",
+        lookback_days=30,
+        pricing=DEFAULT_PRICING,
+    )
+    store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+    scanners: list[tuple[str, Any]] = [("claude", indexer), (VENDOR_CODEX, codex)]
+    for _vendor, scanner in scanners:
+        for _ in range(20):
+            result = scanner.scan_once()
+            store.retract_rollups(result.retractions)
+            store.merge(result.deltas)
+            if scanner.progress().complete:
+                break
+    return store, scanners, local_day_key(time.time())
+
+
+def test_a_clean_store_audits_to_no_note_at_all() -> None:
+    """A store that matches its corpus must say nothing.
+
+    A `!` line that is always on is a `!` line nobody reads, so "no drift" has
+    to be silent - and it has to be silent over a REAL two-vendor corpus, not
+    an empty one, or the test proves only that zero equals zero.
+    """
+    from cc_usage_widget.audit import SelfAudit
+
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        store, scanners, today = _audit_fixture(root)
+        assert store.today(today).total.total_tokens > 0, "the fixture indexed nothing"
+        audit = SelfAudit.beside(store.path)
+        result = audit.run(store, scanners, today=today)
+        assert result.error is None, result.error
+        assert result.cells_compared > 0, result
+        assert result.drifted == (), result.drifted
+        assert result.note is None, result.note
+        assert result.log_line.startswith("audit: 0 drift"), result.log_line
+
+
+def test_an_inflated_cell_is_named_and_repaired() -> None:
+    """The 1,650x incident, in miniature: a cell the corpus does not support is
+    detected, named in the note, and put back to what the corpus says."""
+    from cc_usage_widget.audit import SelfAudit
+
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        store, scanners, today = _audit_fixture(root)
+        key = f"{VENDOR_CODEX}:gpt-5.6-sol"
+        truth = store.today(today).models[key]
+        assert truth.total_tokens > 0, truth
+        # Double it, exactly as a re-read from byte 0 used to.
+        store.add(today, key, truth)
+        assert store.today(today).models[key].total_tokens == truth.total_tokens * 2
+
+        audit = SelfAudit.beside(store.path)
+        result = audit.run(store, scanners, today=today)
+        assert result.error is None, result.error
+        assert len(result.drifted) == 1, result.drifted
+        cell = result.drifted[0]
+        assert cell.key == key and cell.day == today, cell
+        assert cell.ratio is not None and abs(cell.ratio - 2.0) < 0.01, cell.ratio
+        assert result.note is not None and "gpt-5.6-sol" in result.note, result.note
+        # NOT "rebuilt": nothing has been. The audit thread only produces a
+        # plan, and the worker may still drop it (a rebuild in between, a store
+        # that cannot repair a day, a repair that raised). The verdict is
+        # rewritten by `_apply_audit_repairs` once it knows (SPEC 3.2a).
+        assert result.note.endswith("— repair pending"), result.note
+
+        # The audit itself changed NOTHING: it runs on a daemon thread of its
+        # own and the store belongs to the worker (roadmap item 2, hardened
+        # 2026-09-10). What it produces is a plan.
+        assert store.today(today).models[key].total_tokens == truth.total_tokens * 2
+        assert len(result.repairs) == 1, result.repairs
+        repair = result.repairs[0]
+        assert (repair.day, repair.vendor) == (today, VENDOR_CODEX), repair
+        assert repair.fresh_models[key] == truth, repair.fresh_models
+
+        # Applied the way the worker applies it: one atomic store call.
+        store.replace_day_for_vendor(
+            repair.day,
+            repair.vendor,
+            repair.fresh_models,
+            observed=repair.observed_models,
+        )
+        # Repaired to the corpus, and the OTHER vendor left untouched.
+        assert store.today(today).models[key] == truth, store.today(today)
+        claude = [k for k in store.today(today).models if not k.startswith(f"{VENDOR_CODEX}:")]
+        assert claude, store.today(today).models
+
+
+def test_small_and_proportionally_tiny_differences_are_not_drift() -> None:
+    """Both gates, on a real corpus. A cell must differ by MORE than 100k
+    tokens AND by more than 0.5 % before it is called drift.
+
+    Neither alone is enough. A record written between the live scan and the
+    audit scan moves a cell honestly, and an audit that fires on that is an
+    audit whose `!` line the operator learns to ignore - which is how the
+    1,650x inflation survived weeks of daily looking in the first place.
+    """
+    from cc_usage_widget.audit import AUDIT_DRIFT_MIN_TOKENS, SelfAudit
+
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        # A deliberately LARGE codex cell, so 0.5 % of it exceeds the absolute
+        # floor and the two gates can be told apart.
+        _codex_rollout(
+            root / "sessions",
+            _codex_turns("gpt-5.6-sol", 40, tokens=700_000)
+            # ...and a SMALL cell beside it, where 0.5 % is a few hundred
+            # tokens. Without the absolute floor this one would drift on any
+            # rounding; without the relative gate the large one would not drift
+            # on a real doubling. Both gates need a cell that isolates them.
+            + _codex_turns("gpt-5.4-mini", 4, tokens=10_000),
+        )
+        codex = CodexIndexer(
+            sessions_dir=root / "sessions",
+            state_path=root / "codex_scan_state.json",
+            lookback_days=30,
+            pricing=DEFAULT_PRICING,
+        )
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        scanners = [(VENDOR_CODEX, codex)]
+        for _ in range(20):
+            result = codex.scan_once()
+            store.merge(result.deltas)
+            if codex.progress().complete:
+                break
+        today = local_day_key(time.time())
+        key = f"{VENDOR_CODEX}:gpt-5.6-sol"
+        truth = store.today(today).models[key]
+        assert truth.total_tokens == 40 * 700_000, truth
+        relative_floor = truth.total_tokens * 0.005
+        assert relative_floor > AUDIT_DRIFT_MIN_TOKENS, relative_floor
+
+        # Under the absolute floor: too small to be worth a word.
+        store.add(today, key, ModelUsage(input=AUDIT_DRIFT_MIN_TOKENS - 1))
+        result = SelfAudit.beside(store.path).run(store, scanners, today=today)
+        assert result.drifted == (), result.drifted
+        assert result.note is None
+
+        # Over the absolute floor but under 0.5 % of this cell: still not drift,
+        # and the store is left exactly as it was.
+        store.add(today, key, ModelUsage(input=20_001))
+        inflated = store.today(today).models[key]
+        assert AUDIT_DRIFT_MIN_TOKENS < inflated.total_tokens - truth.total_tokens
+        assert inflated.total_tokens - truth.total_tokens < relative_floor
+        result = SelfAudit.beside(store.path).run(store, scanners, today=today)
+        assert result.drifted == (), result.drifted
+        assert store.today(today).models[key] == inflated, "a non-drift was repaired"
+
+        # The small cell: 50k tokens is a LOT of it proportionally (0.5 % is a
+        # few hundred) and still under the absolute floor, so it is not drift.
+        small_key = f"{VENDOR_CODEX}:gpt-5.4-mini"
+        small = store.today(today).models[small_key]
+        assert small.total_tokens == 4 * 10_000, small
+        store.add(today, small_key, ModelUsage(input=AUDIT_DRIFT_MIN_TOKENS // 2))
+        grown = store.today(today).models[small_key]
+        assert grown.total_tokens - small.total_tokens > small.total_tokens * 0.005
+        result = SelfAudit.beside(store.path).run(store, scanners, today=today)
+        assert result.drifted == (), result.drifted
+        assert store.today(today).models[small_key] == grown, "a non-drift was repaired"
+
+
+def test_the_audit_never_repairs_from_an_unfinished_reindex() -> None:
+    """A twin that could not finish reads as "the store has far too much".
+    Repairing from it would destroy real usage, so it must change nothing."""
+    from cc_usage_widget.audit import SelfAudit
+
+    class _NeverFinishes:
+        """A scanner whose twin reports progress it never completes."""
+
+        def __init__(self, inner: Any) -> None:
+            self._inner = inner
+
+        def clone_for_audit(self, state_dir: Any, *, lookback_days: int) -> Any:
+            return self
+
+        def scan_once(self, *, deadline: float | None = None) -> Any:
+            return self._inner.__class__.__mro__ and _EMPTY_SCAN
+
+        def progress(self) -> Any:
+            return IndexProgress(files_done=1, files_total=9, complete=False)
+
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        store, scanners, today = _audit_fixture(root)
+        before = store.today(today)
+        audit = SelfAudit.beside(store.path, budget_seconds=1.0)
+        result = audit.run(store, [("claude", _NeverFinishes(scanners[0][1]))], today=today)
+        assert result.error is not None, result
+        assert "did not finish" in result.error, result.error
+        assert result.drifted == (), result.drifted
+        assert store.today(today) == before, "an unfinished audit changed the store"
+        assert result.note is not None and "could not complete" in result.note
+
+
+def test_a_deleted_transcripts_day_is_not_audited_away() -> None:
+    """A file deleted today is exactly what a naive audit destroys.
+
+    The live store keeps a pruned file's tokens on purpose - they exist nowhere
+    else - so a fresh index of what is on disk NOW legitimately holds less. The
+    audit reconciles with the scanners' tombstones before it compares; without
+    that it would read the gap as drift and "repair" real, unrecoverable usage.
+    """
+    from cc_usage_widget.audit import SelfAudit
+
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        now = time.time()
+        doomed = _write(
+            root / "projects" / "p" / "doomed.jsonl",
+            [_record("req-gone", now, input_tokens=900_000, output_tokens=40_000)],
+        )
+        store, scanners, today = _audit_fixture(root)
+        before = store.today(today)
+        assert before.total.input >= 900_000, before
+
+        doomed.unlink()
+        # One more pass turns the entry into a tombstone.
+        indexer = scanners[0][1]
+        for _ in range(5):
+            result = indexer.scan_once()
+            store.retract_rollups(result.retractions)
+            store.merge(result.deltas)
+            if indexer.progress().complete:
+                break
+        assert store.today(today) == before, "the pruned file was retracted"
+
+        result = SelfAudit.beside(store.path).run(store, scanners, today=today)
+        assert result.error is None, result.error
+        assert result.drifted == (), result.drifted
+        assert store.today(today) == before, "the audit deleted a pruned day"
+
+
+def test_the_audit_runs_once_a_day_and_says_when_it_last_ran() -> None:
+    """The sidecar is what stops a 300 s cost cadence auditing 288 times a day,
+    and what the Settings line reads."""
+    from cc_usage_widget.audit import AuditResult, SelfAudit
+
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        audit = SelfAudit(state_path=root / "audit_state.json")
+        assert audit.due(today="2026-09-10")
+        assert audit.status_label() is None, "no audit has run yet"
+
+        audit.mark_ran(AuditResult(ran_at=time.time()), today="2026-09-10")
+        assert not audit.due(today="2026-09-10")
+        assert audit.due(today="2026-09-11"), "a new local day is a new audit"
+        label = audit.status_label()
+        assert label is not None and label.endswith("· 0 drift"), label
+
+        # A restart re-reads the sidecar rather than auditing again.
+        again = SelfAudit(state_path=root / "audit_state.json")
+        assert not again.due(today="2026-09-10")
+        assert again.last_drift_cells == 0
+
+        again.mark_ran(
+            AuditResult(ran_at=time.time(), error="codex re-index did not finish"),
+            today="2026-09-11",
+        )
+        third = SelfAudit(state_path=root / "audit_state.json")
+        assert third.status_label().endswith("· incomplete"), third.status_label()
+
+
+def test_the_self_audit_off_switch_reads_no_corpus_at_all() -> None:
+    """Off means off: no thread, no second read of the corpus, no sidecar, and
+    no Settings line claiming an audit that never ran.
+
+    Every feature here has an off switch, and a switch that only stops the
+    *note* while the re-index still runs would be the expensive half left on.
+    """
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        _write(
+            root / "projects" / "p" / "s.jsonl",
+            [_record("req-a", time.time(), input_tokens=200_000)],
+        )
+        indexer = Indexer(
+            projects_dir=root / "projects",
+            state_path=root / "scan_state.json",
+            lookback_days=30,
+            pricing=DEFAULT_PRICING,
+        )
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        worker = _worker(root, indexer=indexer, rollups=store)
+        worker._snapshot = replace(
+            worker._snapshot,
+            settings=normalize_settings(
+                {**SETTINGS_DEFAULTS, "self_audit_enabled": False}
+            ),
+        )
+        try:
+            _drain_cost(worker)
+            assert indexer.progress().complete
+            assert worker._audit_thread is None, "the off switch did not stop the audit"
+            assert worker._audit is None, "an audit was constructed anyway"
+            assert not (root / "audit_state.json").exists()
+            assert worker.audit_status_label() is None
+            assert worker._snapshot.audit_note is None
+        finally:
+            worker.stop(timeout=5.0)
+
+
+def test_a_partial_first_index_is_never_audited() -> None:
+    """While the first index is still filling in, the live store is KNOWN to be
+    incomplete. Auditing it would call every unread file's day drift and
+    "repair" it by deleting what the indexer had not reached yet - the audit
+    fighting the indexer, on the one path where the widget is already slow.
+    """
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        now = time.time()
+        for index in range(4):
+            _write(
+                root / "projects" / "p" / f"s{index}.jsonl",
+                [_record(f"req-{index}", now, input_tokens=200_000)],
+            )
+        indexer = Indexer(
+            projects_dir=root / "projects",
+            state_path=root / "scan_state.json",
+            lookback_days=30,
+            pricing=DEFAULT_PRICING,
+            chunk_files=1,
+        )
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        worker = _worker(root, indexer=indexer, rollups=store)
+        try:
+            worker._run_cost_job()
+            assert not indexer.progress().complete, "the fixture indexed in one pass"
+            assert worker._audit_thread is None, "a partial index was audited"
+
+            for _ in range(20):
+                worker._run_cost_job()
+                if indexer.progress().complete:
+                    break
+            assert indexer.progress().complete
+            assert worker._audit_thread is not None, "a finished index was not audited"
+            worker._audit_thread.join(timeout=60.0)
+        finally:
+            worker.stop(timeout=5.0)
+
+
+def test_the_cost_job_actually_fires_the_audit_and_publishes_its_verdict() -> None:
+    """The wiring, not the module. An audit nobody calls is the failure mode
+    this whole item exists to end, so the assertion goes through
+    ``_run_cost_job`` on a real two-vendor worker rather than calling
+    ``SelfAudit.run`` directly.
+
+    The verdict is published on the NEXT tick on purpose: the audit runs on its
+    own daemon thread so a slow corpus cannot starve the 60 s accounts tick, and
+    a read-modify-write of the snapshot from that thread would race the worker's
+    own publishes.
+    """
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        now = time.time()
+        _write(
+            root / "projects" / "p" / "session.jsonl",
+            [_record("req-a", now, input_tokens=400_000, output_tokens=20_000)],
+        )
+        _codex_rollout(root / "sessions", _codex_turns("gpt-5.6-sol", 40, tokens=20_000))
+        worker, indexer, codex = _two_vendor_worker(root)
+        try:
+            _drain_both(worker, [indexer, codex])
+            store = worker._rollups
+            today = local_day_key(time.time())
+            key = f"{VENDOR_CODEX}:gpt-5.6-sol"
+            truth = store.today(today).models[key]
+            assert truth.total_tokens > 0, truth
+
+            # Today's audit already ran while draining and found nothing. Put
+            # the day back on the clock and inflate a cell the way a re-read
+            # from byte 0 used to.
+            (root / "audit_state.json").unlink(missing_ok=True)
+            worker._audit = None
+            store.add(today, key, truth)
+
+            worker._run_cost_job()
+            thread = worker._audit_thread
+            assert thread is not None, "the cost job never started an audit"
+            thread.join(timeout=60.0)
+            assert not thread.is_alive(), "the audit did not finish"
+            # The audit thread computes; it must NOT have touched the store.
+            assert store.today(today).models[key].total_tokens == truth.total_tokens * 2
+            assert worker._audit_repairs, "the audit produced no repair plan"
+
+            worker._run_cost_job()
+            assert store.today(today).models[key] == truth, "the cell was not repaired"
+            assert worker._audit_repairs == (), "the plan was applied twice"
+            note = worker._snapshot.audit_note
+            assert note is not None and "gpt-5.6-sol" in note, note
+            # Only NOW may it say "rebuilt" - the plan has landed. The suffix
+            # is roadmap item 6's half of the repair: the per-project split of
+            # a rebuilt day cannot be reconstructed from a per-(day, model)
+            # plan, so it is reset and the note says why.
+            assert note.startswith("audit: 1 cell drifted"), note
+            assert "— rebuilt" in note, note
+            assert f"project split for {today} reset" in note, note
+            assert worker.audit_status_label() is not None
+            # And it does not audit twice in one local day.
+            worker._run_cost_job()
+            assert worker._audit_thread is thread or not worker._audit_thread.is_alive()
+            assert not worker._audit.due(today=today)
+        finally:
+            worker.stop(timeout=5.0)
+
+
+def test_the_audit_note_reaches_the_cost_section_and_a_clean_one_does_not() -> None:
+    """The verdict is money, so it renders with the money - and only when there
+    is one."""
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        today = local_day_key(time.time())
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        store.merge(
+            [DayRollup(day=today, models={"claude-fable-5": ModelUsage(input=1_000)})]
+        )
+        breakdown = store.cost_breakdown(
+            DEFAULT_PRICING, today=today, progress=IndexProgress(complete=True)
+        )
+        settings = normalize_settings(dict(SETTINGS_DEFAULTS))
+        note = "audit: 1 cell drifted (codex 2026-09-09 gpt-5.6-sol 12.7x) — rebuilt"
+        app = app_mod.CCUsageWidgetApp()
+        try:
+            # Real wiring, not a stand-in: `_cost_items` renders "unavailable"
+            # until the worker actually holds a scanner, a store and prices.
+            app._worker._rollups = store
+            app._worker._pricing = DEFAULT_PRICING
+            app._worker._indexer = Indexer(
+                projects_dir=root / "projects",
+                state_path=root / "scan_state.json",
+                lookback_days=30,
+                pricing=DEFAULT_PRICING,
+            )
+            noisy = app._cost_items(
+                UiSnapshot(settings=settings, cost=breakdown, audit_note=note)
+            )
+            assert any(str(item.title) == f"! {note}" for item in noisy), [
+                str(item.title) for item in noisy
+            ]
+            quiet = app._cost_items(UiSnapshot(settings=settings, cost=breakdown))
+            assert not any("audit:" in str(item.title) for item in quiet), [
+                str(item.title) for item in quiet
+            ]
+        finally:
+            app._running = False
+            app._worker.stop(timeout=2.0)
+
+
+# ---------------------------------------------------------------------------
+# Attribution: two menu blocks that must be absent unless asked for (item 6)
+# ---------------------------------------------------------------------------
+
+
+def _cost_app(root: Path, store: DailyRollupStore) -> Any:
+    """A real app whose worker holds a real store, scanner and price table.
+
+    ``_cost_items`` renders "unavailable" until all three are present, so a
+    byte-for-byte comparison against a stand-in would compare two error lines.
+    """
+    app = app_mod.CCUsageWidgetApp()
+    app._worker._rollups = store
+    app._worker._pricing = DEFAULT_PRICING
+    app._worker._indexer = Indexer(
+        projects_dir=root / "projects",
+        state_path=root / "scan_state.json",
+        lookback_days=30,
+        pricing=DEFAULT_PRICING,
+    )
+    return app
+
+
+def test_the_cost_section_is_byte_for_byte_unchanged_when_attribution_is_off() -> None:
+    """The off switch, measured where a user would notice it.
+
+    Not "roughly the same": the same list of strings. A machine with
+    ``cost_by_project_enabled`` false must draw the Cost section it drew before
+    roadmap item 6 existed, even with rows sitting on the worker.
+    """
+    from cc_usage_widget.attribution import AttributionRow
+
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        today = local_day_key(time.time())
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        store.merge([DayRollup(day=today, models={FABLE: ModelUsage(input=1_000)})])
+        breakdown = store.cost_breakdown(
+            DEFAULT_PRICING, today=today, progress=COMPLETE
+        )
+        app = _cost_app(root, store)
+        try:
+            rows = (
+                AttributionRow(
+                    vendor=VENDOR_CLAUDE,
+                    project="cc-usage-widget",
+                    session="",
+                    usage=ModelUsage(input=1_000),
+                    usd=8.9,
+                    unpriced_tokens=0,
+                ),
+            )
+            app._worker._cost_project_rows = rows
+            app._worker._cost_session_rows = rows
+
+            off = normalize_settings(
+                {**SETTINGS_DEFAULTS, "cost_by_project_enabled": False}
+            )
+            on = normalize_settings({**SETTINGS_DEFAULTS, "cost_by_project_enabled": True})
+            drawn_off = [
+                str(item.title)
+                for item in app._cost_items(UiSnapshot(settings=off, cost=breakdown))
+            ]
+            drawn_on = [
+                str(item.title)
+                for item in app._cost_items(UiSnapshot(settings=on, cost=breakdown))
+            ]
+            assert not any("by project" in line for line in drawn_off), drawn_off
+            assert any("by project" in line for line in drawn_on), drawn_on
+            # ... and the difference is EXACTLY the new block, in place.
+            assert [line for line in drawn_on if line in drawn_off] == drawn_off
+
+            # The same section with nothing to attribute: also byte for byte.
+            app._worker._cost_project_rows = ()
+            app._worker._cost_session_rows = ()
+            empty = [
+                str(item.title)
+                for item in app._cost_items(UiSnapshot(settings=on, cost=breakdown))
+            ]
+            assert empty == drawn_off, (empty, drawn_off)
+        finally:
+            app._running = False
+            app._worker.stop(timeout=2.0)
+
+
+def test_both_attribution_blocks_render_their_rows_with_a_heading() -> None:
+    """Present when there is data: a heading carrying the subtotal, then rows."""
+    from cc_usage_widget.attribution import AttributionRow
+
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        today = local_day_key(time.time())
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        store.merge([DayRollup(day=today, models={FABLE: ModelUsage(input=1_000)})])
+        breakdown = store.cost_breakdown(
+            DEFAULT_PRICING, today=today, progress=COMPLETE
+        )
+        app = _cost_app(root, store)
+        try:
+            # The Export items are gated on the mirror holding rows (roadmap 8
+            # / integration fix 1) and this test asserts the blocks sit ABOVE
+            # them, so give it a mirror with something in it.
+            app._worker._history_rows = 1
+            app._worker._cost_project_rows = (
+                AttributionRow(
+                    vendor=VENDOR_CLAUDE,
+                    project="cc-usage-widget",
+                    session="",
+                    usage=ModelUsage(input=41_200_000),
+                    usd=8.9,
+                    unpriced_tokens=0,
+                ),
+            )
+            app._worker._cost_session_rows = (
+                AttributionRow(
+                    vendor=VENDOR_CLAUDE,
+                    project="cc-usage-widget",
+                    session="5909f788-7a20-41b8",
+                    usage=ModelUsage(input=2_100_000),
+                    usd=6.54,
+                    unpriced_tokens=0,
+                ),
+            )
+            drawn = [
+                str(item.title)
+                for item in app._cost_items(
+                    UiSnapshot(
+                        settings=normalize_settings(dict(SETTINGS_DEFAULTS)),
+                        cost=breakdown,
+                    )
+                )
+            ]
+            assert any("── today by project" in line and "$8.90" in line for line in drawn), drawn
+            assert any("cc-usage-widget" in line and "41.2M tok" in line for line in drawn), drawn
+            assert any("── today's top sessions" in line for line in drawn), drawn
+            # The session row shows the id AND the project, not one or the other.
+            assert any("5909f788" in line and "cc-usage-wid" in line for line in drawn), drawn
+            # The blocks sit under the money, above the exports.
+            first_block = next(i for i, line in enumerate(drawn) if "by project" in line)
+            export = next(i for i, line in enumerate(drawn) if line.startswith("Export"))
+            assert first_block < export, drawn
+        finally:
+            app._running = False
+            app._worker.stop(timeout=2.0)
+
+
+def test_a_real_cost_job_fills_the_attribution_store_and_the_menu_rows() -> None:
+    """The whole wiring, through ``_run_cost_job``: files in, two blocks out."""
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        now = time.time()
+        today = local_day_key(now)
+        record = _record("attr-1", now, input_tokens=4_000, output_tokens=1_000)
+        record["cwd"] = "/Users/v/Desktop/Obsidian"
+        _write(root / "projects" / "-Users-v-Desktop-Obsidian" / "sess-a.jsonl", [record])
+        _codex_rollout(root / "sessions", _codex_turns("gpt-5.6-sol", 3, tokens=2_000))
+        worker, indexer, codex = _two_vendor_worker(root)
+        try:
+            _drain_both(worker, [indexer, codex])
+            assert (root / "attribution.json").exists(), (
+                "the cache must live beside rollups.json, not in the real widget home"
+            )
+            projects = {row.project for row in worker.cost_project_rows}
+            assert "Obsidian" in projects, projects
+            assert worker.cost_session_rows, "no session rows were published"
+            # The partition invariant, through the real job.
+            total = worker._rollups.today(today).total.total_tokens
+            assert sum(row.total_tokens for row in worker.cost_project_rows) == total
+
+            # And a rebuild does not double it.
+            worker._rebuild_index()
+            assert worker.cost_project_rows == (), "the rebuild must clear the rows"
+            _drain_both(worker, [indexer, codex])
+            assert sum(row.total_tokens for row in worker.cost_project_rows) == (
+                worker._rollups.today(today).total.total_tokens
+            )
+        finally:
+            worker.stop(timeout=5.0)
+
+
+def test_attribution_off_writes_no_cache_file_at_all() -> None:
+    """Off means off from every direction, including the disk."""
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        now = time.time()
+        record = _record("attr-2", now, input_tokens=4_000)
+        record["cwd"] = "/Users/v/Desktop/Obsidian"
+        _write(root / "projects" / "-Users-v-Desktop-Obsidian" / "sess-a.jsonl", [record])
+        worker, indexer, codex = _two_vendor_worker(root, codex_on=False)
+        worker._snapshot = replace(
+            worker._snapshot,
+            settings=normalize_settings(
+                {**SETTINGS_DEFAULTS, "cost_by_project_enabled": False}
+            ),
+        )
+        try:
+            for _ in range(40):
+                worker._run_cost_job()
+                if indexer.progress().complete:
+                    break
+            assert not (root / "attribution.json").exists(), "the off switch wrote a file"
+            assert worker.cost_project_rows == ()
+            assert not indexer.attribution_enabled
+        finally:
+            worker.stop(timeout=5.0)
+
+
+def test_the_settings_menu_carries_the_cost_by_project_switch() -> None:
+    """The off switch has to be reachable without editing settings.json.
+
+    It is the only setting that decides whether a name taken out of a
+    transcript reaches the disk, so "the key exists in SETTINGS_DEFAULTS" is
+    not enough: a control a user cannot find is a control they do not have.
+    """
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        for value in (True, False):
+            snapshot = UiSnapshot(
+                settings=normalize_settings(
+                    {**SETTINGS_DEFAULTS, "cost_by_project_enabled": value}
+                )
+            )
+            titles = list(app._settings_submenu(snapshot).keys())
+            # The exact label, not a prefix: `_switch_label` pads the name to a
+            # fixed column, so a prefix match would accept a renamed control
+            # and this test exists to pin the name a user reads.
+            wanted = app._switch_label("Cost by project", value)
+            assert wanted in titles, (wanted, titles)
+            assert ("ON" in wanted) is value, wanted
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+# ---------------------------------------------------------------------------
+# Roadmap item 16 - the compact title
+# ---------------------------------------------------------------------------
+
+
+def test_the_compact_title_is_two_figures_and_never_wider_than_its_budget() -> None:
+    """``V·C 100/100`` for a narrow menu bar (roadmap item 16).
+
+    A different title, not another component: with ``title_compact`` on the
+    ``title_show_*`` toggles are inert, because none of those components is
+    rendered. What it must NOT lose in the shrink is the honesty rules - a
+    standing note replaces the figure it invalidates, an unreported window
+    contributes nothing rather than a zero, and 99.5% is still 99.
+    """
+    from cc_usage_widget import render
+
+    settings = _fleet_settings(title_compact=True)
+    claude = _fleet_rows((1, "vlad", 100.0, None))[0]
+    codex = replace(_scanned_codex_row(), seven_day_pct=100.0)
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        both = UiSnapshot(
+            settings=settings, accounts=(claude,), active=claude, quota_rows=(codex,)
+        )
+        title = app.render_title(both)
+        assert title == "V·C 100/100", title
+        # The budget is measured, not assumed: every previous title widening
+        # was also "just two more characters".
+        assert len(title) <= render.COMPACT_TITLE_MAX, (title, len(title))
+
+        # One vendor each way - initials and figures stay in step.
+        claude_only = UiSnapshot(settings=settings, accounts=(claude,), active=claude)
+        assert app.render_title(claude_only) == "V 100"
+        assert app.render_title(UiSnapshot(settings=settings, quota_rows=(codex,))) == "C 100"
+
+        # Neither: the same fallback the full title makes, never an invented
+        # glyph or a zero.
+        assert app.render_title(UiSnapshot(settings=settings)) == app_mod.TITLE_ICON
+
+        # A derived state REPLACES the figure it invalidates (SPEC 4.3); the
+        # other vendor's number is untouched.
+        noted = replace(both, account_notes={1: "re-login required"})
+        assert app.render_title(noted) == "V·C ⚠/100", app.render_title(noted)
+
+        # The engine's standing verdict keeps its glyph - the one exception the
+        # full title makes too - and only the glyph, never the word.
+        alerted = replace(both, alert=(ALERT_ALL_EXHAUSTED, "all accounts exhausted"))
+        assert app.render_title(alerted) == "V·C 100/100 ⛔", app.render_title(alerted)
+        assert len(app.render_title(alerted)) <= render.COMPACT_TITLE_MAX + 2
+
+        # 99.x floors to 99 here exactly as it does in the menu, and an
+        # unreported window is absent rather than 0.
+        near = replace(
+            both,
+            accounts=(replace(claude, five_hour_pct=99.6),),
+            active=replace(claude, five_hour_pct=99.6),
+        )
+        assert app.render_title(near) == "V·C 99/100", app.render_title(near)
+        blank = replace(both, accounts=(replace(claude, five_hour_pct=None),),
+                        active=replace(claude, five_hour_pct=None))
+        assert app.render_title(blank) == "C 100", app.render_title(blank)
+
+        # Off (the default): the SPEC 4.1 title, byte for byte.
+        assert SETTINGS_DEFAULTS["title_compact"] is False
+        full = replace(both, settings=_fleet_settings())
+        assert app.render_title(full) == "vlad 100%(!) 0/1", app.render_title(full)
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+def test_the_compact_switch_is_in_the_title_submenu_and_writes_the_setting() -> None:
+    """It lives with the components it replaces, and a click goes to the worker
+    like every other setting - the AppKit thread writes no file."""
+    settings = _fleet_settings()
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        snapshot = UiSnapshot(settings=settings)
+        title_menu = app._settings_submenu(snapshot)["Title"]
+        assert app_mod._COMPACT_TITLE_LABEL in list(title_menu.keys()), list(title_menu.keys())
+        item = title_menu[app_mod._COMPACT_TITLE_LABEL]
+        assert item.state == 0, "compact is off by default"
+        recorded: list[tuple[str, Any]] = []
+        app._worker.submit = lambda name, payload=None: recorded.append((name, payload))
+        item.callback(item)
+        assert recorded == [("set_setting", ("title_compact", True))], recorded
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+# ---------------------------------------------------------------------------
+# Wave-1 leftovers: the settings that had no control, and the tier note
+# ---------------------------------------------------------------------------
+
+
+def test_every_wave_one_setting_has_a_control_and_a_claude_only_machine_sees_none() -> None:
+    """Roadmap 8/10/11's switches reach the menu - behind their own vendor.
+
+    ``history_enabled`` is cost-side and appears wherever the cost section
+    does; the three Codex keys appear only where Codex does, so a Claude-only
+    machine's Settings menu is byte-for-byte the one it had before wave 1.
+    """
+    settings = normalize_settings(dict(SETTINGS_DEFAULTS))
+    row = _scanned_codex_row()
+    original = app_mod.CODEX_ACCOUNTS_REGISTRY_PATH
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        # A Claude-only machine: no quota rows, no vendors, no registry.
+        with tempfile.TemporaryDirectory() as name:
+            app_mod.CODEX_ACCOUNTS_REGISTRY_PATH = Path(name) / "codex_accounts.json"
+            bare = UiSnapshot(settings=settings)
+            titles = list(app._settings_submenu(bare).keys())
+            for unexpected in ("Codex fleet line", "Codex pace forecast", "Pricing tier"):
+                assert not any(t.startswith(unexpected) for t in titles), (unexpected, titles)
+            # No cost modules wired either, so not even the history switch.
+            assert not any(t.startswith("History") for t in titles), titles
+
+            # With Codex present the tier chooser appears; the two live-source
+            # switches wait for a registry, because neither draws anything
+            # without a live row.
+            withcodex = UiSnapshot(settings=settings, quota_rows=(row,))
+            titles = list(app._settings_submenu(withcodex).keys())
+            assert any(t.startswith("Pricing tier: standard") for t in titles), titles
+            assert not any(t.startswith("Codex fleet line") for t in titles), titles
+
+            (Path(name) / "codex_accounts.json").write_text(
+                '{"version": 1, "accounts": []}', encoding="utf-8"
+            )
+            titles = list(app._settings_submenu(withcodex).keys())
+            assert any(t.startswith("Codex fleet line") for t in titles), titles
+            assert any(t.startswith("Codex pace forecast") for t in titles), titles
+
+            # The tier is an enum, and picking one goes to the worker.
+            tier_menu = app._settings_submenu(withcodex)["Pricing tier: standard"]
+            assert list(tier_menu.keys()) == ["standard", "fast", "batch"], list(tier_menu.keys())
+            recorded: list[tuple[str, Any]] = []
+            app._worker.submit = lambda n, payload=None: recorded.append((n, payload))
+            tier_menu["fast"].callback(tier_menu["fast"])
+            assert recorded == [("set_setting", ("codex_pricing_tier", "fast"))], recorded
+
+        # The history switch appears once the cost side is actually wired.
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            (root / "projects").mkdir()
+            app._worker._rollups = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+            app._worker._pricing = DEFAULT_PRICING
+            app._worker._indexer = Indexer(
+                projects_dir=root / "projects",
+                state_path=root / "scan_state.json",
+                lookback_days=30,
+                pricing=DEFAULT_PRICING,
+            )
+            titles = list(app._settings_submenu(UiSnapshot(settings=settings)).keys())
+            assert any(t.startswith("History") for t in titles), titles
+    finally:
+        app_mod.CODEX_ACCOUNTS_REGISTRY_PATH = original
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+def test_the_codex_cost_heading_names_the_tier_and_never_rescales_a_rate() -> None:
+    """Roadmap 11, wired: the tier is a LABEL on the Codex group heading.
+
+    ``pricing.py`` carries OpenAI's standard rates only and a rollout does not
+    record which tier ran, so a non-standard tier must say the rows below are
+    not that tier's rather than multiply them by a number nobody measured. The
+    figures are identical either way - that is the assertion that matters.
+    """
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        today = local_day_key(time.time())
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        store.merge(
+            [
+                DayRollup(
+                    day=today,
+                    models={
+                        "claude-fable-5": ModelUsage(input=1_000_000),
+                        "codex:gpt-5.6-sol": ModelUsage(input=2_000_000),
+                    },
+                )
+            ]
+        )
+        breakdown = store.cost_breakdown(
+            DEFAULT_PRICING, today=today, progress=IndexProgress(complete=True)
+        )
+        settings = normalize_settings(dict(SETTINGS_DEFAULTS))
+        app = app_mod.CCUsageWidgetApp()
+        try:
+            standard = [str(item.title) for item in app._model_items(breakdown, settings)]
+            codex_heading = [line for line in standard if "Codex" in line]
+            assert len(codex_heading) == 1, standard
+            assert "(standard tier)" in codex_heading[0], codex_heading[0]
+
+            fast = [
+                str(item.title)
+                for item in app._model_items(breakdown, {**settings, "codex_pricing_tier": "fast"})
+            ]
+            fast_heading = [line for line in fast if "Codex" in line]
+            assert "(fast tier rates not loaded)" in fast_heading[0], fast_heading[0]
+            # Same money, different wording: no rate was re-scaled.
+            assert [line for line in fast if "Codex" not in line] == [
+                line for line in standard if "Codex" not in line
+            ]
+
+            # A Claude-only day has no vendor groups at all, so it carries no
+            # tier claim either - byte-for-byte the pre-Codex section.
+            claude_only = DailyRollupStore(path=root / "claude.json", keep_days=30)
+            claude_only.merge(
+                [DayRollup(day=today, models={"claude-fable-5": ModelUsage(input=1_000_000)})]
+            )
+            solo = [
+                str(item.title)
+                for item in app._model_items(
+                    claude_only.cost_breakdown(
+                        DEFAULT_PRICING, today=today, progress=IndexProgress(complete=True)
+                    ),
+                    settings,
+                )
+            ]
+            assert solo[0] == "  ── by model ──────────", solo[0]
+            assert not any("tier" in line for line in solo), solo
+        finally:
+            app._running = False
+            app._worker.stop(timeout=2.0)
+
+
+# ---------------------------------------------------------------------------
+# Roadmap item 2, hardened (2026-09-10). Three defects the reviewers found in
+# the shipped audit, each with the failure it caused:
+#
+#  * the audit repaired the LIVE store from its own daemon thread, with no
+#    coordination with the worker's retract-then-merge;
+#  * it called `tombstone_rollups` (and through it `_ensure_states_loaded`) on
+#    the live scanners without their scan lock;
+#  * a vanished PRE-LEDGER entry left no tombstone at all, so the first audit
+#    read that file's real contribution as drift and repaired it away.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingHistory:
+    """A history mirror that records what the worker asked it to replace."""
+
+    def __init__(self) -> None:
+        self.replaced: list[tuple[str, int]] = []
+        self.errors: tuple[str, ...] = ()
+
+    def upsert_days(self, days: Any, pricing: Any) -> None:
+        return None
+
+    def replace_day(self, day: str, rollup: Any, pricing: Any) -> None:
+        self.replaced.append((day, rollup.total.total_tokens))
+
+
+def test_the_audit_thread_never_touches_the_live_store() -> None:
+    """The audit computes; the WORKER applies. Nothing else is safe.
+
+    ``_repair`` used to run retract-then-merge on the daemon thread while the
+    worker was doing its own retract-then-merge on the same store: the two
+    interleave, and a whole tick of deltas - bytes whose offsets are already
+    durable, so they are never re-read - can end up subtracted back out. The
+    thread now produces plain data and mutates nothing.
+    """
+    from cc_usage_widget.audit import SelfAudit
+
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        store, scanners, today = _audit_fixture(root)
+        key = f"{VENDOR_CODEX}:gpt-5.6-sol"
+        truth = store.today(today).models[key]
+        store.add(today, key, truth)
+        before = store.today(today)
+
+        result = SelfAudit.beside(store.path).run(store, scanners, today=today)
+        assert result.drifted, "the fixture did not drift"
+        assert result.repairs, "no repair plan was produced"
+        assert store.today(today) == before, "the audit thread mutated the store"
+        # The plan is data, not a live handle on anything.
+        repair = result.repairs[0]
+        assert isinstance(repair.fresh, tuple) and isinstance(repair.observed, tuple)
+        assert repair.observed_models[key] == before.models[key], repair.observed
+
+
+def test_a_repair_applied_after_a_merge_keeps_the_merged_deltas() -> None:
+    """The reason the plan carries what the audit OBSERVED.
+
+    The audit reads the store at 09:00 and the worker merges a tick's deltas at
+    09:00:05, before the plan is applied. Installing the audit's absolute figure
+    would silently delete those deltas - and the indexer has already advanced
+    past the bytes that produced them, so they never come back. The repair is
+    therefore applied as a correction: current - observed + fresh.
+    """
+    from cc_usage_widget.audit import AuditRepair
+
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        now = time.time()
+        today = local_day_key(now)
+        transcript = _write(
+            root / "projects" / "p" / "s.jsonl",
+            [_record("req-a", now, input_tokens=1_000_000)],
+        )
+        indexer = Indexer(
+            projects_dir=root / "projects",
+            state_path=root / "scan_state.json",
+            lookback_days=30,
+            pricing=DEFAULT_PRICING,
+        )
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        worker = _worker(root, indexer=indexer, rollups=store)
+        worker._snapshot = replace(
+            worker._snapshot,
+            settings=normalize_settings(
+                {**SETTINGS_DEFAULTS, "self_audit_enabled": False}
+            ),
+        )
+        try:
+            _drain_cost(worker)
+            truth = store.today(today).models[FABLE]
+            assert truth.input == 1_000_000, truth
+            # The store is inflated the way a re-read from byte 0 used to
+            # inflate it. This is what the audit sees.
+            store.add(today, FABLE, truth)
+            observed = store.today(today).models[FABLE]
+            assert observed.input == 2_000_000, observed
+
+            # ...and while the audit is still running, the worker merges a new
+            # tick's deltas.
+            with transcript.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(_record("req-b", now, input_tokens=500_000)) + "\n"
+                )
+            worker._run_cost_job()
+            assert store.today(today).models[FABLE].input == 2_500_000
+
+            # Only now does the plan land.
+            worker._audit_repairs = (
+                AuditRepair(
+                    day=today,
+                    vendor=VENDOR_CLAUDE,
+                    fresh=((FABLE, truth),),
+                    observed=((FABLE, observed),),
+                ),
+            )
+            worker._run_cost_job()
+            after = store.today(today).models[FABLE]
+            assert after.input == 1_500_000, (
+                "the repair overwrote deltas merged while it was being computed"
+            )
+            assert worker._audit_repairs == (), "the plan was left to run again"
+        finally:
+            worker.stop(timeout=5.0)
+
+
+def test_a_repaired_day_is_replaced_in_the_long_term_record() -> None:
+    """history.sqlite mirrors the store's days, so a rebuilt day has to be
+    REPLACED there too - otherwise the dashboard reads the inflated figure for
+    ever, from a table nothing else ever corrects."""
+    from cc_usage_widget.audit import AuditRepair
+
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        now = time.time()
+        today = local_day_key(now)
+        _write(
+            root / "projects" / "p" / "s.jsonl",
+            [_record("req-a", now, input_tokens=1_000_000)],
+        )
+        indexer = Indexer(
+            projects_dir=root / "projects",
+            state_path=root / "scan_state.json",
+            lookback_days=30,
+            pricing=DEFAULT_PRICING,
+        )
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        worker = _worker(root, indexer=indexer, rollups=store)
+        worker._snapshot = replace(
+            worker._snapshot,
+            settings=normalize_settings(
+                {**SETTINGS_DEFAULTS, "self_audit_enabled": False}
+            ),
+        )
+        history = _RecordingHistory()
+        worker._history = history
+        try:
+            _drain_cost(worker)
+            truth = store.today(today).models[FABLE]
+            store.add(today, FABLE, truth)
+            observed = store.today(today).models[FABLE]
+            worker._audit_repairs = (
+                AuditRepair(
+                    day=today,
+                    vendor=VENDOR_CLAUDE,
+                    fresh=((FABLE, truth),),
+                    observed=((FABLE, observed),),
+                ),
+            )
+            worker._run_cost_job()
+            assert history.replaced, "the repaired day never reached history"
+            day, tokens = history.replaced[0]
+            assert day == today, history.replaced
+            assert tokens == truth.total_tokens, history.replaced
+        finally:
+            worker.stop(timeout=5.0)
+
+
+def test_a_rebuild_between_the_plan_and_the_tick_drops_the_plan() -> None:
+    """A plan describes a store that existed. After `Rebuild cost index` it does
+    not: applying the correction to an emptied day could add tokens nothing has
+    read, and the rebuild's own re-index is the authority anyway."""
+    from cc_usage_widget.audit import AuditRepair
+
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        now = time.time()
+        today = local_day_key(now)
+        _write(
+            root / "projects" / "p" / "s.jsonl",
+            [_record("req-a", now, input_tokens=1_000_000)],
+        )
+        indexer = Indexer(
+            projects_dir=root / "projects",
+            state_path=root / "scan_state.json",
+            lookback_days=30,
+            pricing=DEFAULT_PRICING,
+        )
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        worker = _worker(root, indexer=indexer, rollups=store)
+        worker._snapshot = replace(
+            worker._snapshot,
+            settings=normalize_settings(
+                {**SETTINGS_DEFAULTS, "self_audit_enabled": False}
+            ),
+        )
+        try:
+            _drain_cost(worker)
+            truth = store.today(today).models[FABLE]
+            worker._audit_repairs = (
+                AuditRepair(
+                    day=today,
+                    vendor=VENDOR_CLAUDE,
+                    fresh=((FABLE, truth),),
+                    observed=(),
+                ),
+            )
+            # What `Rebuild cost index` does before the next tick.
+            store.clear()
+            indexer.reset()
+            worker._apply_audit_repairs(store)
+            assert worker._audit_repairs == (), "the stale plan was kept"
+            assert store.days() == (), "a plan repopulated an emptied store"
+        finally:
+            worker.stop(timeout=5.0)
+
+
+def test_the_audit_refuses_to_repair_a_vendor_with_a_pre_ledger_tombstone() -> None:
+    """The legacy hole, end to end.
+
+    A transcript indexed by an older build has no ledger. When it is pruned its
+    entry becomes a LEGACY tombstone: its tokens are in the store, no ledger
+    describes them and no re-index can find the file. The audit therefore sees
+    drift it cannot explain - and must leave it alone and say so, because
+    "repairing" it deletes real money that exists nowhere else.
+    """
+    from cc_usage_widget.audit import SelfAudit
+
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        now = time.time()
+        doomed = _write(
+            root / "projects" / "p" / "doomed.jsonl",
+            [_record("req-gone", now, input_tokens=9_000_000)],
+        )
+        store, scanners, today = _audit_fixture(root)
+        before = store.today(today)
+        assert before.total.input >= 9_000_000, before
+
+        # Age the scan state back to what a pre-ledger build wrote.
+        state_path = root / "scan_state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        for entry in state.values():
+            entry.pop("ledger", None)
+            entry.pop("lv", None)
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        doomed.unlink()
+
+        indexer = Indexer(
+            projects_dir=root / "projects",
+            state_path=state_path,
+            lookback_days=30,
+            pricing=DEFAULT_PRICING,
+        )
+        for _ in range(5):
+            result = indexer.scan_once()
+            store.retract_rollups(result.retractions)
+            store.merge(result.deltas)
+            if indexer.progress().complete:
+                break
+        assert indexer.legacy_tombstone_days(since="2026-01-01"), "no legacy tombstone"
+
+        pairs = [(VENDOR_CLAUDE, indexer), scanners[1]]
+        result = SelfAudit.beside(store.path).run(store, pairs, today=today)
+        assert result.error is None, result.error
+        assert result.drifted, "the pruned legacy file did not read as drift"
+        assert result.repairs == (), "a pre-ledger vendor was repaired anyway"
+        assert result.legacy_vendors == (VENDOR_CLAUDE,), result.legacy_vendors
+        assert result.note is not None and "NOT rebuilt" in result.note, result.note
+        assert "pre-ledger history" in result.note, result.note
+        assert store.today(today) == before, "the audit destroyed a pruned day"
+
+
+def test_tombstone_rollups_waits_for_the_scan_lock() -> None:
+    """Both scanners' tombstone readers take the scan lock.
+
+    The audit calls them from its own thread; ``_states`` is the dict a scan
+    rewrites entry by entry, and on a cold indexer the call also *loads* it from
+    disk. Reading it unlocked was a race with every tick.
+    """
+
+    def _blocks(scanner: Any) -> None:
+        done = threading.Event()
+
+        def _read() -> None:
+            scanner.tombstone_rollups(since="2026-01-01")
+            done.set()
+
+        scanner._scan_lock.acquire()
+        thread = threading.Thread(target=_read, daemon=True)
+        thread.start()
+        try:
+            assert not done.wait(0.25), (
+                f"{type(scanner).__name__}.tombstone_rollups read the live scan "
+                "state without the scan lock"
+            )
+        finally:
+            scanner._scan_lock.release()
+        assert done.wait(5.0), "the reader never finished after the lock was free"
+        thread.join(timeout=5.0)
+
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        _blocks(
+            Indexer(
+                projects_dir=root / "projects",
+                state_path=root / "scan_state.json",
+                lookback_days=30,
+                pricing=DEFAULT_PRICING,
+            )
+        )
+        _blocks(
+            CodexIndexer(
+                sessions_dir=root / "sessions",
+                state_path=root / "codex_scan_state.json",
+                lookback_days=30,
+                pricing=DEFAULT_PRICING,
+            )
+        )
+
+
+def test_switching_the_audit_off_clears_the_note_it_left_behind() -> None:
+    """Lifecycle: set / cleared / aged / rehydrated / DISABLED.
+
+    The `!` line survived the off switch - nothing cleared ``_audit_note``, so a
+    verdict from this morning stayed on the Cost section for a feature that was
+    no longer running and could never contradict it.
+    """
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        _write(
+            root / "projects" / "p" / "s.jsonl",
+            [_record("req-a", time.time(), input_tokens=200_000)],
+        )
+        indexer = Indexer(
+            projects_dir=root / "projects",
+            state_path=root / "scan_state.json",
+            lookback_days=30,
+            pricing=DEFAULT_PRICING,
+        )
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        worker = _worker(root, indexer=indexer, rollups=store)
+        try:
+            _drain_cost(worker)
+            worker._audit_note = "audit: 1 cell drifted (claude 2026-09-09 x 2.0x) — rebuilt"
+            worker._run_cost_job()
+            assert worker._snapshot.audit_note is not None, "the note never published"
+
+            worker._snapshot = replace(
+                worker._snapshot,
+                settings=normalize_settings(
+                    {**SETTINGS_DEFAULTS, "self_audit_enabled": False}
+                ),
+            )
+            worker._run_cost_job()
+            assert worker._audit_note is None, "the note survived the off switch"
+            assert worker._snapshot.audit_note is None, worker._snapshot.audit_note
+        finally:
+            worker.stop(timeout=5.0)
+
+
+def test_the_audit_status_label_is_served_from_the_worker_cache() -> None:
+    """The Settings line is read on the AppKit thread, so it must be a string
+    the worker already computed - ``SelfAudit.status_label`` reads a file."""
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        _write(
+            root / "projects" / "p" / "s.jsonl",
+            [_record("req-a", time.time(), input_tokens=200_000)],
+        )
+        indexer = Indexer(
+            projects_dir=root / "projects",
+            state_path=root / "scan_state.json",
+            lookback_days=30,
+            pricing=DEFAULT_PRICING,
+        )
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        worker = _worker(root, indexer=indexer, rollups=store)
+        try:
+            assert worker.audit_status_label() is None, "a label before any audit"
+            _drain_cost(worker)
+            thread = worker._audit_thread
+            assert thread is not None
+            thread.join(timeout=60.0)
+            worker._run_cost_job()
+            label = worker.audit_status_label()
+            assert label is not None and label.startswith("Last audit:"), label
+
+            # Nothing is asked of the audit object at read time.
+            worker._audit = object()
+            assert worker.audit_status_label() == label
+        finally:
+            worker.stop(timeout=5.0)
+
+
+# ---------------------------------------------------------------------------
+# Fix pass 2 - the audit twin reads the STORE's bytes, not the corpus's
+#
+# The audit re-indexes into a TemporaryDirectory and compares. It used to read
+# every file from byte 0 to its CURRENT end, while the live scanner had
+# consumed only part of it: the "fresh" total then included bytes the store
+# does not hold yet, the repair installed them, and the same cost tick merged
+# the very same tail again. Probed at 10M indexed + 5M appended -> 20M, where
+# the truth is 15M.
+# ---------------------------------------------------------------------------
+
+
+def test_the_audit_never_counts_bytes_the_live_scanner_has_not_read() -> None:
+    """The 20M probe. A tail appended after the live scan must not be in
+    "fresh", or the repair installs it and the next scan merges it again."""
+    from cc_usage_widget.audit import SelfAudit
+
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        now = time.time()
+        today = local_day_key(now)
+        transcript = _write(
+            root / "projects" / "p" / "s.jsonl",
+            [_record("req-a", now, input_tokens=10_000_000)],
+        )
+        indexer = Indexer(
+            projects_dir=root / "projects",
+            state_path=root / "scan_state.json",
+            lookback_days=30,
+            pricing=DEFAULT_PRICING,
+        )
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        for _ in range(20):
+            result = indexer.scan_once()
+            store.retract_rollups(result.retractions)
+            store.merge(result.deltas)
+            if indexer.progress().complete:
+                break
+        assert store.today(today).models[FABLE].input == 10_000_000
+
+        # ...and now the session writes 5M more, which the live scanner has
+        # NOT read: those bytes are past its offset and are nobody's tokens yet.
+        with transcript.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(_record("req-b", now, input_tokens=5_000_000)) + "\n")
+
+        audit = SelfAudit.beside(store.path)
+        verdict = audit.run(store, [(VENDOR_CLAUDE, indexer)], today=today)
+        assert verdict.error is None, verdict.error
+        # An unbounded twin reads 15M against the store's 10M and calls the
+        # difference drift - a 50% "inflation" that is nothing of the sort.
+        assert verdict.drifted == (), verdict.drifted
+        assert verdict.repairs == (), verdict.repairs
+
+        # Apply whatever the audit asked for (nothing), then let the live
+        # scanner do its job: the tail is merged exactly once.
+        for repair in verdict.repairs:
+            store.replace_day_for_vendor(
+                repair.day, repair.vendor, repair.fresh_models,
+                observed=repair.observed_models,
+            )
+        for _ in range(20):
+            result = indexer.scan_once()
+            store.retract_rollups(result.retractions)
+            store.merge(result.deltas)
+            if indexer.progress().complete:
+                break
+        assert store.today(today).models[FABLE].input == 15_000_000, (
+            "the audit counted bytes the store did not hold; the tail was "
+            "merged twice"
+        )
+
+
+def test_a_file_replaced_under_the_live_offset_is_reported_not_repaired() -> None:
+    """A transcript whose inode changed since the snapshot cannot be compared.
+
+    The store holds what the OLD file contributed; no index of the new one can
+    reproduce it, so the difference is not drift and "repairing" it would
+    delete real usage. The day is named as not comparable instead.
+    """
+    from cc_usage_widget.audit import SelfAudit
+
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        now = time.time()
+        today = local_day_key(now)
+        path = root / "projects" / "p" / "s.jsonl"
+        _write(path, [_record("req-a", now, input_tokens=4_000_000)])
+        indexer = Indexer(
+            projects_dir=root / "projects",
+            state_path=root / "scan_state.json",
+            lookback_days=30,
+            pricing=DEFAULT_PRICING,
+        )
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        for _ in range(20):
+            result = indexer.scan_once()
+            store.retract_rollups(result.retractions)
+            store.merge(result.deltas)
+            if indexer.progress().complete:
+                break
+        held = store.today(today).models[FABLE]
+        assert held.input == 4_000_000, held
+
+        # The file is replaced wholesale - a restore, a sync agent, a session
+        # id reused. Same path, new inode, and the live offsets still describe
+        # the old one.
+        replacement = _write(
+            root / "projects" / "p" / "other.jsonl",
+            [_record("req-b", now, input_tokens=1_000)],
+        )
+        os.replace(replacement, path)
+
+        verdict = SelfAudit.beside(store.path).run(
+            store, [(VENDOR_CLAUDE, indexer)], today=today
+        )
+        assert verdict.error is None, verdict.error
+        assert verdict.drifted, "the disagreement was not even noticed"
+        assert (today, VENDOR_CLAUDE) in verdict.not_comparable, verdict.not_comparable
+        assert verdict.repairs == (), "a day nothing can describe was repaired"
+        assert verdict.note is not None and "not comparable" in verdict.note, verdict.note
+        assert store.today(today).models[FABLE] == held, "the store was touched"
+
+
+def test_a_twin_that_cannot_be_bounded_is_never_repaired_from() -> None:
+    """A scanner whose ``clone_for_audit`` takes no ``limits`` reads the corpus
+    as it is NOW. Comparing that with the store is the bug itself, so such a
+    vendor is reported and never repaired."""
+    from cc_usage_widget.audit import SelfAudit
+
+    class _Unbounded:
+        """A scanner of the older shape: no limits, no offsets."""
+
+        def __init__(self, inner: Any) -> None:
+            self._inner = inner
+
+        def clone_for_audit(self, state_dir: Any, *, lookback_days: int) -> Any:
+            return self._inner.clone_for_audit(state_dir, lookback_days=lookback_days)
+
+        def tombstone_rollups(self, *, since: str) -> tuple[Any, ...]:
+            return ()
+
+        def legacy_tombstone_days(self, *, since: str) -> tuple[str, ...]:
+            return ()
+
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        now = time.time()
+        today = local_day_key(now)
+        _write(
+            root / "projects" / "p" / "s.jsonl",
+            [_record("req-a", now, input_tokens=4_000_000)],
+        )
+        indexer = Indexer(
+            projects_dir=root / "projects",
+            state_path=root / "scan_state.json",
+            lookback_days=30,
+            pricing=DEFAULT_PRICING,
+        )
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        for _ in range(20):
+            result = indexer.scan_once()
+            store.merge(result.deltas)
+            if indexer.progress().complete:
+                break
+        truth = store.today(today).models[FABLE]
+        store.add(today, FABLE, truth)  # double it, as a re-read used to
+
+        verdict = SelfAudit.beside(store.path).run(
+            store, [(VENDOR_CLAUDE, _Unbounded(indexer))], today=today
+        )
+        assert verdict.drifted, "the doubling was not noticed"
+        assert verdict.repairs == (), "an unbounded twin produced a repair plan"
+        assert (today, VENDOR_CLAUDE) in verdict.not_comparable, verdict.not_comparable
+
+
+def test_a_plan_that_lands_after_a_rebuild_and_a_reindex_is_refused() -> None:
+    """The generation guard.
+
+    The old guard only recognised an EMPTY store, and a rebuild stops being
+    empty on its very first delta. A plan landing one tick later was applied as
+    a correction against days that no longer exist:
+    ``max(0, 1M - 50M + 1M) == 0`` - the freshly re-indexed day silently zeroed.
+    """
+    from cc_usage_widget.audit import AuditRepair
+
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        now = time.time()
+        today = local_day_key(now)
+        _write(
+            root / "projects" / "p" / "s.jsonl",
+            [_record("req-a", now, input_tokens=1_000_000)],
+        )
+        indexer = Indexer(
+            projects_dir=root / "projects",
+            state_path=root / "scan_state.json",
+            lookback_days=30,
+            pricing=DEFAULT_PRICING,
+        )
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        worker = _worker(root, indexer=indexer, rollups=store)
+        worker._snapshot = replace(
+            worker._snapshot,
+            settings=normalize_settings(
+                {**SETTINGS_DEFAULTS, "self_audit_enabled": False}
+            ),
+        )
+        try:
+            _drain_cost(worker)
+            truth = store.today(today).models[FABLE]
+            assert truth.input == 1_000_000, truth
+            # What the audit saw before the rebuild: an inflated day.
+            stale = AuditRepair(
+                day=today,
+                vendor=VENDOR_CLAUDE,
+                fresh=((FABLE, truth),),
+                observed=((FABLE, ModelUsage(input=50_000_000)),),
+                generation=store.generation,
+            )
+
+            # `Rebuild cost index`, and then a tick that re-indexes the day.
+            store.clear()
+            indexer.reset()
+            worker._run_cost_job()
+            assert store.today(today).models[FABLE] == truth, "the rebuild lost the day"
+            assert store.days(), "the store is empty; this is not the case under test"
+
+            # ...and only NOW does the audit thread publish what it computed
+            # before the rebuild.
+            worker._audit_repairs = (stale,)
+            worker._run_cost_job()
+
+            assert store.today(today).models[FABLE] == truth, (
+                "a plan from before the rebuild zeroed the re-indexed day"
+            )
+            assert worker._audit_repairs == (), "the stale plan was kept"
+
+            # ...and the verdict says so. (Published straight into
+            # `_apply_audit_repairs` because the tick above ends by clearing
+            # the note: the self-audit is switched off in this fixture, and off
+            # means no `!` line at all.)
+            worker._audit_note = (
+                "audit: 1 cell drifted (claude 2026-09-09 x 50.0x) — repair pending"
+            )
+            worker._audit_repairs = (stale,)
+            worker._apply_audit_repairs(store)
+            note = worker._audit_note or ""
+            assert note.endswith("NOT rebuilt - the cost index was rebuilt since"), note
+        finally:
+            worker.stop(timeout=5.0)
+
+
+def test_a_rebuild_during_the_audit_drain_invalidates_the_plan() -> None:
+    """The generation must be sampled BEFORE the twin drains.
+
+    Sampled afterwards, a `Rebuild cost index` that lands while the twin is
+    reading stamps the plan with the NEW generation, the worker's mismatch
+    check passes, and the re-indexed day is counted twice (verifier,
+    2026-09-10). Here the store moves its generation on the first read the
+    comparison makes - i.e. after the drain - and the plan must still be the
+    old generation's, which the worker then refuses.
+    """
+    from cc_usage_widget.audit import SelfAudit
+
+    class _RebuildingStore(DailyRollupStore):
+        """Bumps its generation once, on the first read after construction."""
+
+        _bumped = False
+
+        def _bump_once(self) -> None:
+            if not self._bumped:
+                self._bumped = True
+                self.bump_generation()
+
+        def get(self, day):  # type: ignore[override]
+            self._bump_once()
+            return super().get(day)
+
+        def today(self, day=None):  # type: ignore[override]
+            self._bump_once()
+            return super().today(day)
+
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        store, scanners, today = _audit_fixture(root)
+        key = f"{VENDOR_CODEX}:gpt-5.6-sol"
+        truth = store.today(today).models[key]
+        store.add(today, key, truth)  # the inflated cell the audit will want to repair
+        store.save(force=True)
+        racing = _RebuildingStore(path=store.path, keep_days=30)
+        racing.load()
+        before = racing.generation
+        assert racing._bumped is False  # noqa: SLF001
+
+        result = SelfAudit.beside(racing.path).run(racing, scanners, today=today)
+        assert result.error is None, result.error
+        assert result.repairs, "the fixture must produce a repair plan"
+        assert racing._bumped is True, "the comparison never read the store"  # noqa: SLF001
+        assert racing.generation == before + 1
+        assert all(r.generation == before for r in result.repairs), (
+            "the plan carries the generation read AFTER the rebuild"
+        )
+
+        indexer = next(scanner for vendor, scanner in scanners if vendor == "claude")
+        worker = _worker(root, indexer=indexer, rollups=racing)
+        try:
+            inflated = racing.today(today).models[key]
+            worker._audit_note = result.note
+            worker._audit_repairs = tuple(result.repairs)
+            worker._apply_audit_repairs(racing)
+            assert racing.today(today).models[key] == inflated, "the stale plan was applied"
+            note = worker._audit_note or ""
+            assert note.endswith("NOT rebuilt - the cost index was rebuilt since"), note
+        finally:
+            worker.stop(timeout=5.0)
+
+
+def test_a_dropped_plan_never_leaves_the_note_claiming_a_rebuild() -> None:
+    """SPEC 3.2a: "rebuilt" is published only after the plan applied.
+
+    Every other exit rewrites the tail to ``NOT rebuilt - <reason>``. A note
+    that claims a repair that never happened is worse than no note: it is the
+    one line the operator would use to decide the number can be trusted.
+    """
+    from cc_usage_widget.audit import AuditRepair
+
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        now = time.time()
+        today = local_day_key(now)
+        _write(
+            root / "projects" / "p" / "s.jsonl",
+            [_record("req-a", now, input_tokens=1_000_000)],
+        )
+        indexer = Indexer(
+            projects_dir=root / "projects",
+            state_path=root / "scan_state.json",
+            lookback_days=30,
+            pricing=DEFAULT_PRICING,
+        )
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        worker = _worker(root, indexer=indexer, rollups=store)
+        worker._snapshot = replace(
+            worker._snapshot,
+            settings=normalize_settings(
+                {**SETTINGS_DEFAULTS, "self_audit_enabled": False}
+            ),
+        )
+        try:
+            _drain_cost(worker)
+            truth = store.today(today).models[FABLE]
+            pending = (
+                "audit: 1 cell drifted (claude 2026-09-09 x 2.0x) — repair pending"
+            )
+
+            # 1. every repair raises.
+            class _Refuses:
+                def __getattr__(self, item: str) -> Any:
+                    return getattr(store, item)
+
+                def replace_day_for_vendor(self, *a: Any, **k: Any) -> None:
+                    raise RuntimeError("no")
+
+            worker._audit_note = pending
+            worker._audit_repairs = (
+                AuditRepair(
+                    day=today,
+                    vendor=VENDOR_CLAUDE,
+                    fresh=((FABLE, truth),),
+                    observed=((FABLE, truth),),
+                    generation=store.generation,
+                ),
+            )
+            worker._apply_audit_repairs(_Refuses())
+            assert worker._audit_note == (
+                "audit: 1 cell drifted (claude 2026-09-09 x 2.0x) "
+                "— NOT rebuilt - every repair failed"
+            ), worker._audit_note
+
+            # 2. a store that cannot repair a day at all.
+            class _CannotRepair:
+                def days(self) -> tuple[str, ...]:
+                    return (today,)
+
+                generation = store.generation
+
+            worker._audit_note = pending
+            worker._audit_repairs = (
+                AuditRepair(day=today, vendor=VENDOR_CLAUDE, generation=store.generation),
+            )
+            worker._apply_audit_repairs(_CannotRepair())
+            assert (worker._audit_note or "").endswith(
+                "NOT rebuilt - this store cannot repair a day"
+            ), worker._audit_note
+
+            # 3. `Rebuild cost index` while a plan is outstanding.
+            worker._audit_note = pending
+            worker._audit_repairs = (
+                AuditRepair(day=today, vendor=VENDOR_CLAUDE, generation=store.generation),
+            )
+            worker._rebuild_index()
+            assert worker._audit_repairs == (), "the rebuild kept the plan"
+            assert (worker._audit_note or "").endswith(
+                "NOT rebuilt - the cost index was rebuilt"
+            ), worker._audit_note
+            assert store.generation > 0, "the rebuild did not bump the generation"
+        finally:
+            worker.stop(timeout=5.0)
+
+
+def test_a_repaired_day_resets_its_per_project_split_and_says_so() -> None:
+    """A repair rebuilds a day's AGGREGATE. The per-project decomposition of
+    that day cannot be rebuilt from a per-(day, model) plan, so it is dropped -
+    from ``attribution.json`` and from ``history.daily_project`` - and the note
+    says why, or the menu block just looks broken."""
+    from cc_usage_widget.attribution import Attribution, AttributionStore
+    from cc_usage_widget.audit import AuditRepair
+    from cc_usage_widget.history import HistoryStore
+
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        now = time.time()
+        today = local_day_key(now)
+        _write(
+            root / "projects" / "p" / "s.jsonl",
+            [_record("req-a", now, input_tokens=1_000_000)],
+        )
+        indexer = Indexer(
+            projects_dir=root / "projects",
+            state_path=root / "scan_state.json",
+            lookback_days=30,
+            pricing=DEFAULT_PRICING,
+        )
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        worker = _worker(root, indexer=indexer, rollups=store)
+        worker._snapshot = replace(
+            worker._snapshot,
+            settings=normalize_settings(
+                {**SETTINGS_DEFAULTS, "self_audit_enabled": False}
+            ),
+        )
+        history = HistoryStore(path=root / "history.sqlite")
+        worker._history = history
+        try:
+            _drain_cost(worker)
+            truth = store.today(today).models[FABLE]
+
+            # The split as it stood before the repair, in both places.
+            attribution = AttributionStore(path=root / "attribution.json")
+            scope = Attribution(vendor=VENDOR_CLAUDE, project="alpha", session="s")
+            inflated = DayRollup(day=today, models={FABLE: ModelUsage(input=9_000_000)})
+            attribution.merge([(scope, inflated)])
+            attribution.save(force=True)
+            worker._attribution = attribution
+            history.upsert_projects(attribution.project_rollups(), DEFAULT_PRICING)
+            assert history.project_rows(), "the fixture wrote no project rows"
+
+            worker._audit_note = (
+                "audit: 1 cell drifted (claude 2026-09-09 x 9.0x) — repair pending"
+            )
+            worker._audit_repairs = (
+                AuditRepair(
+                    day=today,
+                    vendor=VENDOR_CLAUDE,
+                    fresh=((FABLE, truth),),
+                    observed=((FABLE, truth),),
+                    generation=store.generation,
+                ),
+            )
+            worker._apply_audit_repairs(store)
+
+            assert attribution.top_projects(today, DEFAULT_PRICING) == (), (
+                "the repaired day kept a project split of a figure the "
+                "aggregate has disowned"
+            )
+            rows = [row for row in history.project_rows() if row.day == today]
+            assert rows, "the rows were deleted rather than zeroed"
+            assert all(row.total_tokens == 0 for row in rows), rows
+            note = worker._audit_note or ""
+            assert note.endswith(f"— rebuilt (project split for {today} reset)"), note
+
+            # And the file on disk agrees with the store in memory.
+            reloaded = AttributionStore(path=root / "attribution.json")
+            reloaded.load()
+            assert reloaded.top_projects(today, DEFAULT_PRICING) == ()
+        finally:
+            worker.stop(timeout=5.0)
+
+
+def test_the_audit_plan_changes_hands_under_a_lock() -> None:
+    """``plan, self._audit_repairs = self._audit_repairs, ()`` is a read and
+    then a write, and the audit thread publishes into the gap between them: the
+    plan it just computed is overwritten by the ``()`` and lost, with the audit
+    already marked done for the day.
+
+    Both sides therefore take ``_audit_lock``. The proof is that a publish
+    cannot complete while the lock is held - with the guard removed the thread
+    below finishes immediately.
+    """
+    from cc_usage_widget.audit import AuditRepair
+
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        indexer = Indexer(
+            projects_dir=root / "projects",
+            state_path=root / "scan_state.json",
+            lookback_days=30,
+            pricing=DEFAULT_PRICING,
+        )
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        worker = _worker(root, indexer=indexer, rollups=store)
+        try:
+            today = local_day_key(time.time())
+            plan = (AuditRepair(day=today, vendor=VENDOR_CLAUDE),)
+
+            # The audit thread cannot publish while the worker holds the lock.
+            published = threading.Thread(
+                target=worker._publish_audit_plan, args=(plan, "note")
+            )
+            with worker._audit_lock:
+                published.start()
+                published.join(timeout=0.3)
+                assert published.is_alive(), (
+                    "a plan was published without taking the hand-over lock"
+                )
+            published.join(timeout=5.0)
+            assert not published.is_alive()
+            assert worker._audit_repairs == plan
+
+            # ...and the worker cannot take one while the audit thread holds it.
+            taken: list[Any] = []
+            taker = threading.Thread(
+                target=lambda: taken.append(worker._take_audit_plan()[0])
+            )
+            with worker._audit_lock:
+                taker.start()
+                taker.join(timeout=0.3)
+                assert taker.is_alive(), (
+                    "a plan was taken without the hand-over lock"
+                )
+            taker.join(timeout=5.0)
+            assert taken == [plan], taken
+            assert worker._audit_repairs == ()
+        finally:
+            worker.stop(timeout=5.0)
+
+
+def test_switching_cost_by_project_off_empties_the_cache_it_leaves_behind() -> None:
+    """Off must leave nothing that would be wrong when it comes back on.
+
+    The scanners keep indexing while the feature is off, so a cache left
+    standing describes a window with a hole in it: re-enabling would show a
+    project split missing everything read in between, beside day totals that
+    are complete. ``_rebuild_index`` already clears it for exactly this reason.
+    """
+    from cc_usage_widget.attribution import Attribution, AttributionStore
+
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        today = local_day_key(time.time())
+        indexer = Indexer(
+            projects_dir=root / "projects",
+            state_path=root / "scan_state.json",
+            lookback_days=30,
+            pricing=DEFAULT_PRICING,
+        )
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        worker = _worker(root, indexer=indexer, rollups=store)
+        try:
+            path = root / "attribution.json"
+            cache = AttributionStore(path=path)
+            cache.merge(
+                [
+                    (
+                        Attribution(vendor=VENDOR_CLAUDE, project="alpha", session="s"),
+                        DayRollup(day=today, models={FABLE: ModelUsage(input=1_000)}),
+                    )
+                ]
+            )
+            cache.save(force=True)
+            assert path.exists()
+
+            worker._attribution = cache
+            worker._attribution_on = True
+            worker._set_attribution(False)
+
+            reloaded = AttributionStore(path=path)
+            reloaded.load()
+            assert reloaded.top_projects(today, DEFAULT_PRICING) == (), (
+                "the stale split survived the off switch"
+            )
+            assert worker._attribution is None
+
+            # ...and a machine that has never had the feature on gets no file.
+            path.unlink()
+            worker._attribution_on = True
+            worker._set_attribution(False)
+            assert not path.exists(), "the off switch created the cache file"
+        finally:
+            worker.stop(timeout=5.0)
+
+
+def test_a_restore_drops_the_plan_and_moves_the_store_on_a_generation() -> None:
+    """``Restore last backup`` replaces the days wholesale with other bytes.
+
+    That is exactly as fatal to an outstanding repair plan as a rebuild -
+    ``observed`` describes figures nobody holds any more - and ``load()`` does
+    not bump the generation, because it is a read. So the restore does.
+    """
+    from cc_usage_widget.audit import AuditRepair
+
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        now = time.time()
+        today = local_day_key(now)
+        _write(
+            root / "projects" / "p" / "s.jsonl",
+            [_record("req-a", now, input_tokens=1_000_000)],
+        )
+        indexer = Indexer(
+            projects_dir=root / "projects",
+            state_path=root / "scan_state.json",
+            lookback_days=30,
+            pricing=DEFAULT_PRICING,
+        )
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        worker = _worker(root, indexer=indexer, rollups=store)
+        worker._snapshot = replace(
+            worker._snapshot,
+            settings=normalize_settings(
+                {**SETTINGS_DEFAULTS, "self_audit_enabled": False}
+            ),
+        )
+        try:
+            _drain_cost(worker)
+            truth = store.today(today).models[FABLE]
+            assert truth.input == 1_000_000, truth
+
+            worker._rebuild_index("backup-state-20260910-120000")
+            assert store.days() == (), "the rebuild kept the days"
+            after_rebuild = store.generation
+
+            # A plan computed against the REBUILT store, still in flight when
+            # the operator puts the old files back.
+            worker._audit_note = (
+                "audit: 1 cell drifted (claude 2026-09-09 x 2.0x) — repair pending"
+            )
+            worker._audit_repairs = (
+                AuditRepair(
+                    day=today,
+                    vendor=VENDOR_CLAUDE,
+                    fresh=((FABLE, truth),),
+                    observed=((FABLE, truth),),
+                    generation=after_rebuild,
+                ),
+            )
+            worker._restore_backup("backup-state-20260910-120000")
+
+            assert store.today(today).models[FABLE] == truth, "the restore lost the day"
+            assert worker._audit_repairs == (), "the restore kept the plan"
+            assert store.generation > after_rebuild, (
+                "a plan computed before the restore would still look current"
+            )
+            assert (worker._audit_note or "").endswith(
+                "NOT rebuilt - the cost index was restored"
+            ), worker._audit_note
+        finally:
+            worker.stop(timeout=5.0)
 
 
 if __name__ == "__main__":

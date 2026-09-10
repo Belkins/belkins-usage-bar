@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+os.environ.setdefault("CC_USAGE_WIDGET_NO_REVEAL", "1")  # never open Finder from a test
 
 from cc_usage_widget import app as app_mod  # noqa: E402
 from cc_usage_widget import fleet  # noqa: E402
@@ -55,6 +56,35 @@ from cc_usage_widget.contracts import (  # noqa: E402
 
 DEAD_PID = 2**22 - 1
 """Comfortably above the default macOS pid ceiling, so it is never alive."""
+
+try:  # an OPTIONAL dependency (README: "account features need claude-swap")
+    import claude_swap as _claude_swap
+except Exception:  # pragma: no cover - a clean machine, and CI
+    _claude_swap = None  # type: ignore[assignment]
+
+_CLAUDE_SWAP_PRESENT = _claude_swap is not None
+"""Whether the four profile/pin tests below can run at all.
+
+They are not testing OUR code in isolation: ``session_dir_for`` and
+``MappingStore`` are claude-swap's, and ``fleet.set_mapping`` calls the second
+one in production. Re-implementing either here would test a guess about
+upstream rather than upstream, so on a machine without it these four have
+nothing to check."""
+
+
+class _NeedsClaudeSwap(Exception):
+    """A test that cannot run without the optional dependency.
+
+    Never swallowed: the runner prints one ``skip`` line per test and the
+    summary counts them, so a machine that has quietly lost claude-swap reads
+    as ``13 passed, 4 skipped`` and never as ``17 passed`` - an all-green run
+    that silently skipped a test is the one outcome worse than a red one.
+    """
+
+
+def _require_claude_swap() -> None:
+    if not _CLAUDE_SWAP_PRESENT:
+        raise _NeedsClaudeSwap("claude_swap is not installed")
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +316,7 @@ def test_profile_sessions_are_pinned_to_their_slot() -> None:
     there. Such a session does NOT follow a default-login switch, which is
     what ``pinned`` tells the operator.
     """
+    _require_claude_swap()
     from claude_swap.session import session_dir_for
 
     with tempfile.TemporaryDirectory() as name:
@@ -418,6 +449,8 @@ def test_pin_writes_identity_and_warns_when_target_is_active() -> None:
     writing that mapping would let the operator believe the fleet was spread
     when it was not.
     """
+    # `fleet.set_mapping` writes through claude-swap's own `MappingStore`.
+    _require_claude_swap()
     with tempfile.TemporaryDirectory() as name:
         root = Path(name)
         backup = root / "backup"
@@ -587,6 +620,9 @@ def test_pinned_count_is_only_claimed_when_the_profile_scan_ran() -> None:
     """``· 0 pinned`` was asserted even when no profile directory was read
     (no backup dir, or no identities) — an invented number about the very
     fact the section exists to convey."""
+    # `fleet.collect` reaches claude-swap's profile-session layout to decide
+    # whether the pinned count was scanned at all.
+    _require_claude_swap()
     with tempfile.TemporaryDirectory() as tmp:
         sessions = Path(tmp) / "sessions"
         _write_session(sessions, os.getpid(), cwd="/tmp/a", name="a")
@@ -628,6 +664,7 @@ def test_missing_session_module_is_reported_not_silent() -> None:
 def test_emails_fallback_scans_profiles_without_sequence_json() -> None:
     """The widget's own rows know slot→email even when ``sequence.json`` is
     unreadable; a pinned session must still be found through them."""
+    _require_claude_swap()
     from claude_swap.session import session_dir_for
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -698,10 +735,16 @@ def _uncollected_tests(collected: list[tuple[str, Any]], source: str | None = No
 
 def main() -> int:
     failures: list[str] = []
+    skipped: list[str] = []
     tests = _tests()
     for name, func in tests:
         try:
             func()
+        except _NeedsClaudeSwap as exc:
+            # Counted and named, never hidden: the summary must not be able to
+            # read "all green" on a machine that could not run four of them.
+            skipped.append(name)
+            print(f"skip  {name}: {exc}")
         except Exception:
             failures.append(name)
             print(f"FAIL  {name}")
@@ -709,7 +752,11 @@ def main() -> int:
         else:
             print(f"pass  {name}")
     total = len(tests)
-    print(f"\n{total - len(failures)} passed, {len(failures)} failed, out of {total}")
+    passed = total - len(failures) - len(skipped)
+    tail = f", {len(skipped)} skipped" if skipped else ""
+    print(f"\n{passed} passed, {len(failures)} failed{tail}, out of {total}")
+    if skipped:
+        print("skipped (claude_swap not installed): " + ", ".join(skipped))
     if failures:
         print("failed: " + ", ".join(failures))
     orphans = _uncollected_tests(tests)

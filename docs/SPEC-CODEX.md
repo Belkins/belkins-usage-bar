@@ -203,7 +203,7 @@ from the token payload) and **refuses a duplicate account id**, printing both
 paths: two dirs claiming one account means the workspace picker was not used as
 intended, and silently keeping one would hide a login that is not tracked.
 
-### 6.4 Token policy: phase 1 never refreshes
+### 6.4 Token policy: refresh exists, and it is off
 
 The stored access token lives ~10 days (`exp = iat + 10 d`). The widget decodes
 `exp` locally — base64url payload, **no signature verification**, which is safe
@@ -215,19 +215,56 @@ decides whether a token is good. From that:
   token has exactly one outcome; making the call would only teach the endpoint
   our polling schedule).
 
-Refresh is not implemented. Whether two `codex login` sessions under the one
-public OAuth client (`app_EMoamEEZ73f0CkXaXp7hrann`) share a refresh-token
-family is unverified, and a wrong guess logs the user out of the account they
-are coding in.
+Refresh is **implemented and switched off** (`codex_refresh_enabled`, default
+`False` — roadmap 13). Whether two `codex login` sessions under the one public
+OAuth client (`app_EMoamEEZ73f0CkXaXp7hrann`) share a refresh-token family is
+still unverified, and a wrong guess logs the user out of the account they are
+coding in — so the code exists, the switch does not move on its own, and the
+off state is asserted rather than assumed.
 
-**Revisit trigger** (the only thing that opens phase 2): a throwaway
-`CODEX_HOME`, one refresh grant through the transport, persist-before-use, a
-24 h soak confirming the first store *and* `~/.codex` still work, then a
-deliberate replay of the superseded refresh token to learn whether reuse
-detection revokes the family. Only a clean result earns
-`codex_refresh_enabled` (default off, proactive at `exp − 24 h`, reactive once
-on 401, never on 403). Until then the 10-day relogin is the shipped cost and
-it is stated on the row rather than hidden.
+**Off means silent.** With the setting off, `TokenRefresher` is never called:
+no POST of any kind is made, and `auth.json` is read and never written. The
+test that proves it injects a transport whose `post_form` fails the suite, runs
+a full cycle over a token one hour from expiry, and asserts the credential file
+is byte-identical afterwards. The reactive path is behind the same switch, so a
+401 is not a back door.
+
+**On, the rules are:**
+
+| Rule | Why |
+|---|---|
+| `POST https://auth.openai.com/oauth/token`, form body `grant_type=refresh_token&refresh_token=…&client_id=app_EMoamEEZ73f0CkXaXp7hrann` | one endpoint, one grant type; the client id is public and already sits in every `auth.json` |
+| **Persist before use** — rotated `refresh_token` / `access_token` / `id_token` written to that account's `auth.json` (temp file + `os.replace`, 0600, every other key preserved) *before* the new access token authorises anything, and the `Credential` returned is **re-read from that file** | a crash between the POST and the write costs one grant; the reverse order costs the account |
+| **No replay path** — the superseded refresh token is overwritten in place. No `.prev`, no backup, no in-memory copy kept for a retry | if reuse detection is armed on this client, the only way to ask is on purpose |
+| Proactive when `exp − now < 24 h` on that account's poll | 48 h is the countdown threshold (a refresh there would make the sentinel a liar); an hour leaves no room for a sleeping machine |
+| Reactive **exactly once** on a 401 — one flag covers both trigger points, so one poll never posts twice | a dead family must not become a POST loop |
+| **403 never refreshes** | a 403 is an answer about permissions; the token in hand is the one it refused |
+| `invalid_grant` → the `relogin` sentinel, no retry, and no usage request | the family is gone; the access token it would carry is the dead one |
+| Any other failure (offline, 5xx, non-JSON, unwritable file) changes nothing — a diagnostics line, the stored token still valid until `exp`, the countdown unchanged | a failed rotation must not manufacture a sentinel |
+| A credential with any group/world bit is refused for rotation exactly as it is for reading | writing to it would only mint a second leaked token |
+| Nothing about a token is logged — alias, outcome and remaining life only | SPEC-CODEX 6.8 rule 2, extended to the refresh token |
+
+Our own rotation rewrites `auth.json`, which is the same signal the cycle uses
+to spot a human running `codex login` under a standing sentinel. The stored
+`(mtime_ns, size)` signature is therefore re-stamped after a successful
+refresh; without that, a warn sentinel's backoff would be cancelled on every
+cycle by our own write.
+
+**What opens the switch** (unchanged in substance, now runnable):
+
+```
+python -m cc_usage_widget.codex_accounts probe-refresh <alias>
+```
+
+One grant on that account, persisted, then one usage `GET` proving the new
+access token is accepted — printing plan / email / expiry before and after, and
+never a token. It is deliberately **not** gated on `codex_refresh_enabled`
+(requiring the switch to earn the switch would be circular) and deliberately
+one-shot. Then leave the other stores alone for **24 h** and confirm they and
+`~/.codex` still work. Only that clean result earns the setting; the deliberate
+replay of a superseded token is a separate, manual experiment and there is no
+code path that can perform it by accident. Until then the 10-day relogin is the
+shipped cost and it is stated on the row rather than hidden.
 
 ### 6.5 Mapping rules
 
@@ -250,8 +287,18 @@ it is stated on the row rather than hidden.
 * `plan_type` passes through **verbatim** (treat it as opaque: the enum
   includes `self_serve_business_prolite`, `ent26`, `enterprise_cbp_*` …).
 * `spend_control.individual_limit` is **not rendered** — the unit is unverified,
-  and a wrong unit beside a real number is worse than silence. `credits` stay
-  ignored for §3a's reason.
+  and a wrong unit beside a real number is worse than silence.
+* `credits` and `model_usage` are read for **three** facts and nothing else
+  (roadmap 11/12): `credits.balance` (a count, printed with no currency and
+  only when it is positive or `has_credits` is true — the probed Pro body sends
+  `has_credits:false, balance:"0"`, and `credits 0` there would read as a
+  problem on a healthy account), `credits.has_credits` + a model's
+  `credits_would_enable` (the corroborating route to the out-of-credits
+  verdict), and `model_usage.<slug>.available_at` (rendered as
+  `gpt-6-astra back Sep 15`, dropped once it has passed). Per-model token
+  counts are still ignored: they come from the corpus, and two definitions of
+  one quantity is how two numbers for one thing get shipped. The model is named
+  by its own slug, matching `pricing.MODEL_DISPLAY_NAMES`.
 * A response whose `account_id` is not the credential's is **dropped**: the
   previous snapshot is kept and a `!` diagnostics line says so. Showing another
   account's figure under this alias is the worst failure this file can have.
@@ -278,6 +325,38 @@ that carries **no figure** — so a capped plan still reads `C100%`.
 | `awaiting first reading` | an enabled account with no snapshot | the first outcome of any kind | — |
 | `credential unreadable` | `auth.json` missing, unparseable, claims another id, or not 0600 | a successful read, or the file changing | interval |
 | `capped <type>` | `limit_reached` / `allowed:false` | the next healthy 200 | — (this one sits **beside** the figures: they are still true) |
+| `out of credits · Add credits` | a capped 200 whose `rate_limit_reached_type.type` is `workspace_owner_credits_depleted`, or `credits.has_credits:false` **with** a model's `credits_would_enable` | the next 200 that is not capped | — (also beside the figures) |
+
+**Facts beside the bars** (`AccountRow.info_notes`, roadmap 10/11/12). A note
+is one standing verdict; these are dim lines that sit *under* the header and
+never replace a figure: `credits 12`, `gpt-6-astra back Sep 15`, `at this pace:
+wall in 6h`. They were all read at `fetched_at`, so a row that withholds its
+bars (expired reading, or a warn sentinel) withholds these **and**
+`soonest_reset_at` with them — otherwise the title would count down to a reset
+nobody re-read.
+
+**Pace** (roadmap 10). The sidecar keeps a per-account ring of the last 12
+`(fetched_at, weekly used_percent)` samples, recorded on every healthy 200
+whatever `codex_pace_forecast_enabled` says — the setting gates the note, not
+the memory, so switching it on does not start an hour of silence. A forecast
+needs **three** samples spanning **30 minutes** with a strictly rising
+percentage, is never made on a capped row, and is trimmed at any percentage
+DROP (a window that went 98 % → 3 % has no trend through the seam). When the
+projection lands at or beyond the window's reset the note is `at this pace:
+resets first` rather than a countdown the plan makes impossible.
+
+**Earliest reset** (roadmap 4). `AccountRow.soonest_reset_at` is the epoch of
+the earliest reset the row reports — the one numeric reset on a row, because
+`*_resets_at` are display strings and nothing can order two rows by them. Two
+renderers read it: the menu-bar suffix `↺4d` on a **capped active** row, hard
+capped at four characters (`render.TITLE_RESET_SUFFIX_MAX`) and absent below the
+wall, and the Codex block's fleet heading `Codex 1/4 · next Sat 09:00 (vlad)` —
+rooms are live rows whose weekly figure is known, under 100 and carrying no
+warn/crit verdict (a credit-blocked account with an unspent week is **not** a
+room), and `next` is the soonest reset among the capped ones, with its alias. A
+row whose source carries no epoch — every claude-swap row, and the
+transcript-derived Codex row — renders neither, which is what keeps a
+live-quota-off machine byte-for-byte as it was.
 
 Ageing has two steps, both from one number: past **15 min**
 (`CODEX_FETCH_STALE_SECONDS`) the row shows its age beside the figure; past
@@ -317,6 +396,27 @@ unchanged with its own age note. Both are never shown for one account, and
 nothing else is touched. Zero credentials, or the feature off, means the menu
 is exactly §5's.
 
+### 6.7a Launching on the best account (roadmap 5)
+
+`python -m cc_usage_widget.codex_accounts best [--json]` prints the `CODEX_HOME`
+of the enabled account with the lowest weekly usage that still has room; when
+every account is capped, the one whose window reopens first. It ranks the very
+rows `quota_rows()` builds — so the CLI and the menu can never disagree — and it
+is offline **by construction**: the source is built with a transport that raises
+on any request. Skipped as candidates: an account with no credential directory
+(there is no home to hand out) and one carrying a `warn` sentinel (there is
+nowhere to send work). Nothing usable, no registry, or the feature off ⇒ one
+line on stdout and **exit 2**, because the README's `codexb` propagates the code
+and an empty `CODEX_HOME=` silently means `~/.codex`.
+
+`link [--unlink]` symlinks `~/.codex/{config.toml,AGENTS.md,skills,plugins,
+agents,rules,memories}` into each account home when the target exists and the
+name is free. It never overwrites (a real file, or a link that points elsewhere,
+is counted as `kept`), never writes anything under `~/.codex`, and `--unlink`
+removes only links whose target is the matching upstream name. `auth.json`,
+`sessions`, `history.jsonl` and `log` are deliberately not linked — each home
+must keep its own credential and its own history.
+
 ### 6.8 Definition of done
 
 1. Four rows in registry order, exactly one `· active`, plan strings verbatim,
@@ -329,3 +429,7 @@ is exactly §5's.
    header must FAIL.
 3. `~/.codex/auth.json` is byte- and mtime-identical after a full cycle.
 4. Claude-only and Codex-only machines keep the pre-6 layouts byte-for-byte.
+5. With `codex_refresh_enabled` off (the default), a full cycle over a token an
+   hour from expiry makes **zero** token requests and leaves `auth.json`
+   byte-identical — asserted by a transport whose `post_form` fails the suite,
+   not by reading the code (6.4).

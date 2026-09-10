@@ -110,11 +110,12 @@ import json
 import os
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Final
 
+from .attribution import AttributionCollector, AttributionPass, codex_scope
 from .contracts import (
     CODEX_PSEUDO_ACCOUNT_SLOT,
     CODEX_SCAN_STATE_PATH,
@@ -127,6 +128,7 @@ from .contracts import (
     DayRollup,
     FileScanState,
     IndexProgress,
+    LedgerEntry,
     ModelUsage,
     Pct,
     PricingTable,
@@ -134,9 +136,12 @@ from .contracts import (
     Vendor,
     VendorModelKey,
     day_keys_back,
+    ledger_from_counters,
+    legacy_day_for_vanished,
     local_day_key,
     local_day_key_from_iso,
     make_vendor_key,
+    merge_ledgers,
     parse_day_key,
     raw_model_of_key,
     scan_state_from_json,
@@ -366,6 +371,82 @@ def _to_pct(value: Any) -> Pct | None:
             return None
         return min(100.0, max(0.0, result))
     return None
+
+
+def _fold_counters(
+    target: dict[DayKey, dict[VendorModelKey, list[int]]],
+    source: dict[DayKey, dict[VendorModelKey, list[int]]],
+) -> None:
+    """Field-wise add *source* into *target*, both ``{day: {key: [5]}}``.
+
+    One rollout's counters folded into the pass's. Rollouts are scanned into
+    their OWN dict so the pass can tell what each one contributed (roadmap
+    item 1); this puts the pass total back together.
+    """
+    for day, models in source.items():
+        bucket = target.get(day)
+        if bucket is None:
+            target[day] = {key: list(row) for key, row in models.items()}
+            continue
+        for key, row in models.items():
+            acc = bucket.get(key)
+            if acc is None:
+                bucket[key] = list(row)
+                continue
+            for i, value in enumerate(row):
+                acc[i] += value
+
+
+def _fold_ledger(
+    target: dict[DayKey, dict[VendorModelKey, list[int]]],
+    entries: Iterable[LedgerEntry],
+    *,
+    since: DayKey,
+) -> None:
+    """Add a rollout's ledger into the pass's pending retractions.
+
+    Rows older than *since* are dropped: the store's window is the same length,
+    so retracting a day it has already pruned would clamp at zero and log a
+    shortfall that is not one.
+    """
+    for entry in entries:
+        if entry.day < since:
+            continue
+        bucket = target.setdefault(entry.day, {})
+        row = bucket.get(entry.model)
+        if row is None:
+            bucket[entry.model] = list(entry.counters)
+            continue
+        for i, value in enumerate(entry.counters):
+            row[i] += value
+
+
+def _windowed_ledger(
+    entries: tuple[LedgerEntry, ...], *, since: DayKey
+) -> tuple[LedgerEntry, ...]:
+    """Drop ledger rows for days the store no longer keeps.
+
+    Bounds ``codex_scan_state.json``: without it a rollout appended to for
+    weeks would accumulate one ledger row per day it was ever written to.
+    """
+    kept = tuple(entry for entry in entries if entry.day >= since)
+    return entries if len(kept) == len(entries) else kept
+
+
+def _rollups_from_counters(
+    counters: dict[DayKey, dict[VendorModelKey, list[int]]],
+) -> tuple[DayRollup, ...]:
+    """``{day: {key: [5]}}`` as sorted :class:`DayRollup` values."""
+    return tuple(
+        DayRollup(
+            day=day,
+            models={
+                model: ModelUsage.from_counters(counter)
+                for model, counter in sorted(models.items())
+            },
+        )
+        for day, models in sorted(counters.items())
+    )
 
 
 def _local_midnight_epoch(day: dt.date) -> float:
@@ -639,6 +720,7 @@ class CodexIndexer:
         state_loader: Callable[[], Any] | None = None,
         state_saver: Callable[[Mapping[str, Any]], bool | None] | None = None,
         defer_state_commit: bool = False,
+        audit_limits: Mapping[str, tuple[int, int]] | None = None,
     ) -> None:
         self._sessions_dir = os.path.abspath(os.fspath(sessions_dir))
         self._state_path = os.fspath(state_path)
@@ -686,6 +768,41 @@ class CodexIndexer:
         # and popped the moment the file is read to completion, so at most the
         # single in-flight transcript is held (SPEC 2.2).
         self._resume_fingerprint: dict[str, tuple[Any, ...]] = {}
+
+        # --- attribution (roadmap item 6) -----------------------------------
+        # Off unless the owner switches it on. A rollout's project and thread
+        # come from its `session_meta` record, which is the FIRST line of the
+        # file - so the scope survives a resumed read without a second field
+        # in the scan state (see `attribution.codex_scope`).
+        self._attribution: AttributionCollector | None = None
+
+        # --- audit twin ------------------------------------------------------
+        self._audit_limits: dict[str, tuple[int, int]] | None = (
+            None
+            if audit_limits is None
+            else {
+                str(key): (int(pair[0]), int(pair[1]))
+                for key, pair in audit_limits.items()
+            }
+        )
+        """Per-file ceiling for an AUDIT TWIN: ``path -> (inode, offset)`` as the
+        LIVE scanner had it (roadmap item 2, 2026-09-10).
+
+        ``None`` on every real scanner. On a twin it is the whole difference:
+        without it the twin read each rollout **to its current end** while the
+        live scanner had consumed only part of it, so "fresh" counted bytes the
+        store does not hold yet, the repair installed them, and the same cost
+        tick then merged the very same tail again (probe: 10M indexed, 5M
+        appended, audit and apply gave 15M, the next scan 20M, truth 15M).
+        ``indexer.Indexer._audit_limits`` documents the skip rules; they are the
+        same here because the two scanners are audited by one comparison."""
+        self._audit_unusable: set[str] = set()
+        """Snapshotted paths this twin could not read as they were snapshotted."""
+        self._audit_seen: set[str] = set()
+        """Every path this twin's walk has laid eyes on, across passes. A
+        snapshotted path that never turns up was deleted between the snapshot
+        and the audit: the store holds its contribution and this index cannot
+        read it, so those days are not comparable."""
 
         # --- day-key memo ---------------------------------------------------
         # Keyed on the ISO timestamp truncated to the MINUTE. Every real UTC
@@ -766,6 +883,153 @@ class CodexIndexer:
         self._files_done = 0
         self._files_total = 0
         self._publish_progress(scanning=False)
+
+    def set_attribution(self, enabled: bool) -> None:
+        """Switch per-project/per-session attribution on or off (roadmap item 6).
+
+        The Claude twin's contract, verbatim: idempotent, dropping the
+        accumulator when switched off, and starting from empty when switched
+        on - the days already consumed are not re-read, because their offsets
+        are durable and re-reading them would double-count the money.
+        """
+        if bool(enabled) == (self._attribution is not None):
+            return
+        self._attribution = (
+            AttributionCollector(lambda path, hint: codex_scope(path, hint))
+            if enabled
+            else None
+        )
+
+    @property
+    def attribution_enabled(self) -> bool:
+        """True when this scanner is attributing its reads."""
+        return self._attribution is not None
+
+    def take_attribution(self) -> AttributionPass:
+        """Drain what the last scan attributed. Empty when the feature is off."""
+        collector = self._attribution
+        return AttributionPass() if collector is None else collector.take()
+
+    def tombstone_rollups(self, *, since: DayKey) -> tuple[DayRollup, ...]:
+        """What rollouts that no longer exist contributed, from *since* on.
+
+        The self-audit's reconciliation term (roadmap item 2). A fresh index
+        reads only what is on disk **now**; the live store also holds the
+        contribution of files that have since been deleted, and that is
+        deliberate - a corpus prunes on a schedule of its own, and the tokens then survive only in
+        ``rollups.json``. Without this the audit would read every such day as
+        drift and "repair" it by deleting real, unrecoverable usage.
+
+        Only tombstoned entries are reported: a file still on disk is the
+        twin's business, not this one's.
+
+        **Takes the scan lock**, for the reason the Claude twin does: the audit
+        calls this from its own thread, and ``_states`` is the dict a scan
+        rewrites entry by entry (and, on a cold indexer, loads from disk).
+        """
+        with self._scan_lock:
+            self._ensure_states_loaded()
+            by_day: dict[DayKey, dict[str, ModelUsage]] = {}
+            for state in self._states.values():
+                if not state.is_tombstone:
+                    continue
+                for entry in state.ledger:
+                    if entry.day < since:
+                        continue
+                    bucket = by_day.setdefault(entry.day, {})
+                    bucket[entry.model] = (
+                        bucket.get(entry.model, ModelUsage()) + entry.usage
+                    )
+            return tuple(
+                DayRollup(day=day, models=by_day[day]) for day in sorted(by_day)
+            )
+
+    def legacy_tombstone_days(self, *, since: DayKey) -> tuple[DayKey, ...]:
+        """Days from *since* on where a **legacy** tombstone stands (item 2 fix).
+
+        A legacy tombstone marks a vanished rollout whose ledger never described
+        its whole contribution - tokens in ``rollups.json`` that neither a fresh
+        index nor :meth:`tombstone_rollups` can account for. The audit refuses to
+        repair this vendor while one stands in the audited window, because the
+        drift it measures may be exactly that unaccountable usage.
+        """
+        with self._scan_lock:
+            self._ensure_states_loaded()
+            days = {
+                state.legacy_day
+                for state in self._states.values()
+                if state.is_legacy_tombstone and state.legacy_day is not None
+                and state.legacy_day >= since
+            }
+        return tuple(sorted(days))
+
+    def audit_offsets(
+        self, *, since: DayKey
+    ) -> tuple[tuple[str, int, int, tuple[DayKey, ...]], ...]:
+        """``(path, inode, offset, in-window ledger days)`` per live entry.
+
+        What the audit twin is allowed to read (roadmap item 2, 2026-09-10);
+        see ``indexer.Indexer.audit_offsets`` for the reasoning, which is one
+        rule for both scanners. Tombstones are excluded - their contribution
+        reaches the audit through :meth:`tombstone_rollups`.
+
+        **Takes the scan lock**, like :meth:`tombstone_rollups`.
+        """
+        with self._scan_lock:
+            self._ensure_states_loaded()
+            out: list[tuple[str, int, int, tuple[DayKey, ...]]] = []
+            for path, state in self._states.items():
+                if state.is_tombstone:
+                    continue
+                days = tuple(
+                    sorted({entry.day for entry in state.ledger if entry.day >= since})
+                )
+                out.append((str(path), int(state.inode), int(state.offset), days))
+        return tuple(sorted(out))
+
+    def audit_unusable_paths(self) -> tuple[str, ...]:
+        """Snapshotted paths this twin could not read as snapshotted.
+
+        Every entry is a rollout whose inode moved under the live offset, so
+        the store holds a contribution no index can reproduce: those days are
+        reported as not comparable and never repaired.
+        """
+        if self._audit_limits is None:
+            return ()
+        vanished = set(self._audit_limits) - self._audit_seen
+        return tuple(sorted(self._audit_unusable | vanished))
+
+    def clone_for_audit(
+        self,
+        state_dir: os.PathLike[str] | str,
+        *,
+        lookback_days: int,
+        limits: Mapping[str, tuple[int, int]] | None = None,
+    ) -> CodexIndexer:
+        """A throwaway twin over the SAME corpus with its state in *state_dir*.
+
+        The seam the daily self-audit (roadmap item 2) re-indexes through. Same
+        class, same parser, same clock, a short window, and a scan state (plus
+        its quota sidecar) confined to a ``TemporaryDirectory``. It gets no
+        ``state_loader`` / ``state_saver``: it must start from zero offsets and
+        must never write where the live indexer writes. ``~/.codex`` itself is
+        read-only here as it is everywhere in this package.
+
+        *limits* is :meth:`audit_offsets` from the live scanner, snapshotted on
+        the worker thread: it bounds every read to the bytes the store was
+        actually built from (see ``_audit_limits``).
+        """
+        return CodexIndexer(
+            sessions_dir=self._sessions_dir,
+            state_path=os.path.join(
+                os.fspath(state_dir), "audit_codex_scan_state.json"
+            ),
+            lookback_days=lookback_days,
+            pricing=self._pricing,
+            chunk_files=self._chunk_files,
+            now=self._now,
+            audit_limits=limits,
+        )
 
     @property
     def state_count(self) -> int:
@@ -1292,6 +1556,11 @@ class CodexIndexer:
         self._states_at_load = False
         self._states_dirty = False
         self._resume_fingerprint = {}
+        if self._attribution is not None:
+            # A rebuild empties the attribution store too (app.py), so a
+            # collector still holding this pass's adds would put a contribution
+            # back that the re-read is about to make again.
+            self._attribution.forget()
         self._complete = False
         self._files_done = 0
         self._files_total = 0
@@ -1335,10 +1604,25 @@ class CodexIndexer:
         files_seen = 0
         skipped_unchanged = 0
         skipped_out_of_window = 0
+        limits = self._audit_limits
         for record in self._iter_rollouts(errors):
-            path, size, mtime, _inode = record
+            path, size, mtime, inode = record
             files_seen += 1
             seen.add(path)
+            if limits is not None:
+                # AUDIT TWIN ONLY: read exactly as far as the LIVE scanner had
+                # read this rollout when the snapshot was taken, or not at all.
+                bound = limits.get(path)
+                if bound is None:
+                    continue
+                snapshot_inode, ceiling = bound
+                if inode != snapshot_inode or size < ceiling:
+                    self._audit_unusable.add(path)
+                    continue
+                if ceiling <= 0:
+                    continue
+                size = ceiling
+                record = (path, size, mtime, inode)
             prev = states.get(path)
             # STEP 2 - the hot exit. This is the single predicate that keeps a
             # ~15 GB corpus inside a 30 ms tick, and nothing above this line
@@ -1361,6 +1645,8 @@ class CodexIndexer:
                 skipped_out_of_window += 1
                 continue
             work.append(record)
+        if limits is not None:
+            self._audit_seen |= seen
         return work, seen, files_seen, skipped_unchanged, skipped_out_of_window
 
     def _scan_locked(self, *, deadline: float | None) -> ScanResult:
@@ -1376,6 +1662,10 @@ class CodexIndexer:
         errors: list[str] = []
         stats = _Stats()
         counters: dict[DayKey, dict[VendorModelKey, list[int]]] = {}
+        # What this pass must take back OUT of the store before its deltas go
+        # in (roadmap item 1): the recorded contribution of every rollout being
+        # re-read from byte 0, and of every rollout that has vanished.
+        retractions: dict[DayKey, dict[VendorModelKey, list[int]]] = {}
 
         self._publish_progress(scanning=True)
 
@@ -1405,19 +1695,89 @@ class CodexIndexer:
             if processed and deadline is not None and time.monotonic() >= deadline:
                 interrupted = True
                 break
+            prev = self._states.get(path)
+            # The predicate that decides whether this read REPLACES the
+            # rollout's contribution or APPENDS to it. Evaluated here, before
+            # `_scan_file` overwrites the entry, and deliberately the same test
+            # `_scan_file` uses to choose its own offset - a divergence would
+            # either double-count (append after a reset) or under-count
+            # (retract on a resume).
+            restarted = prev is None or prev.needs_reset(size, inode)
+            if restarted:
+                # Retraction and re-read must be SYMMETRIC. The ledger below
+                # gives the store its tokens back; this drops the TRAP 4
+                # fingerprint carried from the partial read of a file that no
+                # longer exists, which would otherwise suppress the first
+                # identical record of the re-read.
+                self._resume_fingerprint.pop(path, None)
+            file_counters: dict[DayKey, dict[VendorModelKey, list[int]]] = {}
             new_state, stopped_early = self._scan_file(
                 path,
                 size=size,
                 mtime=mtime,
                 inode=inode,
                 window_start_key=window_start_key,
-                counters=counters,
+                counters=file_counters,
                 stats=stats,
                 errors=errors,
                 deadline=deadline,
             )
+            _fold_counters(counters, file_counters)
             if new_state is not None:
-                self._states[path] = new_state
+                if self._attribution is not None:
+                    # The scope this rollout's tokens went INTO, as persisted by
+                    # whichever process put them there. `codex_scope` reads the
+                    # `session_meta` line of the file that is on disk NOW, which
+                    # is the right answer for an append and the wrong one for a
+                    # path whose file was replaced while we were not running -
+                    # the retraction below has to go back to the project the
+                    # tokens actually left (`FileScanState.scope`).
+                    if prev is not None and prev.scope:
+                        self._attribution.remember(path, prev.scope)
+                    # Roadmap item 6 rides on roadmap item 1's events, in the
+                    # same order (retract, then add) and off the same
+                    # `restarted` predicate.
+                    if restarted and prev is not None and prev.ledger:
+                        self._attribution.retract(
+                            path, _windowed_ledger(prev.ledger, since=window_start_key)
+                        )
+                    self._attribution.add(path, file_counters)
+                if restarted and prev is not None and prev.ledger:
+                    _fold_ledger(retractions, prev.ledger, since=window_start_key)
+                base: tuple[LedgerEntry, ...] = (
+                    ()
+                    if restarted or prev is None
+                    else _windowed_ledger(prev.ledger, since=window_start_key)
+                )
+                # A read from byte 0 leaves a ledger that describes EVERYTHING
+                # this entry contributed; an append inherits what the previous
+                # entry could say, so a pre-ledger entry stays legacy until it
+                # is re-read whole (`FileScanState.ledger_complete`).
+                complete = (
+                    True if (restarted or prev is None) else prev.ledger_complete
+                )
+                # Only ever written while attribution is on; carried across
+                # every other pass so switching the feature off cannot erase the
+                # scope of tokens already in the cache.
+                scope_key = prev.scope if prev is not None else None
+                if self._attribution is not None:
+                    scope_key = self._attribution.scope_for(path).session_key
+                self._states[path] = new_state.advanced(
+                    inode=new_state.inode,
+                    size=new_state.size,
+                    mtime=new_state.mtime,
+                    offset=new_state.offset,
+                    last_model=new_state.last_model,
+                    ledger_complete=complete,
+                    scope=scope_key,
+                    ledger=merge_ledgers(
+                        base,
+                        _windowed_ledger(
+                            ledger_from_counters(file_counters),
+                            since=window_start_key,
+                        ),
+                    ),
+                )
                 self._states_dirty = True
             processed += 1
             if not self._complete:
@@ -1436,22 +1796,41 @@ class CodexIndexer:
                 # clean full pass - a transient scandir error must not be allowed
                 # to evict live entries.
                 for gone in [p for p in self._states if p not in seen_paths]:
-                    del self._states[gone]
-                    self._states_dirty = True
+                    # The file is gone. Its contribution is NOT retracted:
+                    # Codex rollouts are pruned on a schedule of their own, so an
+                    # aged-out file's money survives only in `rollups.json` and
+                    # zeroing it there is permanent and unrecoverable. What the
+                    # entry becomes instead is a TOMBSTONE carrying its ledger,
+                    # so a path that ever comes back (a restore, a sync agent,
+                    # a re-created id) reads as a reset and REPLACES that
+                    # contribution rather than doubling it.
+                    stale = self._states[gone]
+                    kept = _windowed_ledger(stale.ledger, since=window_start_key)
+                    legacy_day = legacy_day_for_vanished(
+                        stale, window_start=window_start_key
+                    )
+                    if self._attribution is not None:
+                        # The rollout is gone; its scope belongs on the
+                        # tombstone below, not in a cache that would otherwise
+                        # keep an entry for every file this process ever saw.
+                        self._attribution.forget_path(gone)
+                    if not kept and legacy_day is None:
+                        # Nothing left to protect: every day it touched has aged
+                        # out of the window. This is what bounds the state file.
+                        del self._states[gone]
+                        self._states_dirty = True
+                        continue
+                    replacement = FileScanState.tombstone(
+                        kept, legacy_day=legacy_day, scope=stale.scope
+                    )
+                    if replacement != stale:
+                        self._states[gone] = replacement
+                        self._states_dirty = True
             if not self._complete:
                 self._complete = True
                 self._files_done = self._files_total
 
-        deltas = tuple(
-            DayRollup(
-                day=day,
-                models={
-                    model: ModelUsage.from_counters(counter)
-                    for model, counter in sorted(models.items())
-                },
-            )
-            for day, models in sorted(counters.items())
-        )
+        deltas = _rollups_from_counters(counters)
         unknown = self._unknown_models(counters)
         # STEP 8, deliberately AFTER the deltas exist. Persisting "these bytes
         # are consumed" before the caller has the tokens they contained turns any
@@ -1467,6 +1846,7 @@ class CodexIndexer:
         )
         return ScanResult(
             deltas=deltas,
+            retractions=_rollups_from_counters(retractions),
             progress=self._progress,
             files_seen=files_seen,
             files_skipped_unchanged=skipped_unchanged,
@@ -1630,8 +2010,18 @@ class CodexIndexer:
                 oversize_hit = False
                 oversize_errors = 0
                 eof = False
+                # AUDIT TWIN ONLY: `size` was clamped to the live scanner's
+                # offset by `_collect`, and the read stops there - the bytes
+                # past it are the ones the store does not hold yet.
+                remaining = None if self._audit_limits is None else max(0, size - offset)
                 while not eof:
-                    chunk = fh.read(_READ_BUFFER)
+                    if remaining is None:
+                        chunk = fh.read(_READ_BUFFER)
+                    elif remaining <= 0:
+                        chunk = b""
+                    else:
+                        chunk = fh.read(min(_READ_BUFFER, remaining))
+                        remaining -= len(chunk)
                     if chunk:
                         buf += chunk
                     else:
