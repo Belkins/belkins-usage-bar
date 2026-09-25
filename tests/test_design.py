@@ -65,7 +65,9 @@ RELOGIN = "re-login needed — refresh token dead; log in with Claude Code, then
 
 def _settings(**overrides: Any) -> dict[str, Any]:
     """Today's live title settings (spec §2.1): icon off, scoped off, Codex % on,
-    cost off; everything else at its shipped default."""
+    cost off; everything else at its shipped default - except the menu, pinned
+    to the glance layout these tests describe (design 3 made a card theme the
+    default; tests/test_themes_switch.py covers the themes)."""
     settings = normalize_settings(dict(SETTINGS_DEFAULTS))
     settings.update(
         {
@@ -73,6 +75,7 @@ def _settings(**overrides: Any) -> dict[str, Any]:
             "title_show_cost": False,
             "title_show_scoped_pct": False,
             "title_show_codex_pct": True,
+            "menu_theme": "glance",
         }
     )
     settings.update(overrides)
@@ -916,7 +919,10 @@ def test_settings_offer_the_three_new_switches() -> None:
         app.rebuild_menu(real_snapshot())
         settings = app.menu["Settings"]
         top = [_title(i) for i in settings.values() if i is not None]
-        assert top[0] == "Title" and top[1] == "Classic menu layout", top
+        # Design 3: the classic toggle became one of Theme's five choices.
+        assert top[0] == "Title" and top[1] == "Theme", top
+        themes = [_title(i) for i in settings["Theme"].values() if i is not None]
+        assert themes == ["Apple", "Dense", "Cards", "Glance (text)", "Classic (text)"], themes
         title = [_title(i) for i in settings["Title"].values() if i is not None]
         assert "Merge alerts into ⚠N" in title and "Reset-credit marker (↺now)" in title, title
         app.rebuild_menu(claude_only_snapshot())

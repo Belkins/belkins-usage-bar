@@ -1,5 +1,29 @@
 # Changelog
 
+## 2026-09-25 — Native card themes: Cards (default), Apple, Dense
+
+The dropdown is now drawn by native views instead of text lines. **Settings ▸
+Theme** switches between three designs, applied immediately: **Cards**
+(default), **Apple** and **Dense**; **Glance** and **Classic** stay available
+as text layouts.
+
+- Real rounded bars, SF Pro with SF Pro Rounded figures (monospaced digits), a
+  fixed 360 pt width, hover highlight, click to switch (Claude rows), Log in
+  again (dead Codex logins), tooltips and VoiceOver labels on every card.
+- Colours chosen on a wallpaper-tinted menu, not a grey mock-up: information
+  text never uses the faint system tertiary, empty bars show a visible neutral
+  groove (a 0 % account no longer looks full), warning/critical text stays
+  vivid and meets AA contrast, a dead window's figure is dimmed, and green is
+  reserved for a usable reset credit.
+- Cards: near-opaque neutral panels so the wallpaper cannot wash the content
+  out; Needs attention carries an orange edge and copyable `cswap` chips; the
+  Codex fleet facts get their own line instead of being cut off.
+- More air throughout (card padding, row pitch, pauses between attention
+  items), within a height that fits a 14" MacBook menu.
+- New setting `menu_theme` (`cards` | `apple` | `dense` | `glance` |
+  `classic`, default `cards`); a stored `menu_layout_classic: true` migrates to
+  `classic`. Any drawing failure falls back to Glance for that rebuild.
+
 ## 2026-09-25 — Menu redesign (glance layout)
 
 The dropdown now opens on a **Claude** card and a **Codex** card that answer,

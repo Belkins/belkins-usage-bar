@@ -1782,7 +1782,8 @@ def test_derived_usage_state_reaches_title_and_menu() -> None:
         five_hour_pct=47.0, seven_day_pct=78.0,
     )
     settings = normalize_settings(dict(SETTINGS_DEFAULTS))
-    settings.update({"title_show_icon": False, "title_show_cost": False})
+    # menu_theme pins the text layout these line assertions read (design 3).
+    settings.update({"title_show_icon": False, "title_show_cost": False, "menu_theme": "glance"})
     app = app_mod.CCUsageWidgetApp()
     try:
         plain = UiSnapshot(settings=settings, accounts=(idle, active), active=active)
@@ -2989,7 +2990,8 @@ def test_switch_best_is_one_click_and_dims_with_nowhere_to_go() -> None:
     """
     active = _switch_row(1, "main", five=100.0, active=True)
     other = _switch_row(3, "podol", five=100.0, reset="00:00")
-    settings = normalize_settings(dict(SETTINGS_DEFAULTS))
+    # menu_theme pins the text layout whose top-level item this reads (design 3).
+    settings = normalize_settings({**SETTINGS_DEFAULTS, "menu_theme": "glance"})
     app = app_mod.CCUsageWidgetApp()
     try:
         alone = UiSnapshot(settings=settings, accounts=(active,), active=active)
@@ -7151,7 +7153,7 @@ def test_alert_line_not_duplicated_by_recent_block() -> None:
     try:
         active = _ux_row(1, "main", five=7.0, active=True)
         snap = UiSnapshot(
-            settings=_fleet_settings(),
+            settings=_fleet_settings(menu_theme="glance"),  # the text layout (design 3)
             accounts=(active,),
             active=active,
             alert=(ALERT_EXTERNAL_SWITCH, line),

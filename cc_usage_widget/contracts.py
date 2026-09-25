@@ -2874,6 +2874,8 @@ SETTINGS_DEFAULTS: dict[str, Any] = {
     "title_merge_alerts": False,
     "title_show_reset_credit": True,
     "menu_layout_classic": False,
+    # --- menu themes (design 3, 2026-09-25) ------------------------------
+    "menu_theme": "cards",
 }
 """Full ``settings.json`` schema with defaults.
 
@@ -3026,6 +3028,15 @@ Notification keys (roadmap item 7, ``notify.py``):
     no Claude accounts and no live Codex row (the Codex-only features-off and
     never-onboarded machines), which keeps them byte-for-byte as they were.
 
+``menu_theme``
+    Defaults ``"cards"`` (design 4; ``"apple"`` in design 3). Which dropdown to draw: one of the three
+    native card themes (``apple``, ``dense``, ``cards``; each followed by the
+    same native tail) or one of the text layouts (``glance``, ``classic``).
+    Picked in Settings ▸ Theme. A file written before this key existed with
+    ``menu_layout_classic: true`` migrates to ``"classic"``; the Theme menu
+    keeps ``menu_layout_classic`` equal to ``menu_theme == "classic"``, and a
+    true ``menu_layout_classic`` still means the classic layout on its own.
+
 **These keys must be declared here to exist.** :func:`normalize_settings`
 drops unknown keys, so a vendor setting added only in ``app.py`` would be
 silently discarded on the next save.
@@ -3047,6 +3058,7 @@ would defeat the whole design.
 
 SETTINGS_CHOICES: dict[str, tuple[str, ...]] = {
     "codex_pricing_tier": ("standard", "fast", "batch"),
+    "menu_theme": ("apple", "dense", "cards", "glance", "classic"),
 }
 """Allowed values for the string settings, first entry = the default.
 
@@ -3095,6 +3107,10 @@ def normalize_settings(raw: Mapping[str, Any] | None) -> dict[str, Any]:
             choices = SETTINGS_CHOICES.get(key, ())
             if isinstance(value, str) and value in choices:
                 out[key] = value
+    # Design 3 migration: a file from before `menu_theme` that chose the
+    # classic rollback keeps the classic menu rather than jumping to a theme.
+    if "menu_theme" not in raw and out["menu_layout_classic"] is True:
+        out["menu_theme"] = "classic"
     return out
 
 

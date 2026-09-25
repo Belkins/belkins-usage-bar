@@ -70,7 +70,7 @@ import threading
 import time
 import traceback
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Final, Iterator, NamedTuple, Sequence
+from typing import Any, Callable, Final, Iterable, Iterator, NamedTuple, Sequence
 
 import rumps
 
@@ -141,6 +141,14 @@ try:  # CX-5/CX-7b: Codex relogin UX, optional the same way
     from . import codex_login as _codex_login
 except Exception:  # pragma: no cover - codex_login is optional at import time
     _codex_login = None  # type: ignore[assignment]
+
+
+try:  # design 3: native card themes; without them every theme renders as glance
+    from . import card_base as _card_base
+    from . import themes as _themes
+except Exception:  # pragma: no cover - the text layouts need neither
+    _card_base = None  # type: ignore[assignment]
+    _themes = None  # type: ignore[assignment]
 
 
 __all__ = [
@@ -246,9 +254,15 @@ _TITLE_TOGGLES = (
 _VENDOR_TITLE_TOGGLES = ("title_show_codex_pct", "title_show_reset_credit")
 """Title toggles that only mean something where a Codex source exists."""
 
-_CLASSIC_LAYOUT_LABEL = "Classic menu layout"
-"""Settings item for ``menu_layout_classic`` (design wave 2): the rollback to
-today's menu order, wording and ``resets …`` format."""
+_THEME_MENU_LABEL = "Theme"
+"""Settings submenu for ``menu_theme`` (design 3). It replaced design wave 2's
+``Classic menu layout`` toggle: Classic is one of its choices."""
+
+_THEME_LABELS: dict[str, str] = (
+    dict(_themes.THEME_LABELS)
+    if _themes is not None
+    else {"glance": "Glance (text)", "classic": "Classic (text)"}
+)
 
 _COMPACT_TITLE_LABEL = "Compact (V\u00b7C 100/100)"
 """The Title submenu's name for ``title_compact``.
@@ -411,6 +425,29 @@ def _open_in_browser(path: Any) -> bool:
     if not opened:
         _log(f"could not open {path}: no handler accepted it")
     return opened
+
+
+def _open_web_url(url: str) -> bool:
+    """Open an ``http(s)`` URL in the default browser (a theme's link action).
+
+    **AppKit thread only**, behind the same :data:`_NO_REVEAL_ENV` guard as
+    :func:`_open_in_browser`; any other scheme is refused, so a theme cannot
+    turn a string into a file or app launch. Returns True when handed off.
+    """
+    text = str(url or "")
+    if not re.match(r"^https?://[^\s]+$", text):
+        _log(f"open refused: not an http(s) URL: {text[:80]!r}")
+        return False
+    if os.environ.get(_NO_REVEAL_ENV):
+        _log(f"open suppressed ({_NO_REVEAL_ENV}): {text}")
+        return False
+    try:
+        import AppKit
+
+        return bool(AppKit.NSWorkspace.sharedWorkspace().openURL_(AppKit.NSURL.URLWithString_(text)))
+    except Exception as exc:
+        _log(f"could not open {text}: {exc!r}")
+        return False
 
 
 def _confirm(title: str, message: str, ok: str = "OK") -> bool:
@@ -4837,6 +4874,78 @@ class BackgroundWorker:
 # ---------------------------------------------------------------------------
 
 
+class _CallbackRegistry(dict):
+    """rumps' NSMenuItem -> (MenuItem, callback) map, where an item this app
+    has retired answers a late click with a no-op instead of a KeyError
+    raised inside an AppKit action."""
+
+    def __missing__(self, _key: Any) -> tuple[None, Callable[[Any], None]]:
+        return (None, _ignore_retired_click)
+
+
+def _ignore_retired_click(_sender: Any) -> None:
+    return None
+
+
+def _menu_natives(items: Iterable[Any]) -> list[Any]:
+    """Every NSMenuItem under *items* (rumps MenuItems), submenus included."""
+    out: list[Any] = []
+    stack = [item for item in items if item is not None]
+    while stack:
+        item = stack.pop()
+        native = getattr(item, "_menuitem", None)
+        if native is not None:
+            out.append(native)
+        try:
+            stack.extend(child for child in item.values() if child is not None)
+        except Exception:
+            pass
+    return out
+
+
+def _callback_registry() -> dict[Any, Any] | None:
+    """rumps' class-level NSMenuItem -> (MenuItem, callback) map, made a
+    :class:`_CallbackRegistry` on first use; ``None`` if rumps changed shape."""
+    owner = getattr(getattr(rumps, "rumps", None), "NSApp", None)
+    registry = getattr(owner, "_ns_to_py_and_callback", None)
+    if not isinstance(registry, dict):
+        return None
+    if not isinstance(registry, _CallbackRegistry):
+        registry = _CallbackRegistry(registry)
+        owner._ns_to_py_and_callback = registry
+    return registry
+
+
+def _retire_natives(natives: Iterable[Any], keep: Iterable[Any] = ()) -> int:
+    """Release NSMenuItems that are no longer shown (review appkit-2).
+
+    rumps records every MenuItem it creates in the class-level registry and
+    never removes one, so every rebuild kept the whole previous menu alive -
+    and under a card theme each BlockView with its Block, its paint/action
+    closures and their snapshot. Drops the registry entry and detaches the
+    view of each of *natives* not in *keep*. Returns how many it dropped.
+    """
+    registry = _callback_registry()
+    if registry is None:
+        return 0
+    kept = set(keep)
+    dropped = 0
+    for native in natives:
+        if native in kept:
+            continue
+        try:
+            view = native.view()
+            if view is not None:
+                if hasattr(view, "block"):
+                    view.block = None
+                native.setView_(None)
+        except Exception:
+            pass
+        if registry.pop(native, None) is not None:
+            dropped += 1
+    return dropped
+
+
 def _dedupe_titles(items: Sequence[Any]) -> list[Any]:
     """Make every title in one menu level unique.
 
@@ -5791,21 +5900,41 @@ class CCUsageWidgetApp(rumps.App):
     def rebuild_menu(self, snapshot: UiSnapshot | None = None) -> None:
         """Rebuild the whole menu from *snapshot*. Main thread only.
 
-        Two layouts (design wave 2): the glance layout is the default; the
-        classic one is today's menu byte for byte, chosen by
-        ``menu_layout_classic`` or automatically when there is nothing for the
-        glance layout to summarise (:meth:`_menu_layout`). Both are pure item
-        builders over the snapshot - no I/O on this thread (SPEC 2.3).
+        ``menu_theme`` picks the layout (:meth:`_menu_layout`): one of the
+        three native card themes (design 3; blocks from ``themes/`` then the
+        common native tail), or the glance / classic text layouts (design wave
+        2), which render byte for byte as before. Classic is also chosen
+        automatically when there is nothing to summarise. A card theme that
+        fails to build falls back to glance for that rebuild. Every builder
+        is pure over the snapshot - no I/O on this thread (SPEC 2.3).
         """
         snapshot = snapshot or self.snapshot()
         self.title = self.render_title(snapshot)
         self._install_icon_once()
-        if self._menu_layout(snapshot) == "classic":
+        layout = self._menu_layout(snapshot)
+        items = None
+        if layout == "classic":
             items = self._rebuild_classic(snapshot)
-        else:
+        elif _themes is not None and layout in _themes.THEMES:
+            items = self._rebuild_themed(snapshot, layout)
+        if items is None:
             items = self._rebuild_glance(snapshot)
+        shown = _menu_natives(self.menu.values())
         self.menu.clear()
         self.menu = _dedupe_titles(items)
+        # rumps never forgets a MenuItem (review appkit-2). Release the menu
+        # from the rebuild BEFORE the one just replaced - one rebuild of
+        # grace, so a submenu still open from the old menu keeps working -
+        # and every item this rebuild made but did not place in the menu.
+        new = _menu_natives(self.menu.values())
+        registry = _callback_registry()
+        known = self.__dict__.get("_known_natives")
+        orphans = [] if registry is None or known is None else [k for k in registry if k not in known]
+        retiring = (self.__dict__.get("_retiring_menu") or []) + orphans
+        self._retiring_menu = shown
+        if retiring:
+            _retire_natives(retiring, keep=new + shown)
+        self._known_natives = set(new) | set(shown)
         # Last: rumps' title setter calls `setTitle_`, which wipes attributes.
         self._apply_title_attributes(snapshot)
 
@@ -5815,19 +5944,186 @@ class CCUsageWidgetApp(rumps.App):
         return time.time()
 
     def _menu_layout(self, snapshot: UiSnapshot) -> str:
-        """``"classic"`` or ``"glance"`` for *snapshot* (spec §5.4).
+        """``"classic"``, ``"glance"`` or a card theme name for *snapshot*.
 
-        Classic when the operator asked for it, OR when the snapshot has no
-        Claude accounts and no LIVE Codex row: the glance cards would have
-        nothing to summarise, and this is what keeps the Codex-only
-        features-off machine and the never-onboarded machine byte-for-byte
-        (SPEC-CODEX 6 item 4).
+        Classic when the operator asked for it (``menu_theme == "classic"``,
+        or the older ``menu_layout_classic`` switch, which still means classic
+        on its own), OR when the snapshot has no Claude accounts and no LIVE
+        Codex row: there is nothing to summarise, and this is what keeps the
+        Codex-only features-off machine and the never-onboarded machine
+        byte-for-byte (SPEC-CODEX 6 item 4, spec §5.4). A card theme without
+        AppKit (or without the themes package) renders as glance.
         """
-        if snapshot.settings.get("menu_layout_classic", SETTINGS_DEFAULTS["menu_layout_classic"]):
+        theme = self._theme_choice(snapshot.settings)
+        if theme == "classic":
             return "classic"
         if not snapshot.accounts and not self._live_quota_rows(snapshot):
             return "classic"
+        if (
+            _themes is not None
+            and _card_base is not None
+            and theme in _themes.THEMES
+            and _card_base.available()
+        ):
+            return theme
         return "glance"
+
+    @staticmethod
+    def _theme_choice(settings: dict[str, Any]) -> str:
+        """The theme the operator chose: ``menu_theme``, except that a true
+        ``menu_layout_classic`` (the design-wave-2 rollback) means classic."""
+        if settings.get("menu_layout_classic", SETTINGS_DEFAULTS["menu_layout_classic"]):
+            return "classic"
+        theme = settings.get("menu_theme", SETTINGS_DEFAULTS["menu_theme"])
+        return theme if theme in SETTINGS_CHOICES["menu_theme"] else SETTINGS_DEFAULTS["menu_theme"]
+
+    # -- card themes (design 3) ---------------------------------------------
+
+    def _rebuild_themed(self, snapshot: UiSnapshot, theme: str) -> list[Any] | None:
+        """The theme's blocks as view items, then the common native tail.
+
+        ``None`` - and one log line per theme and failure type - when AppKit or
+        the theme fails; the caller then renders glance for this rebuild, so a
+        drawing bug can cost the cards but never the menu.
+        """
+        try:
+            blocks = _themes.build_blocks(theme, snapshot, self._now(), self._theme_actions(snapshot))
+            items: list[Any] = list(_card_base.menu_items_for(blocks))
+        except Exception as exc:
+            seen = self.__dict__.setdefault("_theme_failures", set())
+            key = f"{theme}:{type(exc).__name__}"
+            if key not in seen:
+                seen.add(key)
+                _log(f"menu theme {theme!r} failed, showing glance: {_describe(exc)}")
+            return None
+        tail = self._card_tail_items(snapshot)
+        if items and tail:
+            items.append(None)
+        items.extend(tail)
+        return items
+
+    def _theme_actions(self, snapshot: UiSnapshot) -> Any:
+        """:class:`themes.ThemeActions` bound to this app's (enqueueing) callbacks."""
+        by_slot = {row.slot: row for row in snapshot.accounts}
+
+        def switch_to(slot: int) -> None:
+            row = by_slot.get(slot)
+            target = (row.alias or str(row.slot)) if row is not None else str(slot)
+            self._worker.submit(_CMD_SWITCH_TO, target)
+
+        def codex_login_for(row: AccountRow) -> Callable[[], None] | None:
+            callback = self._codex_login_callback(row)
+            if callback is None:
+                return None
+            return lambda: callback(None)
+
+        def codex_login(row: AccountRow) -> bool:
+            action = codex_login_for(row)
+            if action is None:
+                return False
+            action()
+            return True
+
+        # The glance Needs attention's non-account lines, verbatim (engine
+        # verdict, external-switch alert, switch note): the SAME slice, except
+        # that an external-switch / ghost-flip alert is kept even while it is
+        # the newest journal line - glance drops it then because its inline
+        # Recent-switches line says it, and no card theme draws that line.
+        extras = tuple(
+            str(getattr(item, "title", ""))
+            for item in self._alert_items(snapshot, inline_recent=False)[len(snapshot.account_notes):]
+        )
+        return _themes.ThemeActions(
+            switch_to=switch_to,
+            switch_best=lambda: self._on_switch_best(None),
+            codex_login=codex_login,
+            codex_login_for=codex_login_for,
+            open_url=_open_web_url,
+            refresh=lambda: self._on_refresh_now(None),
+            attention_extras=extras,
+        )
+
+    def _card_tail_items(self, snapshot: UiSnapshot) -> list[Any]:
+        """The native NSMenuItems under every card theme (design2-spec §7),
+        one per :func:`themes.tail_rows` row, in that order."""
+        problems = [str(item.title) for item in self._problem_items(snapshot)]
+        items: list[Any] = []
+        for row in _themes.tail_rows(snapshot, problems=problems):
+            if row is None:
+                items.append(None)
+                continue
+            item = self._card_tail_item(snapshot, row)
+            if item is not None:
+                items.append(item)
+        return items
+
+    def _card_tail_item(self, snapshot: UiSnapshot, row: dict[str, Any]) -> Any:
+        kind = row["id"]
+        title = row["title"]
+        detail = row.get("detail") or ""
+        if kind == "problem":
+            item = _info(title)
+            full = row.get("tooltip") or ""
+            if full and full != title:
+                item._menuitem.setToolTip_(full)
+            return item
+        if kind == "cost":
+            return _submenu(title, self._cost_items(snapshot)[1:])
+        if kind == "best":
+            # The glance item itself, so the no-target dimming is the same.
+            return self._switch_items(snapshot)[2]
+        if kind == "sessions":
+            item = _submenu(title, self._session_items(snapshot))
+        elif kind == "recent":
+            recent = self._recent_switch_items(snapshot)
+            item = recent[1] if len(recent) > 1 else _submenu(title, [])
+        elif kind == "autoswitch":
+            item = _check(
+                rumps.MenuItem(title, callback=self._on_toggle_autoswitch),
+                bool(row.get("check")),
+            )
+        elif kind == "cost_tracking":
+            item = _check(
+                rumps.MenuItem(title, callback=self._on_toggle_cost_tracking),
+                bool(row.get("check")),
+            )
+        elif kind == "switch":
+            return self._switch_account_submenu(snapshot, reset_style="mark")
+        elif kind == "all":
+            return _submenu(title, self._all_windows_items(snapshot))
+        elif kind == "refresh":
+            return rumps.MenuItem(title, callback=self._on_refresh_now, key="r")
+        elif kind == "settings":
+            return self._settings_submenu(snapshot)
+        elif kind == "quit":
+            return rumps.MenuItem(title, callback=self._on_quit, key="q")
+        else:  # pragma: no cover - tail_rows and this map are one contract
+            return None
+        if detail and _card_base is not None:
+            _card_base.apply_native_title(item, [(title, "label"), (f"  {detail}", "secondary")])
+        return item
+
+    def _all_windows_items(self, snapshot: UiSnapshot) -> list[Any]:
+        """``All windows & resets ▸``: every Claude bar and window (noted slots
+        included, dim) then every Codex row - the glance menu's two ``All …
+        bars`` submenus in one."""
+        items: list[Any] = []
+        claude = [
+            item
+            for item in self._account_items(snapshot, reset_style="mark")
+            if str(getattr(item, "title", "")) != "Accounts"
+        ]
+        if claude:
+            items.append(render.section_header("Claude"))
+            items.extend(claude)
+        codex = self._quota_items(snapshot, reset_style="mark", plan_style="label")
+        if codex:
+            if items:
+                items.append(None)
+            items.extend(codex)
+        if not items:
+            items.append(_info("No accounts"))
+        return items
 
     def _live_quota_rows(self, snapshot: UiSnapshot) -> tuple[AccountRow, ...]:
         """Visible per-account Codex rows (negative slots), in row order."""
@@ -6420,7 +6716,7 @@ class CCUsageWidgetApp(rumps.App):
         except Exception:
             return False
 
-    def _alert_items(self, snapshot: UiSnapshot) -> list[rumps.MenuItem]:
+    def _alert_items(self, snapshot: UiSnapshot, *, inline_recent: bool = True) -> list[rumps.MenuItem]:
         """Standing problems that need the operator, right under the header.
 
         One line per slot with a derived usage state (verbatim claude-swap
@@ -6457,9 +6753,11 @@ class CCUsageWidgetApp(rumps.App):
                 # the opposite of what this verdict says. Skipped while it IS
                 # the newest journal line (the adapter writes both from one
                 # string): the Recent switches line already says it, and the
-                # same sentence twice read as two flips (UX-6).
+                # same sentence twice read as two flips (UX-6). A layout with
+                # no inline Recent line (the card themes) passes
+                # inline_recent=False and always keeps it.
                 newest = snapshot.recent_events[-1] if snapshot.recent_events else None
-                if newest != snapshot.alert[1]:
+                if not inline_recent or newest != snapshot.alert[1]:
                     items.append(_info(f"⚠ {line}"))
             else:
                 glyph = "⛔" if kind == ALERT_ALL_EXHAUSTED else "⚠"
@@ -7429,21 +7727,10 @@ class CCUsageWidgetApp(rumps.App):
             )
         # Directly under `Title`, where the vendor switch has always been.
         children[1:1] = codex_children
-        # Design wave 2: the layout rollback sits right under Title - it is the
-        # other "how does the menu look" control.
-        classic_on = bool(
-            settings.get("menu_layout_classic", SETTINGS_DEFAULTS["menu_layout_classic"])
-        )
-        children.insert(
-            1,
-            _check(
-                rumps.MenuItem(
-                    _CLASSIC_LAYOUT_LABEL,
-                    callback=self._make_setting_toggle("menu_layout_classic"),
-                ),
-                classic_on,
-            ),
-        )
+        # Design 3: Theme sits right under Title - it is the other "how does
+        # the menu look" control, and it replaces design wave 2's classic
+        # toggle (Classic is one of its five choices).
+        children.insert(1, self._theme_submenu(settings))
         audit_on = bool(
             settings.get("self_audit_enabled", SETTINGS_DEFAULTS["self_audit_enabled"])
         )
@@ -7513,6 +7800,43 @@ class CCUsageWidgetApp(rumps.App):
         children.append(None)
         children.extend(self._diagnostic_items(snapshot))
         return _submenu("Settings", children)
+
+    def _theme_submenu(self, settings: dict[str, Any]) -> rumps.MenuItem:
+        """``Theme ▸ Apple / Dense / Cards / Glance (text) / Classic (text)``.
+
+        A checkmark on the current choice; a click applies at once (an
+        optimistic repaint) and the worker persists it.
+        """
+        current = self._theme_choice(settings)
+        return _submenu(
+            _THEME_MENU_LABEL,
+            [
+                _check(
+                    rumps.MenuItem(_THEME_LABELS.get(theme, theme), callback=self._make_theme_choice(theme)),
+                    current == theme,
+                )
+                for theme in SETTINGS_CHOICES["menu_theme"]
+            ],
+        )
+
+    def _make_theme_choice(self, theme: str) -> Callable[[Any], None]:
+        """Apply *theme*: ``menu_theme`` = *theme* and ``menu_layout_classic``
+        kept equal to ``theme == "classic"``, so the older switch never
+        overrides a newer choice. Two worker commands, theme first: every
+        intermediate publish shows either the old or the new menu."""
+
+        def callback(_sender: Any) -> None:
+            snapshot = self.snapshot()
+            classic = theme == "classic"
+            self._optimistic(
+                settings=normalize_settings(
+                    {**snapshot.settings, "menu_theme": theme, "menu_layout_classic": classic}
+                )
+            )
+            self._worker.submit(_CMD_SET_SETTING, ("menu_theme", theme))
+            self._worker.submit(_CMD_SET_SETTING, ("menu_layout_classic", classic))
+
+        return callback
 
     def _codex_tier_submenu(self, settings: dict[str, Any]) -> rumps.MenuItem:
         """``Pricing tier ▸ standard / fast / batch`` (roadmap item 11).

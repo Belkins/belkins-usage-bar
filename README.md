@@ -104,9 +104,18 @@ tools. Every reset reads the same way everywhere: `↺ 14:50` today, `↺ Thu
 20:25` this week, `↺ Oct 2 10:49` later, `↺ overdue` once passed. The full
 bars are one submenu away (**All Claude bars ▸**, **All Codex bars ▸**).
 
-**Settings ▸ Classic menu layout** (`menu_layout_classic`) brings back the
-previous menu exactly; it is also what a machine with no Claude accounts and no
-live Codex row shows. **Settings ▸ Title ▸ Merge alerts into ⚠N**
+**Settings ▸ Theme** (`menu_theme`) picks how the dropdown is drawn:
+**Cards** (default: one rounded panel per provider, the active account large,
+the others one line each, fixes as copyable `cswap` chips), **Apple** (the
+language of Control Center: hero lines, section headers, symbols, two-line
+rows), **Dense** (every account on one aligned line; the shortest menu), or the
+text layouts **Glance** (described above) and **Classic** (the previous menu,
+exactly). The three card themes are drawn by native views in the system font,
+with rounded figures and colours chosen to stay readable on a menu tinted by
+your wallpaper; clicking a Claude row switches to it, a dead Codex login opens
+Log in again. A stored `menu_layout_classic: true` still means Classic, and
+Classic is also what a machine with no Claude accounts and no live Codex row
+shows under the Glance theme. **Settings ▸ Title ▸ Merge alerts into ⚠N**
 (`title_merge_alerts`, off) folds `C⚠` and the bare `⚠` into one count that
 matches the Needs attention section, which makes the title narrower. When the
 Codex account you are on is capped and holds a usable reset credit, its
