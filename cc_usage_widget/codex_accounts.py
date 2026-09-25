@@ -49,23 +49,22 @@ locally (base64url payload, **no signature check** — display and scheduling
 only) and starts saying ``relogin in 1d 4h`` 48 h out, then ``relogin`` when it
 passes.
 
-:class:`TokenRefresher` (roadmap 13) can POST the OAuth refresh grant that
-would avoid that relogin, but ``codex_refresh_enabled`` defaults to **False**
-and while it is False the class is never called: not one token request is made,
-and ``auth.json`` is read and never written — which is the only reason this
-module is allowed to hold a write path to a credential file at all. Whether two
-``codex login`` sessions under one public OAuth client share a refresh-token
-family is still unverified, and a wrong guess logs Vlad out of the account he
-is coding in.
-
-*What opens the switch:* ``python -m cc_usage_widget.codex_accounts
-probe-refresh <alias>`` on a throwaway account — one grant, persisted, then one
-usage GET proving the new token works — followed by a 24 h soak confirming the
-other stores and ``~/.codex`` still work (SPEC-CODEX 6.4). Until that result
-exists the 10-day relogin is the shipped cost and it is stated on the row
-rather than hidden. There is deliberately **no replay path**: a superseded
-refresh token is overwritten in place, never kept in a ``.prev`` file, so the
-reuse-detection question can only be asked on purpose.
+:class:`TokenRefresher` (roadmap 13) POSTs the OAuth refresh grant that
+avoids that relogin. ``codex_refresh_enabled`` defaults to **True** since
+2026-09-25: it shipped False, and on 2026-09-20 every widget copy expired and
+stayed dead for five days. The 2026-09-25 ``probe-refresh`` runs showed that
+rotating one widget copy did not log out ``~/.codex``. Four guards bound the
+write path (SPEC-CODEX 6.4): the account ``~/.codex`` is logged in as is never
+rotated (our copy may share the app's family), and the guard fails closed when
+that file cannot be read (the last account it named stays protected); a terminal refusal is remembered
+per file signature (``refresh_dead_sig``) across polls and restarts; a file the
+Codex CLI rotated while our POST was in flight is kept, never overwritten; and
+the app's own ``~/.codex`` token is borrowed read-only for its account
+(:meth:`CredentialStore.read_desktop`) and never refreshed. With the switch
+off not one token request is made and ``auth.json`` is only read. There is
+deliberately **no replay path**: a superseded refresh token is overwritten in
+place, never kept in a ``.prev`` file, so the reuse-detection question can only
+be asked on purpose.
 
 Threading
 =========
@@ -110,7 +109,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, NamedTuple, Protocol, Sequence
 
@@ -286,6 +285,12 @@ endpoint's clock and ours differ by seconds, and a window that flips to
 ``overdue`` two seconds early is a lie about a healthy account."""
 
 _CYCLE_SLEEP_MAX_SECONDS = 30.0
+_SLOW_REQUEST_MS = 3000
+"""A usage GET slower than this is logged even when its status is unchanged
+(OPS-4); a fast 200 that matches the last one logged is not."""
+_ANNOUNCED_NOTES = frozenset({NOTE_RELOGIN, NOTE_NO_CREDENTIAL, NOTE_OFFLINE})
+"""The notes whose arrival and departure are written to the log once each
+(OPS-3): the ones that mean no figure will appear until something changes."""
 """Longest the poller sleeps between cycles even when nothing is due, so the
 wake detector runs soon after the lid opens."""
 
@@ -438,6 +443,26 @@ def _model_availability(raw: Any) -> tuple[tuple[tuple[str, float], ...], bool]:
     return tuple(entries), would_enable
 
 
+def _reset_credits(raw: Any) -> tuple[int | None, int | None]:
+    """``rate_limit_reset_credits`` -> ``(available, usable)``, each or ``None``.
+
+    ``available`` is ``available_count``; ``usable`` is our reading of
+    ``applicable_available_count`` (inference from the 2026-09-25 bodies: one
+    credit held, 0 applicable on an uncapped account). The object arrived as
+    ``{}`` on an older Pro body, so a missing key, junk, a negative count or a
+    non-object is UNKNOWN - never 0, which would tell the user they hold none.
+    """
+    if not isinstance(raw, Mapping):
+        return None, None
+    available, usable = (
+        _to_int(raw.get(key)) for key in ("available_count", "applicable_available_count")
+    )
+    return (
+        available if available is not None and available >= 0 else None,
+        usable if usable is not None and usable >= 0 else None,
+    )
+
+
 def _reached_type(value: Any) -> str | None:
     """``rate_limit_reached_type`` as a string, whichever shape it arrives in.
 
@@ -540,6 +565,17 @@ def _format_reset_date(epoch: float) -> str:
     except (OSError, OverflowError, ValueError):  # pragma: no cover - absurd epoch
         return ""
     return f"{when:%b} {when.day}"
+
+
+def _format_instant(epoch: float | None) -> str:
+    """``"Sep 20 11:13"`` (local time) for a log line, or ``"at an unknown time"``."""
+    if epoch is None:
+        return "at an unknown time"
+    try:
+        when = dt.datetime.fromtimestamp(epoch)
+    except (OSError, OverflowError, ValueError):  # pragma: no cover - absurd epoch
+        return "at an unknown time"
+    return f"{when:%b} {when.day} {when:%H:%M}"
 
 
 def _format_count(value: float) -> str:
@@ -817,6 +853,11 @@ class CodexAccountQuota:
     back. They are counts and instants the endpoint stated, never a price and
     never a unit we guessed — ``credits.balance`` renders as ``credits 12``
     with no currency, and ``available_at`` as a date.
+
+    ``rate_limit_reset_credits`` is carried as two counters (display only; no
+    API to consume a reset credit is known). ``rate_limit_upsell``, present on
+    a capped body, is ignored on purpose: it is OpenAI marketing copy
+    (``Add Credits`` banners), not a fact about this account's quota.
     """
 
     account_id: str
@@ -845,6 +886,15 @@ class CodexAccountQuota:
     NOT available yet, soonest first. The slug is the vendor's own
     (``gpt-6-astra``) — the same choice ``pricing.MODEL_DISPLAY_NAMES`` makes
     for OpenAI models, and the name the user sees everywhere else in the menu."""
+    reset_credits_available: int | None = None
+    """``rate_limit_reset_credits.available_count``: reset credits HELD.
+    ``None`` = unknown (missing, junk, or the ``{}`` an older Pro body sent),
+    never 0."""
+    reset_credits_usable: int | None = None
+    """``rate_limit_reset_credits.applicable_available_count`` — "usable" is our
+    READING of that key (inference from the 2026-09-25 bodies: 1 held, 0
+    applicable on an uncapped account), not a documented meaning. ``None`` =
+    unknown, never 0."""
 
     # -- construction ------------------------------------------------------
 
@@ -953,6 +1003,7 @@ class CodexAccountQuota:
         credits = credits if isinstance(credits, Mapping) else {}
         raw_has = credits.get("has_credits")
         availability, would_enable = _model_availability(body.get("model_usage"))
+        resets_available, resets_usable = _reset_credits(body.get("rate_limit_reset_credits"))
 
         return cls(
             account_id=credential_account_id,
@@ -969,6 +1020,8 @@ class CodexAccountQuota:
             credits_has=raw_has if isinstance(raw_has, bool) else None,
             credits_would_enable=would_enable,
             availability=availability,
+            reset_credits_available=resets_available,
+            reset_credits_usable=resets_usable,
         )
 
     # -- persistence -------------------------------------------------------
@@ -991,6 +1044,8 @@ class CodexAccountQuota:
             "credits_has": self.credits_has,
             "credits_would_enable": self.credits_would_enable,
             "availability": [[slug, when] for slug, when in self.availability],
+            "reset_credits_available": self.reset_credits_available,
+            "reset_credits_usable": self.reset_credits_usable,
         }
 
     @classmethod
@@ -1033,6 +1088,14 @@ class CodexAccountQuota:
                 if slug and when is not None:
                     availability.append((slug, when))
         raw_has = obj.get("credits_has")
+        # A sidecar written before the reset counters existed has no keys and
+        # reads back as unknown (None), never as 0.
+        resets_available, resets_usable = _reset_credits(
+            {
+                "available_count": obj.get("reset_credits_available"),
+                "applicable_available_count": obj.get("reset_credits_usable"),
+            }
+        )
         return cls(
             account_id=account_id,
             email=_to_str(obj.get("email")),
@@ -1051,6 +1114,8 @@ class CodexAccountQuota:
             credits_has=raw_has if isinstance(raw_has, bool) else None,
             credits_would_enable=_to_bool(obj.get("credits_would_enable"), False),
             availability=tuple(availability),
+            reset_credits_available=resets_available,
+            reset_credits_usable=resets_usable,
         )
 
     # -- rendering ---------------------------------------------------------
@@ -1118,8 +1183,19 @@ class CodexAccountQuota:
         A model whose ``available_at`` has PASSED is dropped here rather than
         at mapping time: the snapshot may be hours old, and "back Sep 15"
         printed on Sep 16 is the bygone-reset bug in a new place.
+
+        Reset credits are good news, never a verdict, and an honest reading of
+        the two counters: a USABLE one leads the notes (``↺ 1 reset credit
+        usable now — use it in Codex``; "usable" is our reading of
+        ``applicable_available_count``), a held-but-not-applicable one follows
+        the credit balance (``reset credits: 1 (not usable now)``), and an
+        unknown or zero count says nothing.
         """
         notes: list[str] = []
+        usable, held = self.reset_credits_usable, self.reset_credits_available
+        if usable is not None and usable > 0:
+            noun, pronoun = ("credit", "it") if usable == 1 else ("credits", "them")
+            notes.append(f"↺ {usable} reset {noun} usable now — use {pronoun} in Codex")
         if self.credits_balance is not None and (
             self.credits_balance > 0 or self.credits_has is True
         ):
@@ -1130,6 +1206,8 @@ class CodexAccountQuota:
             # its week left. When the zero IS the problem, `capped_note`
             # already says ``out of credits``.
             notes.append(f"credits {_format_count(self.credits_balance)}")
+        if usable == 0 and held is not None and held > 0:
+            notes.append(f"reset credits: {held} (not usable now)")
         for slug, when in self.availability:
             if when <= now:
                 continue
@@ -1242,6 +1320,9 @@ class CodexAccountQuota:
             # these either (roadmap 10/11/12 under SPEC 4.3).
             info_notes=() if withheld else self.info_notes(now=now, pace_note=pace_note),
             soonest_reset_at=None if withheld else self.soonest_reset_at,
+            # Read at `fetched_at` like the notes above: withheld with them.
+            reset_credits_available=None if withheld else self.reset_credits_available,
+            reset_credits_usable=None if withheld else self.reset_credits_usable,
         )
 
     @property
@@ -1498,10 +1579,17 @@ def _atomic_write_json(path: Path, payload: Any) -> bool:
     states the intent for the next reader of this code. ``fsync`` is skipped
     for the same reason the indexers skip it: ``os.replace`` gives readers
     all-or-nothing, and a power cut costs one poll interval.
+
+    The temp name carries the writer's pid (``<name>.tmp.<pid>_<random>``) so
+    :func:`sweep_rotation_orphans` can tell a SIGKILLed rotation's leftover
+    from a live writer's file (SEC-2). Every exception path unlinks it; only a
+    kill between the write and the replace can leave one behind.
     """
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f"{path.name}.tmp.")
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(path.parent), prefix=f"{path.name}.tmp.{os.getpid()}_"
+        )
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 json.dump(payload, handle, indent=2, sort_keys=True)
@@ -1520,9 +1608,104 @@ def _atomic_write_json(path: Path, payload: Any) -> bool:
         return False
 
 
+ROTATION_ORPHAN_MAX_AGE_SECONDS = 600.0
+"""How old an ``auth.json.tmp.*`` must be before the sweep may remove it. A
+rotation holds its temp file for one ``json.dump``; ten minutes is far past
+any live writer."""
+
+ROTATION_SWEEP_INTERVAL_SECONDS = 3600.0
+"""How often the poller re-runs :func:`sweep_rotation_orphans` (R2-SEC-1). A
+launchd restart after a kill starts the poller seconds after the orphan was
+written - younger than :data:`ROTATION_ORPHAN_MAX_AGE_SECONDS` - so a single
+sweep per process would never see it. One ``iterdir`` per account home an
+hour is the whole cost."""
+
+_ROTATION_TMP_PREFIX = "auth.json.tmp."
+
+
+def _pid_alive(pid: int) -> bool:
+    """``kill(pid, 0)``: True unless the pid is certainly gone.
+
+    A number ``pid_t`` cannot hold (``>= 2**31``, only ever a hand-made name)
+    raises ``OverflowError`` in ``os.kill``; no process can own it, so it is
+    answered False rather than raised (R2-SEC2)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by someone else
+    except (OSError, OverflowError, ValueError):
+        return False
+    return True
+
+
+def sweep_rotation_orphans(
+    accounts_dir: os.PathLike[str] | str,
+    *,
+    now: float,
+    max_age_s: float = ROTATION_ORPHAN_MAX_AGE_SECONDS,
+    log: Callable[[str], None] = _log,
+) -> int:
+    """Unlink stale ``codex-accounts/<id>/auth.json.tmp.*`` files (SEC-2).
+
+    A rotation killed between its write and its ``os.replace`` leaves a temp
+    file holding the NEW tokens next to the credential, in a directory the
+    widget-home sweep (``__main__._sweep_tmp_orphans``) deliberately skips.
+    This removes exactly those: a regular file (never a symlink) whose name
+    starts ``auth.json.tmp.``, older than *max_age_s*, and - when its name
+    carries a pid - whose writer is dead. ``auth.json`` itself can never
+    match. Names from before the pid was added are judged on age alone, and
+    so is a pid token no process could own. Never raises - one odd name
+    cannot abort the sweep or the poll cycle around it; returns how many it
+    removed. The log line names the account
+    prefix only.
+    """
+    removed = 0
+    try:
+        homes = sorted(Path(accounts_dir).iterdir())
+    except OSError:
+        return 0
+    for home in homes:
+        try:
+            if home.is_symlink() or not home.is_dir():
+                continue
+            children = list(home.iterdir())
+        except OSError:
+            continue
+        for orphan in children:
+            name = orphan.name
+            if not name.startswith(_ROTATION_TMP_PREFIX):
+                continue
+            try:
+                if orphan.is_symlink() or not orphan.is_file():
+                    continue
+                if now - orphan.stat().st_mtime <= max_age_s:
+                    continue
+                pid, sep, _rand = name[len(_ROTATION_TMP_PREFIX):].partition("_")
+                # ASCII digits only: `isdigit` also accepts "²", which `int`
+                # refuses - such a name carries no pid and is judged on age.
+                if sep and pid.isascii() and pid.isdigit() and _pid_alive(int(pid)):
+                    continue
+                orphan.unlink()
+                removed += 1
+                log(f"codex accounts: removed a stale rotation temp file in {home.name[:8]}")
+            except Exception:  # noqa: BLE001 - never raises (see docstring)
+                continue
+    return removed
+
+
 # ---------------------------------------------------------------------------
 # 3. Credentials — read-only, refused when they leak
 # ---------------------------------------------------------------------------
+
+
+CREDENTIAL_SOURCE_WIDGET = "widget"
+CREDENTIAL_SOURCE_DESKTOP = "desktop"
+NOTE_VIA_DESKTOP = "via ChatGPT app login"
+"""Info note on a row whose last reading was authorised by the ChatGPT app's
+own ``~/.codex`` login rather than the widget's copy (CX-1). A contract string:
+other lanes match on it."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1541,11 +1724,20 @@ class Credential:
     exp: float | None = None
     email: str | None = None
     plan_type: str | None = None
+    source: str = CREDENTIAL_SOURCE_WIDGET
+    """Where the token came from: ``"widget"`` (our own
+    ``codex-accounts/<id>/auth.json``) or ``"desktop"`` (read-only from
+    ``~/.codex/auth.json``, see :meth:`CredentialStore.read_desktop`). A desktop
+    credential is never refreshed and never written anywhere."""
+    has_refresh: bool = False
+    """Whether the file this came from holds a refresh token. A boolean, not
+    the token: the countdown needs to know whether a refresh is possible, and
+    nothing outside :class:`TokenRefresher` may ever hold the value."""
 
     def __repr__(self) -> str:  # pragma: no cover - exercised via the canary test
         return (
             f"Credential(account_id={self.account_id[:8]!r}, access_token=<redacted>, "
-            f"exp={self.exp!r}, plan_type={self.plan_type!r})"
+            f"exp={self.exp!r}, plan_type={self.plan_type!r}, source={self.source!r})"
         )
 
     def expired(self, now: float) -> bool:
@@ -1576,6 +1768,10 @@ class CredentialStore:
     * :meth:`active_account_id` — ``~/.codex/auth.json``, opened read-only, for
       exactly one field. The ChatGPT desktop app owns that file and rewrites it
       on its own schedule; the widget marks a row from it and never touches it.
+    * :meth:`read_desktop` — the same file, read-only, for the access token of
+      the account it is logged in as (CX-1): the widget's own copy of that
+      account is never rotated, so the app's login is the fresh one. Never the
+      refresh token, never a write.
 
     A credential file with any group or world bit set is **refused**, not used:
     a token readable by another user is a token to rotate, and quietly polling
@@ -1593,9 +1789,16 @@ class CredentialStore:
         self._auth_path = Path(auth_path)
         self._clock = clock
         self.last_error: str | None = None
+        self.desktop_error: str | None = None
         self._active_id: str | None = None
         self._active_seen_at: float = 0.0
         self._active_key: tuple[int, int] | None = None
+        self.mirror_state: str = MIRROR_UNKNOWN
+        """What the last :meth:`active_account_id` call learned from the file
+        itself (SEC-1): :data:`MIRROR_READ`, :data:`MIRROR_ABSENT`,
+        :data:`MIRROR_NO_LOGIN` or :data:`MIRROR_UNKNOWN`. The refresh guard
+        needs "nobody is logged in" told apart from "could not tell this
+        tick"; the returned id alone cannot say which."""
 
     @property
     def accounts_dir(self) -> Path:
@@ -1682,6 +1885,61 @@ class CredentialStore:
             exp=claims.get("exp"),
             email=claims.get("email"),
             plan_type=claims.get("plan_type"),
+            has_refresh=bool(_to_str(tokens.get("refresh_token"))),
+        )
+
+    def read_desktop(self, account_id: str) -> Credential | None:
+        """The ChatGPT app's own login for *account_id*, read-only, or ``None``.
+
+        The widget's copy of the account ``~/.codex`` is logged in as goes
+        stale (the widget may never rotate that grant, see SPEC-CODEX 6.4),
+        while the app keeps ``~/.codex/auth.json`` fresh on its own schedule.
+        This reads that file for ONE request's worth of access token:
+
+        * the same ``0o077`` refusal as :meth:`read` - a token other users can
+          read is one to rotate by hand, not one to borrow;
+        * ``tokens.account_id`` must equal *account_id* - the file speaks only
+          for the login it holds, never for a sibling that shares its email;
+        * the refresh token is never returned (``has_refresh`` stays False)
+          and the file is only ever opened for reading.
+
+        Problems land in :attr:`desktop_error`, not :attr:`last_error`, so a
+        refused mirror cannot mask the widget copy's own diagnosis. A mirror
+        logged in as a different account is not a problem and says nothing.
+        """
+        try:
+            st = self._auth_path.stat()
+        except OSError:
+            return None
+        mode = stat_module.S_IMODE(st.st_mode)
+        if mode & 0o077:
+            self.desktop_error = (
+                f"~/.codex/auth.json is {mode:04o}, refusing to use a credential "
+                "other users can read (chmod 600)"
+            )
+            return None
+        try:
+            raw = json.loads(self._auth_path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, ValueError):
+            return None  # mid-write by the app is normal; the next tick re-reads
+        tokens = raw.get("tokens") if isinstance(raw, Mapping) else None
+        if not isinstance(tokens, Mapping):
+            return None
+        if _to_str(tokens.get("account_id")) != account_id:
+            return None
+        access = _to_str(tokens.get("access_token"))
+        if not access:
+            return None
+        claims = decode_jwt_claims(access)
+        self.desktop_error = None
+        return Credential(
+            account_id=account_id,
+            access_token=access,
+            exp=claims.get("exp"),
+            email=claims.get("email"),
+            plan_type=claims.get("plan_type"),
+            source=CREDENTIAL_SOURCE_DESKTOP,
+            has_refresh=False,
         )
 
     # -- the read-only ~/.codex mirror ------------------------------------
@@ -1709,12 +1967,17 @@ class CredentialStore:
         try:
             st = self._auth_path.stat()
             key = (st.st_mtime_ns, st.st_size)
+        except FileNotFoundError:
+            self.mirror_state = MIRROR_ABSENT
+            return self._active_within_grace(now)
         except OSError:
+            self.mirror_state = MIRROR_UNKNOWN
             return self._active_within_grace(now)
         if key == self._active_key and self._active_id is not None:
+            self.mirror_state = MIRROR_READ
             self._active_seen_at = now
             return self._active_id
-        claimed = _account_id_in(self._auth_path)
+        claimed, self.mirror_state = _mirror_login(self._auth_path)
         if claimed is None:
             return self._active_within_grace(now)
         self._active_key = key
@@ -1748,6 +2011,40 @@ def _account_id_in(auth_path: Path) -> str | None:
     if not isinstance(tokens, Mapping):
         return None
     return _to_str(tokens.get("account_id")) or None
+
+
+MIRROR_READ = "read"
+MIRROR_ABSENT = "absent"
+MIRROR_NO_LOGIN = "no-login"
+MIRROR_UNKNOWN = "unknown"
+"""What one read of ``~/.codex/auth.json`` proved (SEC-1). ``read``: it names
+an account. ``absent``: there is no file. ``no-login``: a well-formed object
+with no ``tokens`` at all (API-key mode) - no OAuth login lives there.
+``unknown``: anything else - torn mid-rewrite, not JSON, a ``tokens`` object
+without ``account_id``, unreadable. Only ``unknown`` leaves the refresh guard
+unable to say which account it must not touch."""
+
+
+def _mirror_login(auth_path: Path) -> tuple[str | None, str]:
+    """``(tokens.account_id, MIRROR_READ)`` or ``(None, why not)``. Read-only.
+
+    Same single-field discipline as :func:`_account_id_in`; the second value
+    is what lets the refresh guard fail closed on a torn read while still
+    letting an API-key ``~/.codex`` (which holds no OAuth login) refresh.
+    """
+    try:
+        raw = json.loads(auth_path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return None, MIRROR_UNKNOWN
+    if not isinstance(raw, Mapping):
+        return None, MIRROR_UNKNOWN
+    tokens = raw.get("tokens")
+    if tokens is None:
+        return None, MIRROR_NO_LOGIN
+    if not isinstance(tokens, Mapping):
+        return None, MIRROR_UNKNOWN
+    claimed = _to_str(tokens.get("account_id"))
+    return (claimed, MIRROR_READ) if claimed else (None, MIRROR_UNKNOWN)
 
 
 # ---------------------------------------------------------------------------
@@ -1924,7 +2221,7 @@ def _TwoPhaseHTTPSHandler(read_timeout: float) -> urllib.request.HTTPSHandler:  
 
 
 # ---------------------------------------------------------------------------
-# 4a. Token refresh — roadmap 13, DEFAULT OFF (SPEC-CODEX 6.4)
+# 4a. Token refresh — roadmap 13, default ON since CX-4 (SPEC-CODEX 6.4)
 # ---------------------------------------------------------------------------
 
 CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
@@ -1950,11 +2247,57 @@ REFRESH_OK = "ok"
 REFRESH_RELOGIN = "relogin"
 REFRESH_FAILED = "failed"
 REFRESH_UNSUPPORTED = "unsupported"
-"""The four outcomes. ``relogin`` is reserved for ``invalid_grant`` — the one
-answer that means the family is gone and no retry can help; everything else
-(offline, 5xx, a body that is not JSON, an unwritable file) is ``failed``, and
-a failed refresh changes nothing: the old access token is still valid until
-``exp`` and the row keeps counting down to the manual relogin."""
+REFRESH_RACED = "raced"
+"""The outcomes. ``relogin`` is reserved for a terminal refusal
+(:data:`_TERMINAL_REFRESH_ERRORS`) — the answers that mean the family is gone
+and no retry can help; everything else (offline, 5xx, a body that is not JSON,
+an unwritable file) is ``failed``, and a failed refresh changes nothing: the
+old access token is still valid until ``exp`` and the row keeps counting down
+to the manual relogin. ``raced`` means somebody else (the Codex CLI) rotated
+the same ``auth.json`` while our POST was in flight: their file is kept, ours
+is discarded, and ``credential`` carries what is now on disk."""
+
+REFRESH_GUARD_UNKNOWN = "<~/.codex login unknown>"
+"""The refresh guard's answer when ``~/.codex/auth.json`` cannot be read this
+tick and no account was ever seen there (SEC-1): no rotation of ANY account
+runs, because the one it must not touch cannot be named. Not a valid account
+id, so it can never equal one."""
+
+_TERMINAL_REFRESH_ERRORS = frozenset(
+    {"invalid_grant", "refresh_token_reused", "refresh_token_expired", "refresh_token_invalidated"}
+)
+"""Grant refusals that end the refresh family. The last three are the codes the
+Codex CLI 0.155 binary names (evidence/codex-accounts-lane-codex-refresh-strings.txt);
+OpenAI sends them either flat (``{"error": "invalid_grant"}``) or nested
+(``{"error": {"code": "refresh_token_reused"}}``), so both shapes are read."""
+
+
+def _refresh_error_code(body: Any) -> str:
+    """The error code of a refused grant, flat or nested, or ``""``."""
+    if not isinstance(body, Mapping):
+        return ""
+    error = body.get("error")
+    if isinstance(error, Mapping):
+        return _to_str(error.get("code"))
+    return _to_str(error)
+
+
+def _auth_fingerprint(auth: Path) -> tuple[int, int, str] | None:
+    """``(mtime_ns, size, sha256 of tokens.refresh_token)`` or ``None``.
+
+    The digest is held in memory only, for one comparison, and is never logged
+    or persisted: it exists so a rotation can tell "the file we read" from "a
+    file somebody rewrote while we were waiting for the token endpoint".
+    """
+    try:
+        st = auth.stat()
+        raw = json.loads(auth.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return None
+    tokens = raw.get("tokens") if isinstance(raw, Mapping) else None
+    refresh = _to_str(tokens.get("refresh_token")) if isinstance(tokens, Mapping) else ""
+    digest = hashlib.sha256(refresh.encode("utf-8")).hexdigest()
+    return (st.st_mtime_ns, st.st_size, digest)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2027,9 +2370,16 @@ class TokenRefresher:
        place. No ``.prev`` file, no in-memory copy kept for a retry, no
        "try the old one if the new one fails". If OpenAI's reuse detection is
        armed on this client, the only way to trip it is to ask on purpose.
-    3. **``invalid_grant`` is terminal.** It means the family is gone; a retry
-       can only make it worse, so the outcome is ``relogin`` and the caller
-       shows the sentinel it would have shown anyway a day later.
+    3. **A refusal is terminal.** ``invalid_grant`` and the
+       ``refresh_token_reused`` / ``_expired`` / ``_invalidated`` codes, flat or
+       nested, mean the family is gone; a retry can only make it worse, so the
+       outcome is ``relogin`` and the caller remembers it per file signature
+       (CX-2). Judged only after a re-read: if the file's refresh token moved
+       while we waited, the refusal was about the superseded one (``raced``).
+    3a. **Compare before write.** The fingerprint read before the POST
+       (``mtime_ns``, size, a digest of the refresh token) must still hold
+       after it; if the Codex CLI rotated the file meanwhile, its file is kept
+       and ours is dropped (``raced``, CX-3).
     4. **Nothing about a token is logged.** The refresh token goes from the
        file into one form body and out of scope; log lines carry the alias, the
        outcome and how much life the new token has — never a value, a length or
@@ -2062,21 +2412,44 @@ class TokenRefresher:
         self.posts = 0
         """POSTs attempted, including ones that raised. Never reset."""
 
-    def refresh(self, account_id: str, *, label: str = "") -> RefreshOutcome:
-        """Rotate one account's tokens. Never raises; returns the verdict."""
+    def refresh(self, account_id: str, *, active: str | None, label: str = "") -> RefreshOutcome:
+        """Rotate one account's tokens. Never raises; returns the verdict.
+
+        *active* is the account ``~/.codex`` is logged in as, as the caller
+        knows it (:data:`REFRESH_GUARD_UNKNOWN` when it could not tell). It is
+        a required keyword on purpose - defence in depth for guard 1 (SEC-1):
+        the grant for that account, or for any account while the answer is
+        unknown, is refused here with no POST, whatever the caller's own
+        guard decided.
+        """
         label = label or account_id[:8]
+        if active is not None and active in (account_id, REFRESH_GUARD_UNKNOWN):
+            return self._failed(
+                label, "refused: ~/.codex is or may be logged in as this account"
+            )
         post = getattr(self._transport, "post_form", None)
         if not callable(post):
             return self._failed(label, "transport cannot post a form")
 
         auth = Path(self._credentials.accounts_dir) / account_id / "auth.json"
+        try:
+            st_before = auth.stat()
+        except OSError:
+            st_before = None
         raw, problem = _read_auth_for_rotation(auth)
-        if raw is None:
-            return self._failed(label, problem)
+        if raw is None or st_before is None:
+            return self._failed(label, problem or "auth.json unreadable")
         tokens = raw.get("tokens")
         tokens = dict(tokens) if isinstance(tokens, Mapping) else {}
         if not _to_str(tokens.get("refresh_token")):
             return self._failed(label, "auth.json has no refresh token")
+        # What we read, for the compare-before-write below (CX-3). Held in
+        # memory for this call only; the digest is never logged or stored.
+        read_fp = (
+            st_before.st_mtime_ns,
+            st_before.st_size,
+            hashlib.sha256(_to_str(tokens.get("refresh_token")).encode("utf-8")).hexdigest(),
+        )
 
         data = {
             "grant_type": "refresh_token",
@@ -2095,10 +2468,16 @@ class TokenRefresher:
 
         body = _decode_json(response.body)
         if response.status != 200:
-            error = _to_str(body.get("error")) if isinstance(body, Mapping) else ""
-            if error == "invalid_grant":
-                self._log(f"codex {label}: refresh refused (invalid_grant) - relogin")
-                return RefreshOutcome(REFRESH_RELOGIN, "invalid_grant")
+            error = _refresh_error_code(body)
+            # Re-read before judging: if the Codex CLI rotated this file while
+            # we waited, the refusal is about the token it superseded (reuse
+            # detection answers exactly that way), not about the family.
+            now_fp = _auth_fingerprint(auth)
+            if now_fp is not None and now_fp[2] != read_fp[2]:
+                return self._raced(account_id, label)
+            if error in _TERMINAL_REFRESH_ERRORS:
+                self._log(f"codex {label}: refresh refused ({error}) - relogin")
+                return RefreshOutcome(REFRESH_RELOGIN, error)
             return self._failed(label, f"HTTP {response.status}" + (f" {error}" if error else ""))
         if not isinstance(body, Mapping):
             return self._failed(label, "grant body was not JSON")
@@ -2116,6 +2495,13 @@ class TokenRefresher:
         payload = dict(raw)
         payload["tokens"] = tokens
         payload["last_refresh"] = _iso_utc(self._clock())
+        if _auth_fingerprint(auth) != read_fp:
+            # Compare-before-write (CX-3): the file moved while our POST was in
+            # flight - a Codex CLI run rotated it. Its tokens are the live
+            # family now; writing ours over them would log that CLI out. Keep
+            # the newer file and drop what we were handed.
+            del payload, tokens, raw, body, response
+            return self._raced(account_id, label)
         written = _atomic_write_json(auth, payload)
         del payload, tokens, raw, body, response
         if not written:
@@ -2138,6 +2524,13 @@ class TokenRefresher:
     def _failed(self, label: str, detail: str) -> RefreshOutcome:
         self._log(f"codex {label}: refresh failed ({detail})")
         return RefreshOutcome(REFRESH_FAILED, detail)
+
+    def _raced(self, account_id: str, label: str) -> RefreshOutcome:
+        """Somebody else rotated the file mid-grant: keep theirs, re-read it."""
+        self._log(f"codex {label}: auth.json changed during refresh; kept the newer file")
+        return RefreshOutcome(
+            REFRESH_RACED, "auth.json changed during refresh", self._credentials.read(account_id)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2165,10 +2558,42 @@ class FetchState:
     """Which ladder the counter belongs to (``"rate"`` for 429, ``"endpoint"``
     for 5xx/garbage/offline). The count restarts when the class changes, so
     two 429s cannot make the very first 502 print ``endpoint error``."""
-    credential_sig: tuple[int, int] | None = None
-    """``(mtime_ns, size)`` of the account's ``auth.json`` at the last poll. A
-    standing warn sentinel is cleared the moment this moves: a fresh ``codex
-    login`` must show within one tick, not after a 30-minute backoff."""
+    credential_sig: tuple[Any, Any] | None = None
+    """``(widget_sig, desktop_sig)`` at the last poll: ``(mtime_ns, size)`` of
+    the account's own ``auth.json``, and of ``~/.codex/auth.json`` while that
+    file is logged in as this account (else ``None``). A standing warn
+    sentinel is cleared the moment either moves: a fresh ``codex login`` - or
+    the ChatGPT app rewriting its own login - must show within one tick, not
+    after a 30-minute backoff."""
+    dead_refresh_sig: tuple[int, int] | None = None
+    """``(mtime_ns, size)`` of the widget ``auth.json`` whose refresh grant was
+    refused terminally (CX-2). While the file still has this signature neither
+    rotation point runs: a dead family asked again is a POST every poll.
+    set-by: a ``relogin`` verdict from :class:`TokenRefresher`. cleared-by: the
+    file's signature moving (a new login). ages-out: never. rehydrated: yes,
+    from the sidecar's ``refresh_dead_sig``. producer off: never set."""
+    credential_source: str = ""
+    """``"widget"`` / ``"desktop"``: which credential the last poll chose (CX-1).
+    set-by: every poll that read a credential. cleared-by: a poll choosing the
+    widget copy (or finding none). ages-out: no. rehydrated: no, deliberately
+    - the next poll decides again. producer off: no desktop read, never set."""
+    credential_exp: float | None = None
+    """The ``exp`` claim of the credential the last poll used (CX-7a), exported
+    as ``AccountRow.credential_expires_at``. A claim, not a secret."""
+    last_refresh_failed: bool = False
+    """The last grant attempt ended ``failed``/``unsupported``. Brings the
+    relogin countdown back: a refresh that is not working is no reason to hide
+    the deadline. Cleared by a successful (or raced) rotation."""
+    extra_info: str = ""
+    """A relogin countdown that could not be the row's note because the plan is
+    capped (the ``crit`` note wins); carried as an extra info line instead."""
+    logged_status: int | None = None
+    """The HTTP status the log last reported for this account (OPS-4)."""
+    announced_note: str = ""
+    """The dead-credential note the log last announced (OPS-3), so a
+    transition is logged once and a steady state never."""
+    last_status_at: float | None = None
+    """Wall time :attr:`last_status` was recorded, for the diagnostics age."""
 
     def clear_note(self) -> None:
         self.note = ""
@@ -2259,6 +2684,26 @@ class CodexAccountsSource:
         """Transient diagnostics lines (id mismatch, wake, untracked login).
         Bounded, newest last; never a token, header or body."""
         self.last_error: str | None = None
+        self._desktop_id: str | None = None
+        """The last account ``~/.codex/auth.json`` was READ as naming (SEC-1),
+        tracked or not. set-by: a read that names an account. cleared-by: a
+        DEFINITIVE read that nobody is logged in (R2-SEC1) - an API-key file
+        (no ``tokens`` at all), or a file absent on every poll for longer
+        than :data:`CODEX_ACTIVE_GRACE_SECONDS`; a torn or id-less file, or
+        a shorter absence, never clears it, so the guard still fails closed
+        on the reads that prove nothing. A read naming a different account
+        replaces it. ages-out: no. rehydrated: yes, from the sidecar's
+        top-level ``desktop_account_id`` (an id, not a secret) - a cold start
+        that lands on a mid-rewrite read still knows which account to leave
+        alone. producer off: never set."""
+        self._desktop_absent_since: float | None = None
+        """When the poller first saw ``~/.codex/auth.json`` missing in the
+        current unbroken run of missing reads (R2-SEC1); None while the file
+        exists. Not persisted: a restart restarts the grace."""
+        self._desktop_unknown_logged = False
+        self._swept_at: float | None = None
+        """When the rotation-temp sweep last ran (R2-SEC-1); None before the
+        first cycle."""
 
     # -- the source contract ----------------------------------------------
 
@@ -2332,7 +2777,34 @@ class CodexAccountsSource:
                             pace_note=self._pace_note_locked(entry.account_id, snapshot, now),
                         )
                     )
+                rows[-1] = self._decorate_row_locked(rows[-1], state)
             return tuple(rows)
+
+    @staticmethod
+    def _decorate_row_locked(row: AccountRow, state: FetchState | None) -> AccountRow:
+        """Credential facts the snapshot cannot know (CX-1, CX-7a).
+
+        ``credential_expires_at`` always (``None`` before the first poll); the
+        capped row's relogin countdown and ``via ChatGPT app login`` as info
+        lines - but only on a row that shows its figures, since info lines sit
+        beside the bars and a withheld row withholds them all.
+        """
+        if state is None:
+            return row
+        changes: dict[str, Any] = {"credential_expires_at": state.credential_exp}
+        withheld = row.attention_kind == KIND_WARN or (
+            row.usage_age_seconds is not None
+            and row.usage_age_seconds > CODEX_FETCH_EXPIRE_SECONDS
+        )
+        extras: list[str] = []
+        if not withheld:
+            if state.extra_info and row.attention_kind == KIND_CRIT:
+                extras.append(state.extra_info)
+            if state.credential_source == CREDENTIAL_SOURCE_DESKTOP:
+                extras.append(NOTE_VIA_DESKTOP)
+        if extras:
+            changes["info_notes"] = tuple(row.info_notes) + tuple(extras)
+        return replace(row, **changes)
 
     def active_account_id(self) -> str | None:
         """Which tracked account ``~/.codex`` is logged in as, or ``None``.
@@ -2379,9 +2851,17 @@ class CodexAccountsSource:
                 state = self._states.get(entry.account_id)
                 snapshot = self._snapshots.get(entry.account_id)
                 label = entry.alias or entry.account_id[:8]
-                status = "never polled" if state is None or state.last_status is None else str(
-                    state.last_status
-                )
+                if state is None or state.last_status is None:
+                    status = "never polled"
+                elif state.last_status_at is None:
+                    status = f"last {state.last_status}"
+                else:
+                    # With its age: on the expired path no request is made,
+                    # and a bare "200" read as current for five days.
+                    status = (
+                        f"last {state.last_status} "
+                        f"{_format_duration(max(0.0, now - state.last_status_at))} ago"
+                    )
                 if state is None:
                     due = "due now"
                 else:
@@ -2393,11 +2873,18 @@ class CodexAccountsSource:
                     else ", no reading"
                 )
                 note = f", {state.note}" if state is not None and state.note else ""
-                lines.append(f"  {label}: {status}, {due}{age}{note}")
+                via = (
+                    ", via desktop login"
+                    if state is not None and state.credential_source == CREDENTIAL_SOURCE_DESKTOP
+                    else ""
+                )
+                lines.append(f"  {label}: {status}, {due}{age}{note}{via}")
             for line in self._notes[-4:]:
                 lines.append(f"  ! {line}")
             if self._credentials.last_error:
                 lines.append(f"  ! {self._credentials.last_error}")
+            if self._credentials.desktop_error:
+                lines.append(f"  ! {self._credentials.desktop_error}")
             if self.last_error:
                 lines.append(f"  ! {self.last_error}")
             return tuple(lines)
@@ -2508,6 +2995,18 @@ class CodexAccountsSource:
             return
 
         now = self._clock()
+        swept_at = self._swept_at
+        if (
+            swept_at is None
+            or now - swept_at >= ROTATION_SWEEP_INTERVAL_SECONDS
+            or now < swept_at  # the wall clock stepped back
+        ):
+            # On the poller, at start and then hourly: a rotation killed
+            # mid-write left its temp file beside a credential (SEC-2), and
+            # after a launchd restart that file is seconds old at the first
+            # sweep - too young to judge - so one pass is not enough (R2-SEC-1).
+            self._swept_at = now
+            sweep_rotation_orphans(self._credentials.accounts_dir, now=now, log=self._log)
         self._detect_wake(now)
         interval = self._interval_seconds()
         include_extra = bool(self._settings().get("codex_show_extra_limits", False))
@@ -2545,13 +3044,37 @@ class CodexAccountsSource:
             return bool(self._stop.wait(_MIN_ACCOUNT_SPACING_SECONDS))
         return bool(sleeper(_MIN_ACCOUNT_SPACING_SECONDS))
 
-    def _credential_sig(self, account_id: str) -> tuple[int, int] | None:
-        """``(mtime_ns, size)`` of the account's ``auth.json``, or ``None``."""
+    def _widget_sig(self, account_id: str) -> tuple[int, int] | None:
+        """``(mtime_ns, size)`` of the account's own ``auth.json``, or ``None``."""
         try:
             st = os.stat(self._credentials.accounts_dir / account_id / "auth.json")
         except OSError:
             return None
         return (st.st_mtime_ns, st.st_size)
+
+    def _credential_sig(self, account_id: str) -> tuple[Any, Any] | None:
+        """``(widget_sig, desktop_sig)``, or ``None`` when neither file exists.
+
+        ``desktop_sig`` is the ``(mtime_ns, size)`` of ``~/.codex/auth.json``
+        only while that file is logged in as *account_id* (else ``None``): the
+        ChatGPT app rewriting its own login is then as good as a fresh
+        ``codex login`` for this row, and must clear a standing ``relogin``
+        within one tick (CX-1). One ``stat`` each; nothing is parsed here
+        beyond the active marker's own gated read.
+        """
+        widget = self._widget_sig(account_id)
+        desktop = None
+        with self._lock:
+            active = self._active_id_locked()
+        if active == account_id:
+            try:
+                st = os.stat(self._credentials.auth_path)
+                desktop = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                desktop = None
+        if widget is None and desktop is None:
+            return None
+        return (widget, desktop)
 
     def _detect_wake(self, now: float) -> None:
         """Mark everything due when the Mac slept through the schedule.
@@ -2599,7 +3122,7 @@ class CodexAccountsSource:
     # -- one account -------------------------------------------------------
 
     def _refresh_enabled(self) -> bool:
-        """``codex_refresh_enabled`` (roadmap 13), default False.
+        """``codex_refresh_enabled`` (roadmap 13), default True since CX-4.
 
         Read on every poll rather than cached, for the same reason the live
         switch is: turning it off in Settings must stop the next request, not
@@ -2607,13 +3130,88 @@ class CodexAccountsSource:
         never called and no token request of any kind is made.
         """
         try:
-            return bool(self._settings().get("codex_refresh_enabled", False))
+            return bool(
+                self._settings().get(
+                    "codex_refresh_enabled", SETTINGS_DEFAULTS["codex_refresh_enabled"]
+                )
+            )
         except Exception as exc:  # a settings read must never break a poll
             self.last_error = _describe(exc)
             return False
 
+    def _refresh_guard(self) -> str | None:
+        """The account no rotation may touch this poll (guard 1, SEC-1).
+
+        Fails closed. A read of ``~/.codex/auth.json`` that names an account
+        answers with it (and remembers it); otherwise the last account a read
+        ever named stays protected - a torn mid-rewrite read, an id-less
+        ``tokens`` object or a missing file proves nothing about who the app
+        is logged in as. Two reads ARE definitive and release it (R2-SEC1):
+        an API-key file (no ``tokens`` at all - no OAuth login lives there)
+        and a file missing on every poll for longer than
+        :data:`CODEX_ACTIVE_GRACE_SECONDS` (a rewrite's transient unlink is
+        far shorter). With nothing ever seen: an absent file or an API-key
+        file means no OAuth login exists to protect (``None``); an unreadable
+        one means it cannot be named, so the answer is
+        :data:`REFRESH_GUARD_UNKNOWN` and no account is rotated this poll,
+        with one log line per episode.
+        """
+        released = False
+        announce = False
+        with self._lock:
+            try:
+                raw = self._credentials.active_account_id()
+                mirror = self._credentials.mirror_state
+            except Exception as exc:  # pragma: no cover - stat + one parse
+                self.last_error = _describe(exc)
+                raw, mirror = None, MIRROR_UNKNOWN
+            now = self._clock()
+            since = self._desktop_absent_since
+            if mirror != MIRROR_ABSENT:
+                self._desktop_absent_since = since = None
+            elif since is None or now < since:
+                self._desktop_absent_since = since = now
+            if raw is not None:
+                self._desktop_id = raw
+                self._desktop_unknown_logged = False
+                return raw
+            if self._desktop_id is not None and (
+                mirror == MIRROR_NO_LOGIN
+                or (
+                    mirror == MIRROR_ABSENT
+                    and since is not None
+                    and now - since > CODEX_ACTIVE_GRACE_SECONDS
+                )
+            ):
+                # Definitive: nothing to protect any more. The next sidecar
+                # save omits desktop_account_id, so a restart agrees.
+                self._desktop_id = None
+                released = True
+            if self._desktop_id is not None:
+                return self._desktop_id
+            no_login = mirror in (MIRROR_ABSENT, MIRROR_NO_LOGIN)
+            if no_login:
+                self._desktop_unknown_logged = False
+            else:
+                announce = not self._desktop_unknown_logged
+                self._desktop_unknown_logged = True
+        if released:
+            self._log(
+                "codex accounts: ~/.codex holds no login any more; "
+                "its last account is refreshed like any other again"
+            )
+        if no_login:
+            return None
+        if announce:
+            self._log(
+                "codex accounts: ~/.codex login unreadable and never seen; "
+                "token refresh skipped until it reads"
+            )
+        self._note("~/.codex login unreadable; token refresh skipped")
+        return REFRESH_GUARD_UNKNOWN
+
     def _try_refresh(
-        self, state: FetchState, account_id: str, label: str, *, reason: str
+        self, state: FetchState, account_id: str, label: str, *, reason: str, guard: str | None
     ) -> RefreshOutcome:
         """One grant attempt, plus the bookkeeping a rotation implies.
 
@@ -2623,13 +3221,105 @@ class CodexAccountsSource:
         human logging in again and would clear a standing sentinel and cancel
         its backoff on the very next cycle.
         """
-        outcome = self._refresher.refresh(account_id, label=label)
-        if outcome.status == REFRESH_OK:
-            with self._lock:
+        outcome = self._refresher.refresh(account_id, active=guard, label=label)
+        with self._lock:
+            if outcome.status in (REFRESH_OK, REFRESH_RACED):
+                # Ours or the CLI's, the file moved and this poll has seen it.
                 state.credential_sig = self._credential_sig(account_id)
-        elif outcome.status != REFRESH_RELOGIN:
+                state.last_refresh_failed = False
+                state.dead_refresh_sig = None
+            elif outcome.status == REFRESH_RELOGIN:
+                # CX-2: terminal until the file changes. The refused grant did
+                # not touch the file, so its signature is the one we read.
+                state.dead_refresh_sig = self._widget_sig(account_id)
+            else:
+                state.last_refresh_failed = True
+        if outcome.status not in (REFRESH_OK, REFRESH_RELOGIN, REFRESH_RACED):
             self._note(f"{label}: {reason} refresh failed ({outcome.detail})")
         return outcome
+
+    def _may_refresh(
+        self, state: FetchState, account_id: str, guard: str | None,
+        *, unknown_blocks: bool = True,
+    ) -> bool:
+        """Whether a rotation point may run for this account (CX-2/CX-3).
+
+        Three guards, all required: the switch is on; the account is NOT the
+        one ``~/.codex`` is logged in as (the ChatGPT app owns that grant, and
+        our copy may share its refresh family - rotating it would log the app
+        out), which fails closed while that account cannot be named (*guard*
+        from :meth:`_refresh_guard`); and the family is not already known dead
+        at this file signature. ``unknown_blocks=False`` is the countdown's
+        question - "will a refresh happen?" - where an unreadable tick only
+        defers the rotation and must not flash a countdown on every row.
+        """
+        if not self._refresh_enabled():
+            return False
+        if guard is not None and account_id == guard:
+            return False
+        if guard == REFRESH_GUARD_UNKNOWN and unknown_blocks:
+            return False
+        with self._lock:
+            return state.dead_refresh_sig is None
+
+    def _choose_credential(
+        self, account_id: str, widget: Credential | None, now: float
+    ) -> tuple[Credential | None, Credential | None]:
+        """``(credential to use, desktop backstop)``.
+
+        The first is the widget copy, or the ChatGPT app's own login when it
+        is better. The desktop login is consulted only while ``~/.codex`` is
+        logged in as this account, and preferred when it is unexpired AND the
+        widget copy is missing, expired, or older (``desktop.exp >
+        widget.exp``). Read-only: see :meth:`CredentialStore.read_desktop`.
+
+        The second is that unexpired desktop login whenever there is one, even
+        when the widget copy is chosen (SMC-3): the app renews it, so the row
+        has a login that outlives the widget copy and no human has to act.
+        """
+        with self._lock:
+            active = self._active_id_locked()
+        if active != account_id:
+            return widget, None
+        desktop = self._credentials.read_desktop(account_id)
+        if desktop is None or desktop.expired(now):
+            return widget, None
+        if widget is None or widget.expired(now):
+            return desktop, desktop
+        if desktop.exp is not None and widget.exp is not None and desktop.exp > widget.exp:
+            return desktop, desktop
+        return widget, desktop
+
+    def _countdown(
+        self, state: FetchState, account_id: str, guard: str | None,
+        credential: Credential, now: float, backstop: Credential | None = None,
+    ) -> str:
+        """``relogin in 1d 4h`` when a human really will have to act, else ``""``.
+
+        CX-7a: with refresh working, a token inside 48 h is rotated at 24 h and
+        nobody needs to do anything, so a countdown would cry wolf for a day.
+        It is shown only when no refresh will happen: the switch is off, the
+        file has no refresh token, the family is dead (CX-2), the last attempt
+        failed, or this is the ``~/.codex`` account's widget copy (which is
+        never rotated). A desktop credential shows none: the app renews it -
+        and neither does a widget copy with a usable desktop *backstop* for
+        the same account (SMC-3): when the copy runs out, the app's login
+        carries the row.
+        """
+        if credential.source == CREDENTIAL_SOURCE_DESKTOP or backstop is not None:
+            return ""
+        with self._lock:
+            failed = state.last_refresh_failed
+        if (
+            credential.has_refresh
+            and not failed
+            and self._may_refresh(state, account_id, guard, unknown_blocks=False)
+        ):
+            return ""
+        remaining = credential.relogin_seconds(now)
+        if remaining is not None and remaining <= CODEX_RELOGIN_WARN_SECONDS:
+            return f"{NOTE_RELOGIN} in {_format_duration(remaining)}"
+        return ""
 
     def _usage_request(
         self,
@@ -2656,6 +3346,8 @@ class CodexAccountsSource:
             # Type name only: a URLError's message can carry the host and,
             # through a proxy, the URL. Neither belongs in widget.log.
             self._log(f"codex {label}: unreachable ({type(exc).__name__})")
+            with self._lock:
+                state.logged_status = None
             self._on_failure(
                 state,
                 account_id,
@@ -2668,9 +3360,14 @@ class CodexAccountsSource:
         finally:
             del headers, credential  # the token's lifetime ends here
         elapsed_ms = int(max(0.0, (self._monotonic() - started)) * 1000)
-        self._log(f"codex {label}: {response.status} in {elapsed_ms} ms")
         with self._lock:
-            self._requests += 1
+            self._requests += 1  # every call, logged or not (diagnostics volume)
+            changed = response.status != state.logged_status
+            state.logged_status = response.status
+        # OPS-4: a fast 200 like the last one is not news; it was 90 % of the
+        # log and buried the lines that matter.
+        if changed or response.status != 200 or elapsed_ms > _SLOW_REQUEST_MS:
+            self._log(f"codex {label}: {response.status} in {elapsed_ms} ms")
         return response
 
     def _poll_account(self, entry: RegistryEntry, *, interval: float, include_extra: bool) -> None:
@@ -2686,39 +3383,78 @@ class CodexAccountsSource:
         ``exp``; and **reactive exactly once**, when the endpoint answers 401.
         A 403 never refreshes — it is an answer about permissions, and the
         token in hand is the one it refused. ``attempted_refresh`` is one flag
-        for both points, so a poll can never make two grant requests.
+        for both points, so a poll can never make two grant requests. Both are
+        further gated by :meth:`_may_refresh` (never the ``~/.codex`` account,
+        never a family known dead at this file signature) and skipped for a
+        desktop credential (CX-1), whose 401 instead earns one retry with an
+        in-date widget copy and otherwise says ``relogin``.
         """
         account_id = entry.account_id
         label = entry.alias or account_id[:8]
         now = self._clock()
+        guard = self._refresh_guard()
         with self._lock:
             state = self._states.setdefault(account_id, FetchState())
             state.credential_sig = self._credential_sig(account_id)
+            widget_sig = state.credential_sig[0] if state.credential_sig else None
+            if state.dead_refresh_sig is not None and widget_sig != state.dead_refresh_sig:
+                # A new login moved the file: the dead family is gone with it.
+                state.dead_refresh_sig = None
+                state.last_refresh_failed = False
 
-        credential = self._credentials.read(account_id)
+        widget = self._credentials.read(account_id)
+        credential, backstop = self._choose_credential(account_id, widget, now)
         if credential is None:
+            with self._lock:
+                state.credential_source = ""
+                state.credential_exp = None
             self._finish(
                 state,
                 account_id,
                 note=NOTE_NO_CREDENTIAL,
                 kind=KIND_WARN,
                 next_due=now + interval,
+                reason=self._credentials.last_error or "",
             )
             return
+        desktop = credential.source == CREDENTIAL_SOURCE_DESKTOP
+        with self._lock:
+            state.credential_source = credential.source
 
+        # Neither rotation point ever runs on a desktop credential: its refresh
+        # token belongs to the ChatGPT app and is never even read (CX-1).
         attempted_refresh = False
-        if self._refresh_enabled() and refresh_due(credential, now):
+        if not desktop and self._may_refresh(state, account_id, guard) and refresh_due(
+            credential, now
+        ):
             attempted_refresh = True
-            outcome = self._try_refresh(state, account_id, label, reason="proactive")
-            if outcome.status == REFRESH_RELOGIN:
+            outcome = self._try_refresh(
+                state, account_id, label, reason="proactive", guard=guard
+            )
+            if outcome.status == REFRESH_RELOGIN and credential.expired(now):
+                with self._lock:
+                    state.credential_exp = credential.exp
                 self._finish(
                     state, account_id, note=NOTE_RELOGIN, kind=KIND_WARN,
-                    next_due=now + interval,
+                    next_due=now + interval, reason=f"refresh refused ({outcome.detail})",
                 )
                 return
-            if outcome.status == REFRESH_OK and outcome.credential is not None:
+            # SMC-1: a refusal while the access token is still in date is not
+            # a relogin YET - that token keeps working until exp. The dead
+            # family is recorded (dead_refresh_sig), so the countdown below
+            # shows the real deadline and the usage request still runs; the
+            # refresher's own log line is the one announcement.
+            if outcome.status in (REFRESH_OK, REFRESH_RACED) and outcome.credential is not None:
                 credential = outcome.credential
 
+        with self._lock:
+            # SMC-3: while the app's own login backs this account, its expiry
+            # is the row's deadline - not the widget copy nobody renews.
+            state.credential_exp = (
+                backstop.exp
+                if backstop is not None and credential.source != CREDENTIAL_SOURCE_DESKTOP
+                else credential.exp
+            )
         if credential.expired(now):
             # No request: an expired token has exactly one outcome and making
             # the call would only teach the endpoint our polling schedule.
@@ -2728,42 +3464,59 @@ class CodexAccountsSource:
                 note=NOTE_RELOGIN,
                 kind=KIND_WARN,
                 next_due=now + interval,
+                reason=f"access token expired {_format_instant(credential.exp)}",
             )
             return
 
-        remaining = credential.relogin_seconds(now)
-        countdown = ""
-        if remaining is not None and remaining <= CODEX_RELOGIN_WARN_SECONDS:
-            countdown = f"{NOTE_RELOGIN} in {_format_duration(remaining)}"
-
+        countdown = self._countdown(state, account_id, guard, credential, now, backstop)
         response = self._usage_request(
             credential, state=state, account_id=account_id, label=label, now=now
         )
         if response is None:
             return
 
-        if response.status == 401 and self._refresh_enabled() and not attempted_refresh:
-            outcome = self._try_refresh(state, account_id, label, reason="401")
+        if response.status == 401 and desktop:
+            # The app's token was refused. One retry with our own copy if it is
+            # still in date; never a refresh (either token's family may be the
+            # app's). Otherwise the 401 below says relogin.
+            if widget is not None and not widget.expired(now):
+                credential = widget
+                with self._lock:
+                    state.credential_source = credential.source
+                    state.credential_exp = credential.exp
+                # The backstop was the token just refused: it backs nothing.
+                countdown = self._countdown(state, account_id, guard, credential, now)
+                response = self._usage_request(
+                    credential, state=state, account_id=account_id, label=label, now=now
+                )
+                if response is None:
+                    return
+        elif (
+            response.status == 401
+            and not attempted_refresh
+            and self._may_refresh(state, account_id, guard)
+        ):
+            outcome = self._try_refresh(state, account_id, label, reason="401", guard=guard)
             if outcome.status == REFRESH_RELOGIN:
                 with self._lock:
                     state.consecutive_failures = 0
                 self._finish(
                     state, account_id, note=NOTE_RELOGIN, kind=KIND_WARN,
                     next_due=now + _UNAUTHORIZED_BACKOFF_SECONDS, status=401,
+                    reason=f"refresh refused ({outcome.detail})",
                 )
                 return
-            if outcome.status == REFRESH_OK and outcome.credential is not None:
+            if outcome.status in (REFRESH_OK, REFRESH_RACED) and outcome.credential is not None:
                 credential = outcome.credential
-                remaining = credential.relogin_seconds(now)
-                countdown = ""
-                if remaining is not None and remaining <= CODEX_RELOGIN_WARN_SECONDS:
-                    countdown = f"{NOTE_RELOGIN} in {_format_duration(remaining)}"
+                with self._lock:
+                    state.credential_exp = credential.exp
+                countdown = self._countdown(state, account_id, guard, credential, now, backstop)
                 response = self._usage_request(
                     credential, state=state, account_id=account_id, label=label, now=now
                 )
                 if response is None:
                     return
-        del credential  # the token's lifetime ends here
+        del credential, widget, backstop  # the tokens' lifetime ends here
 
         self._handle_response(
             response,
@@ -2830,6 +3583,9 @@ class CodexAccountsSource:
                 self._snapshots[account_id] = quota
                 self._record_sample(account_id, quota)
                 state.consecutive_failures = 0
+                # CX-7a: the capped verdict wins the note, but a real relogin
+                # deadline must not vanish behind it - it rides as an info line.
+                state.extra_info = countdown if quota.capped_note else ""
             note, kind = (quota.capped_note, KIND_CRIT) if quota.capped_note else (countdown, KIND_INFO)
             self._finish(
                 state, account_id,
@@ -2846,6 +3602,7 @@ class CodexAccountsSource:
             self._finish(
                 state, account_id, note=NOTE_RELOGIN, kind=KIND_WARN,
                 next_due=now + _UNAUTHORIZED_BACKOFF_SECONDS, status=status,
+                reason="usage endpoint answered 401",
             )
             return
 
@@ -2920,7 +3677,8 @@ class CodexAccountsSource:
         delay = _ladder(start, failures)
         if failures >= _NOTE_AFTER_FAILURES:
             self._finish(state, account_id, note=note, kind=KIND_WARN,
-                         next_due=now + delay, status=status)
+                         next_due=now + delay, status=status,
+                         reason=f"{failures} failures in a row")
         else:
             self._finish(state, account_id, note=state.note, kind=state.note_kind,
                          next_due=now + delay, status=status)
@@ -2934,14 +3692,46 @@ class CodexAccountsSource:
         kind: str,
         next_due: float,
         status: int | None = None,
+        reason: str = "",
     ) -> None:
-        """Commit one account's outcome and persist the sidecar."""
+        """Commit one account's outcome and persist the sidecar.
+
+        OPS-3: a move into or out of a dead-credential note
+        (:data:`_ANNOUNCED_NOTES`) writes ONE log line - ``codex vlad: relogin
+        (access token expired Sep 20 11:13)`` / ``codex vlad: recovered`` - and
+        a steady state writes none. The comparison is against what the log
+        last said (``announced_note``), not the live note, because the cycle
+        clears a standing note the moment a fresh login lands. *reason* is
+        prose built from claims and status codes; never a token.
+        """
         with self._lock:
             state.set_note(note, kind if note else "")
             state.next_due_wall = next_due
             if status is not None:
                 state.last_status = status
+                state.last_status_at = self._clock()
+            line = ""
+            if note in _ANNOUNCED_NOTES:
+                if note != state.announced_note:
+                    line = f"codex {self._label(account_id)}: {note}" + (
+                        f" ({reason})" if reason else ""
+                    )
+                    state.announced_note = note
+            elif state.announced_note:
+                line = f"codex {self._label(account_id)}: recovered" + (
+                    f" (now {note})" if note and kind == KIND_WARN else ""
+                )
+                state.announced_note = ""
+        if line:
+            self._log(line)
         self._save()
+
+    def _label(self, account_id: str) -> str:
+        """The alias a log line uses, else the id prefix (never an email)."""
+        for entry in self._registry.entries():
+            if entry.account_id == account_id:
+                return entry.alias or account_id[:8]
+        return account_id[:8]
 
     # -- the sidecar -------------------------------------------------------
 
@@ -2961,6 +3751,11 @@ class CodexAccountsSource:
             raw = json.loads(self._snapshots_path.read_text(encoding="utf-8", errors="replace"))
         except (OSError, ValueError):
             return
+        desktop_id = _to_str(raw.get("desktop_account_id")) if isinstance(raw, Mapping) else ""
+        if desktop_id and self._desktop_id is None:
+            # SEC-1: the account the refresh guard must keep leaving alone on
+            # a cold start whose first read of ~/.codex lands mid-rewrite.
+            self._desktop_id = desktop_id
         accounts = raw.get("accounts") if isinstance(raw, Mapping) else None
         if not isinstance(accounts, Mapping):
             return
@@ -2988,6 +3783,20 @@ class CodexAccountsSource:
             if note:
                 state = self._states.setdefault(account_id, FetchState())
                 state.set_note(note, kind or KIND_WARN)
+                if note in _ANNOUNCED_NOTES:
+                    # The log already said so before the restart; saying it
+                    # again on every launch is the per-poll noise OPS-3 removes.
+                    state.announced_note = note
+            dead = record.get("refresh_dead_sig")
+            if (
+                isinstance(dead, list)
+                and len(dead) == 2
+                and all(isinstance(v, int) and not isinstance(v, bool) for v in dead)
+            ):
+                # CX-2 across a restart: a refused family stays refused until
+                # the file itself changes, or every launch buys one dead POST.
+                state = self._states.setdefault(account_id, FetchState())
+                state.dead_refresh_sig = (dead[0], dead[1])
 
     def _save(self) -> bool:
         """Persist snapshots + notes (never counters, never a token). 0600."""
@@ -3008,7 +3817,14 @@ class CodexAccountsSource:
                     # holds, so the sidecar's privacy story is unchanged.
                     "samples": [[when, pct] for when, pct in self._samples.get(account_id, ())],
                 }
-            payload = {"version": _SNAPSHOT_VERSION, "accounts": accounts}
+                if state is not None and state.dead_refresh_sig is not None:
+                    # [mtime_ns, size] of the refused file - a stat, not a secret.
+                    accounts[account_id]["refresh_dead_sig"] = list(state.dead_refresh_sig)
+            payload: dict[str, Any] = {"version": _SNAPSHOT_VERSION, "accounts": accounts}
+            if self._desktop_id:
+                # SEC-1: the last account ~/.codex was read as - an id, not a
+                # secret; the same id `list` prints.
+                payload["desktop_account_id"] = self._desktop_id
         return _atomic_write_json(self._snapshots_path, payload)
 
     def _record_sample(self, account_id: str, quota: CodexAccountQuota) -> None:
@@ -3100,9 +3916,12 @@ _USAGE = """usage: python -m cc_usage_widget.codex_accounts <command>
                  ONE OAuth refresh grant on that account, persisted to its
                  auth.json before use, then one usage request to prove the new
                  access token works. Prints plan/email/expiry before and
-                 after; never a token. This is the SPEC-CODEX 6.4 probe that
-                 must run clean (and soak 24 h) before codex_refresh_enabled
-                 is worth turning on - it works whether or not it is on.
+                 after; never a token. The widget already refreshes on its
+                 own (codex_refresh_enabled, on by default, behind the
+                 SPEC-CODEX 6.4 guards); this is the one-shot probe for
+                 evidence before and after a change there. It works whether
+                 or not the switch is on, and refuses the account ~/.codex is
+                 logged in as, as the widget does.
 """
 
 COPY_TARGETS: tuple[str, ...] = (
@@ -3142,6 +3961,30 @@ without ``skills/`` gets four links and no error. Deliberately NOT here:
 ``auth.json`` (the whole point is that each home has its own),
 ``sessions``/``history.jsonl``/``log`` (Codex writes those, and a symlink would
 braid four accounts' history into one file), and :data:`COPY_TARGETS`."""
+
+
+def best_codex_row(rows: Sequence[AccountRow]) -> AccountRow | None:
+    """The Codex account with the most headroom, or ``None`` (UX-5).
+
+    Pure: the ranking ``best`` prints and the menu's ``best:`` line shows, so
+    the two cannot disagree. Among LIVE rows (negative slots) that are not
+    disabled and carry no ``warn``/``crit`` verdict, the lowest KNOWN weekly
+    percentage below 100 wins; a tie goes to the earlier row. A withheld
+    figure (``None``) is not room, and neither is a credit block (``crit``)
+    standing over an unspent percentage. ``None`` when no row has room.
+    """
+    best: AccountRow | None = None
+    for row in rows:
+        if row.slot >= 0 or getattr(row, "disabled", False):
+            continue
+        if getattr(row, "attention_kind", "") in (KIND_WARN, KIND_CRIT):
+            continue
+        pct = row.seven_day_pct
+        if pct is None or pct >= 100.0:
+            continue
+        if best is None or pct < (best.seven_day_pct or 0.0):
+            best = row
+    return best
 
 
 def _cmd_best(
@@ -3239,17 +4082,13 @@ def _cmd_best(
             write(f"{home}\n")
         return 0
 
-    with_room = [
-        item
-        for item in candidates
-        if item[1].seven_day_pct is not None
-        and item[1].seven_day_pct < 100.0
-        and item[1].attention_kind != KIND_CRIT
-    ]
-    if with_room:
-        entry, row, home = min(
-            with_room, key=lambda item: (item[1].seven_day_pct, item[0].order, item[0].account_id)
-        )
+    # One ranking for the CLI and the menu's `best:` line (UX-5): the pure
+    # `best_codex_row`, fed in (order, account_id) order so its first-wins tie
+    # break is exactly this command's historical one.
+    ranked = sorted(candidates, key=lambda item: (item[0].order, item[0].account_id))
+    best = best_codex_row([row for _entry, row, _home in ranked])
+    if best is not None:
+        entry, row, home = next(item for item in ranked if item[1] is best)
         return emit(entry, row, home, "lowest weekly usage with headroom")
 
     resets = [item for item in candidates if item[1].soonest_reset_at is not None]
@@ -3671,8 +4510,11 @@ def _cmd_probe_refresh(
     """The SPEC-CODEX 6.4 probe: one grant, then one GET that proves it.
 
     Deliberately **not** gated on ``codex_refresh_enabled``: this command is
-    what produces the evidence that opens that switch, so requiring the switch
-    would be circular. It is also deliberately one-shot — no loop, no second
+    the evidence for a change to the refresh path, and it must work whichever
+    way the switch is set. Guard 1 still applies (SEC-1): the account
+    ``~/.codex`` is logged in as - or every account, while that file cannot be
+    read and never named one - is refused by :class:`TokenRefresher` itself.
+    It is also deliberately one-shot — no loop, no second
     account, no retry — because the question it answers ("does rotating this
     login break the others?") is answered by looking at the *other* stores 24 h
     later, and every extra grant muddies that reading.
@@ -3701,7 +4543,10 @@ def _cmd_probe_refresh(
 
     client = transport or UrllibTransport()
     refresher = TokenRefresher(client, credentials, clock=clock, log=lambda line: None)
-    outcome = refresher.refresh(match.account_id, label=label)
+    active = credentials.active_account_id()
+    if active is None and credentials.mirror_state == MIRROR_UNKNOWN:
+        active = REFRESH_GUARD_UNKNOWN
+    outcome = refresher.refresh(match.account_id, active=active, label=label)
     if outcome.status != REFRESH_OK or outcome.credential is None:
         write(f"refresh {outcome.status}: {outcome.detail or 'no detail'}\n")
         return 1
@@ -3739,8 +4584,9 @@ def _cmd_probe_refresh(
         )
     write(f"usage   HTTP 200, plan {body.get('plan_type')!r}, {weekly}\n")
     write(
-        "soak    leave the other stores alone for 24 h, then run `list` and check\n"
-        "        ~/.codex still works before turning codex_refresh_enabled on\n"
+        "check   run `list` and confirm ~/.codex is still logged in as before;\n"
+        "        the widget keeps refreshing on its own while\n"
+        "        codex_refresh_enabled is on (the default)\n"
     )
     return 0
 

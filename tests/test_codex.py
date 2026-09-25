@@ -475,15 +475,16 @@ def test_cached_input_is_a_subset_hand_computed_cost() -> None:
 
     Hand computation, ``gpt-5.6-sol`` at $4.00 / $0.40 / $20.00 per Mtok (the
     post-cut rate; the fixture is dated today, after ``OPENAI_SOL_RATE_CUT_DAY``),
-    with cache writes billed at the standard input rate (SPEC-CODEX 3):
+    with cache writes billed at the page's published "Cache writes" rate,
+    $5.00 for Sol (SPEC-CODEX 3, read 2026-09-25):
 
     ==============================  ==================  ==========
     uncached in  1,000,000 - 800,000    200,000 @ $4.00   $0.800000
     cached in                            800,000 @ $0.40   $0.320000
-    cache write                          100,000 @ $4.00   $0.400000
+    cache write                          100,000 @ $5.00   $0.500000
     output                                50,000 @ $20.00  $1.000000
     ==============================  ==================  ==========
-    **total**                                             **$2.52**
+    **total**                                             **$2.62**
     """
     with tempfile.TemporaryDirectory() as name:
         tmp = Path(name)
@@ -512,12 +513,12 @@ def test_cached_input_is_a_subset_hand_computed_cost() -> None:
         assert usage.output == 50_000
 
         got = usd(f"{VENDOR_CODEX}:{SOL}", usage)
-        assert round(got, 10) == 2.52, f"expected exactly $2.52, got ${got}"
+        assert round(got, 10) == 2.62, f"expected exactly $2.62, got ${got}"
 
         # What the additive (naive) reading would have produced, for the record:
-        # 1,000,000 @ $4.00 + 800,000 @ $0.40 + 100,000 @ $4.00 + 50,000 @ $20.00
-        # = 4.00 + 0.32 + 0.40 + 1.00 = $5.72 - more than twice the truth.
-        assert round(got, 10) != 5.72
+        # 1,000,000 @ $4.00 + 800,000 @ $0.40 + 100,000 @ $5.00 + 50,000 @ $20.00
+        # = 4.00 + 0.32 + 0.50 + 1.00 = $5.82 - more than twice the truth.
+        assert round(got, 10) != 5.82
 
 
 def test_cached_greater_than_input_is_clamped_not_negative() -> None:
@@ -1465,7 +1466,11 @@ def test_a_note_only_row_survives_and_renders_header_plus_note() -> None:
             f"a sentinel row must not render a bar or a percentage: {label!r}"
         )
         # And the plain fallback says the same thing the attributed block does.
-        assert _quota_row_label(dead) == "acme (pro)  (relogin)", _quota_row_label(dead)
+        # CX-7b adds the dim action line (`codex_login.relogin_detail`); the
+        # verdict itself is still exactly `(relogin)`.
+        assert _quota_row_label(dead) == (
+            "acme (pro)  (relogin)  · last reading 1m ago · Log in again…"
+        ), _quota_row_label(dead)
 
         # Control: strip the note and the row goes back to being dropped.
         silent = live_quota_row(-1, "acme", pct=None)

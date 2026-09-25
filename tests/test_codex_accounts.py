@@ -41,6 +41,8 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
+os.environ.setdefault("CC_USAGE_WIDGET_NO_REVEAL", "1")  # never open Finder from a test
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cc_usage_widget.codex_accounts import (  # noqa: E402
@@ -51,6 +53,9 @@ from cc_usage_widget.codex_accounts import (  # noqa: E402
     NOTE_PENDING,
     NOTE_RATE_LIMITED,
     NOTE_RELOGIN,
+    NOTE_VIA_DESKTOP,
+    REFRESH_GUARD_UNKNOWN,
+    REFRESH_RACED,
     CodexAccountQuota,
     CodexAccountsSource,
     Credential,
@@ -927,7 +932,11 @@ def test_an_expired_token_relogins_without_making_a_request() -> None:
 
 
 def test_a_token_expiring_within_48h_shows_a_countdown_and_still_reads() -> None:
-    with temp_harness(accounts=[(PRO_ACCOUNT_ID, "a")]) as h:
+    """With refresh OFF nobody will renew the token, so the deadline is real.
+    (With refresh on and healthy the countdown is withheld - CX-7a below.)"""
+    with temp_harness(
+        accounts=[(PRO_ACCOUNT_ID, "a")], settings={"codex_refresh_enabled": False}
+    ) as h:
         h.transport = FakeTransport(lambda a, n: ok(verified_pro_body()))
         h.source = h.build_source()
         write_credential(h.accounts_dir, PRO_ACCOUNT_ID, exp=BASE_NOW + 30 * 3600)
@@ -2568,14 +2577,14 @@ def test_unlink_removes_only_the_links_it_made() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Token refresh, default OFF (roadmap 13, SPEC-CODEX 6.4)
+# Token refresh, default ON since CX-4 (roadmap 13, SPEC-CODEX 6.4)
 # ---------------------------------------------------------------------------
 #
 # The feature this suite must be hardest on, because its failure mode is not a
 # wrong number on a menu — it is Vlad logged out of the account he is coding
 # in. Four properties are asserted rather than described:
 #
-#   off      with ``codex_refresh_enabled`` unset or False, NOT ONE POST is
+#   off      with ``codex_refresh_enabled`` explicitly False, NOT ONE POST is
 #            made. Proven by a transport whose ``post_form`` fails the test.
 #   order    the rotated tokens are on disk BEFORE the access token they carry
 #            authorises anything. Proven from inside the usage handler, which
@@ -2658,14 +2667,18 @@ def tokens_on_disk(harness: "Harness", account_id: str) -> dict[str, Any]:
     return json.loads(auth.read_text())["tokens"]
 
 
-def test_the_refresh_switch_is_declared_and_defaults_off() -> None:
-    """A key only ``app.py`` knew about would be dropped on the next save, and
-    a default of True would ship the unproven behaviour to everyone."""
-    assert SETTINGS_DEFAULTS["codex_refresh_enabled"] is False
-    assert normalize_settings({})["codex_refresh_enabled"] is False
+def test_the_refresh_switch_is_declared_and_defaults_on() -> None:
+    """CX-4. A key only ``app.py`` knew about would be dropped on the next
+    save. The default is ON since 2026-09-25: off, every widget copy of a
+    ten-day token expired unannounced on Sep 20 and stayed dead for five days;
+    the CX-2/CX-3 guards remove the risk the off default protected against.
+    An explicit False must still survive a save - it is the off switch."""
+    assert SETTINGS_DEFAULTS["codex_refresh_enabled"] is True
+    assert normalize_settings({})["codex_refresh_enabled"] is True
+    assert normalize_settings({"codex_refresh_enabled": False})["codex_refresh_enabled"] is False
     assert normalize_settings({"codex_refresh_enabled": True})["codex_refresh_enabled"] is True
-    assert normalize_settings({"codex_refresh_enabled": "yes"})["codex_refresh_enabled"] is False, (
-        "a hand-edited junk value must fall back to OFF, never to on"
+    assert normalize_settings({"codex_refresh_enabled": "yes"})["codex_refresh_enabled"] is True, (
+        "a hand-edited junk value falls back to the declared default"
     )
 
 
@@ -2686,7 +2699,9 @@ def test_the_switch_off_makes_not_one_token_request() -> None:
     """The whole default state, asserted by construction: the transport fails
     the test if it is ever asked to post, and the auth.json bytes must be
     identical after a cycle over a token that is an hour from expiry."""
-    with temp_harness(accounts=[("acct-a", "vlad")]) as h:
+    with temp_harness(
+        accounts=[("acct-a", "vlad")], settings={"codex_refresh_enabled": False}
+    ) as h:
         auth = write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 3_600)
         before = auth.read_bytes()
         h.transport = NoPostTransport(
@@ -2695,7 +2710,7 @@ def test_the_switch_off_makes_not_one_token_request() -> None:
         h.source = h.build_source()
         h.source.run_cycle_once()
 
-        assert "codex_refresh_enabled" not in h.settings, "the harness runs the shipped default"
+        assert h.settings["codex_refresh_enabled"] is False, "the explicit off switch"
         assert auth.read_bytes() == before, "the widget wrote to a credential file with refresh off"
         assert h.rows_by_alias()["vlad"].seven_day_pct == 19.0, "the poll still happened"
 
@@ -2703,7 +2718,9 @@ def test_the_switch_off_makes_not_one_token_request() -> None:
 def test_a_401_with_the_switch_off_still_makes_no_token_request() -> None:
     """The reactive path is gated on the same switch as the proactive one — a
     401 must not become a back door into rotating a credential."""
-    with temp_harness(accounts=[("acct-a", "vlad")]) as h:
+    with temp_harness(
+        accounts=[("acct-a", "vlad")], settings={"codex_refresh_enabled": False}
+    ) as h:
         auth = write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 9 * 86_400)
         before = auth.read_bytes()
         h.transport = NoPostTransport(lambda account_id, attempt: json_response(401, {}))
@@ -2894,7 +2911,7 @@ def test_the_refresher_refuses_a_world_readable_credential_on_its_own() -> None:
             clock=h.clock.time,
             log=h.logs.append,
         )
-        outcome = refresher.refresh("acct-a", label="vlad")
+        outcome = refresher.refresh("acct-a", active=None, label="vlad")
 
         assert outcome.status == "failed" and "refusing to rotate" in outcome.detail
         assert transport.posts == [], "a leaky credential bought a grant anyway"
@@ -2918,9 +2935,12 @@ def test_a_403_never_refreshes() -> None:
         assert h.rows_by_alias()["vlad"].attention_note == NOTE_NO_ACCESS
 
 
-def test_invalid_grant_says_relogin_and_never_retries() -> None:
-    """The one terminal answer: the family is gone, so no retry, and no usage
-    request either — the access token it would carry is the dead one."""
+def test_invalid_grant_with_a_live_token_counts_down_and_never_retries() -> None:
+    """The one terminal answer: the family is gone, so no retry - but the
+    ACCESS token is still in date and still works until ``exp`` (SMC-1: the
+    old contract skipped the read here, and the next poll's 200 proved the
+    token was never dead). The row keeps its figures and counts down to the
+    real deadline; only an expired token turns the refusal into ``relogin``."""
     with temp_harness(accounts=[("acct-a", "vlad")], settings={"codex_refresh_enabled": True}) as h:
         auth = write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 3_600)
         before = auth.read_bytes()
@@ -2932,9 +2952,15 @@ def test_invalid_grant_says_relogin_and_never_retries() -> None:
         h.source.run_cycle_once()
 
         assert len(h.transport.posts) == 1, "one attempt, never a retry"
-        assert h.transport.calls == [], "no usage request with a token we know is dead"
-        assert h.rows_by_alias()["vlad"].attention_note == NOTE_RELOGIN
+        assert h.transport.calls == ["acct-a"], "the in-date token still reads"
+        row = h.rows_by_alias()["vlad"]
+        assert (row.attention_note, row.attention_kind) == ("relogin in 1h", "info"), row
+        assert row.seven_day_pct == 19.0
         assert auth.read_bytes() == before, "a refused grant must not touch the file"
+
+        h.clock.advance(300)
+        h.source.run_cycle_once()
+        assert len(h.transport.posts) == 1, "a dead family is not asked twice"
 
 
 def test_a_failed_refresh_changes_nothing_and_the_old_token_still_reads() -> None:
@@ -3069,6 +3095,904 @@ def test_no_token_value_from_a_refresh_reaches_a_log_or_the_sidecar() -> None:
         haystack.append(h.snapshots_path.read_text())
         for line in haystack:
             assert REFRESH_CANARY not in line, "a refresh token escaped"
+
+
+# ---------------------------------------------------------------------------
+# Credential engine 2026-09-25: CX-1 desktop mirror, CX-2 dead families, CX-3
+# refresh guards, CX-4 default on, OPS-3/OPS-4 logging, CX-7a countdown
+# ---------------------------------------------------------------------------
+#
+# The outage these exist for: every widget copy of a ten-day Codex token
+# expired on 2026-09-20 with refresh off, the ~/.codex account's copy included,
+# while the ChatGPT app held a fresh token for exactly that account - and the
+# log said nothing for five days.
+
+
+def write_desktop_login(
+    auth_path: Path,
+    account_id: str,
+    *,
+    exp: float | None,
+    token: str | None = None,
+    mode: int = 0o600,
+) -> Path:
+    """``~/.codex/auth.json`` as the ChatGPT app writes it: a full login."""
+    auth_path.parent.mkdir(parents=True, exist_ok=True)
+    auth_path.write_text(
+        json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "account_id": account_id,
+                    "access_token": token
+                    or access_token(
+                        account_id=account_id, email="who@example.test", plan="pro", exp=exp
+                    ),
+                    "refresh_token": "desktop-rt",
+                    "id_token": "desktop-id",
+                },
+            }
+        )
+    )
+    os.chmod(auth_path, mode)
+    return auth_path
+
+
+class HeaderRecordingTransport(RefreshingTransport):
+    """Records which bearer each GET carried. Test-process memory only - the
+    point is to prove WHICH credential authorised a request."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.bearers: list[str] = []
+
+    def get(self, url: str, headers: Any, timeout: float) -> HttpResponse:
+        self.bearers.append(dict(headers).get("Authorization", ""))
+        return super().get(url, headers, timeout)
+
+
+def _no_grant(data: Any, n: int) -> Any:
+    return AssertionError("a token grant was requested where none may be")
+
+
+def test_the_desktop_login_speaks_for_its_own_account_when_the_widget_copy_is_dead() -> None:
+    """CX-1, the literal complaint: the ~/.codex account's row said relogin for
+    five days while the app's own login for that account was fresh."""
+    with temp_harness(accounts=[("acct-a", "personal")]) as h:  # shipped default: refresh ON
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW - 60)
+        mirror = write_desktop_login(h.auth_path, "acct-a", exp=BASE_NOW + 5 * 86_400)
+        before_bytes, before_mtime = mirror.read_bytes(), mirror.stat().st_mtime_ns
+        h.transport = RefreshingTransport(
+            lambda account_id, attempt: ok(verified_pro_body(account_id=account_id)), _no_grant
+        )
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+
+        assert h.transport.calls == ["acct-a"], h.transport.calls
+        assert h.transport.posts == [], "never a refresh with the desktop token"
+        row = h.rows_by_alias()["personal"]
+        assert row.attention_note == "", row.attention_note
+        assert row.seven_day_pct == 19.0 and row.is_active
+        assert NOTE_VIA_DESKTOP == "via ChatGPT app login"
+        assert NOTE_VIA_DESKTOP in row.info_notes, row.info_notes
+        assert row.credential_expires_at == BASE_NOW + 5 * 86_400
+        assert h.state("acct-a").credential_source == "desktop"
+        assert mirror.read_bytes() == before_bytes, "the widget wrote to ~/.codex"
+        assert mirror.stat().st_mtime_ns == before_mtime, "the widget touched ~/.codex"
+
+
+def test_a_desktop_login_for_another_account_never_speaks_for_this_one() -> None:
+    """Identity is the file's ``tokens.account_id``, never a shared email."""
+    with temp_harness(
+        accounts=[("acct-a", "personal"), ("acct-b", "work")],
+        settings={"codex_refresh_enabled": False},
+    ) as h:
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW - 60)
+        write_credential(h.accounts_dir, "acct-b", exp=BASE_NOW + 9 * 86_400)
+        write_desktop_login(h.auth_path, "acct-b", exp=BASE_NOW + 5 * 86_400)
+        h.transport = RefreshingTransport(
+            lambda account_id, attempt: ok(verified_pro_body(account_id=account_id)), _no_grant
+        )
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+
+        assert h.transport.calls_for("acct-a") == 0
+        assert h.rows_by_alias()["personal"].attention_note == NOTE_RELOGIN
+        assert NOTE_VIA_DESKTOP not in h.rows_by_alias()["personal"].info_notes
+        assert h.source._credentials.read_desktop("acct-a") is None  # noqa: SLF001
+        assert h.transport.posts == []
+
+
+def test_a_refused_desktop_token_retries_once_with_the_widget_copy_and_never_refreshes() -> None:
+    """A 401 on the app's token: one retry with our own copy if it is still in
+    date, else relogin - and in neither case a grant request."""
+    desktop_token = access_token(
+        account_id="acct-a", email="who@example.test", plan="pro", exp=BASE_NOW + 5 * 86_400
+    )
+    with temp_harness(accounts=[("acct-a", "personal")]) as h:
+        # 3 days: outside the 48 h countdown, older than the app's 5-day token.
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 3 * 86_400)
+        write_desktop_login(h.auth_path, "acct-a", exp=None, token=desktop_token)
+        h.transport = HeaderRecordingTransport(
+            lambda account_id, attempt: (
+                json_response(401, {}) if attempt == 1 else ok(verified_pro_body(account_id=account_id))
+            ),
+            _no_grant,
+        )
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+
+        assert h.transport.posts == []
+        assert h.transport.calls == ["acct-a", "acct-a"], "exactly one retry"
+        assert h.transport.bearers[0] == f"Bearer {desktop_token}", "the newer desktop token went first"
+        assert h.transport.bearers[1] != h.transport.bearers[0], "the retry used the widget copy"
+        row = h.rows_by_alias()["personal"]
+        assert row.seven_day_pct == 19.0 and row.attention_note == ""
+        assert NOTE_VIA_DESKTOP not in row.info_notes, "the reading came from the widget copy"
+
+    with temp_harness(accounts=[("acct-a", "personal")]) as h:
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW - 60)
+        write_desktop_login(h.auth_path, "acct-a", exp=BASE_NOW + 5 * 86_400)
+        h.transport = RefreshingTransport(lambda account_id, attempt: json_response(401, {}), _no_grant)
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+
+        assert h.transport.posts == []
+        assert h.transport.calls == ["acct-a"], "no widget copy in date, so no retry"
+        assert h.rows_by_alias()["personal"].attention_note == NOTE_RELOGIN
+
+
+def test_a_desktop_login_other_users_can_read_is_refused() -> None:
+    """The same 0o077 rule as our own files, and it says why."""
+    with temp_harness(accounts=[("acct-a", "personal")]) as h:
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW - 60)
+        write_desktop_login(h.auth_path, "acct-a", exp=BASE_NOW + 5 * 86_400, mode=0o644)
+        h.transport = RefreshingTransport(
+            lambda account_id, attempt: ok(verified_pro_body(account_id=account_id)), _no_grant
+        )
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+
+        assert h.transport.calls == [] and h.transport.posts == []
+        assert h.rows_by_alias()["personal"].attention_note == NOTE_RELOGIN
+        assert any("0644" in line for line in h.source.diagnostics())
+
+
+def test_the_app_rewriting_its_login_clears_a_standing_relogin_within_one_tick() -> None:
+    """``_credential_sig`` watches ~/.codex too while it is this account's."""
+    with temp_harness(accounts=[("acct-a", "personal")]) as h:
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW - 60)
+        write_mirror(h.auth_path, "acct-a")  # logged in, but no usable token in it
+        h.transport = RefreshingTransport(
+            lambda account_id, attempt: ok(verified_pro_body(account_id=account_id)), _no_grant
+        )
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+        assert h.rows_by_alias()["personal"].attention_note == NOTE_RELOGIN
+
+        h.clock.advance(60)
+        write_desktop_login(h.auth_path, "acct-a", exp=BASE_NOW + 5 * 86_400)
+        h.source.run_cycle_once()  # 60 s later, well inside the 300 s interval
+        assert h.transport.calls == ["acct-a"], "the app's rewrite was not noticed"
+        assert h.rows_by_alias()["personal"].attention_note == ""
+
+
+def test_invalid_grant_is_not_retried_on_later_polls_until_the_file_changes() -> None:
+    """CX-2: before, a dead grant cost one POST per poll (288/day/account)."""
+    with temp_harness(accounts=[("acct-a", "vlad")], settings={"codex_refresh_enabled": True}) as h:
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW - 60)
+        h.transport = RefreshingTransport(
+            lambda account_id, attempt: ok(verified_pro_body(account_id=account_id)),
+            lambda data, n: json_response(400, {"error": "invalid_grant"}),
+        )
+        h.source = h.build_source()
+        for _ in range(6):
+            h.source.run_cycle_once()
+            h.clock.advance(300)
+        assert len(h.transport.posts) == 1, h.transport.posts
+        assert h.rows_by_alias()["vlad"].attention_note == NOTE_RELOGIN
+
+        auth = write_credential(
+            h.accounts_dir, "acct-a", exp=BASE_NOW - 60, refresh="refresh-after-a-new-login"
+        )
+        h.source.run_cycle_once()
+        assert len(h.transport.posts) == 2, "a new login earns exactly one new attempt"
+
+        st = auth.stat()
+        sidecar = json.loads(h.snapshots_path.read_text())
+        assert sidecar["accounts"]["acct-a"]["refresh_dead_sig"] == [st.st_mtime_ns, st.st_size]
+
+        h.source = h.build_source()  # cold start over the same home
+        h.clock.advance(300)
+        h.source.run_cycle_once()
+        assert len(h.transport.posts) == 2, "a restart bought a dead POST"
+        assert h.rows_by_alias()["vlad"].attention_note == NOTE_RELOGIN
+
+
+def test_the_account_codex_is_logged_in_as_is_never_refreshed() -> None:
+    """CX-3: our copy of the ~/.codex account may share the app's refresh
+    family; rotating it would log the app out."""
+    with temp_harness(accounts=[("acct-a", "personal")], settings={"codex_refresh_enabled": True}) as h:
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 3_600)
+        write_mirror(h.auth_path, "acct-a")
+        h.transport = RefreshingTransport(
+            lambda account_id, attempt: ok(verified_pro_body(account_id=account_id)),
+            lambda data, n: ok(grant_body(account_id="acct-a", exp=BASE_NOW + 10 * 86_400)),
+        )
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+        assert h.transport.posts == []
+        # Nobody will renew this copy, so its deadline is real (CX-7a).
+        assert h.rows_by_alias()["personal"].attention_note.startswith(NOTE_RELOGIN + " in")
+
+    # The control: logged in as a TRACKED second account, so the guard really
+    # names acct-b (an untracked id used to fall through the same fail-open
+    # branch the positive case was meant to exclude, SEC-1).
+    with temp_harness(
+        accounts=[("acct-a", "personal"), ("acct-b", "work")],
+        settings={"codex_refresh_enabled": True},
+    ) as h:
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 3_600)
+        write_credential(h.accounts_dir, "acct-b", exp=BASE_NOW + 3_600)
+        write_mirror(h.auth_path, "acct-b")
+        h.transport = RefreshingTransport(
+            lambda account_id, attempt: ok(verified_pro_body(account_id=account_id)),
+            lambda data, n: ok(grant_body(account_id="acct-a", exp=BASE_NOW + 10 * 86_400)),
+        )
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+        assert h.source.active_account_id() == "acct-b", "the control must be a tracked login"
+        assert len(h.transport.posts) == 1, "acct-a rotated, acct-b (the app's) did not"
+        assert tokens_on_disk(h, "acct-a")["refresh_token"] == "rotated-refresh-token"
+        assert tokens_on_disk(h, "acct-b")["refresh_token"] == "refresh-for-acct-b"
+
+
+# ---------------------------------------------------------------------------
+# Review round 1 (2026-09-25): SEC-1 fail-closed guard, SMC-1 proactive
+# refusal, SMC-3 desktop backstop, SEC-2 rotation temp files
+# ---------------------------------------------------------------------------
+
+TORN_MIRROR = '{"auth_mode": "chatgpt", "tokens": {"acco'
+"""What a read lands on while the ChatGPT app rewrites ~/.codex/auth.json in
+place: the first bytes of the new file."""
+ID_LESS_MIRROR = '{"auth_mode": "chatgpt", "tokens": {}}'
+
+
+class _NotifySnap:
+    """The attributes ``notify.detect`` reads from a UiSnapshot, and no more."""
+
+    def __init__(self, rows: Any) -> None:
+        self.accounts = ()
+        self.quota_rows = rows
+        self.account_notes: dict[Any, Any] = {}
+        self.cost = None
+
+
+def _refreshing(h: Harness) -> RefreshingTransport:
+    return RefreshingTransport(
+        lambda account_id, attempt: ok(verified_pro_body(account_id=account_id)),
+        lambda data, n: ok(grant_body(account_id="acct-a", exp=BASE_NOW + 10 * 86_400)),
+    )
+
+
+def test_a_cold_start_on_a_torn_mirror_never_refreshes_the_last_known_desktop_account() -> None:
+    """SEC-1. The guard used to read "unknown this tick" as "nobody": a restart
+    whose first read of ~/.codex landed mid-rewrite POSTed a grant for the
+    widget copy of the very account the app is logged in as. The last account
+    a read ever named is persisted and stays protected until a read names
+    another; a torn, id-less or missing file is not such a read."""
+    for bad in (TORN_MIRROR, ID_LESS_MIRROR, None):
+        with temp_harness(
+            accounts=[("acct-a", "personal")], settings={"codex_refresh_enabled": True}
+        ) as h:
+            write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 9 * 86_400)
+            write_mirror(h.auth_path, "acct-a")
+            h.transport = _refreshing(h)
+            h.source = h.build_source()
+            h.source.run_cycle_once()  # a healthy run learns who the app is
+            sidecar = json.loads(h.snapshots_path.read_text())
+            assert sidecar["desktop_account_id"] == "acct-a", sidecar.keys()
+
+            # The widget copy is now due (and even expired); the app rewrites.
+            write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW - 60)
+            if bad is None:
+                h.auth_path.unlink()
+            else:
+                write_mirror(h.auth_path, None, raw=bad)
+            h.clock.advance(3_600)  # far past the store's 600 s in-memory grace
+            h.source = h.build_source()  # cold start
+            h.source.run_cycle_once()
+            assert h.transport.posts == [], (bad, "a grant for the app's account")
+            assert h.source.active_account_id() is None, "the UI marker is not faked"
+
+
+def test_a_definitive_no_login_read_releases_the_persisted_desktop_account() -> None:
+    """R2-SEC1. The persisted id was cleared by nothing, so after the app
+    logged out (file gone) or moved to API-key mode (no `tokens`), that
+    account's widget copy was never rotated again and sat in `relogin`. An
+    API-key file releases it at once, cold or warm; a missing file releases it
+    once it has been missing on every poll for longer than the grace - a torn
+    read in between restarts that clock, and a torn file alone never does."""
+    api_key = '{"OPENAI_API_KEY": "sk-placeholder", "tokens": null}'
+
+    def learned(h: Harness) -> None:
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 9 * 86_400)
+        write_mirror(h.auth_path, "acct-a")
+        h.transport = _refreshing(h)
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+        assert json.loads(h.snapshots_path.read_text())["desktop_account_id"] == "acct-a"
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW - 60)
+
+    # API-key mode, cold start: released on the first read.
+    with temp_harness(accounts=[("acct-a", "personal")], settings={"codex_refresh_enabled": True}) as h:
+        learned(h)
+        write_mirror(h.auth_path, None, raw=api_key)
+        h.clock.advance(3_600)
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+        assert len(h.transport.posts) == 1, "an API-key ~/.codex protects nothing"
+        assert "desktop_account_id" not in json.loads(h.snapshots_path.read_text())
+        assert sum("holds no login any more" in line for line in h.logs) == 1, h.logs
+
+    # API-key mode, warm: released once the store's own grace lets go.
+    with temp_harness(accounts=[("acct-a", "personal")], settings={"codex_refresh_enabled": True}) as h:
+        learned(h)
+        write_mirror(h.auth_path, None, raw=api_key)
+        h.clock.advance(3_600)
+        h.source.force_due()
+        h.source.run_cycle_once()
+        assert len(h.transport.posts) == 1, "warm, API-key: released"
+
+    # Missing file: held through the grace, released past it.
+    with temp_harness(accounts=[("acct-a", "personal")], settings={"codex_refresh_enabled": True}) as h:
+        learned(h)
+        h.auth_path.unlink()
+        h.clock.advance(3_600)
+        h.source = h.build_source()  # cold start on a missing file
+        h.source.run_cycle_once()
+        assert h.transport.posts == [], "a fresh absence is not yet definitive"
+        h.clock.advance(300)
+        h.source.force_due()
+        h.source.run_cycle_once()
+        assert h.transport.posts == [], "300 s missing: still held"
+        write_mirror(h.auth_path, None, raw=TORN_MIRROR)  # the file is back, torn
+        h.clock.advance(60)
+        h.source.force_due()
+        h.source.run_cycle_once()
+        h.auth_path.unlink()
+        h.clock.advance(400)  # 760 s since the first miss; this poll restarts it
+        h.source.force_due()
+        h.source.run_cycle_once()
+        assert h.transport.posts == [], "a torn read restarts the absence clock"
+        h.clock.advance(601)  # 601 s missing on every poll
+        h.source.force_due()
+        h.source.run_cycle_once()
+        assert len(h.transport.posts) == 1, "missing past the grace: released"
+        assert "desktop_account_id" not in json.loads(h.snapshots_path.read_text())
+
+    # Control: a torn file, however long, never releases it.
+    with temp_harness(accounts=[("acct-a", "personal")], settings={"codex_refresh_enabled": True}) as h:
+        learned(h)
+        write_mirror(h.auth_path, None, raw=TORN_MIRROR)
+        for _ in range(4):
+            h.clock.advance(3_600)
+            h.source.force_due()
+            h.source.run_cycle_once()
+        assert h.transport.posts == [], "torn proves nothing"
+        assert json.loads(h.snapshots_path.read_text())["desktop_account_id"] == "acct-a"
+
+
+def test_no_account_is_refreshed_while_the_desktop_login_was_never_readable() -> None:
+    """SEC-1, first run: nothing persisted and the mirror unreadable - the one
+    account to leave alone cannot be named, so none is rotated, with ONE log
+    line. A later read that names the app's account (a tracked one here)
+    restores rotation for everyone else. A missing file or an API-key file
+    holds no OAuth login, so rotation there needs no knowledge at all."""
+    with temp_harness(
+        accounts=[("acct-a", "personal"), ("acct-b", "work")],
+        settings={"codex_refresh_enabled": True},
+    ) as h:
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 3_600)
+        write_credential(h.accounts_dir, "acct-b", exp=BASE_NOW + 9 * 86_400)
+        write_mirror(h.auth_path, None, raw=TORN_MIRROR)
+        h.transport = _refreshing(h)
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+        h.source.force_due()
+        h.source.run_cycle_once()
+        assert h.transport.posts == []
+        skipped = [line for line in h.logs if "token refresh skipped" in line]
+        assert len(skipped) == 1, h.logs
+        row = h.rows_by_alias()["personal"]
+        assert row.attention_note == "" and row.seven_day_pct == 19.0, (
+            "a deferred rotation is not a deadline: no countdown flash"
+        )
+
+        write_mirror(h.auth_path, "acct-b")
+        h.source.force_due()
+        h.source.run_cycle_once()
+        assert len(h.transport.posts) == 1, "acct-a rotates once the app is named"
+
+    for harmless in (None, '{"OPENAI_API_KEY": "sk-placeholder", "tokens": null}'):
+        with temp_harness(
+            accounts=[("acct-a", "personal")], settings={"codex_refresh_enabled": True}
+        ) as h:
+            write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 3_600)
+            if harmless is not None:
+                write_mirror(h.auth_path, None, raw=harmless)
+            h.transport = _refreshing(h)
+            h.source = h.build_source()
+            h.source.run_cycle_once()
+            assert len(h.transport.posts) == 1, harmless
+            assert not any("token refresh skipped" in line for line in h.logs)
+
+
+def test_the_refresher_itself_refuses_the_account_codex_is_logged_in_as() -> None:
+    """SEC-1 defence in depth: the guard lives in TokenRefresher too, so a
+    caller that skipped its own check still cannot rotate the app's account -
+    nor any account while that one is unknown. `active` is a required
+    keyword, so no caller can forget to say."""
+    with temp_harness(accounts=[("acct-a", "vlad")]) as h:
+        auth = write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 3_600)
+        before = auth.read_bytes()
+        transport = _refreshing(h)
+        refresher = TokenRefresher(
+            transport,
+            CredentialStore(h.accounts_dir, auth_path=h.auth_path, clock=h.clock.time),
+            clock=h.clock.time,
+            log=h.logs.append,
+        )
+        for active in ("acct-a", REFRESH_GUARD_UNKNOWN):
+            outcome = refresher.refresh("acct-a", active=active, label="vlad")
+            assert outcome.status == "failed" and "refused" in outcome.detail, outcome
+        assert transport.posts == [] and refresher.posts == 0
+        assert auth.read_bytes() == before
+
+        assert refresher.refresh("acct-a", active="acct-b", label="vlad").status == "ok"
+        assert len(transport.posts) == 1, "the control: another account's login blocks nothing"
+
+
+def test_probe_refresh_refuses_the_account_codex_is_logged_in_as() -> None:
+    with temp_harness(accounts=[("acct-a", "gmail")]) as h:
+        auth = write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 3_600)
+        before = auth.read_bytes()
+        write_mirror(h.auth_path, "acct-a")
+        transport = _refreshing(h)
+        code, text = run_cli(h, "probe-refresh", "gmail", transport=transport)
+        assert code == 1 and "refused" in text, text
+        assert transport.posts == [] and auth.read_bytes() == before
+
+
+def test_a_proactive_refusal_with_a_live_token_counts_down_once_and_never_flaps() -> None:
+    """SMC-1, the verifier's timeline: exp = now + 20 h (inside the 24 h
+    proactive window) and the grant answers invalid_grant. Before: cycle 0 said
+    `relogin` (warn) with no read, cycle 1 read a 200 and logged a false
+    `recovered`, and the real expiry announced relogin a third time. Now: the
+    row keeps its figures and counts down, one log line names the dead family,
+    nothing `recovered`, and the only relogin verdict comes at the real exp."""
+    from cc_usage_widget import notify
+
+    with temp_harness(accounts=[("acct-a", "vlad")], settings={"codex_refresh_enabled": True}) as h:
+        auth = write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 20 * 3_600)
+        before = auth.read_bytes()
+        h.transport = RefreshingTransport(
+            lambda account_id, attempt: ok(verified_pro_body(account_id=account_id)),
+            lambda data, n: json_response(400, {"error": "invalid_grant"}),
+        )
+        h.source = h.build_source()
+        previous = None
+        seen: list[tuple[str, str, list[str]]] = []
+        reads: list[int] = []
+        for delta in (0, 300, 300, 20 * 3_600, 300):
+            h.clock.advance(delta)
+            h.source.run_cycle_once()
+            rows = h.source.quota_rows()
+            snap = _NotifySnap(rows)
+            keys = [e.key for e in notify.detect(previous, snap, now=h.clock.time())]
+            previous = snap
+            seen.append((rows[0].attention_note, rows[0].attention_kind, keys))
+            reads.append(len(h.transport.calls))
+
+        assert len(h.transport.posts) == 1, "a dead family is asked once"
+        for note, kind, _ in seen[:3]:
+            assert note.startswith(NOTE_RELOGIN + " in") and kind == "info", seen
+        assert seen[0][2] and all(k.startswith("expiring:") for k in seen[0][2]), seen[0]
+        assert seen[1][2] == [] and seen[2][2] == [], "no flap between polls"
+        assert seen[3][0] == NOTE_RELOGIN and seen[3][1] == "warn", seen[3]
+        assert [k for k in seen[3][2] if k.startswith("attention:")], seen[3]
+        assert seen[4][2] == [], seen[4]
+        assert reads[0] == 1, "the in-date token read on the refusal's own poll"
+        assert reads[4] == reads[3] == reads[2], "no read once the token expired"
+        refused = [line for line in h.logs if "refresh refused" in line]
+        assert len(refused) == 1 and refused[0].startswith("codex vlad:"), h.logs
+        assert not any("recovered" in line for line in h.logs), h.logs
+        relogin = [line for line in h.logs if line.startswith("codex vlad: relogin")]
+        assert len(relogin) == 1 and "access token expired" in relogin[0], h.logs
+        assert auth.read_bytes() == before
+
+
+def test_the_codex_accounts_widget_copy_has_no_countdown_while_the_app_backs_it() -> None:
+    """SMC-3: the widget copy of the ~/.codex account is never rotated, so it
+    counted down and notify said "login expires ... Log in again" - but the
+    app's own login for that account is unexpired and renewed by the app, and
+    carries the row when the copy runs out. No countdown, and the row's
+    deadline is the app's login, not the copy's. When ~/.codex moves to
+    another account the backstop is gone and the countdown returns."""
+    from cc_usage_widget import notify
+
+    with temp_harness(
+        accounts=[("acct-a", "personal"), ("acct-b", "work")],
+        settings={"codex_refresh_enabled": False},
+    ) as h:
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 20 * 3_600)
+        write_credential(h.accounts_dir, "acct-b", exp=BASE_NOW + 9 * 86_400)
+        # Older than the widget copy, so the widget copy is the one used.
+        write_desktop_login(h.auth_path, "acct-a", exp=BASE_NOW + 10 * 3_600)
+        h.transport = RefreshingTransport(
+            lambda account_id, attempt: ok(verified_pro_body(account_id=account_id)), _no_grant
+        )
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+        row = h.rows_by_alias()["personal"]
+        assert h.state("acct-a").credential_source == "widget"
+        assert (row.attention_note, row.attention_kind) == ("", ""), row.attention_note
+        assert row.credential_expires_at == BASE_NOW + 10 * 3_600, "the app's login, not the copy"
+        events = notify.detect(None, _NotifySnap(h.source.quota_rows()), now=h.clock.time())
+        assert not [e for e in events if e.key.startswith("expiring:")], events
+
+        write_mirror(h.auth_path, "acct-b")  # the app logs in elsewhere
+        h.source.force_due()
+        h.source.run_cycle_once()
+        row = h.rows_by_alias()["personal"]
+        assert row.attention_note.startswith(NOTE_RELOGIN + " in"), row.attention_note
+        assert row.credential_expires_at == BASE_NOW + 20 * 3_600
+
+
+def test_a_rotation_that_fails_mid_write_leaves_no_temp_file() -> None:
+    """SEC-2, the exception half: every failure between mkstemp and replace
+    unlinks the temp file, which holds the NEW tokens. Its name carries the
+    writer's pid so the sweep can tell a dead writer's file from a live one."""
+    from cc_usage_widget import codex_accounts as accounts_mod
+
+    with temp_harness(accounts=[("acct-a", "vlad")], settings={"codex_refresh_enabled": True}) as h:
+        auth = write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 3_600)
+        before = auth.read_bytes()
+        h.transport = _refreshing(h)
+        h.source = h.build_source()
+        sources: list[str] = []
+        real_replace = accounts_mod.os.replace
+
+        def failing_replace(src: Any, dst: Any) -> None:
+            if Path(dst).name == "auth.json":
+                sources.append(Path(src).name)
+                raise OSError(28, "No space left on device")
+            real_replace(src, dst)
+
+        accounts_mod.os.replace = failing_replace
+        try:
+            h.source.run_cycle_once()
+        finally:
+            accounts_mod.os.replace = real_replace
+
+        assert sources and sources[0].startswith(f"auth.json.tmp.{os.getpid()}_"), sources
+        home = h.accounts_dir / "acct-a"
+        assert sorted(p.name for p in home.iterdir()) == ["auth.json"], list(home.iterdir())
+        assert auth.read_bytes() == before
+        assert any("could not be persisted" in line for line in h.source.diagnostics())
+
+
+def test_the_poller_sweeps_a_killed_rotations_temp_file_and_nothing_else() -> None:
+    """SEC-2, the kill half: a SIGKILL between write and replace leaves
+    `auth.json.tmp.*` beside the credential, where the widget-home sweep never
+    looks. The poller's first cycle removes it when it is over ten minutes old
+    and its writer is dead - never a live writer's file, never a fresh one,
+    never auth.json."""
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    with temp_harness(accounts=[("acct-a", "vlad")]) as h:
+        auth = write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 9 * 86_400)
+        before = auth.read_bytes()
+        home = h.accounts_dir / "acct-a"
+        old = h.clock.time() - 3_600
+        planted = {
+            f"auth.json.tmp.{dead.pid}_x1": (old, False),
+            "auth.json.tmp.legacyrand": (old, False),  # mkstemp name before the pid
+            f"auth.json.tmp.{os.getpid()}_x2": (old, True),  # a live writer
+            f"auth.json.tmp.{dead.pid}_x3": (h.clock.time() - 60, True),  # too fresh
+            "notes.txt": (old, True),
+        }
+        for name, (mtime, _) in planted.items():
+            (home / name).write_text("{}")
+            os.utime(home / name, (mtime, mtime))
+        h.transport = FakeTransport(lambda a, n: ok(verified_pro_body(account_id=a)))
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+
+        left = {p.name for p in home.iterdir()}
+        for name, (_, kept) in planted.items():
+            assert (name in left) is kept, (name, sorted(left))
+        assert "auth.json" in left and auth.read_bytes() == before
+        swept = [line for line in h.logs if "stale rotation temp file" in line]
+        assert len(swept) == 2 and all("acct-a" in line for line in swept), h.logs
+
+        (home / "auth.json.tmp.legacy2").write_text("{}")
+        os.utime(home / "auth.json.tmp.legacy2", (old, old))
+        h.source.force_due()
+        h.source.run_cycle_once()
+        assert (home / "auth.json.tmp.legacy2").exists(), "at most hourly, not per cycle"
+
+
+def test_a_rotation_temp_file_too_young_at_the_first_sweep_is_swept_later() -> None:
+    """R2-SEC-1. launchd restarts a killed widget within seconds, so the
+    poller's first sweep sees the orphan ~5 s old - under the 10 minute floor
+    - and the sweep used to run once per process: the file, holding the
+    rotated refresh token, stayed for the life of the process. It is now
+    re-run hourly, and nothing sooner (one listdir per account an hour)."""
+    hour = 3_600  # the contract: at most hourly (ROTATION_SWEEP_INTERVAL_SECONDS)
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    with temp_harness(accounts=[("acct-a", "vlad")]) as h:
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 9 * 86_400)
+        home = h.accounts_dir / "acct-a"
+        orphan = home / f"auth.json.tmp.{dead.pid}_kill1"
+        orphan.write_text('{"tokens": {"refresh_token": "SYNTHETIC-ROTATED"}}')
+        written = h.clock.time() - 5
+        os.utime(orphan, (written, written))
+        h.transport = FakeTransport(lambda a, n: ok(verified_pro_body(account_id=a)))
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+        assert orphan.exists(), "5 s old: too young to judge"
+
+        h.clock.advance(hour - 60)
+        h.source.force_due()
+        h.source.run_cycle_once()
+        assert orphan.exists(), "not re-swept inside the hour"
+
+        h.clock.advance(60)
+        h.source.force_due()
+        h.source.run_cycle_once()
+        assert not orphan.exists(), "an hour on, the dead writer's temp file is gone"
+        assert sum("stale rotation temp file" in line for line in h.logs) == 1, h.logs
+
+
+def test_the_rotation_sweep_survives_a_pid_token_no_process_can_own() -> None:
+    """R2-SEC2. `auth.json.tmp.<digits>_x` with digits >= 2**31 made os.kill
+    raise OverflowError, which escaped the never-raises sweep and cost the
+    poll cycle; a non-ASCII digit (`isdigit` but not `int`) did the same with
+    ValueError. Both are judged on age alone now, and the sweep goes on to
+    the next file."""
+    import time
+
+    from cc_usage_widget import codex_accounts as accounts_mod
+
+    with tempfile.TemporaryDirectory() as name:
+        accounts = Path(name)
+        home = accounts / "acct-a"
+        home.mkdir()
+        (home / "auth.json").write_text("{}")
+        now = time.time()
+        old = now - 3_600
+        names = [
+            "auth.json.tmp.99999999999999999999999_x",
+            f"auth.json.tmp.{2**31}_y",
+            "auth.json.tmp.\u00b2_z",
+            "auth.json.tmp.legacyrand",
+        ]
+        for leaf in names:
+            (home / leaf).write_text("{}")
+            os.utime(home / leaf, (old, old))
+        logs: list[str] = []
+        removed = accounts_mod.sweep_rotation_orphans(accounts, now=now, log=logs.append)
+        assert removed == 4, (removed, sorted(p.name for p in home.iterdir()))
+        assert sorted(p.name for p in home.iterdir()) == ["auth.json"]
+
+
+def test_a_cli_rotation_during_our_post_is_not_clobbered() -> None:
+    """CX-3 compare-before-write: the CLI's newer file wins."""
+    cli_exp = BASE_NOW + 9 * 86_400
+
+    def build(h: Harness) -> RefreshingTransport:
+        def grant(data: Any, n: int) -> Any:
+            write_credential(h.accounts_dir, "acct-a", exp=cli_exp, refresh="cli-rotated")
+            return ok(grant_body(account_id="acct-a", exp=BASE_NOW + 10 * 86_400,
+                                 refresh="widget-rotated"))
+        return RefreshingTransport(
+            lambda account_id, attempt: ok(verified_pro_body(account_id=account_id)), grant
+        )
+
+    with temp_harness(accounts=[("acct-a", "vlad")], settings={"codex_refresh_enabled": True}) as h:
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 3_600)
+        refresher = TokenRefresher(
+            build(h), CredentialStore(h.accounts_dir, auth_path=h.auth_path, clock=h.clock.time),
+            clock=h.clock.time, log=h.logs.append,
+        )
+        outcome = refresher.refresh("acct-a", active=None, label="vlad")
+        assert outcome.status == REFRESH_RACED, outcome
+        assert outcome.credential is not None and outcome.credential.exp == cli_exp, "re-read from disk"
+        assert tokens_on_disk(h, "acct-a")["refresh_token"] == "cli-rotated"
+
+    with temp_harness(accounts=[("acct-a", "vlad")], settings={"codex_refresh_enabled": True}) as h:
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 3_600)
+        h.transport = build(h)
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+        assert tokens_on_disk(h, "acct-a")["refresh_token"] == "cli-rotated"
+        raced = [l for l in h.logs if "auth.json changed during refresh; kept the newer file" in l]
+        assert len(raced) == 1 and raced[0].startswith("codex vlad:"), h.logs
+        row = h.rows_by_alias()["vlad"]
+        assert row.seven_day_pct == 19.0 and row.credential_expires_at == cli_exp
+
+
+def test_a_nested_reuse_error_is_terminal() -> None:
+    """OpenAI's reuse/expiry codes arrive nested; before, ``_to_str`` of the
+    object was ``""`` and the dead family was re-asked every poll."""
+    for body in (
+        {"error": {"code": "refresh_token_reused"}},
+        {"error": {"code": "refresh_token_expired"}},
+        {"error": {"code": "refresh_token_invalidated"}},
+        {"error": "invalid_grant"},
+    ):
+        with temp_harness(
+            accounts=[("acct-a", "vlad")], settings={"codex_refresh_enabled": True}
+        ) as h:
+            write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW - 60)
+            h.transport = RefreshingTransport(
+                lambda account_id, attempt: ok(verified_pro_body(account_id=account_id)),
+                lambda data, n, body=body: json_response(400, body),
+            )
+            h.source = h.build_source()
+            for _ in range(3):
+                h.source.run_cycle_once()
+                h.clock.advance(300)
+            assert len(h.transport.posts) == 1, (body, len(h.transport.posts))
+            assert h.rows_by_alias()["vlad"].attention_note == NOTE_RELOGIN, body
+
+
+def test_a_refusal_after_a_concurrent_rotation_is_not_terminal() -> None:
+    """The refusal was about the token the CLI just superseded: re-read, go on."""
+    with temp_harness(accounts=[("acct-a", "vlad")], settings={"codex_refresh_enabled": True}) as h:
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 3_600)
+
+        def grant(data: Any, n: int) -> Any:
+            write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 9 * 86_400, refresh="cli-rotated")
+            return json_response(400, {"error": {"code": "refresh_token_reused"}})
+
+        h.transport = RefreshingTransport(
+            lambda account_id, attempt: ok(verified_pro_body(account_id=account_id)), grant
+        )
+        h.source = h.build_source()
+        h.source.run_cycle_once()
+        assert h.state("acct-a").dead_refresh_sig is None
+        row = h.rows_by_alias()["vlad"]
+        assert row.attention_note == "" and row.seven_day_pct == 19.0
+        assert tokens_on_disk(h, "acct-a")["refresh_token"] == "cli-rotated"
+
+
+def test_the_settings_menu_offers_the_refresh_switch_while_live_quota_is_on() -> None:
+    """CX-4: the switch used to be a hand-edit of settings.json."""
+    from cc_usage_widget import app as app_mod
+    from cc_usage_widget.app import UiSnapshot
+
+    title = "Refresh Codex logins automatically"
+    original = app_mod.CODEX_ACCOUNTS_REGISTRY_PATH
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        with tempfile.TemporaryDirectory() as name:
+            registry = Path(name) / "codex_accounts.json"
+            registry.write_text('{"version": 1, "accounts": []}', encoding="utf-8")
+            app_mod.CODEX_ACCOUNTS_REGISTRY_PATH = registry
+
+            def menu(**overrides: Any) -> Any:
+                settings = normalize_settings({**SETTINGS_DEFAULTS, **overrides})
+                return app._settings_submenu(UiSnapshot(settings=settings))
+
+            assert title not in list(menu(codex_live_quota_enabled=False).keys())
+            assert menu(codex_live_quota_enabled=True)[title].state == 1, "default on"
+            off = menu(codex_live_quota_enabled=True, codex_refresh_enabled=False)[title]
+            assert off.state == 0, "the checkmark mirrors the setting"
+            assert off.callback is not None
+    finally:
+        app_mod.CODEX_ACCOUNTS_REGISTRY_PATH = original
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+def test_a_dead_credential_is_logged_once_and_its_recovery_once() -> None:
+    """OPS-3: widget.log had zero Codex lines from Sep 20 11:13 to Sep 25."""
+    with temp_harness(accounts=[("acct-a", "vlad")], settings={"codex_refresh_enabled": False}) as h:
+        h.transport = FakeTransport(lambda account_id, attempt: ok(verified_pro_body(account_id=account_id)))
+        h.source = h.build_source()
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW - 3_600, refresh=REFRESH_CANARY)
+        h.source.run_cycle_once()
+        h.clock.advance(300)
+        h.source.run_cycle_once()
+        relogin = [line for line in h.logs if "relogin" in line]
+        assert len(relogin) == 1, h.logs
+        assert relogin[0].startswith("codex vlad: relogin (access token expired "), relogin
+        for line in h.logs:
+            assert REFRESH_CANARY not in line and "eyJ" not in line, "a token-like value was logged"
+
+        h.clock.advance(300)
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW + 9 * 86_400)
+        h.source.run_cycle_once()
+        assert [line for line in h.logs if "recovered" in line] == ["codex vlad: recovered"], h.logs
+
+        h.clock.advance(300)
+        write_credential(h.accounts_dir, "acct-a", exp=BASE_NOW - 60, refresh="another-length-x")
+        h.source.force_due()
+        h.source.run_cycle_once()
+        assert len([line for line in h.logs if "relogin" in line]) == 2
+        h.source = h.build_source()  # a restart must not announce it again
+        h.clock.advance(300)
+        h.source.run_cycle_once()
+        assert len([line for line in h.logs if "relogin" in line]) == 2, h.logs
+
+
+def test_a_steady_200_is_logged_once_and_a_change_is_logged() -> None:
+    """OPS-4: the per-poll ``200 in N ms`` line was 91 % of widget.log."""
+    holder: list[Harness] = []
+
+    def handler(account_id: str, attempt: int) -> Any:
+        if attempt == 6:
+            holder[0].clock.mono += 4.0  # a slow answer is news even at 200
+        return json_response(429, {}) if attempt == 4 else ok(verified_pro_body(account_id=account_id))
+
+    with temp_harness(accounts=[(PRO_ACCOUNT_ID, "a")], handler=handler) as h:
+        holder.append(h)
+        write_credential(h.accounts_dir, PRO_ACCOUNT_ID, exp=BASE_NOW + 9 * 86_400)
+        for _ in range(3):
+            h.source.force_due()
+            h.source.run_cycle_once()
+        assert [l for l in h.logs if l.startswith("codex a: ")] == ["codex a: 200 in 0 ms"], h.logs
+        h.source.force_due(); h.source.run_cycle_once()
+        assert "codex a: 429 in 0 ms" in h.logs
+        h.source.force_due(); h.source.run_cycle_once()
+        assert h.logs.count("codex a: 200 in 0 ms") == 2, "the change back to 200 is news"
+        h.source.force_due(); h.source.run_cycle_once()
+        assert "codex a: 200 in 4000 ms" in h.logs
+        assert h.source._requests == 6, "every request still counts"  # noqa: SLF001
+
+
+def test_no_countdown_while_refresh_is_on_and_healthy() -> None:
+    """CX-7a: a healthy refresher rotates at 24 h, so a 48 h countdown would
+    cry wolf for a day. The row still carries the claim for anyone who asks."""
+    with temp_harness(accounts=[(PRO_ACCOUNT_ID, "a")], settings={"codex_refresh_enabled": True}) as h:
+        h.transport = FakeTransport(lambda a, n: ok(verified_pro_body()))
+        h.source = h.build_source()
+        write_credential(h.accounts_dir, PRO_ACCOUNT_ID, exp=BASE_NOW + 40 * 3_600)
+        h.source.run_cycle_once()
+        row = h.source.quota_rows()[0]
+        assert row.attention_note == "", row.attention_note
+        assert row.credential_expires_at == BASE_NOW + 40 * 3_600
+
+
+def test_a_capped_row_keeps_its_relogin_countdown() -> None:
+    """CX-7a: the capped verdict used to swallow the deadline entirely."""
+    body = CAPTURED_business_body()
+    with temp_harness(accounts=[("acct-biz", "work")], settings={"codex_refresh_enabled": False}) as h:
+        h.transport = FakeTransport(lambda a, n: ok(body))
+        h.source = h.build_source()
+        write_credential(h.accounts_dir, "acct-biz", exp=BASE_NOW + 30 * 3_600)
+        h.source.run_cycle_once()
+        row = h.rows_by_alias()["work"]
+        assert (row.attention_note, row.attention_kind) == ("out of credits · Add credits", "crit")
+        assert "relogin in 1d 6h" in row.info_notes, row.info_notes
+
+
+def test_diagnostics_give_the_last_status_its_age() -> None:
+    """CX-7a: on the expired path no request is made, and a bare ``200`` read
+    as current for five days."""
+    with temp_harness(accounts=[(PRO_ACCOUNT_ID, "a")], settings={"codex_refresh_enabled": False}) as h:
+        h.transport = FakeTransport(lambda a, n: ok(verified_pro_body()))
+        h.source = h.build_source()
+        write_credential(h.accounts_dir, PRO_ACCOUNT_ID, exp=BASE_NOW + 3_600)
+        h.source.run_cycle_once()
+        h.clock.advance(5 * 86_400)
+        h.source.run_cycle_once()
+        line = next(l for l in h.source.diagnostics() if l.startswith("  a: "))
+        assert line.startswith("  a: last 200 5d ago, "), line
+        assert NOTE_RELOGIN in line
 
 
 # ---------------------------------------------------------------------------

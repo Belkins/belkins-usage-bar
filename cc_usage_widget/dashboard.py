@@ -72,6 +72,7 @@ from typing import Any, Final
 
 from .contracts import (
     NOTIONAL_LABEL,
+    PROJECTS_DIR,
     VENDORS,
     WIDGET_HOME,
     AccountRow,
@@ -99,6 +100,7 @@ __all__ = [
     "INDEXING_BANNER",
     "WINDOW_DAYS",
     "WALL_NO_HISTORY_NOTE",
+    "WORKFLOW_NOTE",
     "build_dashboard",
     "collect_cells",
     "dashboard_path_for",
@@ -139,6 +141,16 @@ dollars, so the bars sum to the window total rather than to "the top eight".
 """
 
 MAX_PROJECTS: Final[int] = 12
+
+MAX_WORKFLOW_RUNS: Final[int] = 12
+"""Rows in the workflow table - the dearest runs, like :data:`MAX_PROJECTS`."""
+
+WORKFLOW_NOTE: Final[str] = (
+    "Workflow swarms of today and yesterday (the session window), dearest first. "
+    "Tokens are the sum of the agents of each run; phases and agent labels come from "
+    "the journal.jsonl of the run, and an agent it does not name is listed as (no phase)."
+)
+"""The workflow table's caption, named so a test asserts the wording."""
 
 EMPTY_MARKER: Final[str] = "No usage recorded yet"
 """The empty state's exact wording, named so a test asserts the string rather
@@ -852,6 +864,93 @@ def _project_section(history: Any, today: DayKey) -> str:
     )
 
 
+def _workflow_money(usd: float, unpriced: int) -> str:
+    """Notional dollars, plus the unpriced volume behind a $0 when there is any."""
+    text = format_usd(usd)
+    if unpriced > 0:
+        text += f" + {format_tokens(unpriced)} tok unpriced"
+    return text
+
+
+def _workflow_section(runs: Sequence[Any]) -> str:
+    """One row per workflow run, then its phases and models (F1).
+
+    *runs* are ``attribution.WorkflowRun`` values. Absent when there are none,
+    for :func:`_project_section`'s reason. Labels and phases reach the page
+    from a journal on disk, so they are escaped like every other name here.
+    """
+    rows: list[str] = []
+    for run in list(runs)[:MAX_WORKFLOW_RUNS]:
+        usage = getattr(run, "usage", None)
+        if not isinstance(usage, ModelUsage) or usage.is_zero:
+            continue
+        days = getattr(run, "days", ()) or ()
+        when = " – ".join(sorted({str(days[0]), str(days[-1])})) if days else ""
+        rows.append(
+            '<tr class="run">'
+            f"<td><strong>{_esc(getattr(run, 'label', ''))}</strong></td>"
+            f"<td>{_esc(when)}</td>"
+            f'<td class="num">{_int(getattr(run, "agents", 0))}</td>'
+            f'<td class="num">{_esc(format_tokens(usage.total_tokens))}</td>'
+            f'<td class="num exact">{_int(usage.total_tokens)}</td>'
+            f'<td class="num">{_esc(_workflow_money(getattr(run, "usd", 0.0), getattr(run, "unpriced_tokens", 0)))}</td>'
+            "</tr>"
+        )
+        for kind, parts in (
+            ("phase", getattr(run, "phases", ()) or ()),
+            ("model", getattr(run, "models", ()) or ()),
+            ("agent", tuple(getattr(run, "agent_rows", ()) or ())[:3]),
+        ):
+            for part in parts:
+                tokens = getattr(part, "total_tokens", 0)
+                rows.append(
+                    '<tr class="part">'
+                    f'<td>&nbsp;&nbsp;{_esc(kind)}: {_esc(getattr(part, "name", ""))}</td>'
+                    "<td></td>"
+                    f'<td class="num">{_int(getattr(part, "agents", 0))}</td>'
+                    f'<td class="num">{_esc(format_tokens(tokens))}</td>'
+                    f'<td class="num exact">{_int(tokens)}</td>'
+                    f'<td class="num">{_esc(_workflow_money(getattr(part, "usd", 0.0), getattr(part, "unpriced_tokens", 0)))}</td>'
+                    "</tr>"
+                )
+    if not rows:
+        return ""
+    return (
+        '<table><thead><tr><th>Workflow run</th><th>Days</th><th class="num">Agents</th>'
+        '<th class="num">Tokens</th><th class="num exact">exact</th>'
+        f'<th class="num">Notional</th></tr></thead><tbody>{"".join(rows)}</tbody></table>'
+    )
+
+
+def _workflow_runs_beside(
+    rollups: Any, pricing: PricingTable | None, projects_dir: Path | str | None
+) -> tuple[Any, ...]:
+    """The runs the attribution cache BESIDE *rollups* holds; ``()`` otherwise.
+
+    Read-only: the cache is loaded and never saved, and a missing file is not
+    created. A store with no ``path`` (a test double) reads nothing - never the
+    installed widget's cache. Any failure costs the table, not the page.
+    """
+    where = getattr(rollups, "path", None)
+    if where is None:
+        return ()
+    try:
+        from .attribution import AttributionStore, attribution_path_for
+
+        path = attribution_path_for(where)
+        if not path.exists():
+            return ()
+        store = AttributionStore(path=path)
+        store.load()
+        return store.workflow_runs(
+            pricing,
+            projects_dir=PROJECTS_DIR if projects_dir is None else projects_dir,
+            limit=MAX_WORKFLOW_RUNS,
+        )
+    except Exception:
+        return ()
+
+
 def _quota_section(rows: Sequence[AccountRow]) -> str:
     """Every reported window as a bar, with its reset and its capped state.
 
@@ -1105,6 +1204,7 @@ def render_dashboard(
     now: float | None = None,
     pricing: PricingTable | None = None,
     indexing: str | None = None,
+    workflow_runs: Sequence[Any] = (),
 ) -> str:
     """One self-contained HTML document describing what the stores hold.
 
@@ -1132,6 +1232,9 @@ def render_dashboard(
             a page rendered mid-scan says its figures are partial in the same
             words the menu uses. The page never derives this: only the widget
             knows whether a scanner has finished.
+        workflow_runs: ``attribution.WorkflowRun`` values for the workflow
+            table (F1); empty, the section is absent. :func:`build_dashboard`
+            reads them from the attribution cache beside *rollups*.
     """
     stamp = time.time() if now is None else float(now)
     today = local_day_key(stamp)
@@ -1150,6 +1253,7 @@ def render_dashboard(
             note="Share of each day's tokens, per vendor. Absolute volume is the chart above.",
         ),
         _section("By project", _project_section(history, today)),
+        _section("Workflow runs", _workflow_section(workflow_runs), note=WORKFLOW_NOTE),
         _section("Quota windows", _quota_section(rows)),
         _section("Hours at the wall", _wall_section(rows, stamp), note=WALL_NO_HISTORY_NOTE),
         _section("Unpriced volume", _unpriced_section(cells, today)),
@@ -1221,15 +1325,25 @@ def build_dashboard(
     pricing: PricingTable | None = None,
     path: Path | str | None = None,
     indexing: str | None = None,
+    projects_dir: Path | str | None = None,
 ) -> Path:
     """Render and write in one call. Returns the file written.
 
     The seam ``app`` uses: everything up to and including the disk write
     belongs on the worker thread, and only the hand-off to the browser is left
-    to the caller.
+    to the caller. It is also where the workflow table's I/O happens: the
+    attribution cache beside *rollups* and each run's journal under
+    *projects_dir* (default :data:`~contracts.PROJECTS_DIR`), both read-only.
     """
     document = render_dashboard(
-        history, rollups, quota_rows, accounts, now=now, pricing=pricing, indexing=indexing
+        history,
+        rollups,
+        quota_rows,
+        accounts,
+        now=now,
+        pricing=pricing,
+        indexing=indexing,
+        workflow_runs=_workflow_runs_beside(rollups, pricing, projects_dir),
     )
     destination = (
         Path(path)

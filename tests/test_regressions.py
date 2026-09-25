@@ -76,8 +76,9 @@ except Exception:  # pragma: no cover - a clean machine, and CI
     _claude_swap = None  # type: ignore[assignment]
 
 _CLAUDE_SWAP_PRESENT = _claude_swap is not None
-"""Whether upstream is importable. Read by exactly one assertion below, where
-the widget's own behaviour legitimately DIFFERS without it."""
+"""Whether upstream is importable. Read by the assertions (one below, one in
+test_swap_forensics) where the widget's own behaviour legitimately DIFFERS
+without it."""
 
 from cc_usage_widget import app as app_mod  # noqa: E402
 from cc_usage_widget import indexer as indexer_mod  # noqa: E402
@@ -6570,6 +6571,760 @@ def test_a_restore_drops_the_plan_and_moves_the_store_on_a_generation() -> None:
             ), worker._audit_note
         finally:
             worker.stop(timeout=5.0)
+
+
+
+# ---------------------------------------------------------------------------
+# menu-title-ux (2026-09-25): the title and the dropdown tell the engine's story
+# ---------------------------------------------------------------------------
+
+
+def _ux_row(
+    slot: int,
+    alias: str,
+    *,
+    five: float | None = None,
+    seven: float | None = None,
+    scoped: tuple[tuple[str, float], ...] = (),
+    active: bool = False,
+    age: float | None = None,
+    disabled: bool = False,
+    expired: tuple[str, ...] = (),
+    pace: tuple[tuple[str, bool], ...] = (),
+    five_reset: str | None = None,
+    seven_reset: str | None = None,
+    scoped_resets: tuple[tuple[str, str], ...] = (),
+) -> Any:
+    """One SYNTHETIC claude-swap row; every new field defaults to "absent"."""
+    from cc_usage_widget.contracts import AccountRow
+
+    return AccountRow(
+        slot=slot,
+        alias=alias,
+        email=f"{alias}@example.com",
+        is_active=active,
+        five_hour_pct=five,
+        seven_day_pct=seven,
+        scoped_windows=scoped,
+        five_hour_resets_at=five_reset,
+        seven_day_resets_at=seven_reset,
+        scoped_resets_at=scoped_resets,
+        usage_age_seconds=age,
+        pace_ahead=pace,
+        disabled=disabled,
+        expired_windows=expired,
+    )
+
+
+def _ux_capture(app: Any, build: Any) -> list[list[tuple[str, Any]]]:
+    """Run *build* with ``render.apply_attributed`` recording its segments."""
+    captured: list[list[tuple[str, Any]]] = []
+    original = app_mod.render.apply_attributed
+
+    def _record(_item: Any, segments: Any) -> bool:
+        captured.append([(str(text), kind) for text, kind in segments])
+        return True
+
+    app_mod.render.apply_attributed = _record
+    try:
+        build()
+    finally:
+        app_mod.render.apply_attributed = original
+    return captured
+
+
+def _ux_lines(segments: list[tuple[str, Any]]) -> list[list[tuple[str, Any]]]:
+    """Split one attributed block on its ``\\n`` segments into lines."""
+    lines: list[list[tuple[str, Any]]] = [[]]
+    for text, kind in segments:
+        if text == "\n":
+            lines.append([])
+        else:
+            lines[-1].append((text, kind))
+    return lines
+
+
+def _ux_block(app: Any, row: Any, **kwargs: Any) -> list[list[tuple[str, Any]]]:
+    """The attributed account block ``_decorate_account_item`` draws for *row*."""
+    import rumps
+
+    captured = _ux_capture(
+        app,
+        lambda: app._decorate_account_item(rumps.MenuItem("x"), row, label_width=5, **kwargs),
+    )
+    assert captured, "the block raised and fell back to the plain label"
+    return _ux_lines(captured[-1])
+
+
+def _ux_render(app: Any, snapshot: Any) -> dict[str, Any]:
+    """Title, every top-level menu title and every attributed block, verbatim."""
+    out: dict[str, Any] = {}
+    segments = _ux_capture(app, lambda: app.rebuild_menu(snapshot))
+    out["title"] = app.render_title(snapshot)
+    out["menu"] = [
+        None if item is None else str(getattr(item, "title", ""))
+        for item in app.menu.values()
+    ]
+    out["switch"] = [
+        str(getattr(item, "title", "")) for item in app.menu["Switch account"].values()
+    ]
+    out["segments"] = segments
+    return out
+
+
+def _ux_quiet_claude_snapshot(**settings: Any) -> Any:
+    """A quiet Claude-only machine: two healthy slots, nothing standing."""
+    main = _ux_row(1, "main", five=7.0, seven=3.0, active=True, five_reset="14:50", seven_reset="Sep 30 16:00")
+    podol = _ux_row(3, "podol", five=1.0, seven=25.0, five_reset="13:00", seven_reset="Sep 26 14:00", age=420.0)
+    return UiSnapshot(
+        settings=_fleet_settings(**settings),
+        accounts=(main, podol),
+        active=main,
+        accounts_at=1.0,
+    )
+
+
+def _ux_quiet_fable_snapshot(**settings: Any) -> Any:
+    """The quiet Claude machine with a scoped Fable window on each slot."""
+    main = _ux_row(
+        1, "main", five=7.0, seven=3.0, scoped=(("Fable", 1.0),), active=True,
+        five_reset="14:50", seven_reset="Sep 30 16:00", scoped_resets=(("Fable", "Sep 30 16:00"),),
+    )
+    podol = _ux_row(
+        3, "podol", five=1.0, seven=25.0, scoped=(("Fable", 9.0),),
+        five_reset="13:00", seven_reset="Sep 26 14:00", scoped_resets=(("Fable", "Sep 26 14:00"),),
+    )
+    return UiSnapshot(
+        settings=_fleet_settings(**settings),
+        accounts=(main, podol),
+        active=main,
+        accounts_at=1.0,
+    )
+
+
+def _ux_codex_only_snapshot() -> Any:
+    """A Codex-only machine: the transcript-derived quota row and nothing else."""
+    from cc_usage_widget.contracts import AccountRow
+
+    codex = AccountRow(
+        slot=CODEX_PSEUDO_ACCOUNT_SLOT,
+        alias="Codex",
+        email="",
+        is_active=False,
+        seven_day_pct=42.0,
+        seven_day_resets_at="Oct 1 20:25",
+        vendor=VENDOR_CODEX,
+        switchable=False,
+        plan_type="pro",
+    )
+    return UiSnapshot(settings=_fleet_settings(), quota_rows=(codex,), accounts_at=1.0)
+
+
+
+_UX_GOLDEN_MENU_CLAUDE = [
+    "main (main@example.com) — active", "", "Auto-switch:      OFF", "Cost tracking:    ON",
+    "Switch to best now", "", "Accounts",
+    "  1 main  5h   7%  · 7d   3%  resets 14:50",
+    "  3 podol 5h   1%  · 7d  25%  resets 13:00  (usage 7m old)",
+    "", "Cost (notional, API list prices)", "  unavailable — cost modules are not wired",
+    "", "Switch account", "Refresh now", "Settings", "Quit",
+]
+_UX_GOLDEN_MENU_FABLE_OFF = [
+    "main (main@example.com) — active", "", "Auto-switch:      OFF", "Cost tracking:    ON",
+    "Switch to best now", "", "Accounts",
+    "  1 main  5h   7%  · 7d   3%  · Fable   1%  resets 14:50",
+    "  3 podol 5h   1%  · 7d  25%  · Fable   9%  resets 13:00",
+    "", "Cost (notional, API list prices)", "  unavailable — cost modules are not wired",
+    "", "Switch account", "Refresh now", "Settings", "Quit",
+]
+_UX_GOLDEN_MENU_CODEX = [
+    "No active account", "", "Auto-switch:      OFF", "Cost tracking:    ON",
+    "Switch to best now", "", "  Codex (pro)   weekly  42%  resets Oct 1 20:25",
+    "", "Cost (notional, API list prices)", "  unavailable — cost modules are not wired",
+    "", "Switch account", "Refresh now", "Settings", "Quit",
+]
+_UX_GOLDEN_SEGMENT_SHA = {
+    # sha256 of json.dumps(segments, ensure_ascii=False), captured from main
+    # 0d22d70 BEFORE this lane changed a line (scratch generator, not shipped).
+    "claude": "5116fd38b23575325f55a0e55adc848cc2461b242275e57e9b0f16a2fb965174",
+    "fable_off": "29656c05eea45758e3252f33bb232996733683dcabdaecc821739e99d7209c8e",
+    "codex": "984d7e26858a03973671161ff6ba2e0078baffcae09292ff8d84360c9b89dc9f",
+}
+
+
+def test_quiet_machines_render_byte_identical_title_and_menu() -> None:
+    """Every menu-title-ux change is invisible where it has nothing to say.
+
+    The goldens were captured from main (0d22d70) before this lane touched a
+    line: a quiet Claude-only machine, the same machine with scoped Fable
+    windows and the new Fable fleet line switched off, and a Codex-only
+    machine. With every new input absent (no autoswitch models, no disabled
+    slot, no expired window, no note, no extra-usage spend, no alert, no
+    recent switch) the title, every top-level menu title, the Switch account
+    submenu and every attributed block must be byte-for-byte what they were.
+    """
+    import hashlib
+
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        # The claude cases pin the classic layout; the glance twin is in
+        # tests/test_design.py. The codex case runs with the flag off AND on:
+        # both must equal the golden, which proves the automatic fallthrough.
+        codex_classic = _ux_codex_only_snapshot()
+        codex_classic = replace(
+            codex_classic, settings={**codex_classic.settings, "menu_layout_classic": True}
+        )
+        cases = (
+            ("claude", _ux_quiet_claude_snapshot(menu_layout_classic=True), "main 7%",
+             _UX_GOLDEN_MENU_CLAUDE, ["3 podol 5h 1% ↺13:00 · 7d 25%  (usage 7m old)"]),
+            ("fable_off",
+             _ux_quiet_fable_snapshot(scoped_fleet_line_enabled=False, menu_layout_classic=True),
+             "main 7% F1%", _UX_GOLDEN_MENU_FABLE_OFF,
+             ["3 podol 5h 1% ↺13:00 · 7d 25% · Fable 9%"]),
+            ("codex", _ux_codex_only_snapshot(), app_mod.TITLE_ICON, _UX_GOLDEN_MENU_CODEX,
+             ["No other accounts"]),
+            ("codex", codex_classic, app_mod.TITLE_ICON, _UX_GOLDEN_MENU_CODEX,
+             ["No other accounts"]),
+        )
+        for name, snapshot, title, menu, switch in cases:
+            got = _ux_render(app, snapshot)
+            assert got["title"] == title, (name, got["title"])
+            assert got["menu"] == [None if t == "" else t for t in menu] or got["menu"] == menu, (
+                name, got["menu"],
+            )
+            assert got["switch"] == switch, (name, got["switch"])
+            digest = hashlib.sha256(
+                json.dumps(got["segments"], ensure_ascii=False).encode()
+            ).hexdigest()
+            assert digest == _UX_GOLDEN_SEGMENT_SHA[name], (name, got["segments"])
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+def test_title_fleet_binds_on_the_same_window_as_the_engine() -> None:
+    """UX-1b. 2026-09-25: vlad read 5h 0% / Fable 90% and counted as room.
+
+    claude-swap's engine decides on ``relevant_windows`` — the 5h, the 7d and
+    every scoped window named by ``autoswitch.models`` — and fails over on the
+    highest. The title bucketed on the 5-hour window alone, so an active slot
+    at 5h 7% / Fable 90% under a threshold of 85 drew NO suffix while the
+    engine was about to move it: the flip the operator saw was unannounced.
+    """
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        active = _ux_row(1, "main", five=7.0, seven=3.0, scoped=(("Fable", 90.0),), active=True,
+                         five_reset="14:50", scoped_resets=(("Fable", "16:00"),))
+        other = _ux_row(5, "calloway", five=1.0, seven=2.0, scoped=(("Fable", 9.0),))
+        snap = UiSnapshot(
+            settings=_fleet_settings(),
+            accounts=(active, other),
+            active=active,
+            autoswitch_threshold=85.0,
+            autoswitch_models=("Fable",),
+        )
+        title = app.render_title(snap)
+        assert "1/2" in title and "F90%" in title, title
+        assert title.count("F90%") == 1, title
+        assert len(title.split(" 1/2", 1)[0]) <= app_mod._TITLE_FLEET_BASE_BUDGET, title
+        # The binding window is labelled even with the scoped figure toggled off.
+        bare = replace(snap, settings=_fleet_settings(title_show_scoped_pct=False))
+        assert "F90% 1/2" in app.render_title(bare), app.render_title(bare)
+        # The peer's own Fable window counts against it too: at 90% it is no room.
+        full_peer = replace(snap, accounts=(active, replace(other, scoped_windows=(("Fable", 90.0),))))
+        assert "0/2" in app.render_title(full_peer), app.render_title(full_peer)
+
+        # Companion: the engine names no models -> max(5h, 7d); a quiet slot's
+        # title is byte-identical to today's.
+        quiet = replace(snap, autoswitch_models=())
+        assert app.render_title(quiet) == "main 7% F90%", app.render_title(quiet)
+        plain = UiSnapshot(
+            settings=_fleet_settings(),
+            accounts=(replace(active, scoped_windows=()), other),
+            active=replace(active, scoped_windows=()),
+        )
+        assert app.render_title(plain) == "main 7%", app.render_title(plain)
+
+        # 7d binds with models=(): labelled, and its reset only in HH:MM form.
+        weekly = _ux_row(1, "main", five=7.0, seven=92.0, active=True, seven_reset="Sep 30 16:00")
+        peer = _ux_row(2, "podol", five=3.0, seven=95.0, seven_reset="23:00")
+        wsnap = UiSnapshot(settings=_fleet_settings(), accounts=(weekly, peer), active=weekly)
+        assert app._title_fleet(wsnap, base="main 7%", now_minutes=0) == "7d92% 0/2 · next 23:00"
+        dated = replace(wsnap, accounts=(weekly, replace(peer, seven_day_resets_at="Oct 1 09:00")))
+        assert app._title_fleet(dated, base="main 7%", now_minutes=0) == "7d92% 0/2"
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+def test_binding_window_mirrors_claude_swap_relevant_windows() -> None:
+    """``_binding_window`` is upstream's ``relevant_windows`` + max, not a
+    reinvention: 5h and 7d always; scoped windows only when named
+    (case-insensitive), ``all`` naming every one; the 5-hour window wins a tie
+    so a 5h-bound title never changes shape."""
+    row = _ux_row(1, "m", five=40.0, seven=40.0, scoped=(("Fable", 60.0), ("Opal", 80.0)))
+    assert app_mod._binding_window(row, ()) == ("5h", 40.0)
+    assert app_mod._binding_window(row, ("fable",)) == ("Fable", 60.0)
+    assert app_mod._binding_window(row, ("all",)) == ("Opal", 80.0)
+    assert app_mod._binding_window(_ux_row(2, "n"), ("Fable",)) is None
+    assert app_mod._binding_window(_ux_row(3, "o", seven=12.0), ()) == ("7d", 12.0)
+
+
+def test_an_expired_window_never_binds_the_title_or_costs_a_room() -> None:
+    """2026-09-25 integrate: forbid06 read ``5h 88%`` from Sep 12 with
+    ``expired_windows=("five_hour",)``. That window ENDED; its figure must not
+    bind the title (no at-the-wall suffix, no badge) nor make the slot count
+    as no room. The live windows still bind."""
+    stale = _ux_row(6, "forbid06", five=88.0, seven=4.0, expired=("five_hour",))
+    assert app_mod._binding_window(stale, ()) == ("7d", 4.0)
+    scoped = _ux_row(6, "d", five=3.0, seven=4.0, scoped=(("Fable", 97.0),), expired=("Fable",))
+    assert app_mod._binding_window(scoped, ("Fable",)) == ("7d", 4.0)
+    assert app_mod._binding_window(_ux_row(7, "e", five=88.0, expired=("five_hour",)), ()) is None
+
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        # A peer's ended 88% does not cost the fleet a room.
+        active = _ux_row(1, "main", five=90.0, seven=3.0, active=True)
+        snap = UiSnapshot(
+            settings=_fleet_settings(),
+            accounts=(active, stale),
+            active=active,
+            autoswitch_threshold=85.0,
+        )
+        assert "1/2" in app._title_fleet(snap, base="main 90%", now_minutes=0), (
+            app._title_fleet(snap, base="main 90%", now_minutes=0)
+        )
+        # An active slot whose only hot window ended is not at the wall.
+        ended = replace(stale, is_active=True)
+        quiet = replace(snap, accounts=(ended, replace(active, is_active=False, five_hour_pct=2.0)),
+                        active=ended)
+        assert app._title_fleet(quiet, base="forbid06 88%", now_minutes=0) == ""
+        ext = replace(quiet, alert=(ALERT_EXTERNAL_SWITCH, "09:56 active 1→6 (external)"))
+        assert app._title_alert_kind(ext) is None
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+def test_autoswitch_models_reach_the_snapshot_from_the_cached_accessor() -> None:
+    """The models come from the adapter's CACHED policy, like the threshold,
+    and a source without the accessor degrades to ``()`` (max of 5h, 7d)."""
+    live = (_ux_row(1, "main", five=9.0, active=True), _ux_row(2, "podol", five=1.0))
+
+    class _Source:
+        def refresh(self, *, force: bool = False) -> None:
+            return None
+
+        def rows(self) -> tuple[Any, ...]:
+            return live
+
+        def active(self) -> Any:
+            return live[0]
+
+        def autoswitch_enabled(self) -> bool | None:
+            return False
+
+        def set_autoswitch_enabled(self, enabled: bool) -> None:
+            return None
+
+        def evaluate_autoswitch(self) -> str | None:
+            return None
+
+        def switch_to(self, slot_or_alias: str) -> bool:
+            return False
+
+    class _WithModels(_Source):
+        def cached_autoswitch_models(self) -> tuple[str, ...]:
+            return ("Fable",)
+
+    for source, expected in ((_WithModels(), ("Fable",)), (_Source(), ())):
+        published: list[UiSnapshot] = []
+        worker = BackgroundWorker(
+            publish=published.append,
+            snapshot=UiSnapshot(settings=normalize_settings(dict(SETTINGS_DEFAULTS))),
+            accounts=source,
+        )
+        worker._run_accounts_job(force=False)
+        assert published, "nothing published"
+        assert published[-1].autoswitch_models == expected, published[-1].autoswitch_models
+    assert app_mod._autoswitch_models_of(object()) == ()
+
+
+def test_disabled_slot_is_never_the_top_switch_target_or_counted_as_room() -> None:
+    """UX-2. work1 is ``cswap disable``d and sat FIRST in Switch account.
+
+    ``AccountRow.disabled`` has been on the row since the adapter learned it;
+    nothing read it, so the emptiest-looking slot — empty because the engine
+    never uses it — topped the ranking and counted as a free room.
+    """
+    work1 = _ux_row(4, "work1", five=0.0, seven=0.0, disabled=True)
+    calloway = _ux_row(5, "calloway", five=5.0, seven=11.0)
+    active = _ux_row(1, "main", five=100.0, active=True, five_reset="14:50")
+    targets = app_mod._switch_targets((active, work1, calloway))
+    assert targets[0].slot == 5, [r.slot for r in targets]
+    assert [r.slot for r in targets] == [5, 4]
+    label = app_mod._switch_target_label(work1, name_width=5)
+    assert label.endswith("(disabled)"), label
+    assert not app_mod._switch_target_label(calloway, name_width=8).endswith("(disabled)")
+
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        snap = UiSnapshot(
+            settings=_fleet_settings(menu_layout_classic=True),  # # pins the classic layout; the glance twin is in tests/test_design.py
+            accounts=(replace(calloway, is_active=True), work1),
+            active=replace(calloway, is_active=True),
+            alert=(ALERT_NO_TARGET, "no viable target"),
+        )
+        assert app._title_fleet(snap, now_minutes=0) == "1/1", app._title_fleet(snap, now_minutes=0)
+        # Control: the same slot enabled is room again.
+        enabled = replace(snap, accounts=(snap.accounts[0], replace(work1, disabled=False)))
+        assert app._title_fleet(enabled, now_minutes=0) == "2/2"
+
+        block = _ux_block(app, work1)
+        header = "".join(text for text, _kind in block[0])
+        assert "disabled" in header, header
+        # VoiceOver parity: the plain label says it too.
+        texts = [t for t in _ux_render(app, snap)["menu"] if t]
+        assert any(t.startswith("  4 work1") and "disabled" in t for t in texts), texts
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+def test_a_row_whose_5h_reset_has_passed_renders_dim_and_without_severity() -> None:
+    """UX-3. forbid06's 5h 88% from Sep 12 was drawn in live amber.
+
+    A window whose reset instant has passed describes a window that has ENDED
+    (``AccountRow.expired_windows``); ``render.window_line`` has supported
+    ``expired=True`` since SPEC-CODEX 6 and the Claude block never passed it.
+    """
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        row = _ux_row(6, "forbid06", five=100.0, seven=0.0, expired=("five_hour",),
+                      five_reset="Sep 12 18:10")
+        five = _ux_block(app, row)[1]
+        assert all(kind == "dim" for _text, kind in five), five
+        assert not any("(!)" in text for text, _kind in five), five
+        seven = _ux_block(app, row)[2]
+        assert any(kind == "ok" for _text, kind in seven), seven
+        plain = app_mod._account_row_label(row)
+        assert "(!)" not in plain, plain
+        # Control: the same row with no expired window is live amber/red.
+        live = _ux_block(app, replace(row, five_hour_pct=88.0, expired_windows=()))[1]
+        assert any(kind == "warn" for _text, kind in live), live
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+def test_a_noted_claude_slot_draws_dim_bars_with_its_age_and_no_pace() -> None:
+    """UX-4. Slot 2 (invalid_grant since 09-22) still drew ``Fable 90% (!)
+    (ahead of pace)`` beside a note saying none of it was current, the age
+    was hidden, and the 110-character remedy was printed twice."""
+    prose = "re-login needed — refresh token dead; log in with Claude Code, then run: cswap add"
+    row = _ux_row(2, "vlad", five=0.0, seven=51.0, scoped=(("Fable", 90.0),),
+                  pace=(("Fable", True),), age=3 * 86400.0)
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        block = _ux_block(app, row, note=prose, note_kind="re-login needed")
+        flat = [seg for line in block for seg in line]
+        assert not any(kind == "crit" for _text, kind in flat), flat
+        assert not any("ahead of pace" in text for text, _kind in flat), flat
+        header = "".join(text for text, _kind in block[0])
+        assert "⚠ relogin" in header and "last seen 3d ago" in header, header
+        assert "cswap add" not in header, header
+
+        active = _ux_row(1, "main", five=7.0, active=True)
+        snap = UiSnapshot(
+            settings=_fleet_settings(menu_layout_classic=True),  # # pins the classic layout; the glance twin is in tests/test_design.py
+            accounts=(active, row),
+            active=active,
+            account_notes={2: prose},
+            account_note_kinds={2: "re-login needed"},
+        )
+        texts = [t for t in _ux_render(app, snap)["menu"] if t]
+        assert sum("cswap add" in t for t in texts) == 1, texts
+        assert any(t.startswith("⚠ vlad (2): re-login needed") for t in texts), texts
+        row_label = next(t for t in texts if t.startswith("  2 vlad"))
+        assert "⚠ relogin · last seen 3d ago" in row_label, row_label
+        assert "(!)" not in row_label, row_label
+
+        # Control: without the note the same row is live — crit bar and pace.
+        live = [seg for line in _ux_block(app, row) for seg in line]
+        assert any(kind == "crit" for _text, kind in live), live
+        assert any("ahead of pace" in text for text, _kind in live), live
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+def test_active_slot_header_keeps_its_note() -> None:
+    """The active slot is the one whose note matters most; the header dropped
+    it whenever ``is_active`` was set."""
+    from cc_usage_widget import render
+
+    header = "".join(text for text, _kind in render.account_header(1, "main", "e", True, age_note="⚠ relogin"))
+    assert "⚠ relogin" in header and "● active" in header, header
+    bare = render.account_header(1, "main", "e", True)
+    assert "".join(text for text, _kind in bare) == "1  main (e)   ● active"
+
+
+def test_external_flip_to_a_healthy_slot_does_not_badge_the_title() -> None:
+    """UX-6. With 22 flips a day, ``⚠ ext`` was on the bar most of the time,
+    including after benign flips onto a healthy slot. It now badges only when
+    the slot we were flipped ONTO needs the operator."""
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        active = _ux_row(1, "main", five=7.0, active=True)
+        snap = UiSnapshot(
+            settings=_fleet_settings(),
+            accounts=(active, _ux_row(5, "calloway", five=5.0)),
+            active=active,
+            alert=(ALERT_EXTERNAL_SWITCH, "09:56 active 5→1 (external)"),
+        )
+        assert "⚠ ext" not in app.render_title(snap), app.render_title(snap)
+        assert "⚠" not in app._compact_title(replace(snap, settings=_fleet_settings(title_compact=True)))
+        hot = replace(snap, accounts=(replace(active, five_hour_pct=90.0), snap.accounts[1]),
+                      active=replace(active, five_hour_pct=90.0))
+        assert "⚠ ext" in app.render_title(hot), app.render_title(hot)
+        noted = replace(snap, account_notes={1: "re-login needed"})
+        assert "⚠ ext" in app.render_title(noted), app.render_title(noted)
+        scoped = replace(
+            snap,
+            active=replace(active, scoped_windows=(("Fable", 95.0),)),
+            autoswitch_models=("Fable",),
+        )
+        assert "⚠ ext" in app.render_title(scoped), app.render_title(scoped)
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+def test_a_single_ghost_flip_to_a_healthy_slot_does_not_badge_but_a_login_fight_does() -> None:
+    """INT-1. swap-3 labels a config-only flip ``ALERT_GHOST_FLIP`` - all six
+    flips on 2026-09-24 were - and the UX-6 rule covered only
+    ``ALERT_EXTERNAL_SWITCH``, so ``⚠ ghost`` came back for exactly the benign
+    flips UX-6 took the glyph off. One ghost flip onto a healthy slot is a
+    menu line only; the standing login fight (3+ in an hour) is the
+    operator's to fix and always badges."""
+    from cc_usage_widget.contracts import ALERT_GHOST_FLIP
+
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        active = _ux_row(1, "main", five=7.0, active=True)
+        ghost = (
+            ALERT_GHOST_FLIP,
+            "20:25 ~/.claude.json rewritten to main by a running Claude Code "
+            "session; keychain still holds calloway",
+        )
+        snap = UiSnapshot(
+            settings=_fleet_settings(),
+            accounts=(active, _ux_row(5, "calloway", five=5.0)),
+            active=active,
+            alert=ghost,
+        )
+        assert app._title_alert_kind(snap) is None
+        assert "⚠" not in app.render_title(snap), app.render_title(snap)
+        # ...unless the slot it landed on needs the operator.
+        hot = replace(snap, active=replace(active, five_hour_pct=90.0))
+        assert app._title_alert_kind(hot) == ALERT_GHOST_FLIP
+        noted = replace(snap, account_notes={1: "re-login needed"})
+        assert app._title_alert_kind(noted) == ALERT_GHOST_FLIP
+        # The login fight badges even onto a healthy slot.
+        fight = replace(snap, alert=(
+            ALERT_GHOST_FLIP,
+            "20:38 " + accounts_mod.LOGIN_FIGHT_MARK + " running Claude Code sessions "
+            "restored main (slot 1) 3× in the last hour",
+        ))
+        assert app._title_alert_kind(fight) == ALERT_GHOST_FLIP
+        assert "⚠ ghost" in app.render_title(fight), app.render_title(fight)
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+def test_alert_line_not_duplicated_by_recent_block() -> None:
+    """The external-switch alert and the newest journal line are ONE string
+    (accounts.py sets both); the menu printed it twice, once at the top."""
+    line = "09:56 active 5→1 (external)"
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        active = _ux_row(1, "main", five=7.0, active=True)
+        snap = UiSnapshot(
+            settings=_fleet_settings(),
+            accounts=(active,),
+            active=active,
+            alert=(ALERT_EXTERNAL_SWITCH, line),
+            recent_events=("20:24 autoswitch → 5", line),
+        )
+        texts = [t for t in _ux_render(app, snap)["menu"] if t]
+        assert sum("09:56 active 5→1" in t for t in texts) == 1, texts
+        # A newer event makes the standing alert distinct again: it returns.
+        later = replace(snap, recent_events=(line, "10:30 autoswitch → 5"))
+        texts = [t for t in _ux_render(app, later)["menu"] if t]
+        assert any(t == f"⚠ {line}" for t in texts), texts
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+def test_recent_switches_are_one_line_and_a_submenu_below_the_accounts() -> None:
+    """Five forensic lines sat ABOVE Accounts. The history still exists for
+    the 2026-09-01 forensic purpose (who moved the login, and when) — as the
+    newest line inline plus a ``Recent switches`` submenu, under the blocks
+    the operator opened the menu to read."""
+    events = tuple(f"20:{m:02d} autoswitch → 5" for m in range(10, 17))
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        active = _ux_row(1, "main", five=7.0, active=True)
+        snap = UiSnapshot(settings=_fleet_settings(menu_layout_classic=True),  # # pins the classic layout; the glance twin is in tests/test_design.py
+                          accounts=(active,), active=active, recent_events=events)
+        titles = _ux_render(app, snap)["menu"]
+        accounts_at = titles.index("Accounts")
+        newest = titles.index("20:16 autoswitch → 5")
+        sub = titles.index("Recent switches")
+        assert accounts_at < newest < sub, titles
+        assert sum(1 for t in titles if t and "autoswitch → 5" in t) == 1, titles
+        children = [str(getattr(i, "title", "")) for i in app.menu["Recent switches"].values()]
+        assert children[0].strip() == "20:16 autoswitch → 5", children
+        assert len(children) == app_mod.RECENT_SWITCH_LINES, children
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+def test_bang_marker_uses_attention_pct_everywhere() -> None:
+    """UX-8. The block marked ``(!)`` at 90 while the title, the submenu and
+    the VoiceOver label mark it at ATTENTION_PCT (100): one account read "at
+    limit" in one place and fine in the next. The colour still warns at 90."""
+    from cc_usage_widget import render
+    from cc_usage_widget.contracts import ATTENTION_PCT
+
+    at90 = render.window_line("Fable", 90.0)
+    assert not any("(!)" in text for text, _kind in at90), at90
+    assert any(kind == "crit" for _text, kind in at90), at90
+    at100 = render.window_line("Fable", ATTENTION_PCT)
+    assert any("(!)" in text for text, _kind in at100), at100
+    # The same boundary the plain label uses.
+    assert app_mod._attention(90.0) == "" and app_mod._attention(100.0) == " (!)"
+
+
+def test_scoped_fleet_heading() -> None:
+    """F4. The 2026-09-22 Fable run-out killed every Fable-pinned stage and the
+    menu had no line answering "how many Fable rooms, and when does one open".
+    """
+    now = dt.datetime(2026, 9, 21, 12, 0).timestamp()  # a Monday, local time
+    rows = (
+        _ux_row(1, "a", five=1.0, scoped=(("Fable", 100.0),), scoped_resets=(("Fable", "Sep 24 15:00"),)),
+        _ux_row(2, "b", five=1.0, scoped=(("Fable", 40.0),), scoped_resets=(("Fable", "Sep 25 10:00"),)),
+        _ux_row(3, "c", five=1.0, scoped=(("Fable", 100.0),), scoped_resets=(("Fable", "Sep 22 09:00"),)),
+        _ux_row(4, "d", five=1.0, scoped=(("Fable", 0.0),), scoped_resets=(("Fable", "Sep 27 10:00"),)),
+        _ux_row(5, "e", five=1.0, scoped=(("Fable", 100.0),), scoped_resets=(("Fable", "Sep 26 10:00"),)),
+    )
+    noted = _ux_row(6, "noted", five=0.0, scoped=(("Fable", 0.0),))
+    heading = app_mod._scoped_fleet_heading(rows + (noted,), name="Fable", now=now, notes={6: "x"})
+    assert heading == "Fable 2/5 · next Tue 09:00", heading
+    disabled = replace(rows[1], slot=7, disabled=True)
+    assert app_mod._scoped_fleet_heading(rows + (disabled,), name="Fable", now=now) == heading
+    # A full window whose reset has already passed rolled over: not full.
+    rolled = replace(rows[2], scoped_resets_at=(("Fable", "Sep 20 09:00"),))
+    assert app_mod._scoped_fleet_heading(
+        (rows[0], rows[1], rolled, rows[3], rows[4]), name="Fable", now=now
+    ) == "Fable 3/5 · next Thu 15:00"
+    expired = replace(rows[2], expired_windows=("Fable",))
+    assert app_mod._scoped_fleet_heading(
+        (rows[0], rows[1], expired, rows[3], rows[4]), name="Fable", now=now
+    ) == "Fable 3/5 · next Thu 15:00"
+    # Today's reset is a bare clock; no row reporting the window -> no line.
+    today = replace(rows[0], scoped_resets_at=(("Fable", "16:00"),))
+    assert app_mod._scoped_fleet_heading((today, rows[1]), name="Fable", now=now) == "Fable 1/2 · next 16:00"
+    assert app_mod._scoped_fleet_heading((_ux_row(1, "a", five=1.0),), name="Fable", now=now) == ""
+    # A reset upstream did not report is not a guessed "next".
+    blind = replace(rows[0], scoped_resets_at=())
+    assert app_mod._scoped_fleet_heading((blind, rows[1]), name="Fable", now=now) == "Fable 1/2"
+
+
+def test_scoped_fleet_line_renders_under_accounts_behind_its_setting() -> None:
+    """The Fable line is an Accounts heading, on by default, and switching it
+    off gives back the exact pre-feature menu (the golden test pins that)."""
+    from cc_usage_widget.contracts import SETTINGS_DEFAULTS as defaults
+
+    assert defaults["scoped_fleet_line_enabled"] is True
+    assert normalize_settings({"scoped_fleet_line_enabled": False})["scoped_fleet_line_enabled"] is False
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        # # pins the classic layout; the glance twin is in tests/test_design.py
+        on = _ux_render(app, _ux_quiet_fable_snapshot(menu_layout_classic=True))["menu"]
+        at = on.index("Accounts")
+        assert on[at + 1].startswith("Fable 2/2"), on
+        off = _ux_render(
+            app, _ux_quiet_fable_snapshot(scoped_fleet_line_enabled=False, menu_layout_classic=True)
+        )["menu"]
+        assert not any(t and t.startswith("Fable ") for t in off), off
+        # Codex-only machines are unaffected (no Accounts section at all).
+        codex = _ux_render(app, _ux_codex_only_snapshot())["menu"]
+        assert not any(t and t.startswith("Fable ") for t in codex), codex
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
+def _ux_spend_row(base: Any, **spend: Any) -> Any:
+    """*base* carrying ``spend_*`` fields — on AccountRow once swap-forensics
+    (F2a) merges; until then a SYNTHETIC subclass with the same default-None
+    fields stands in, so this lane's renderer is tested against the contract."""
+    import dataclasses
+
+    from cc_usage_widget.contracts import AccountRow
+
+    if all(hasattr(AccountRow, name) for name in spend):
+        return replace(base, **spend)
+
+    @dataclasses.dataclass(frozen=True, slots=True)
+    class _SpendRow(AccountRow):
+        spend_used: float | None = None
+        spend_limit: float | None = None
+        spend_pct: float | None = None
+        spend_currency: str | None = None
+        spend_resets_at: str | None = None
+
+    values = {f.name: getattr(base, f.name) for f in dataclasses.fields(AccountRow)}
+    return _SpendRow(**values, **spend)
+
+
+def test_extra_usage_line_under_a_claude_account() -> None:
+    """F2b. Slot 1 sat at $480.00 of $500.00 of REAL extra-usage money and the
+    widget showed nothing; the cost section only ever showed notional dollars."""
+    base = _ux_row(1, "main", five=7.0, seven=3.0, active=True)
+    row = _ux_spend_row(base, spend_used=480.00, spend_limit=500.00, spend_pct=95.6,
+                        spend_currency="USD", spend_resets_at="Oct 1 00:00")
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        block = _ux_block(app, row)
+        last = "".join(text for text, _kind in block[-1])
+        assert "extra" in last and "$480.00 / $500.00" in last and "96%" in last, last
+        assert "resets Oct 1 00:00" in last, last
+        assert app_mod._account_row_label(row).endswith("· extra $480.00 / $500.00 96%"), (
+            app_mod._account_row_label(row)
+        )
+        # No limit -> no line, and the block is exactly the plain row's.
+        none = _ux_spend_row(base, spend_used=12.0, spend_limit=None, spend_currency="USD")
+        assert _ux_block(app, none) == _ux_block(app, base)
+        assert app_mod._account_row_label(none) == app_mod._account_row_label(base)
+        # Currency verbatim: never a "$" on a non-dollar account.
+        eur = _ux_spend_row(base, spend_used=10.5, spend_limit=20.0, spend_pct=52.5,
+                            spend_currency="EUR")
+        text = "".join(t for t, _k in _ux_block(app, eur)[-1])
+        assert "10.50 EUR / 20.00 EUR" in text and "$" not in text, text
+
+        snap = UiSnapshot(settings=_fleet_settings(), accounts=(row,), active=row)
+        items = app._real_spend_items(snap)
+        lines = [str(getattr(item, "title", "")) for item in items]
+        assert lines == ["  Real spend (extra usage)  $480.00 / $500.00 · real, not notional"], lines
+        assert app._real_spend_items(replace(snap, accounts=(base,))) == []
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
 
 
 if __name__ == "__main__":

@@ -35,17 +35,29 @@ Run directly, or with pytest if it is installed::
 
 from __future__ import annotations
 
+import base64
+import calendar
 import json
+import os
 import sys
 import tempfile
+import time
 import traceback
 from pathlib import Path
+
+os.environ.setdefault("CC_USAGE_WIDGET_NO_REVEAL", "1")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from cc_usage_widget import codex_indexer as codex_mod  # noqa: E402
 from cc_usage_widget import indexer as claude_mod  # noqa: E402
 from cc_usage_widget import rollup as rollup_mod  # noqa: E402
+
+FIXED_NOW = calendar.timegm((2026, 8, 17, 18, 0, 0))
+"""The indexers' clock, pinned six hours after the fixtures' timestamps. With
+the real clock the 2026-08-17 records fell outside the 30-day lookback after
+~09-16 and every leak test here passed vacuously (read nothing, leaked
+nothing); a pinned clock keeps the fixtures inside the window forever."""
 
 CANARY = "SECRET_CANARY_9F3B2_do_not_leak"
 """Distinctive enough that a substring match cannot be a coincidence, and not a
@@ -159,11 +171,13 @@ def _scan_everything(root: Path, *, poisoned: bool) -> tuple[int, list[Path]]:
         projects_dir=claude_root,
         state_path=state / "scan_state.json",
         lookback_days=30,
+        now=lambda: FIXED_NOW,
     )
     codex = codex_mod.CodexIndexer(
         sessions_dir=codex_root,
         state_path=state / "codex_scan_state.json",
         lookback_days=30,
+        now=lambda: FIXED_NOW,
     )
 
     tokens = 0
@@ -263,6 +277,20 @@ value in any real ``auth.json``, so a substring hit cannot be a coincidence."""
 
 CODEX_ACCOUNT_ID = "acct-canary-0000"
 
+DESKTOP_TOKEN_CANARY = "SECRET_DESKTOP_CANARY_B81F6_do_not_leak"
+"""Planted in the ChatGPT app's own ``~/.codex/auth.json`` stand-in (CX-1): as
+the access token's signature segment (so the JWT still decodes and the widget
+really uses it) and as the refresh token (which must never even be read)."""
+
+
+def _jwt(payload: dict, signature: str) -> str:
+    """A structurally real JWT; ``decode_jwt_claims`` never checks signatures."""
+
+    def segment(obj: dict) -> str:
+        return base64.urlsafe_b64encode(json.dumps(obj).encode("utf-8")).decode("ascii").rstrip("=")
+
+    return ".".join([segment({"alg": "none"}), segment(payload), signature])
+
 
 class _FakeUsageTransport:
     """Answers one usage body; records nothing. See ``_LeakyTransport``."""
@@ -314,7 +342,9 @@ def _usage_body() -> dict:
     }
 
 
-def _poll_codex_account(root: Path, *, poisoned: bool, leaky: bool = False):
+def _poll_codex_account(
+    root: Path, *, poisoned: bool, leaky: bool = False, desktop: bool = False, before_poll=None
+):  # noqa: ANN001
     """One full live-quota cycle over real files. Returns (rows, written, logs).
 
     ``written`` deliberately EXCLUDES the credential directory: that file is
@@ -330,12 +360,17 @@ def _poll_codex_account(root: Path, *, poisoned: bool, leaky: bool = False):
     account_dir = credentials_dir / CODEX_ACCOUNT_ID
     account_dir.mkdir(parents=True, exist_ok=True)
     auth = account_dir / "auth.json"
+    widget_access = secret
+    if desktop:
+        # CX-1 variant: the widget copy is EXPIRED, so the only live token for
+        # this account is the app's - the one carrying the desktop canary.
+        widget_access = _jwt({"exp": time.time() - 60}, "widget-signature")
     auth.write_text(
         json.dumps(
             {
                 "auth_mode": "chatgpt",
                 "tokens": {
-                    "access_token": secret,
+                    "access_token": widget_access,
                     "refresh_token": secret,
                     "id_token": secret,
                     "account_id": CODEX_ACCOUNT_ID,
@@ -363,7 +398,25 @@ def _poll_codex_account(root: Path, *, poisoned: bool, leaky: bool = False):
     )
     mirror = root / "dot-codex" / "auth.json"
     mirror.parent.mkdir(parents=True, exist_ok=True)
-    mirror.write_text(json.dumps({"tokens": {"account_id": CODEX_ACCOUNT_ID}}))
+    if desktop:
+        mirror.write_text(
+            json.dumps(
+                {
+                    "auth_mode": "chatgpt",
+                    "tokens": {
+                        "account_id": CODEX_ACCOUNT_ID,
+                        "access_token": _jwt(
+                            {"exp": time.time() + 5 * 86_400}, DESKTOP_TOKEN_CANARY
+                        ),
+                        "refresh_token": DESKTOP_TOKEN_CANARY,
+                        "id_token": DESKTOP_TOKEN_CANARY,
+                    },
+                }
+            )
+        )
+        mirror.chmod(0o600)
+    else:
+        mirror.write_text(json.dumps({"tokens": {"account_id": CODEX_ACCOUNT_ID}}))
 
     logs: list[str] = []
     transport = _FakeUsageTransport(_usage_body())
@@ -381,6 +434,8 @@ def _poll_codex_account(root: Path, *, poisoned: bool, leaky: bool = False):
         },
         log=logs.append,
     )
+    if before_poll is not None:
+        before_poll(mirror)
     source.run_cycle_once()
     rows = source.quota_rows()
     logs.extend(source.diagnostics())
@@ -388,7 +443,7 @@ def _poll_codex_account(root: Path, *, poisoned: bool, leaky: bool = False):
     return rows, written, logs
 
 
-def _codex_leaks(rows, written, logs) -> list[str]:  # noqa: ANN001
+def _codex_leaks(rows, written, logs, canary: str = TOKEN_CANARY) -> list[str]:  # noqa: ANN001
     """Every place the token could have escaped to."""
     from cc_usage_widget import render as render_mod
 
@@ -398,12 +453,12 @@ def _codex_leaks(rows, written, logs) -> list[str]:  # noqa: ANN001
             body = path.read_text(errors="replace")
         except OSError:  # pragma: no cover - unreadable artifact
             continue
-        if TOKEN_CANARY in body:
+        if canary in body:
             leaked.append(f"{path.name}: content")
-        if TOKEN_CANARY in str(path):
+        if canary in str(path):
             leaked.append(f"{path.name}: filename")
     for line in logs:
-        if TOKEN_CANARY in line:
+        if canary in line:
             leaked.append("log line")
     for row in rows:
         segments = list(
@@ -412,7 +467,7 @@ def _codex_leaks(rows, written, logs) -> list[str]:  # noqa: ANN001
         for window, pct in (("5h", row.five_hour_pct), ("7d", row.seven_day_pct)):
             segments.extend(render_mod.window_line(window, pct))
         label = "".join(text for text, _ in segments) + repr(row)
-        if TOKEN_CANARY in label:
+        if canary in label:
             leaked.append("rendered row")
     return leaked
 
@@ -462,6 +517,41 @@ def test_the_codex_row_still_carries_a_figure_without_the_canary() -> None:
         assert rows and rows[0].seven_day_pct == 19.0
         assert rows[0].plan_type == "pro" and rows[0].attention_note == ""
         assert any(p.name == "codex_quota_snapshots.json" for p in written)
+
+
+def test_the_desktop_login_never_leaves_its_file_and_is_never_written() -> None:
+    """CX-1: the widget now reads the ChatGPT app's own login for the account
+    it is logged in as. That token reaches one place (the Authorization
+    header), its refresh token reaches none, and the file is never written."""
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        mirror = root / "dot-codex" / "auth.json"
+        seen: list[tuple[bytes, int]] = []
+        rows, written, logs = _poll_codex_account(
+            root, poisoned=False, desktop=True,
+            before_poll=lambda path: seen.append((path.read_bytes(), path.stat().st_mtime_ns)),
+        )
+        assert len(seen) == 1, "the pre-poll snapshot of the mirror was not taken"
+        before = seen[0]
+        assert DESKTOP_TOKEN_CANARY in mirror.read_text(), "the canary was not planted"
+        assert rows and rows[0].seven_day_pct == 19.0, "the desktop token was not used"
+        assert "via ChatGPT app login" in rows[0].info_notes, "not the desktop path"
+        assert written and logs, "nothing written or logged - the check proves nothing"
+        leaked = _codex_leaks(rows, written, logs, DESKTOP_TOKEN_CANARY)
+        assert not leaked, "the desktop token escaped into: " + ", ".join(leaked)
+        assert (mirror.read_bytes(), mirror.stat().st_mtime_ns) == before
+
+
+def test_the_desktop_canary_test_can_actually_fail() -> None:
+    """Negative control for the test above: a transport that logs the
+    Authorization header must be caught carrying the DESKTOP canary - which
+    also proves that token, not the expired widget copy, made the request."""
+    with tempfile.TemporaryDirectory() as name:
+        rows, written, logs = _poll_codex_account(
+            Path(name), poisoned=False, leaky=True, desktop=True
+        )
+        leaked = _codex_leaks(rows, written, logs, DESKTOP_TOKEN_CANARY)
+        assert "log line" in leaked, leaked
 
 
 def _tests() -> list[tuple[str, object]]:

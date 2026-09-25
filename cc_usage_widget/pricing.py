@@ -24,6 +24,9 @@ Two cache-rate shapes - derived (Anthropic) vs published (OpenAI)
     **derived** from the base input rate by the multipliers frozen in
     ``contracts`` (5m write ``1.25x``, 1h write ``2.0x``, read ``0.1x``). A
     cache rate can therefore never drift out of step with its base rate.
+    Exception: a model whose published cache-**read** price is not ``0.1x``
+    (Opus 5.5 ``0.05x``, Fable 5.1 ``0.025x``) states it on its row via
+    :func:`_row`'s ``cache_read_usd``; its write rates still derive.
 
 *Published* (:data:`~contracts.VENDOR_CODEX`)
     OpenAI publishes a real cached-input price per model. For
@@ -31,8 +34,9 @@ Two cache-rate shapes - derived (Anthropic) vs published (OpenAI)
     ``0.1x`` for that model *by coincidence*, and treating the coincidence as
     a rule would be inventing a price - so an OpenAI row stores its published
     cached rate verbatim and Claude's multipliers are never applied to it.
-    ``cache_write_input_tokens`` bills at the standard input rate
-    (SPEC-CODEX 3), which is what an OpenAI row's cache-write rate is set to.
+    ``cache_write_input_tokens`` bills at the page's published "Cache writes"
+    rate, stated on every OpenAI row (SPEC-CODEX 3; the input rate only where
+    the page prints ``-``).
 
 :meth:`TokenRates.from_usd_per_mtok` is the single place that choice is made,
 and :func:`_openai_row` cannot be called without a published cached rate, so
@@ -92,8 +96,10 @@ at ``$0``, and keeps its **raw** name available for the menu via
 ``None``) and :meth:`ModelPricing.unknown_raw_models`. Prefix matching is
 deliberately strict - the remainder after a canonical key must look like a
 snapshot date, an ``@date``, a ``vN[:N]`` provider suffix, a context-window
-marker or nothing at all - so a future ``claude-fable-5-1`` is reported as
-unknown rather than silently billed at Fable 5's rate (SPEC 3.3 trap 5).
+marker or nothing at all - so a point release with no row of its own (say
+``claude-opus-5-7``) is reported as unknown rather than silently billed at
+Opus 5's rate (SPEC 3.3 trap 5). ``claude-fable-5-1`` and ``claude-opus-5-5``
+have their own rows and resolve to them, never to Fable 5's or Opus 5's.
 
 ``codex-auto-review`` takes exactly this path (SPEC-CODEX 3): OpenAI publishes
 no rate for it, so it is **not** priced at ``gpt-5.6-sol``'s rate or any other
@@ -360,9 +366,10 @@ class TokenRates:
                 moment OpenAI ships a model where it is not, a derived table
                 would be quietly wrong with nothing to notice it.
             cache_write_usd: **published** cache-write rate per Mtok, applied
-                to both write slots. For OpenAI this is the standard input rate
-                (SPEC-CODEX 3), which is emphatically not Claude's ``1.25x`` /
-                ``2.0x``. OpenAI publishes no 1-hour tier at all, and
+                to both write slots. For OpenAI this is the page's "Cache
+                writes" column (SPEC-CODEX 3) - stated per row, never derived
+                by Claude's ``1.25x`` / ``2.0x`` even where OpenAI's figure
+                happens to equal ``1.25x`` input. OpenAI publishes no 1-hour tier at all, and
                 :meth:`~contracts.ModelUsage.from_codex_last_token_usage`
                 always leaves that counter at 0, so the 1h slot is priced here
                 only so the field is never undefined - it is multiplied by zero
@@ -453,6 +460,10 @@ class PriceRow:
     The two published-rate fields are ``None`` for an Anthropic row (cache
     rates derive from ``input_usd_per_mtok``) and set for an OpenAI one. They
     are appended last so every pre-Codex positional construction is unchanged.
+    The one Anthropic exception is ``cached_input_usd_per_mtok``, set by
+    :func:`_row`'s ``cache_read_usd`` for a model whose published cache-read
+    price is not ``0.1x`` input; its ``cache_write_usd_per_mtok`` stays
+    ``None``, so the write rates still derive by the multipliers.
     """
 
     model: ModelKey
@@ -472,7 +483,11 @@ class PriceRow:
 
     @property
     def has_published_cache_rates(self) -> bool:
-        """True when the cache rates are published rather than derived."""
+        """True when the cache-read rate is published rather than derived.
+
+        For an OpenAI row the write rate is published too; for an Anthropic
+        row with a ``cache_read_usd`` override only the read rate is.
+        """
         return self.cached_input_usd_per_mtok is not None
 
     def covers(self, day: dt.date) -> bool:
@@ -519,6 +534,7 @@ def _row(
     *,
     effective_from: str | None = None,
     effective_until: str | None = None,
+    cache_read_usd: str | None = None,
 ) -> PriceRow:
     """Build an **Anthropic** :class:`PriceRow` from string literals.
 
@@ -526,17 +542,28 @@ def _row(
     seven-and-a-half hundredths and not the binary double nearest to it. Cache
     rates derive from the input rate. Use :func:`_openai_row` for a vendor that
     publishes its own.
+
+    ``cache_read_usd`` is the one exception, for an Anthropic model whose
+    published cache-read price is **not** the standard ``0.1x`` (Opus 5.5 at
+    ``0.05x``, Fable 5.1 at ``0.025x``). It replaces only the read rate; the
+    two write rates still derive by the frozen ``1.25x`` / ``2.0x``
+    multipliers. Left ``None`` - every row that existed before it - the row is
+    built exactly as before, so no pre-existing rate moves.
     """
     input_dec = Decimal(input_usd)
     output_dec = Decimal(output_usd)
+    read_dec = Decimal(cache_read_usd) if cache_read_usd is not None else None
     return PriceRow(
         model=model,
         input_usd_per_mtok=input_dec,
         output_usd_per_mtok=output_dec,
         effective_from=parse_day_key(effective_from) if effective_from else None,
         effective_until=parse_day_key(effective_until) if effective_until else None,
-        rates=TokenRates.from_usd_per_mtok(input_dec, output_dec),
+        rates=TokenRates.from_usd_per_mtok(
+            input_dec, output_dec, cached_input_usd=read_dec
+        ),
         vendor=VENDOR_CLAUDE,
+        cached_input_usd_per_mtok=read_dec,
     )
 
 
@@ -548,7 +575,7 @@ def _openai_row(
     *,
     effective_from: str | None = None,
     effective_until: str | None = None,
-    cache_write_usd: str | None = None,
+    cache_write_usd: str | None,
 ) -> PriceRow:
     """Build an **OpenAI** :class:`PriceRow` with its *published* cache rates.
 
@@ -559,10 +586,15 @@ def _openai_row(
     silently inherit Claude's ``0.1x`` derivation. Forgetting it is a
     ``TypeError`` at import, not a wrong number at runtime.
 
-    ``cache_write_usd`` defaults to *input_usd* per SPEC-CODEX 3
-    ("``cache_write_input_tokens`` is separate and priced at the standard input
-    rate"). It is a parameter only so a future model that prices cache writes
-    differently has somewhere to say so.
+    ``cache_write_usd`` is **required** too (keyword-only, no default) for
+    the same reason: it is the page's "Cache writes" column, which since the
+    2026-09-25 read is a separate published figure (``1.25x`` input on every
+    model that prints one - ``gpt-6-astra`` ``$12.50`` against ``$10.00``).
+    Pass ``None`` only where the page prints ``-`` or has no such column
+    (``gpt-5.5``, ``gpt-5.4``, ``gpt-5.4-mini``) or where there is no page to
+    read (Sol's pre-cut row): those cache writes then bill at the standard
+    input rate, the SPEC-CODEX 3 rule that predates the column. A ``None`` is
+    a stated choice at the row, never a silent default.
     """
     input_dec = Decimal(input_usd)
     output_dec = Decimal(output_usd)
@@ -605,6 +637,9 @@ the caveat is greppable from code rather than living only in prose.
 """
 
 
+# The $4 Sol rate is PROMOTIONAL: the page read 2026-09-25 says "GPT-5.6 Sol's
+# promotional pricing is available at least through November 21, 2026". When
+# OpenAI states the end date, bound the $4 row there and add the next rate.
 OPENAI_SOL_RATE_CUT_DAY: Final[str] = "2026-09-03"
 """The day from which ``gpt-5.6-sol`` prices at its cut rate ($4/$0.40/$20).
 
@@ -624,8 +659,19 @@ rather than hidden, per `OpenAI rate history`_.
 CLAUDE_PRICE_ROWS: Final[tuple[PriceRow, ...]] = (
     # model              input   output   from          until
     _row("claude-fable-5", "10.00", "50.00"),
+    # Fable 5.1: $10 in / $50 out; cache read $0.25 (0.025x input, NOT the
+    # standard 0.1x); cache writes by the standard 1.25x / 2x multipliers.
+    # Source: the bundled claude-api skill model table and its Fable 5.1
+    # section ("cache reads at $0.25/MTok"), read 2026-09-23.
+    _row("claude-fable-5-1", "10.00", "50.00", cache_read_usd="0.25"),
     _row("claude-mythos-5", "10.00", "50.00"),
     _row("claude-opus-5", "5.00", "25.00"),
+    # Opus 5.5: $4 in / $20 out; cache write 5m $5.00 / 1h $8.00 (the standard
+    # 1.25x / 2x); cache read $0.20 (0.05x input, NOT the standard 0.1x).
+    # Source: platform.claude.com/docs/en/models/opus-5-5/whats-new-opus-5-5
+    # (Pricing section) and the code.claude.com changelog, 2.1.280. The main
+    # loop of this setup since 2026-09-22.
+    _row("claude-opus-5-5", "4.00", "20.00", cache_read_usd="0.20"),
     _row("claude-opus-4-8", "5.00", "25.00"),
     # Sonnet 5: introductory rate, then standard. Inclusive bounds, adjacent
     # days - no gap, no overlap. This pair is the reason resolution is dated.
@@ -637,25 +683,49 @@ CLAUDE_PRICE_ROWS: Final[tuple[PriceRow, ...]] = (
 """Anthropic rows, USD per million tokens (SPEC 3.4).
 
 Only base input/output rates live here; cache rates are **derived** by the
-frozen multipliers. Rows are resolved against the **usage record's** date.
+frozen multipliers, except that a row may state a published cache-**read** rate
+(``cache_read_usd``) where Anthropic's is not ``0.1x`` - Opus 5.5 and Fable
+5.1. Rows are resolved against the **usage record's** date.
+
+A versioned row is its own model. ``claude-opus-5-5`` never falls back to
+``claude-opus-5`` and ``claude-fable-5-1`` never to ``claude-fable-5``: the
+exact key wins, and the ``-5`` / ``-1`` remainder after the shorter key is
+rejected by :data:`_SUFFIX_RE`, so a version with no row of its own (say
+``claude-opus-5-7``) is still unknown and ``$0``.
 """
 
 
 OPENAI_PRICE_ROWS: Final[tuple[PriceRow, ...]] = (
-    # model                input   cached   output
+    # model                input   cached   output   cache writes (keyword)
+    # Source for every figure below unless a row says otherwise:
+    # developers.openai.com/api/docs/pricing, Standard tier, short-context
+    # columns, read 2026-09-25 (saved copy:
+    # ~/.claude/plans/usage-bar-2026-09-25/evidence/drift_openai_pricing.html).
     # gpt-6-astra: OpenAI's flagship since 2026-09-03 and the dominant model in
     # this corpus (1,257 turn_context records in the three days to
     # 2026-09-09 vs 404 for Sol). Standard tier; Fast/Batch/Flex tiers are
     # not represented because a rollout does not say which tier ran.
-    _openai_row("gpt-6-astra", "10.00", "1.00", "50.00"),
-    # gpt-5.6-sol: two real rates, bounded at OPENAI_SOL_RATE_CUT_DAY.
-    _openai_row("gpt-5.6-sol", "5.00", "0.50", "30.00", effective_until="2026-09-02"),
-    _openai_row("gpt-5.6-sol", "4.00", "0.40", "20.00", effective_from=OPENAI_SOL_RATE_CUT_DAY),
-    _openai_row("gpt-5.6-terra", "2.00", "0.20", "12.00"),
-    _openai_row("gpt-5.6-luna", "0.20", "0.02", "1.20"),
-    _openai_row("gpt-5.5", "5.00", "0.50", "30.00"),
-    _openai_row("gpt-5.4", "2.50", "0.25", "15.00"),
-    _openai_row("gpt-5.4-mini", "0.75", "0.075", "4.50"),
+    _openai_row("gpt-6-astra", "10.00", "1.00", "50.00", cache_write_usd="12.50"),
+    # gpt-6-sol / gpt-6-luna: first listed 2026-09-25 (luna was already in use
+    # and pricing at $0). "gpt-6-sol" is its own key; it never folds into
+    # "gpt-5.6-sol", whose name it is not a prefix of.
+    _openai_row("gpt-6-sol", "2.00", "0.20", "10.00", cache_write_usd="2.50"),
+    _openai_row("gpt-6-luna", "0.10", "0.01", "0.50", cache_write_usd="0.125"),
+    # gpt-5.6-sol: two real rates, bounded at OPENAI_SOL_RATE_CUT_DAY. The
+    # pre-cut rate predates the page's cache-write column, so its cache writes
+    # stay at the input rate (None): there is no published figure to state.
+    _openai_row("gpt-5.6-sol", "5.00", "0.50", "30.00", effective_until="2026-09-02",
+                cache_write_usd=None),
+    _openai_row("gpt-5.6-sol", "4.00", "0.40", "20.00", effective_from=OPENAI_SOL_RATE_CUT_DAY,
+                cache_write_usd="5.00"),
+    _openai_row("gpt-5.6-terra", "2.00", "0.20", "12.00", cache_write_usd="2.50"),
+    _openai_row("gpt-5.6-luna", "0.20", "0.02", "1.20", cache_write_usd="0.25"),
+    # gpt-5.5 / gpt-5.4: the page prints "-" in the cache-write cell (rows
+    # headed "<272K context length"); gpt-5.4-mini's row has no such column.
+    # None = cache writes bill at the input rate, as they did before.
+    _openai_row("gpt-5.5", "5.00", "0.50", "30.00", cache_write_usd=None),
+    _openai_row("gpt-5.4", "2.50", "0.25", "15.00", cache_write_usd=None),
+    _openai_row("gpt-5.4-mini", "0.75", "0.075", "4.50", cache_write_usd=None),
 )
 """OpenAI rows, USD per million tokens - verified 2026-08-17 and re-verified
 2026-09-09 against OpenAI's official pricing docs
@@ -667,7 +737,19 @@ unchanged on the official page that day.
 The ``gpt-5.5`` row was added 2026-08-25 from three agreeing secondary
 sources (openrouter.ai/openai/gpt-5.5, morphllm.com/openai-api-pricing,
 benchlm.ai/openai/api-pricing) because 1.46B live-window tokens were pricing
-at $0; re-verify it against OpenAI's own page on the next table pass.
+at $0. **Verified on OpenAI's own page on 2026-09-25**: $5 / $0.50 / $30.
+
+The 2026-09-25 pass (same page) added ``gpt-6-sol`` ($2/$0.20/$10) and
+``gpt-6-luna`` ($0.10/$0.01/$0.50) and states every row's cache-write rate
+from the page's "Cache writes" column (``1.25x`` input where printed; see
+:func:`_openai_row` for the rows that print ``-``).
+
+**Long context is not priced separately.** The page prints a second, higher
+"Long context" rate set for every GPT-6 and gpt-5.6-sol row (and labels the
+5.5 / 5.4 rows "<272K context length"), but gives no threshold for the GPT-6
+rows and a rollout does not say which tier a turn billed at. Every turn is
+therefore priced at the **short-context** rate, so a long-context turn reads
+LOW; no threshold is invented to split them.
 
 The middle column is the **published** cached-input rate, stored verbatim and
 never derived; see `Two cache-rate shapes`_. Every rate here lands on an exact
@@ -696,8 +778,10 @@ MODEL_DISPLAY_NAMES: Final[Mapping[VendorModelKey, str]] = {
     # Claude keys stay BARE - this map is public and pre-Codex callers index it
     # with a plain model string.
     "claude-fable-5": "Fable 5",
+    "claude-fable-5-1": "Fable 5.1",
     "claude-mythos-5": "Mythos 5",
     "claude-opus-5": "Opus 5",
+    "claude-opus-5-5": "Opus 5.5",
     "claude-opus-4-8": "Opus 4.8",
     "claude-sonnet-5": "Sonnet 5",
     "claude-sonnet-4-6": "Sonnet 4.6",
@@ -705,6 +789,8 @@ MODEL_DISPLAY_NAMES: Final[Mapping[VendorModelKey, str]] = {
     # OpenAI keys are vendor-qualified, so a future Anthropic model that
     # happened to share a name could not overwrite one of these.
     "codex:gpt-6-astra": "gpt-6-astra",
+    "codex:gpt-6-sol": "gpt-6-sol",
+    "codex:gpt-6-luna": "gpt-6-luna",
     "codex:gpt-5.6-sol": "gpt-5.6-sol",
     "codex:gpt-5.6-terra": "gpt-5.6-terra",
     "codex:gpt-5.6-luna": "gpt-5.6-luna",
@@ -765,8 +851,16 @@ _SUFFIX_RE: Final[re.Pattern[str]] = re.compile(
 Accepted: nothing, a snapshot date (``-20260514``, ``@20260514``), a provider
 version (``-v1:0``), a context-window marker (``-1m``), ``-latest``,
 ``-preview``, and combinations. Anything else - notably a further version
-segment like ``-1`` in a hypothetical ``claude-fable-5-1`` - is **rejected**,
-so the model reports as unknown instead of borrowing Fable 5's rate.
+segment like the ``-1`` of ``claude-fable-5-1`` or the ``-5`` of
+``claude-opus-5-5`` - is **rejected** as a remainder of the shorter key. So a
+point release resolves only to **its own** row (both now have one, matched
+exactly or longest-first) and never borrows its predecessor's rate, and a
+point release with no row (``claude-opus-5-7``) reports as unknown.
+
+One spelling stays ambiguous and keeps its pre-existing reading: the dash-form
+context marker ``claude-fable-5-1m`` resolves to Fable 5 with a ``1m`` window
+(``-1m`` is an accepted marker; ``claude-fable-5-1`` + ``m`` has no separator).
+Claude Code writes the bracket form ``[1m]``, which strips cleanly.
 """
 
 _BRACKET_SUFFIX_RE: Final[re.Pattern[str]] = re.compile(r"\[[^\]]*\]\s*$")

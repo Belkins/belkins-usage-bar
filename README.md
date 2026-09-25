@@ -82,6 +82,81 @@ cd cc-usage-widget
 Start at login: `./install.sh --launch-agent`
 Remove everything: `./uninstall.sh`
 
+## Reading the menu
+
+The dropdown opens on two cards that answer the questions you open it for:
+
+* **Claude** — the account you are on, its *binding* window (the one
+  auto-switch decides on) and when it resets (`↺ 14:50`), then the next
+  account to move to, how many rooms have headroom (`4/5 room`), each model
+  fleet line (`Fable 4/4`) and extra-usage spend once it passes 70 %. A badge
+  counts the slots that need you.
+* **Codex** — the login `~/.codex` is using, its weekly figure (or `⚠ relogin`
+  instead of a figure it cannot vouch for), then `best:` (the same account
+  `codex_accounts best` prints), the fleet count, the next reset and any reset
+  credits. A reset credit you can use **now** is the one green line in the menu.
+
+Below them: **Needs attention** (every slot or login waiting on you, with the
+remedy — absent when nothing is), **Claude** (the active account's full bars,
+then one line per other account, most headroom first), **Codex** (one line per
+account plus its single most useful fact), recent switches and cost, then the
+tools. Every reset reads the same way everywhere: `↺ 14:50` today, `↺ Thu
+20:25` this week, `↺ Oct 2 10:49` later, `↺ overdue` once passed. The full
+bars are one submenu away (**All Claude bars ▸**, **All Codex bars ▸**).
+
+**Settings ▸ Classic menu layout** (`menu_layout_classic`) brings back the
+previous menu exactly; it is also what a machine with no Claude accounts and no
+live Codex row shows. **Settings ▸ Title ▸ Merge alerts into ⚠N**
+(`title_merge_alerts`, off) folds `C⚠` and the bare `⚠` into one count that
+matches the Needs attention section, which makes the title narrower. When the
+Codex account you are on is capped and holds a usable reset credit, its
+`↺<time>` countdown becomes a green `↺now` (**Reset-credit marker**,
+`title_show_reset_credit`, on). The title text is otherwise unchanged; each
+part is now coloured by its severity.
+
+## Reading the Accounts block
+
+With [claude-swap](https://github.com/realiti4/claude-swap) installed, the
+Accounts block shows more than the bars:
+
+* **A fleet line per model window**, directly under `Accounts` —
+  `Fable 2/4 · next Tue 09:00`: how many enabled, switchable slots still have
+  room in that weekly window, and when the soonest full one resets. One line
+  per scoped window your slots report; a machine that reports none never sees
+  it. **Settings ▸ Fable fleet line** (`Model fleet line` when there are
+  several) turns it off — `scoped_fleet_line_enabled`, on by default — and the
+  block is then exactly what it was before.
+* **Extra usage is real money**, so it gets its own line under the account that
+  spends it — `extra $480.00 / $500.00  96%  resets …` — and a
+  `Real spend (extra usage) … · real, not notional` line in the Cost section. A
+  notification fires when it crosses your threshold and again at the limit.
+* **A window whose reset has passed is drawn dim**, without its `(!)`: the
+  number is from the previous window. `(!)` itself now means *at the wall*
+  (100 %); red still starts at 90 %.
+* **A slot with a standing problem is dimmed and says so once** — its header
+  reads `⚠ relogin · last seen 3d ago` or `⚠ 403`, and the full remedy is in
+  the alert line at the top. A slot whose usage has been refused three times
+  or more says why and what to run: `usage forbidden (HTTP 403) since <day> ·
+  <n> failed polls — … log in as <email> and run cswap add, or cswap remove
+  <slot> to stop polling`. A slot held in upstream's `429` backoff with no good
+  fetch for a day or more says so too: `usage refused for N days since <day>
+  (last error HTTP 429, upstream backoff)`, with `⚠ 429` in the title.
+* **A `cswap disable`d slot is marked `disabled`**, sorts last in **Switch
+  account** with `(disabled)`, and is never counted as room.
+* **Account flips are named.** A running Claude Code session that rewrites
+  `~/.claude.json` behind claude-swap's back is a *ghost flip*; three in an
+  hour is a *login fight* (`⚠ ghost` in the title, always), and the alert lists
+  the remedies. A switch that was reverted before the next pass says so
+  (`switch →2 reverted to 1`); when claude-swap's log shows no revert, it is a
+  ghost flip (`switch →2 reverted: ~/.claude.json rewritten to …`) and counts
+  toward a login fight. A plain `cswap switch` or a single ghost flip to a
+  healthy slot no longer badges the title. The newest switch is shown inline,
+  and the rest are under a **Recent switches** submenu.
+* **The title follows the window auto-switch actually decides on.** If that is
+  the Fable window rather than the 5-hour one, the fleet suffix leads with it
+  (`F90%`, `7d92%`), so you can see which wall is closing. A window whose reset
+  has passed never binds the title and never costs the fleet a room.
+
 ## Optional: a live row for each of your Codex accounts
 
 Out of the box the Codex row is read from your local rollout logs. Those logs
@@ -136,45 +211,90 @@ What to expect:
 * A row says what is wrong instead of showing a wrong number: `relogin`,
   `no access`, `rate limited`, `endpoint error`, `offline`. A reading older than
   6 hours drops its bars and keeps the reason.
-* Codex access tokens last about ten days and the widget **does not refresh
-  them by default**. Two days before one expires the row starts saying
-  `relogin in 1d 4h`; when it expires, run
-  `CODEX_HOME=…/codex-accounts/<account_id> codex login` again. See
-  [Refreshing tokens](#refreshing-tokens-off-by-default) for the switch and why
-  it ships off.
+* Codex access tokens last about ten days. The widget **refreshes them by
+  default**, about a day before one expires; see
+  [Refreshing tokens](#refreshing-tokens) for the switch and its
+  guards. Only when a refresh cannot happen does the row say `relogin in 1d 4h`
+  two days out, and a dead login offers **Log in again…** in the menu (see
+  below).
 * Delete `codex_accounts.json` (or untick every account) and the menu goes back
   to exactly what it was.
 
-## Refreshing tokens (off by default)
+### Log in again / add an account from the menu
 
-Ten days is not long, and four accounts means four browser logins every ten
-days. The widget can avoid them — it knows how to exchange the refresh token in
-each `auth.json` for a fresh one — but the setting that allows it,
-`codex_refresh_enabled`, **ships off**, and off means silent: with it off, no
-token request of any kind is ever made and the widget only ever *reads* your
-credential files. There is a test whose whole job is to fail if that stops
-being true.
+A Codex row whose login is dead (`relogin`, or `credential unreadable`) is
+clickable, and says when and what: `token expired Sep 20 11:13 · Log in again…`
+(or `last reading 5d ago · Log in again…` when the expiry is not known).
+**Settings ▸ Codex accounts ▸ Add Codex account…** does the same for an
+account the widget does not track yet.
 
-It ships off because of one unanswered question. Every `codex login` uses the
-same public OAuth client, and it is not documented whether rotating the token
-for one login invalidates the others (OpenAI, like most providers, may treat a
-reused refresh token as theft and revoke the whole family). A wrong guess here
-does not show a wrong number — it logs you out of the account you are working
-in. So the answer has to be measured on an account you can afford to lose:
+Either click writes a small script, `codex-accounts/login-<time>.command`
+(0700, paths only — no token, no email), and opens it in Terminal. It runs
+`CODEX_HOME=…/codex-accounts/new-<time> codex login` and then
+`python -m cc_usage_widget.codex_login adopt --replace`, which reads the id the
+NEW token claims and either swaps the fresh `auth.json` into that account's
+existing home (a relogin: alias and checkbox kept) or registers it (a new
+account). The browser shows a workspace picker; pick the workspace of the
+account you clicked — two of these accounts can share an email, and the adopt
+step files the login under whichever account it really is. The script deletes
+itself when it succeeds.
+
+Closed the Terminal before it finished? The widget adopts any finished
+`new-*/auth.json` on its next poll (after a 30 s settle, so it never moves a
+file `codex login` is still writing). `codex` is looked up on `PATH`, then
+`/usr/local/bin`, `/opt/homebrew/bin`, and the ChatGPT app's own copy — the
+LaunchAgent has no `/usr/local/bin` on its `PATH`. By hand:
 
 ```bash
-"$PY" -m cc_usage_widget.codex_accounts probe-refresh gmail
+"$PY" -m cc_usage_widget.codex_login adopt --replace
 ```
 
-That performs **one** refresh on that account, writes the rotated tokens into
-its `auth.json` before using them, and then makes one usage request to prove
-the new token is accepted. It prints the plan, email and expiry before and
-after — never a token — and exits non-zero if either half fails. Then wait
-**24 hours** and check that your other accounts and `~/.codex` still work
-(`list` will tell you). Only if all of that is clean is the switch worth
-turning on, by setting `"codex_refresh_enabled": true` in `settings.json`.
+Plain `adopt` (either module) still refuses an account that is already
+tracked; only `--replace` swaps a login in.
 
-With it on, the rules are deliberately narrow:
+<!-- The old anchor, kept so links from before 2026-09-25 still land here. -->
+<a id="refreshing-tokens-off-by-default"></a>
+
+## Refreshing tokens
+
+Ten days is not long, and four accounts means four browser logins every ten
+days. The widget avoids them by exchanging the refresh token in each
+`auth.json` for a fresh one about a day before the old one expires. The setting
+that allows it, `codex_refresh_enabled`, is **on by default** since 2026-09-25,
+and **Settings → Refresh Codex logins automatically** (shown while live Codex
+quota is on) turns it off. Off means silent: no token request of any kind is
+made and the widget only ever *reads* your credential files. There is a test
+whose whole job is to fail if that stops being true.
+
+It used to ship off, because of one unanswered question: every `codex login`
+uses the same public OAuth client, and it is not documented whether rotating
+the token for one login invalidates the others. The off default then cost more
+than it protected: on 2026-09-20 every stored token expired and the Codex rows
+said `relogin` for five days. Hand-run refreshes on 2026-09-25 rotated three
+accounts cleanly while `~/.codex` kept working, and four guards now keep
+refresh away from everything it could break:
+
+* **The account `~/.codex` is logged in as is never refreshed.** The ChatGPT
+  app owns that login. For that one account the widget instead borrows the
+  app's own, fresher token from `~/.codex/auth.json` — read-only, never
+  refreshed, never written — and the row says `via ChatGPT app login`. While
+  the app's login is live, the widget's own copy of that account shows no
+  countdown. The guard fails closed: the last account a read of
+  `~/.codex/auth.json` named stays protected through a torn or missing file,
+  and while an existing file has never been readable no account is refreshed.
+* **A refused refresh is final** (`invalid_grant` and the
+  `refresh_token_reused` / `_expired` / `_invalidated` codes): nothing is
+  retried — not on the next poll, not after a restart — until you log in again
+  and the file changes. While the stored token still works the row keeps its
+  figures and counts down (`relogin in …`); once it expires the row says
+  `relogin`.
+* **A file the Codex CLI rotated mid-refresh is kept.** If `auth.json` changed
+  while the widget's request was in flight, the widget throws its own result
+  away and uses what the CLI wrote.
+* **Nothing about a token is logged.** Log lines carry the alias, the outcome
+  and how long the new token lasts.
+
+And the grant itself stays narrow:
 
 * a refresh is attempted when a token is within **24 hours** of expiring, and
   exactly **once more** if the API answers `401` — never twice in one poll;
@@ -185,11 +305,22 @@ With it on, the rules are deliberately narrow:
   your login;
 * the old refresh token is overwritten in place — no backup copy, nothing that
   could be re-sent by accident;
-* if the API says `invalid_grant`, the row says `relogin` and nothing is
-  retried;
-* any other failure changes nothing at all: your stored token is still valid
-  until it expires, and the countdown carries on as if the refresh had never
-  been attempted.
+* any other failure changes nothing: your stored token is still valid until it
+  expires, and the `relogin in 1d 4h` countdown comes back so the deadline is
+  not hidden. While refresh is working that countdown stays away, because
+  nobody needs to do anything.
+
+To see one refresh happen end to end, on an account you choose:
+
+```bash
+"$PY" -m cc_usage_widget.codex_accounts probe-refresh gmail
+```
+
+That performs **one** refresh on that account, writes the rotated tokens into
+its `auth.json` before using them, and then makes one usage request to prove
+the new token is accepted. It prints the plan, email and expiry before and
+after — never a token — and exits non-zero if either half fails. It refuses
+the account `~/.codex` is logged in as.
 
 ## Notifications
 
@@ -205,11 +336,20 @@ It notifies on:
 | a window **coming back** (below 50 % after having been at or over the threshold) | `back: vlad 0% weekly` |
 | a row that needs attention (`relogin`, `no access`, `offline`, `endpoint error`, out of credits) | the row's own wording |
 | a claude-swap sentinel, or a self-audit that found drift | the note itself |
+| a Codex login **within 24 h of expiring** while its row shows the `relogin in …` countdown | `Codex vlad · login expires Sep 20 11:13 · Log in again from the menu` |
+| Claude **extra-usage spend** crossing the threshold, and again at its limit | `Claude main · extra usage $480.00 / $500.00 (96%) · crossed 85% of the extra-usage limit` |
+| a model with **no published rate** reaching `unpriced_alert_min_tokens` today (default 1,000,000; 0 = off) | `Usage Bar · unpriced model · Codex gpt-… · 2.0M tokens today, counted at $0 (no published rate)` |
+| a Codex **reset credit** becoming usable | `Codex reset available · vlad: 1 reset credit usable now — weekly 87%` |
 
 Once per transition, not once per tick: a standing condition notifies once and
 is only re-armed when it stops being true, so an account that sits at 100 % for
 four days produces one notification, and the next time it walls it notifies
 again. The ledger is `notify_state.json`; deleting it costs at most one repeat.
+One exception: a standing Codex `warn` (a dead login, no access, offline) is
+sent again once a day while it stands — a dead login announced once and then
+never again is how four rows once sat on `relogin` for five days. Claude
+sentinels are not repeated. Every notification actually delivered leaves one
+line in `logs/widget.log`: `notify: sent <key>` (the key, never the wording).
 
 Settings ▸ Notifications has the master switch and the threshold. The threshold
 lives in `settings.json` as `notification_threshold_pct` (50–100).
@@ -252,6 +392,11 @@ What the block tells you once more than one account is live:
   `gpt-6-astra back Sep 15` when the endpoint reports them;
 * `at this pace: wall in 6h` on a rising account — only with three readings
   spanning at least half an hour, and never on a capped one;
+* `↺ 1 reset credit usable now — use it in Codex` first on a row whose
+  account holds a rate-limit reset credit that applies now (`reset credits: 2
+  (not usable now)` when it holds some and none applies), `· 1 reset usable` /
+  `· 2 resets banked` on the heading, and a one-time `Codex reset available`
+  notification. Display only: the widget never spends a credit;
 * `C100%↺4d` in the menu bar when the account you are coding on is at the wall
   (that component is `title_show_codex_pct`, off by default).
 
@@ -350,7 +495,7 @@ text — the same line Notification Center shows — to your own bot. The second
 the [live per-account Codex quota](#optional-a-live-row-for-each-of-your-codex-accounts), which
 reads `https://chatgpt.com/backend-api/wham/usage` — your own account, with your
 own login, for your own quota numbers. The third is
-[token refresh](#refreshing-tokens-off-by-default), which POSTs one OAuth
+[token refresh](#refreshing-tokens), which POSTs one OAuth
 refresh grant to `https://auth.openai.com/oauth/token` for a login of yours that
 is about to expire. Nothing is sent anywhere else, nothing is
 uploaded, and the request contains no transcript content. Your Codex access
@@ -378,14 +523,14 @@ State files are created `0600` in the install directory:
 | `scan_state_dedup.json` | request IDs seen today, for de-duplication |
 | `codex_accounts.json` | *(live Codex quota only)* account ids, your aliases, order — no token |
 | `codex_quota_snapshots.json` | *(live Codex quota only)* the last quota reading per account — no token |
-| `codex-accounts/<id>/auth.json` | *(live Codex quota only)* one Codex login, written by `codex login` — and by the widget **only** if you switch [token refresh](#refreshing-tokens-off-by-default) on, which is off by default |
+| `codex-accounts/<id>/auth.json` | *(live Codex quota only)* one Codex login, written by `codex login` — and by the widget when [token refresh](#refreshing-tokens) rotates it (on by default; Settings → Refresh Codex logins automatically turns it off) |
 | `notify.json` | *(Telegram notifications only)* your bot token and chat id — the one credential the widget writes |
 | `notify_state.json` | which transitions have already been announced — no figures, no names but your own aliases |
 | `history.sqlite` | the long-term copy of `rollups.json` — same counters, kept past the window |
 | `dashboard.html` | *(dashboard only)* the page **Open dashboard** last rendered — the same counters, as charts |
 | `backup-state-<ts>/` | a copy of the two files above, taken before a **Rebuild cost index** |
 | `settings.json` | your preferences |
-| `logs/widget.log` | only if you use `--launch-agent` |
+| `logs/widget.log` | only if you use `--launch-agent`; trimmed to its newest half once a day past 5 MB, and a warning that repeats within an hour is written once, then as `(repeated N times since HH:MM)` |
 
 If [claude-swap](https://github.com/realiti4/claude-swap) is installed, *it*
 talks to Anthropic to read your own account quotas. That is its network activity,
@@ -404,11 +549,14 @@ guessed — if you see an unpriced model, please
 [open an issue](../../issues/new?template=unpriced-model.yml) with a link to the
 published rate.
 
-Priced today (table re-verified 2026-09-09): Anthropic's Fable 5, Mythos 5,
-Opus 5, Opus 4.8, Sonnet 5, Sonnet 4.6 and Haiku 4.5; OpenAI's `gpt-6-astra`
-(the current Codex flagship), `gpt-5.6-sol` / `-terra` / `-luna`, `gpt-5.5`,
-`gpt-5.4` and `gpt-5.4-mini`. `codex-auto-review` has no published rate and
-stays at `$0` by design.
+Priced today (Anthropic's table re-verified 2026-09-09, with Opus 5.5 and
+Fable 5.1 read 2026-09-23; OpenAI's re-read 2026-09-25): Anthropic's Fable 5, Fable 5.1, Mythos 5, Opus 5, Opus 5.5, Opus 4.8, Sonnet 5,
+Sonnet 4.6 and Haiku 4.5; OpenAI's `gpt-6-astra` (the current Codex flagship),
+`gpt-6-sol`, `gpt-6-luna`, `gpt-5.6-sol` / `-terra` / `-luna`, `gpt-5.5`,
+`gpt-5.4` and `gpt-5.4-mini`, with cache writes at OpenAI's published "Cache
+writes" rate where it prints one. `codex-auto-review` has no published rate
+and stays at `$0` by design; any other unpriced model with heavy use in a day
+[notifies you](#notifications) once.
 
 ## History and export
 
@@ -461,6 +609,13 @@ It answers the questions a menu cannot: how the last 30 and 90 days compare, how
 tokens and notional dollars split by vendor and by model, how each vendor's model
 mix moved day by day (this is where "Astra took over from Sol" is visible), which
 windows each account is currently sitting in, and how much volume is unpriced.
+
+Workflow swarms count toward the session that ran them. When one ran today, the
+menu's Cost section adds `today's top workflow runs` (`wf_<id> · <project>`,
+tokens, notional $; behind **Settings ▸ Cost by project**), and the dashboard's
+`Workflow runs` table splits today's and yesterday's runs by phase, model and
+dearest agent. Phase and agent names are read from the run's own
+`journal.jsonl` and never stored.
 
 Everything about the file is deliberate:
 

@@ -29,6 +29,8 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+os.environ.setdefault("CC_USAGE_WIDGET_NO_REVEAL", "1")  # never open Finder from a test
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cc_usage_widget import state as state_mod  # noqa: E402
@@ -284,6 +286,53 @@ def test_the_scan_state_ledger_round_trips_through_the_real_store() -> None:
         loaded = scan_state_from_json(store.load_json())["/a/old.jsonl"]
         assert loaded.offset == 2 and loaded.ledger == ()
         assert loaded.to_json() == legacy["/a/old.jsonl"], loaded.to_json()
+
+
+# ---------------------------------------------------------------------------
+# drift-7: the audit note must say how big a small drift was, and which way.
+# Six nightly repairs 2026-09-16..09-21 all logged "1.0x", because a ratio
+# formatted to one decimal cannot show a drift the 0.5 % threshold flags.
+# ---------------------------------------------------------------------------
+
+
+def test_a_small_audit_drift_states_its_signed_size_and_percentage() -> None:
+    from cc_usage_widget.audit import AuditCell
+
+    over = AuditCell(
+        day="2026-09-16",
+        key="codex:gpt-6-astra",
+        live_tokens=101_000_000,
+        fresh_tokens=100_000_000,
+    ).describe()
+    assert "+1.0M" in over and "+1.0%" in over, over
+    assert "1.0x" not in over, over
+    assert over == "codex 2026-09-16 gpt-6-astra +1.0M tok (+1.0%)", over
+
+    # Under-count: the sign says which way, the size stays positive in tokens.
+    under = AuditCell(
+        day="2026-09-16",
+        key="codex:gpt-6-astra",
+        live_tokens=98_000_000,
+        fresh_tokens=100_000_000,
+    ).describe()
+    assert under.endswith("-2.0M tok (-2.0%)"), under
+
+    # A large drift keeps the multiplier, which is what makes it readable.
+    big = AuditCell(
+        day="2026-09-09",
+        key="codex:gpt-5.6-sol",
+        live_tokens=127_000_000,
+        fresh_tokens=10_000_000,
+    ).describe()
+    assert big == "codex 2026-09-09 gpt-5.6-sol 12.7x", big
+    # The band's edges: 1.05 is a multiplier again, 0.95 is still a delta.
+    edge_hi = AuditCell("2026-09-16", "claude-opus-5-5", 105_000_000, 100_000_000).describe()
+    assert edge_hi.endswith(" 1.1x"), edge_hi
+    edge_lo = AuditCell("2026-09-16", "claude-opus-5-5", 95_000_000, 100_000_000).describe()
+    assert edge_lo.endswith("-5.0M tok (-5.0%)"), edge_lo
+    # Nothing to divide by: still tokens, never an invented multiplier.
+    empty = AuditCell("2026-09-16", "claude-opus-5-5", 2_000_000, 0).describe()
+    assert empty.endswith("+2.0M tok"), empty
 
 
 if __name__ == "__main__":

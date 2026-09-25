@@ -1,5 +1,201 @@
 # Changelog
 
+## 2026-09-25 — Menu redesign (glance layout)
+
+The dropdown now opens on a **Claude** card and a **Codex** card that answer,
+in two lines each, which account you are on and how close it is to the window
+that binds, whether Codex is usable and on which login, what needs you, and
+whether a reset credit is usable right now. Then **Needs attention** (absent
+when empty), **Claude**, **Codex**, activity and tools. Details in the README
+under *Reading the menu*.
+
+- One reset format everywhere in the new layout: `↺ 14:50` / `↺ Thu 20:25` /
+  `↺ Oct 2 10:49` / `↺ overdue`. Plan names read `Pro` / `Business` (other plan
+  strings are shown as sent).
+- Native section headers, count badges, SF Symbols and tooltips on macOS 14+;
+  plain text on older systems. The menu-bar title is coloured per part; its text
+  is unchanged. Green is reserved for a usable reset credit.
+- New settings: `menu_layout_classic` (off; **Settings ▸ Classic menu
+  layout** restores the previous menu exactly, and is chosen automatically on a
+  machine with no Claude accounts and no live Codex row), `title_merge_alerts`
+  (off; one `⚠N` instead of `C⚠ ⚠`), `title_show_reset_credit` (on; `↺now`
+  when the active capped Codex account can use a reset credit).
+- `codex_accounts best` and the menu's `best:` line share one ranking.
+
+## 2026-09-25 — Codex logins that stay alive, account forensics, cost data
+
+On 2026-09-20 every stored Codex token expired and four rows sat on `relogin`
+for five days without a word in the log. This push keeps logins alive, says so
+loudly when one does die, gives you a one-click way back, and makes the Claude
+account block explain itself instead of just colouring a number.
+
+**Upgrading.** A `settings.json` that already stores
+`"codex_refresh_enabled": false` keeps it until you flip it (**Settings ▸
+Refresh Codex logins automatically**). The LaunchAgent's new 20 s quit grace
+reaches a running agent only after the plist is rewritten and reloaded:
+`./install.sh --launch-agent --reload` does both (bootout, wait, bootstrap).
+On first start
+`attribution.json` migrates to version 2 (see Cost below).
+
+### Codex logins
+
+- **Token refresh is on by default** (`codex_refresh_enabled: true`, was
+  `false`), with a menu switch: **Settings ▸ Refresh Codex logins
+  automatically**, shown while live Codex quota is on. Four guards come with
+  it: the account `~/.codex` is logged in as is never refreshed (the last
+  account a read named stays protected through a torn or missing file, and
+  while an existing login file has never been readable nothing is refreshed);
+  a refused refresh (`invalid_grant`, `refresh_token_reused` / `_expired` /
+  `_invalidated`, flat or nested) is final - not retried on the next poll or
+  after a restart, until the credential file changes; a file the Codex CLI
+  rotated while our request was in flight is kept and ours is discarded; and no
+  token is ever logged.
+- **The ChatGPT app's own login speaks for its account.** For the account
+  `~/.codex` is logged in as, the widget reads the app's fresher token from
+  `~/.codex/auth.json` - read-only, never refreshed, never written, refused if
+  anyone else can read the file - and the row says `via ChatGPT app login`. When
+  the app rewrites its login, a standing `relogin` clears within one tick.
+- **`relogin in 1d 4h` only when a refresh cannot happen.** While refresh is
+  working the countdown stays away; a capped row keeps it.
+- **Log in again / add an account from the menu.** A dead row (`relogin`,
+  `credential unreadable`) says when and what - `token expired Sep 20 11:13 ·
+  Log in again…` (or `token refused` / `last reading 5d ago`) - and a click
+  writes a `0700` `codex-accounts/login-<time>.command` (paths only, no token,
+  no email) that runs `codex login` into a fresh home and then
+  `python -m cc_usage_widget.codex_login adopt --replace`. **Settings ▸ Codex
+  accounts ▸ Add Codex account…** does the same for a new account. A login whose
+  Terminal was closed is adopted on the next poll after a 30 s settle. `codex`
+  is found on `PATH`, `/usr/local/bin`, `/opt/homebrew/bin` or inside the
+  ChatGPT app.
+- **The log says when a login dies and when it comes back**, once each:
+  `codex <alias>: relogin (<reason>)` / `codex <alias>: recovered`. A steady
+  `200` is logged once, then only on a change, a non-200 or a request over 3 s.
+  Diagnostics show `last 200 5d ago` rather than a bare status.
+- **Reset credits.** A row whose account holds a rate-limit reset credit that
+  applies now leads with `↺ 1 reset credit usable now — use it in Codex`; one
+  held but not applicable reads `reset credits: N (not usable now)`. The fleet
+  heading adds `· 1 reset usable` / `· N resets banked`. An unknown count says
+  nothing, never `0`. The endpoint's upsell object is ignored on purpose.
+
+### Notifications
+
+- A Codex login **within 24 h of expiring** while its row shows the countdown.
+- A standing Codex `warn` (dead login, no access, offline) is **sent again once
+  a day** while it stands; Claude sentinels are not repeated.
+- Claude **extra-usage spend** crossing the threshold, and again at its limit.
+- A model with **no published rate** reaching `unpriced_alert_min_tokens` in a
+  day (default 1,000,000; `0` turns it off).
+- A Codex **reset credit becoming usable** (`Codex reset available`).
+- Every delivered notification logs `notify: sent <key>` - the key, never the
+  wording.
+
+### Claude accounts
+
+- **A slot whose usage fetch keeps failing says why.** After three refusals
+  (a `401`, a `429` or a network blip does not count) the slot reads
+  `usage forbidden (HTTP 403) since <day> · <n> failed polls — …` with the
+  `cswap add` / `cswap remove` remedy, and the title shows `⚠ 403`. The one
+  `429` that counts is a standing one: after three failures with no good fetch
+  for a day, the slot reads `usage refused for N days since <day> (last error
+  HTTP 429, upstream backoff)` and the title shows `⚠ 429`, even in a widget
+  started inside the backoff hour.
+- **Account flips are classified.** A running Claude Code session rewriting
+  `~/.claude.json` behind claude-swap's back is a *ghost flip*; three in an
+  hour is a *login fight*, with remedies, and always badges `⚠ ghost`. A single
+  ghost flip badges only when the slot it landed on is in trouble. A switch
+  reverted before the next pass is reported (`switch →X reverted to Y`); a
+  revert that claude-swap's log does not record is a ghost flip and counts
+  toward a login fight. claude-swap's log is read tail-only (64 KB), and only when its mtime
+  changes.
+- **Extra-usage spend is shown as real money**: an `extra $used / $limit  N%`
+  line under the account and `Real spend (extra usage) … · real, not notional`
+  in the Cost section. A partial upstream entry shows nothing, never `$0`.
+- **The title binds on the window auto-switch decides on** (the max of 5h, 7d
+  and the scoped windows the engine's model list names), and leads the fleet
+  suffix with it (`F90%`, `7d92%`) when it is not the 5-hour one. A window
+  whose reset has passed never binds the title and never costs a room.
+- **Disabled slots** are marked `disabled`, sort last in **Switch account** with
+  `(disabled)`, and are never counted as room.
+- **Expired windows are dim**: a window whose reset has passed drops its colour
+  and `(!)`. A slot with a standing note draws dim bars, and its header carries
+  the short note and its age (`⚠ relogin · last seen 3d ago`); the full remedy
+  prose is printed once, in the alert line at the top. `(!)` now marks 100 %
+  only (red still starts at 90 %).
+- **Menu top cleanup.** An external flip onto a healthy slot no longer badges the
+  title; the alert line is not repeated by the recent-switches block; the newest
+  switch is one inline line with the rest under a **Recent switches** submenu,
+  below the accounts.
+- **A fleet line per scoped window**, directly under `Accounts`:
+  `Fable 4/4 · next Tue 09:00` - enabled, switchable slots with room in that
+  weekly window, and the soonest full one's reset. Behind
+  `scoped_fleet_line_enabled` (on by default) and **Settings ▸ Fable fleet line**
+  (`Model fleet line` when slots report several windows); off, the block is
+  byte-for-byte the old one.
+
+### Operations
+
+- Stale `*.tmp` files older than 24 h at the top of the widget home (including
+  `dashboard.html.tmp` and the `scan_state_dedup.json.tmp.*` orphans) are swept
+  at start; a live writer's file and anything under `codex-accounts/` are left
+  alone. A failed or interrupted state write no longer leaves a `.tmp` behind.
+- An idle tick writes neither the scan state nor the dedup sidecar.
+- A warning that repeats within an hour is logged once, then as
+  `(repeated N times since HH:MM)`; `logs/widget.log` is trimmed to its newest
+  half once a day past 5 MB, dropping `MallocStackLogging` noise.
+- The LaunchAgent plist sets `ExitTimeOut` to 20 s, so launchd no longer
+  SIGKILLs a quit during its 5 s worker grace.
+
+### Cost
+
+- **`gpt-6-luna` and `gpt-6-sol` are priced** (were `$0`; `gpt-6-luna` was
+  already in use). Rates from developers.openai.com/api/docs/pricing, read
+  2026-09-25: Luna $0.10 / cached $0.01 / cache writes $0.125 / out $0.50,
+  Sol $2.00 / $0.20 / $2.50 / $10.00. Menu labels are the model names.
+  `gpt-6-sol` is its own key and never folds into `gpt-5.6-sol`.
+- **OpenAI cache writes bill at the published "Cache writes" column** instead of
+  the input rate: `gpt-6-astra` $12.50 (was $10.00), `gpt-5.6-sol` $5.00,
+  `gpt-5.6-terra` $2.50, `gpt-5.6-luna` $0.25. Rows whose page cell is `-`
+  (`gpt-5.5`, `gpt-5.4`), `gpt-5.4-mini` (no such column) and Sol's pre-cut row
+  keep the input rate. `gpt-5.5` is now verified on OpenAI's own page; the $4
+  Sol rate is recorded as promotional, at least through 2026-11-21.
+  Long-context turns are still priced at the short-context rate (stated, no
+  threshold invented).
+- **The audit line says how big a small drift was, and which way.** A drift
+  under 5 % in either direction now reads `+1.0M tok (+1.0%)` /
+  `-2.0M tok (-2.0%)` instead of `1.0x`, which six nightly repairs
+  (2026-09-16..21) all logged. Larger drifts keep the `12.7x` multiplier.
+- **Workflow swarms fold into the session that ran them, and each run has a
+  cost.** Agents under `<session>/subagents/workflows/wf_<id>/` used to be
+  session rows of their own (`agent-<id>`), so "today's top sessions" ranked
+  anonymous agents. They now count toward their parent session, and a new
+  menu block, `today's top workflow runs`, lists the dearest runs
+  (`wf_<id> · <project>`, tokens, notional $). It appears only when a run
+  exists today (the Cost section is otherwise unchanged, line for line) and
+  sits behind the existing `cost_by_project_enabled` switch.
+- **Dashboard: a `Workflow runs` table** - today's and yesterday's runs with
+  their per-phase, per-model and dearest-agent split. Phases and agent labels
+  are read from each run's `journal.jsonl` (read-only, cleaned, clamped to 40
+  characters) and are never written to `attribution.json`.
+- `attribution.json` is now version 2 (a new `workflows` dimension, per agent,
+  kept for two days like the session rows). Loading a version-1 file folds its
+  anonymous `agent-<id>` session rows into their parent session and workflow
+  run, found by transcript file name alone (no transcript is opened); a row
+  whose transcript is gone, or whose id sits under two parents, is kept under
+  its own key and labelled `partial`. Retractions owed under the version-1
+  scope follow the fold. Project totals are unaffected.
+
+## Unreleased — Opus 5.5 and Fable 5.1 are priced
+
+`claude-opus-5-5` and `claude-fable-5-1` were unknown models and cost `$0`,
+because the suffix rule refuses to fold a point release into its predecessor.
+Each now has its own row, menu label (`Opus 5.5`, `Fable 5.1`) and published
+rates: Opus 5.5 $4 / $20, cache writes $5 (5m) and $8 (1h), cache read $0.20;
+Fable 5.1 $10 / $50, cache writes by the standard multipliers, cache read $0.25.
+Both cache-read prices are below the standard `0.1x`, so a row may now state its
+own read rate (`_row(..., cache_read_usd=...)`); every other row is unchanged.
+A point release with no row (`claude-opus-5-7`) is still unknown, never billed
+at a neighbour's rate.
+
 ## Unreleased — live quota for every Codex account (SPEC-CODEX 6)
 
 The Codex row was honest but anonymous: rollout transcripts carry no account id,

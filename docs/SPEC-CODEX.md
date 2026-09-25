@@ -35,31 +35,41 @@ deltas. **Status:** implemented and shipped. Kept as the design record.
 
 ## 3. Pricing — from OpenAI's official docs (developers.openai.com/api/docs/pricing)
 
-Per 1M tokens, standard tier. Cached input is a real published rate (10% of input), **not** derived.
-Verified 2026-08-17; re-verified 2026-09-09 (Astra added, Sol's cut recorded — `pricing.OPENAI_SOL_RATE_CUT_DAY`).
+Per 1M tokens, standard tier, short context. Cached input and cache writes are real published
+rates, **not** derived. Verified 2026-08-17; re-verified 2026-09-09 (Astra added, Sol's cut recorded
+— `pricing.OPENAI_SOL_RATE_CUT_DAY`); re-verified 2026-09-25 (gpt-6-sol and gpt-6-luna added, the
+"Cache writes" column stated per row, gpt-5.5 confirmed on OpenAI's own page).
 
-| model | input | cached input | output |
-|---|---|---|---|
-| gpt-6-astra (from 2026-09-03) | 10.00 | 1.00 | 50.00 |
-| gpt-5.6-sol — through 2026-09-02 | 5.00 | 0.50 | 30.00 |
-| gpt-5.6-sol — from 2026-09-03 | 4.00 | 0.40 | 20.00 |
-| gpt-5.6-terra | 2.00 | 0.20 | 12.00 |
-| gpt-5.6-luna | 0.20 | 0.02 | 1.20 |
-| gpt-5.4 | 2.50 | 0.25 | 15.00 |
-| gpt-5.4-mini | 0.75 | 0.075 | 4.50 |
+| model | input | cached input | cache writes | output |
+|---|---|---|---|---|
+| gpt-6-astra (from 2026-09-03) | 10.00 | 1.00 | 12.50 | 50.00 |
+| gpt-6-sol | 2.00 | 0.20 | 2.50 | 10.00 |
+| gpt-6-luna | 0.10 | 0.01 | 0.125 | 0.50 |
+| gpt-5.6-sol — through 2026-09-02 | 5.00 | 0.50 | (input rate) | 30.00 |
+| gpt-5.6-sol — from 2026-09-03 (promotional, at least through 2026-11-21) | 4.00 | 0.40 | 5.00 | 20.00 |
+| gpt-5.6-terra | 2.00 | 0.20 | 2.50 | 12.00 |
+| gpt-5.6-luna | 0.20 | 0.02 | 0.25 | 1.20 |
+| gpt-5.5 | 5.00 | 0.50 | - (input rate) | 30.00 |
+| gpt-5.4 | 2.50 | 0.25 | - (input rate) | 15.00 |
+| gpt-5.4-mini | 0.75 | 0.075 | (no column; input rate) | 4.50 |
 
 `reasoning_output_tokens` is a *subset* of `output_tokens` — do NOT add it again.
 `codex-auto-review` has no published rate → unknown-model path ($0 + surfaced name).
 Sol's two rates are both real (the old one verified here on 2026-08-17, the new one on OpenAI's
 page on 2026-09-09); OpenAI does not publish the cut date, so the bound sits at Astra's launch day
 and the uncertainty is stated in `pricing.py` rather than hidden. A rollout does not say which
-service tier ran, so Fast/Batch/Flex rates are not represented.
+service tier ran, so Fast/Batch/Flex rates are not represented. Cache writes bill at the page's
+"Cache writes" column (1.25x input wherever it is printed); only where the page prints `-` or has
+no such column, and on Sol's pre-cut row, do they bill at the standard input rate. The page also
+lists higher long-context rates; a rollout does not say which context tier a turn billed at and the
+GPT-6 rows state no threshold, so every turn is priced at the short-context rate (long-context
+turns read low) and no threshold is invented.
 
 Cost per turn:
 ```
 (input_tokens - cached_input_tokens) * input_rate
 + cached_input_tokens               * cached_rate
-+ cache_write_input_tokens          * input_rate
++ cache_write_input_tokens          * cache_write_rate
 + output_tokens                     * output_rate
 ```
 
@@ -203,54 +213,137 @@ from the token payload) and **refuses a duplicate account id**, printing both
 paths: two dirs claiming one account means the workspace picker was not used as
 intended, and silently keeping one would hide a login that is not tracked.
 
-### 6.4 Token policy: refresh exists, and it is off
+### 6.4 Token policy: refresh is on, behind four guards
 
 The stored access token lives ~10 days (`exp = iat + 10 d`). The widget decodes
 `exp` locally — base64url payload, **no signature verification**, which is safe
 because nothing security-relevant is decided from it: the endpoint, not us,
 decides whether a token is good. From that:
 
-* `exp − now ≤ 48 h` → a dim `relogin in 1d 4h` countdown, and the poll still happens;
 * `exp ≤ now` → the sentinel `relogin` and **no request is made** (an expired
   token has exactly one outcome; making the call would only teach the endpoint
-  our polling schedule).
+  our polling schedule);
+* `exp − now ≤ 48 h` → a dim `relogin in 1d 4h` countdown, and the poll still
+  happens — **but only when nobody will renew the token** (CX-7a): refresh is
+  off, the file has no refresh token, the family is known dead, the last
+  attempt failed, or this is the `~/.codex` account's widget copy (never
+  rotated, below) **with no unexpired app login behind it**. With refresh
+  working the token is rotated at 24 h, and a countdown would cry wolf for a
+  day. While the app's own login for that account is unexpired it carries the
+  row when the widget copy runs out, so that copy shows no countdown either
+  (SMC-3); when `~/.codex` moves to another account the countdown returns. A
+  capped row keeps its countdown as an info line beside the `crit` note
+  instead of dropping it.
+* Every Codex row carries `AccountRow.credential_expires_at` — the `exp` claim
+  of the token its last poll used (a claim, not a secret), `None` before the
+  first poll. For the `~/.codex` account's widget copy while the app's login
+  is unexpired, it is that login's `exp`: the deadline of the login that will
+  actually carry the row, not of a copy nobody renews.
 
-Refresh is **implemented and switched off** (`codex_refresh_enabled`, default
-`False` — roadmap 13). Whether two `codex login` sessions under the one public
-OAuth client (`app_EMoamEEZ73f0CkXaXp7hrann`) share a refresh-token family is
-still unverified, and a wrong guess logs the user out of the account they are
-coding in — so the code exists, the switch does not move on its own, and the
-off state is asserted rather than assumed.
+**History.** Refresh shipped switched off (`codex_refresh_enabled`, default
+`False`, roadmap 13) while one question was open: does rotating one `codex
+login` under the public OAuth client (`app_EMoamEEZ73f0CkXaXp7hrann`) revoke
+another? On 2026-09-20 every widget copy of a ten-day token expired and every
+Codex row said `relogin` for five days, with nothing in the log. On 2026-09-25
+`probe-refresh` rotated three widget copies by hand; each new token answered
+HTTP 200, and `~/.codex` answered HTTP 200 before and after each rotation. The
+default is now **`True`** (CX-4), and a Settings item — *Refresh Codex logins
+automatically*, shown while live quota is on — is the off switch. An install
+whose `settings.json` already says `false` keeps it until that item is clicked.
 
 **Off means silent.** With the setting off, `TokenRefresher` is never called:
 no POST of any kind is made, and `auth.json` is read and never written. The
-test that proves it injects a transport whose `post_form` fails the suite, runs
-a full cycle over a token one hour from expiry, and asserts the credential file
-is byte-identical afterwards. The reactive path is behind the same switch, so a
-401 is not a back door.
+test that proves it sets the switch to `False` explicitly, injects a transport
+whose `post_form` fails the suite, runs a full cycle over a token one hour from
+expiry, and asserts the credential file is byte-identical afterwards. The
+reactive path is behind the same switch, so a 401 is not a back door.
 
-**On, the rules are:**
+**The four guards (2026-09-25):**
+
+1. **Never the `~/.codex` account (CX-3), failing closed (SEC-1).** The
+   account `~/.codex/auth.json` is logged in as is never rotated by the widget:
+   our copy of it may share the ChatGPT app's refresh family, and rotating it
+   would log the app out. Its widget copy therefore shows the countdown unless
+   the app's login backs it (above). The app rewrites that file in place, so a
+   read can land mid-write; "could not read it this tick" is never taken for
+   "nobody is logged in". The last account a read named is persisted in the
+   sidecar as the top-level `desktop_account_id` (an id, not a secret) and
+   stays protected — across restarts — until a read names a different
+   account, or a read proves nobody is logged in: an API-key file (no
+   `tokens` at all) releases it at once, and a file missing on every poll for
+   longer than `CODEX_ACTIVE_GRACE_SECONDS` (600 s) releases it then (the
+   next sidecar save drops the key). A torn file, a `tokens` object without
+   `account_id` or a shorter absence never clears it; a torn read in the
+   middle of an absence restarts that clock. With nothing ever seen, a missing file or an API-key
+   file (no `tokens` at all) holds no OAuth login and blocks nothing, while an
+   unreadable one blocks every rotation that poll, with one log line per
+   episode (`~/.codex login unreadable and never seen; token refresh skipped
+   until it reads`); the countdown does not treat that as a deadline.
+   `TokenRefresher.refresh` takes the caller's answer as a required `active`
+   keyword and refuses the grant itself — no POST — for that account or,
+   while the answer is unknown, for any; `probe-refresh` passes it too.
+2. **A refusal is terminal until the file changes (CX-2).** `invalid_grant`,
+   `refresh_token_reused`, `refresh_token_expired` and
+   `refresh_token_invalidated` — flat (`{"error": "…"}`) or nested
+   (`{"error": {"code": "…"}}`) — record the file's `(mtime_ns, size)` as
+   `FetchState.dead_refresh_sig`. While the file keeps that signature neither
+   rotation point runs; a new `codex login` moves it and earns exactly one new
+   attempt. The signature is persisted in the sidecar record as
+   `refresh_dead_sig: [mtime_ns, size]` and rehydrated at start, so a restart
+   does not buy a dead POST either. (Before: one dead POST per poll, 288 a day
+   per account.)
+3. **Compare before write (CX-3).** `TokenRefresher` keeps a fingerprint of
+   what it read — `(mtime_ns, size, sha256 of the refresh token)`, in memory
+   for that call only — and re-reads the file after its POST. If the Codex CLI
+   rotated the file meanwhile, the widget's grant is discarded, the newer file
+   is kept, the outcome is `raced`, the credential is re-read from disk, and
+   the log says `codex <alias>: auth.json changed during refresh; kept the
+   newer file`. A refusal is judged only after the same re-read: if the file's
+   refresh token moved, the refusal was about the superseded token, so it is
+   `raced`, not `relogin`.
+4. **The app's login is borrowed, never refreshed (CX-1).** For the account
+   `~/.codex` is logged in as, `CredentialStore.read_desktop` reads that file
+   read-only (same `0o077` refusal; `tokens.account_id` must equal the account;
+   the refresh token is never returned; the file is never opened for writing).
+   The desktop token is used when it is unexpired and the widget copy is
+   missing, expired or older. A row read with it says `via ChatGPT app login`
+   as an info line, shows no countdown (the app renews it), and neither
+   rotation point runs; a 401 on it earns one retry with an in-date widget copy,
+   else `relogin`. The cycle watches that file's `(mtime_ns, size)` too, so the
+   app rewriting its login clears a standing `relogin` within one tick.
+
+**On, the grant rules are:**
 
 | Rule | Why |
 |---|---|
 | `POST https://auth.openai.com/oauth/token`, form body `grant_type=refresh_token&refresh_token=…&client_id=app_EMoamEEZ73f0CkXaXp7hrann` | one endpoint, one grant type; the client id is public and already sits in every `auth.json` |
 | **Persist before use** — rotated `refresh_token` / `access_token` / `id_token` written to that account's `auth.json` (temp file + `os.replace`, 0600, every other key preserved) *before* the new access token authorises anything, and the `Credential` returned is **re-read from that file** | a crash between the POST and the write costs one grant; the reverse order costs the account |
+| **No temp file survives (SEC-2)** — the temp file is `auth.json.tmp.<pid>_<random>` and every exception path unlinks it. A kill between the write and the replace can still leave one, holding the new tokens, in `codex-accounts/<id>/` — which the widget-home orphan sweep skips on purpose. The poller's first cycle in each process, and then one cycle an hour (a launchd restart meets the file seconds old, too young to judge), removes `auth.json.tmp.*` there when it is over 10 minutes old and its pid is dead (a name without a pid, or with one no process could own: age alone); never `auth.json`, never a symlink. The sweep never raises | a second copy of a live refresh token must not accumulate beside the credential |
 | **No replay path** — the superseded refresh token is overwritten in place. No `.prev`, no backup, no in-memory copy kept for a retry | if reuse detection is armed on this client, the only way to ask is on purpose |
-| Proactive when `exp − now < 24 h` on that account's poll | 48 h is the countdown threshold (a refresh there would make the sentinel a liar); an hour leaves no room for a sleeping machine |
+| Proactive when `exp − now < 24 h` on that account's poll | 48 h is the countdown threshold; an hour leaves no room for a sleeping machine |
 | Reactive **exactly once** on a 401 — one flag covers both trigger points, so one poll never posts twice | a dead family must not become a POST loop |
 | **403 never refreshes** | a 403 is an answer about permissions; the token in hand is the one it refused |
-| `invalid_grant` → the `relogin` sentinel, no retry, and no usage request | the family is gone; the access token it would carry is the dead one |
-| Any other failure (offline, 5xx, non-JSON, unwritable file) changes nothing — a diagnostics line, the stored token still valid until `exp`, the countdown unchanged | a failed rotation must not manufacture a sentinel |
+| A terminal refusal → no retry in this poll or any later one until the file changes (guard 2). The row says `relogin` when the access token has expired or the refusal came from the reactive 401; a **proactive** refusal while the access token is still in date keeps reading with it and shows the `relogin in …` countdown to its real `exp` (SMC-1) — one log line (`refresh refused (invalid_grant) - relogin`), no `relogin`/`recovered` flap | the family is gone; asking again only teaches the endpoint our schedule. The access token it minted still works until `exp` |
+| Any other failure (offline, 5xx, non-JSON, unwritable file) changes nothing — a diagnostics line, the stored token still valid until `exp`, and the countdown comes back | a failed rotation must not manufacture a sentinel, nor hide the deadline |
 | A credential with any group/world bit is refused for rotation exactly as it is for reading | writing to it would only mint a second leaked token |
-| Nothing about a token is logged — alias, outcome and remaining life only | SPEC-CODEX 6.8 rule 2, extended to the refresh token |
+| Nothing about a token is logged — alias, outcome and remaining life only | SPEC-CODEX 6.8 rule 2, extended to the refresh token and the desktop login |
 
 Our own rotation rewrites `auth.json`, which is the same signal the cycle uses
 to spot a human running `codex login` under a standing sentinel. The stored
-`(mtime_ns, size)` signature is therefore re-stamped after a successful
-refresh; without that, a warn sentinel's backoff would be cancelled on every
-cycle by our own write.
+signature is therefore re-stamped after a successful (or raced) refresh;
+without that, a warn sentinel's backoff would be cancelled on every cycle by
+our own write.
 
-**What opens the switch** (unchanged in substance, now runnable):
+**Logging (OPS-3/OPS-4).** A move into or out of `relogin`, `credential
+unreadable` or `offline` writes one line — `codex vlad: relogin (access token
+expired Sep 20 11:13)`, `codex vlad: recovered` — and a steady state writes
+none; the last announced note is rehydrated with the sidecar note, so a restart
+does not repeat it. The per-request `codex <alias>: 200 in N ms` line is
+written only when the status changes, is not 200, or took over 3 s; the
+request counter still counts every call. Diagnostics give the last status its
+age (`last 200 5d ago`).
+
+**The probe** stays, for evidence before and after any change here:
 
 ```
 python -m cc_usage_widget.codex_accounts probe-refresh <alias>
@@ -258,13 +351,10 @@ python -m cc_usage_widget.codex_accounts probe-refresh <alias>
 
 One grant on that account, persisted, then one usage `GET` proving the new
 access token is accepted — printing plan / email / expiry before and after, and
-never a token. It is deliberately **not** gated on `codex_refresh_enabled`
-(requiring the switch to earn the switch would be circular) and deliberately
-one-shot. Then leave the other stores alone for **24 h** and confirm they and
-`~/.codex` still work. Only that clean result earns the setting; the deliberate
-replay of a superseded token is a separate, manual experiment and there is no
-code path that can perform it by accident. Until then the 10-day relogin is the
-shipped cost and it is stated on the row rather than hidden.
+never a token. It is deliberately **not** gated on `codex_refresh_enabled` and
+deliberately one-shot. The deliberate replay of a superseded token remains a
+separate, manual experiment; there is no code path that can perform it by
+accident.
 
 ### 6.5 Mapping rules
 
@@ -429,7 +519,7 @@ must keep its own credential and its own history.
    header must FAIL.
 3. `~/.codex/auth.json` is byte- and mtime-identical after a full cycle.
 4. Claude-only and Codex-only machines keep the pre-6 layouts byte-for-byte.
-5. With `codex_refresh_enabled` off (the default), a full cycle over a token an
+5. With `codex_refresh_enabled` explicitly off, a full cycle over a token an
    hour from expiry makes **zero** token requests and leaves `auth.json`
    byte-identical — asserted by a transport whose `post_form` fails the suite,
    not by reading the code (6.4).

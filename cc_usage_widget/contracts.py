@@ -139,6 +139,8 @@ __all__ = [
     "CODEX_FETCH_STALE_SECONDS",
     "CODEX_FETCH_EXPIRE_SECONDS",
     "CODEX_RELOGIN_WARN_SECONDS",
+    "NOTIFY_EXPIRING_SECONDS",
+    "ATTENTION_REARM_SECONDS",
     "CODEX_ACTIVE_GRACE_SECONDS",
     "CODEX_PSEUDO_ACCOUNT_SLOT",
     # json glue
@@ -444,12 +446,22 @@ other ``no-switch`` reason means "nothing to do"; these two mean "something to
 do and no way to do it", which is a standing state the operator must see rather
 than a DEBUG line that also CLEARS whatever alert was standing."""
 
+ALERT_GHOST_FLIP: Final[str] = "ghost-flip"
+"""OURS - an external active-account change that claude-swap.log does NOT
+record as a ``cswap`` switch: a running Claude Code session rewrote
+``~/.claude.json`` to its own login while the Keychain still holds the slot
+claude-swap switched to (2026-09-24: six flips back to account 1, none of them
+a ``Switched from account`` line). Distinct from :data:`ALERT_EXTERNAL_SWITCH`
+because the remedy differs: a rival ``cswap`` actor is stopped by stopping it,
+a config-only rewrite by restarting or isolating the sessions that do it."""
+
 ALERT_KINDS: Final[tuple[str, ...]] = (
     ALERT_ALL_EXHAUSTED,
     ALERT_ACCOUNT_QUARANTINED,
     ALERT_ERROR,
     ALERT_EXTERNAL_SWITCH,
     ALERT_NO_TARGET,
+    ALERT_GHOST_FLIP,
 )
 """Every autoswitch verdict the menu bar renders as a standing alert.
 
@@ -458,6 +470,18 @@ match on it cannot drift apart - the same reason :data:`VENDOR_CLAUDE` exists.
 Before 2026-08-26 these three strings were written as raw literals in five
 places across two modules, with no test crossing the seam.
 """
+
+FETCH_FAILING_MIN_FAILURES: Final[int] = 3
+"""Consecutive failed usage polls (a 4xx other than 401/429) before a
+claude-swap slot is annotated ``fetch-failing``. One refusal can be a blip;
+three in a row (~30 min at upstream's cadence) is a standing state."""
+
+GHOST_FLIP_FIGHT_COUNT: Final[int] = 3
+"""Ghost flips (:data:`ALERT_GHOST_FLIP`) onto one slot within
+:data:`GHOST_FLIP_WINDOW_SECONDS` that turn the alert into a "login fight"."""
+
+GHOST_FLIP_WINDOW_SECONDS: Final[float] = 3600.0
+"""Window over which ghost flips onto one slot are counted (in memory only)."""
 
 ATTENTION_PCT: Final[Pct] = 100.0
 """At or above this percentage the UI appends ``(!)`` to a window
@@ -649,6 +673,19 @@ CODEX_RELOGIN_WARN_SECONDS: Final[float] = 172_800.0
 """How long before the stored access token's ``exp`` the row starts saying
 ``relogin in <n>`` (48 h). Phase 1 never refreshes tokens (SPEC-CODEX 6)."""
 
+NOTIFY_EXPIRING_SECONDS: Final[float] = 86_400.0
+"""How close to its access token's ``exp`` a Codex row earns ONE pre-expiry
+notification (``notify.py``, ledger key ``expiring:<row>``). 24 h: half the
+dim menu countdown (:data:`CODEX_RELOGIN_WARN_SECONDS`), and still a working
+day ahead of the moment the row turns into ``relogin``."""
+
+ATTENTION_REARM_SECONDS: Final[float] = 86_400.0
+"""How long a STANDING Codex ``warn`` notification (``attention:codex:*:warn``
+- a dead login, no access, offline) stays quiet before it is sent again. Once
+a day: a dead login that was announced once on Sep 20 and then never again is
+how four rows sat on ``relogin`` for five days. Codex only - Claude sentinel
+keys are not re-armed (see ``notify.py``)."""
+
 CODEX_ACTIVE_GRACE_SECONDS: Final[float] = 600.0
 """How long the previously seen active ``account_id`` is kept when
 :data:`CODEX_AUTH_PATH` is momentarily unreadable (the desktop app rewrites it)."""
@@ -826,10 +863,11 @@ class ModelUsage:
         ``cache_read``      ``cached_input_tokens`` - priced at the model's
                             **published** cached rate, not a derived multiple
                             (:attr:`ModelPrice.cached_input_usd_per_mtok`).
-        ``cache_write_5m``  ``cache_write_input_tokens`` - priced at the standard
-                            input rate (SPEC-CODEX 3), which is why a Codex
-                            :class:`ModelPrice` sets ``cache_write_usd_per_mtok``
-                            to its input rate rather than Claude's ``1.25x``.
+        ``cache_write_5m``  ``cache_write_input_tokens`` - priced at the model's
+                            published "Cache writes" rate
+                            (:attr:`ModelPrice.cache_write_usd_per_mtok`), or its
+                            input rate where none is published - never Claude's
+                            ``1.25x``.
         ``cache_write_1h``  Always 0 - OpenAI publishes no 1-hour cache tier.
         ``output``          ``output_tokens``. ``reasoning_output_tokens`` is a
                             *subset* of it and is **not** added (SPEC-CODEX 3).
@@ -1783,9 +1821,13 @@ class ModelPrice:
         ``gpt-5.6-sol`` against a ``$5.00`` input rate. That is ``0.1x`` for
         *this* model by coincidence and **must not be treated as a rule**: set
         :attr:`cached_input_usd_per_mtok` to the published number.
-        ``cache_write_input_tokens`` is billed at the standard input rate
-        (SPEC-CODEX 3), which :attr:`cache_write_usd_per_mtok` defaults to for
-        a Codex row.
+        ``cache_write_input_tokens`` is billed at the page's published "Cache
+        writes" column (since the 2026-09-25 read), which ``pricing.py`` passes
+        in as :attr:`cache_write_usd_per_mtok` - ``gpt-6-astra`` ``$12.50``
+        against a ``$10.00`` input rate. Only a row whose page cell is ``-`` or
+        absent (``gpt-5.5``, ``gpt-5.4``, ``gpt-5.4-mini``, Sol's pre-cut row)
+        bills cache writes at the input rate, the older SPEC-CODEX 3 rule; that
+        is also what this type fills in when a Codex row is built with ``None``.
 
     Applying Claude's multipliers to an OpenAI model is not a rounding error,
     it is a fabricated price. A Codex row constructed without a published
@@ -1814,15 +1856,16 @@ class ModelPrice:
     :data:`CACHE_READ_MULTIPLIER` (Anthropic). Required for a Codex row."""
     cache_write_usd_per_mtok: float | None = None
     """Published cache-**write** rate per Mtok, applying to both write slots.
-    ``None`` = derive by the 1.25x / 2.0x multipliers (Anthropic). Defaults to
-    the input rate for a Codex row (SPEC-CODEX 3)."""
+    ``None`` = derive by the 1.25x / 2.0x multipliers (Anthropic). For a Codex
+    row ``pricing.py`` passes the published "Cache writes" figure; ``None``
+    there (no published figure) falls back to the input rate (SPEC-CODEX 3)."""
 
     def __post_init__(self) -> None:
         """Reject a Codex row that would fall back to Claude's multipliers.
 
-        Also fills the Codex cache-write rate with the input rate, so the one
-        published-but-unstated rule in SPEC-CODEX 3 cannot be forgotten at a
-        call site.
+        Also fills a Codex cache-write rate left ``None`` with the input rate
+        (the SPEC-CODEX 3 rule for a model with no published "Cache writes"
+        figure), so a call site cannot leave it unpriced.
         """
         if self.vendor != VENDOR_CODEX:
             return
@@ -2259,9 +2302,9 @@ class AccountRow:
     An expired window's percentage describes a window that has ENDED: the
     renderer must present it as stale — dimmed, never the live ``(!)``
     treatment — and mark its reset as overdue instead of presenting a bygone
-    date as an upcoming reset. Only a source that carries the reset as an
-    epoch (Codex) can know this; claude-swap rows pass verbatim strings and
-    always leave this empty."""
+    date as an upcoming reset. Codex rows derive it from the epoch they carry;
+    claude-swap rows from the stored ISO ``resets_at`` (a weekly window that
+    upstream rolled forward counts only while the slot's fetches are failing)."""
     attention_note: str = ""
     """A standing verdict about THIS row that REPLACES its figures in the
     header (SPEC-CODEX 6): ``relogin``, ``no access``, ``rate limited``,
@@ -2296,6 +2339,37 @@ class AccountRow:
     anchors ``reset_after_seconds`` once at the read instant) sets this;
     claude-swap rows leave it ``None``, and every renderer must read ``None``
     as "not reported" rather than as "now"."""
+    credential_expires_at: float | None = None
+    """Epoch at which the credential that produced this row stops working, or
+    ``None`` when unknown or not applicable (every claude-swap row, the
+    transcript-derived Codex row). Set by ``codex_accounts`` from the ``exp``
+    claim of the token the last poll actually used - a claim, not a secret.
+    Lets a renderer or notifier count down to a relogin without re-reading a
+    credential file; read ``None`` as "not reported", never as "now"."""
+    reset_credits_available: int | None = None
+    """Codex ``rate_limit_reset_credits.available_count``: reset credits this
+    account HOLDS. ``None`` = not reported (or withheld with a dead
+    credential's figures), which is NOT 0. Claude rows leave it ``None``."""
+    reset_credits_usable: int | None = None
+    """Codex ``rate_limit_reset_credits.applicable_available_count``: our
+    reading is "credits that could be applied right now" (inference from the
+    2026-09-25 bodies). ``None`` = unknown, never 0. Read via ``getattr`` by
+    notifiers so rows built before this field existed still work."""
+    spend_used: float | None = None
+    """Claude extra-usage spend so far this cycle, in :attr:`spend_currency`
+    units (claude-swap's ``lastGood['spend']['used']``, already divided from
+    cents upstream). The five ``spend_*`` fields are all set or all ``None``
+    (``spend_resets_at`` may be ``None`` alone when upstream stored no reset):
+    a partial entry is never rendered as ``$0``. ``None`` on Codex rows."""
+    spend_limit: float | None = None
+    """The extra-usage monthly cap, same units as :attr:`spend_used`."""
+    spend_pct: float | None = None
+    """Upstream's ``utilization`` of that cap, 0-100, verbatim."""
+    spend_currency: str | None = None
+    """ISO currency code exactly as upstream stored it (e.g. ``"USD"``)."""
+    spend_resets_at: str | None = None
+    """When the spend cap resets: the same display clock the other
+    ``*_resets_at`` fields carry (raw ISO when upstream's formatter is gone)."""
 
     @property
     def is_pseudo(self) -> bool:
@@ -2775,11 +2849,13 @@ SETTINGS_DEFAULTS: dict[str, Any] = {
     "notifications_enabled": True,
     "telegram_notifications_enabled": False,
     "notification_threshold_pct": 85,
+    "unpriced_alert_min_tokens": 1_000_000,
     "codex_fleet_line_enabled": True,
+    "scoped_fleet_line_enabled": True,
     "codex_pace_forecast_enabled": True,
     "codex_pricing_tier": "standard",
     # --- token refresh (roadmap 13; SPEC-CODEX 6.4) -----------------------
-    "codex_refresh_enabled": False,
+    "codex_refresh_enabled": True,
     # --- scan / cadence (SPEC 3.5); all intervals live here ---------------
     "lookback_days": 30,
     "ui_interval_seconds": 60,
@@ -2794,6 +2870,10 @@ SETTINGS_DEFAULTS: dict[str, Any] = {
     "title_show_codex_pct": False,
     "title_show_fleet": True,
     "title_compact": False,
+    # --- menu design (wave 2, 2026-09-25) ---------------------------------
+    "title_merge_alerts": False,
+    "title_show_reset_credit": True,
+    "menu_layout_classic": False,
 }
 """Full ``settings.json`` schema with defaults.
 
@@ -2843,6 +2923,13 @@ Vendor keys (SPEC-CODEX):
     twin of the Claude title suffix. Off = the block is exactly the per-account
     rows, byte-for-byte the pre-roadmap layout. It draws only when a LIVE row
     exists, so a machine with the live source off never sees it either way.
+``scoped_fleet_line_enabled``
+    Defaults ``True``. The Accounts block's per-scoped-window fleet heading
+    (``Fable 2/5 · next Tue 09:00``) - how many switchable, enabled, un-noted
+    claude-swap slots still have room in that model's weekly window, and when
+    the soonest full one resets. Off = the Accounts block is byte-for-byte the
+    pre-2026-09-25 layout. A machine whose slots report no scoped window, and a
+    Codex-only machine, never see it either way.
 ``codex_pace_forecast_enabled``
     Defaults ``True``. Whether a rising weekly window earns the ``at this
     pace: wall in 6h`` info note from the sidecar's per-account sample ring
@@ -2855,16 +2942,19 @@ Vendor keys (SPEC-CODEX):
     makes the Codex cost heading say ``fast tier rates not loaded`` rather than
     re-scaling a figure nobody measured (roadmap 11).
 ``codex_refresh_enabled``
-    Defaults ``False``, and it is the only setting whose default is a *safety*
-    decision rather than a taste one. On, the live source may POST an OAuth
-    refresh grant for an account whose access token is inside 24 h of expiry
-    (and exactly once more on a 401), persisting the rotated tokens to that
-    account's ``auth.json`` before using them. Off, **not one token request is
-    ever made** — the widget only ever reads that file, and a token near expiry
-    shows ``relogin in 1d 4h`` exactly as before. It stays off until the
-    SPEC-CODEX 6.4 probe (``probe-refresh``, then a 24 h soak) shows that
-    rotating one login does not revoke another under the same public OAuth
-    client; a wrong guess logs the user out of the account they are coding in.
+    Defaults ``True`` (since 2026-09-25; it shipped ``False`` and every widget
+    copy of a ten-day Codex token then expired unannounced on Sep 20). On, the
+    live source may POST an OAuth refresh grant for an account whose access
+    token is inside 24 h of expiry (and exactly once more on a 401),
+    persisting the rotated tokens to that account's ``auth.json`` before using
+    them. Four guards bound it (SPEC-CODEX 6.4): the account ``~/.codex`` is
+    logged in as is **never** rotated (the ChatGPT app owns that grant); a
+    refusal (``invalid_grant``, ``refresh_token_reused`` / ``_expired`` /
+    ``_invalidated``, flat or nested) is terminal until the credential file
+    changes, across polls and restarts; a file the Codex CLI rotated while our
+    POST was in flight is kept, never overwritten; and a token read from
+    ``~/.codex`` is used read-only and never refreshed. Off, **not one token
+    request is ever made** and a token near expiry shows ``relogin in 1d 4h``.
 
 Notification keys (roadmap item 7, ``notify.py``):
 
@@ -2882,6 +2972,11 @@ Notification keys (roadmap item 7, ``notify.py``):
     100 is always notified separately as a wall, and a window that then falls
     below ``notify.RECOVERY_PCT`` notifies once as "back" — so this key sets one
     edge, never a band the widget re-interprets.
+``unpriced_alert_min_tokens``
+    Default 1,000,000. A model with no published rate notifies ONCE (key
+    ``unpriced:<model>``) when today's tokens in its unpriced bucket reach this
+    floor: every such token is priced $0, so the Cost figures are a floor until
+    ``pricing.py`` learns the rate. 0 turns the alert off; nothing is fetched.
 
 ``dashboard_enabled``
     Defaults ``True``. Whether the Cost section offers ``Open dashboard``
@@ -2908,6 +3003,29 @@ Notification keys (roadmap item 7, ``notify.py``):
     the moment the operator needs to know whether another room is free and
     when the next one opens — see ``render_title``.
 
+``title_merge_alerts``
+    Defaults ``False`` (design wave 2). On, the full title replaces the Codex
+    ``C⚠`` and the bare ``⚠`` with ONE ``⚠N``, where N is the number of rows in
+    the menu's Needs attention section (noted Claude slots, active included,
+    plus alarmed Codex rows) - so the glyph always equals the menu's count and
+    the title gets narrower. The engine verdict (``⚠ ext``, ``⛔ exhausted``)
+    is never merged. The compact title ignores it. Off = today's title.
+
+``title_show_reset_credit``
+    Defaults ``True`` (design wave 2). When the ACTIVE Codex account is capped
+    and reports ``reset_credits_usable > 0``, the title's ``↺<duration>``
+    countdown becomes a green ``↺now`` (four characters, the same budget) and
+    the compact title appends ``↺``. Display only - nothing consumes a credit.
+    Off = today's countdown. Listed in Settings only where Codex exists.
+
+``menu_layout_classic``
+    Defaults ``False`` (design wave 2). The dropdown is the glance layout
+    (cards, Needs attention, Claude, Codex, activity, tools). On = today's
+    layout, wording and ``resets …`` format, byte for byte - the rollback
+    switch. The classic layout is also chosen automatically for a snapshot with
+    no Claude accounts and no live Codex row (the Codex-only features-off and
+    never-onboarded machines), which keeps them byte-for-byte as they were.
+
 **These keys must be declared here to exist.** :func:`normalize_settings`
 drops unknown keys, so a vendor setting added only in ``app.py`` would be
 silently discarded on the next save.
@@ -2919,6 +3037,7 @@ SETTINGS_BOUNDS: dict[str, tuple[int, int]] = {
     "cost_interval_seconds": (30, 86_400),
     "codex_quota_interval_seconds": (60, 3600),
     "notification_threshold_pct": (50, 100),
+    "unpriced_alert_min_tokens": (0, 1_000_000_000),
 }
 """Inclusive clamps for the integer settings.
 

@@ -61,8 +61,10 @@ an in-flight guard instead of queueing behind each other.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import logging
+import math
 import re
 import threading
 import time
@@ -77,7 +79,11 @@ from .contracts import (
     ALERT_ALL_EXHAUSTED,
     ALERT_ERROR,
     ALERT_EXTERNAL_SWITCH,
+    ALERT_GHOST_FLIP,
     ALERT_NO_TARGET,
+    FETCH_FAILING_MIN_FAILURES,
+    GHOST_FLIP_FIGHT_COUNT,
+    GHOST_FLIP_WINDOW_SECONDS,
     AccountRow,
     Pct,
     normalize_settings,
@@ -175,6 +181,48 @@ _TESTED_CLAUDE_SWAP_PREFIX: Final[str] = "0.25."
 against. A mismatch WARNS (never refuses): the failure policy already degrades
 gracefully, this just makes the degradation datable."""
 
+FETCH_FAILING_KIND: Final[str] = "fetch-failing"
+"""Sentinel kind (:meth:`SwapAccountSource.sentinel_kinds`) for a slot whose
+usage polls keep being refused with a 4xx other than 401/429. OURS, not an
+upstream sentinel key: claude-swap records the failure (``last_error``,
+``consecutive_failures``) but names no state for it, so slot 6 rendered
+``5h 88% · 7d 0%`` for twelve days of HTTP 403 with no cause (2026-09-25)."""
+
+_HTTP_ERROR_RE: Final[re.Pattern[str]] = re.compile(r"^http-(\d{3})\b")
+"""claude-swap's ``UsageEntry.last_error`` for an HTTP failure: ``http-403``,
+``http-429, retry-after 3600s (...)``. Anything else (``network``,
+``timeout``) is not an answer from the account."""
+
+_COLD_BACKOFF_MIN_AGE_S: Final[float] = 86400.0
+"""How long without a good fetch turns upstream's 429 backoff into a standing
+refusal on its own (:func:`_cold_backoff_code`). The backoff lasts an hour and
+follows every four 403s, so a slot that has not fetched for a DAY is not being
+throttled back to health; a fresh process that starts inside the backoff hour
+has no 403 of its own to remember (2026-09-25 slot 6: ``http-429``, 803
+failures, last good fetch Sep 12)."""
+
+LOGIN_FIGHT_MARK: Final[str] = "login fight:"
+"""The words that set the standing login-fight line apart from a per-flip
+ghost line; both carry :data:`ALERT_GHOST_FLIP`. The title badges the fight
+and not a single benign flip (``app.CCUsageWidgetApp._title_alert_kind``)."""
+
+_SWAP_LOG_NAME: Final[str] = "claude-swap.log"
+"""claude-swap's own log inside ``backup_dir`` (``logging_config``), where every
+real ``cswap`` switch writes ``Switched from account X to Y``."""
+
+_SWAP_LOG_TAIL_BYTES: Final[int] = 64 * 1024
+"""How much of claude-swap.log the flip classifier reads - the tail only."""
+
+_SWAP_LOG_SLACK_S: Final[float] = 15.0
+"""Clock slack around the inter-pass interval when matching a switch line."""
+
+_SWAP_LOG_SWITCH_RE: Final[re.Pattern[str]] = re.compile(
+    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ - \w+ - "
+    r"Switched from account (\d+) to (\d+)\s*$",
+    re.MULTILINE,
+)
+"""A ``%(asctime)s - %(levelname)s - %(message)s`` switch line (local time)."""
+
 
 # ---------------------------------------------------------------------------
 # Small pure helpers (no claude_swap involved)
@@ -252,6 +300,134 @@ def _window(usage: Mapping[str, Any] | None, key: str) -> Mapping[str, Any] | No
         return None
     window = usage.get(key)
     return window if isinstance(window, Mapping) else None
+
+
+def _iso_ts(raw: Any) -> float | None:
+    """POSIX time of a stored ISO ``resets_at``, parsed the way upstream's
+    ``menubar._resets_at_ts`` parses it; ``None`` when missing or bad."""
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return dt.datetime.fromisoformat(raw).timestamp()
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _reset_passed(window: Any, now: float) -> bool:
+    """Whether a usage window's stored reset instant is already behind us."""
+    if not isinstance(window, Mapping):
+        return False
+    ts = _iso_ts(window.get("resets_at"))
+    return ts is not None and ts <= now
+
+
+def _fetch_failing_code(entry: Any) -> int | None:
+    """The HTTP status of a standing usage-fetch refusal, or ``None``.
+
+    Only a 4xx other than 401 (a credential problem upstream names itself)
+    and 429 (throttling, which heals on its own), repeated at least
+    :data:`FETCH_FAILING_MIN_FAILURES` times in a row. A network error or a
+    timeout says nothing about the account.
+    """
+    if entry is None:
+        return None
+    match = _HTTP_ERROR_RE.match(str(getattr(entry, "last_error", None) or ""))
+    if match is None:
+        return None
+    code = int(match.group(1))
+    if not 400 <= code < 500 or code in (401, 429):
+        return None
+    failures = getattr(entry, "consecutive_failures", 0)
+    if isinstance(failures, bool) or not isinstance(failures, int):
+        return None
+    return code if failures >= FETCH_FAILING_MIN_FAILURES else None
+
+
+def _cold_backoff_code(entry: Any, now: float) -> int | None:
+    """``429`` for a throttled slot that has not fetched for a day, or ``None``.
+
+    Upstream's hourly 429 backoff on its own heals, so :func:`_fetch_failing_code`
+    ignores it. But a 429 after at least :data:`FETCH_FAILING_MIN_FAILURES`
+    consecutive failures with ``fetched_at`` over
+    :data:`_COLD_BACKOFF_MIN_AGE_S` old is a refusal that has stood for days;
+    without this a widget started inside the backoff hour showed live-looking
+    figures for that slot until the next 403.
+    """
+    if entry is None:
+        return None
+    match = _HTTP_ERROR_RE.match(str(getattr(entry, "last_error", None) or ""))
+    if match is None or int(match.group(1)) != 429:
+        return None
+    failures = getattr(entry, "consecutive_failures", 0)
+    if isinstance(failures, bool) or not isinstance(failures, int):
+        return None
+    if failures < FETCH_FAILING_MIN_FAILURES:
+        return None
+    fetched = getattr(entry, "fetched_at", None)
+    if isinstance(fetched, bool) or not isinstance(fetched, (int, float)):
+        return None
+    return 429 if now - float(fetched) >= _COLD_BACKOFF_MIN_AGE_S else None
+
+
+def _spend(raw: Any) -> tuple[float, float, float, str] | None:
+    """``(used, limit, pct, currency)`` from ``lastGood['spend']``, or ``None``.
+
+    All four or nothing: a partial entry must never render as ``$0``.
+    ``currency`` is passed through verbatim.
+    """
+    if not isinstance(raw, Mapping):
+        return None
+    numbers: list[float] = []
+    for key in ("used", "limit", "pct"):
+        value = raw.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        if not math.isfinite(float(value)):
+            return None
+        numbers.append(float(value))
+    currency = raw.get("currency")
+    if not isinstance(currency, str) or not currency:
+        return None
+    return numbers[0], numbers[1], numbers[2], currency
+
+
+def _read_switch_lines(path: Path) -> tuple[tuple[float, str, str], ...]:
+    """``(epoch, from, to)`` for every switch line in the log's tail.
+
+    Raises on an unreadable file; the caller turns that into "cannot tell".
+    """
+    with path.open("rb") as handle:
+        handle.seek(0, 2)
+        size = handle.tell()
+        start = max(0, size - _SWAP_LOG_TAIL_BYTES)
+        handle.seek(start)
+        text = handle.read().decode("utf-8", errors="replace")
+    if start > 0:
+        # The first line of the window is almost certainly cut in half.
+        text = text.split("\n", 1)[1] if "\n" in text else ""
+    out: list[tuple[float, str, str]] = []
+    for match in _SWAP_LOG_SWITCH_RE.finditer(text):
+        try:
+            when = time.mktime(time.strptime(match.group(1), "%Y-%m-%d %H:%M:%S"))
+        except (ValueError, OverflowError):
+            continue
+        out.append((when, match.group(2), match.group(3)))
+    return tuple(out)
+
+
+def _parse_policy_models(policy: Any) -> tuple[str, ...]:
+    """``autoswitch.model`` of an already-loaded policy, via upstream's parser.
+
+    No file read: *policy* is the object the engine was just built from.
+    Any failure is ``()`` ("compare 5h/7d only"), as in ``_policy_models``.
+    """
+    try:
+        from claude_swap.settings import parse_model_names
+
+        return tuple(parse_model_names(getattr(policy, "model", None)))
+    except Exception as exc:
+        LOGGER.debug("autoswitch model limits unreadable (%r)", exc)
+        return ()
 
 
 def _on_main_thread() -> bool:
@@ -499,12 +675,30 @@ class SwapAccountSource:
         # on), and in the first cut that took this verdict with it within 60 s
         # (review 2026-09-01). Only a widget-made switch retracts it.
         self._external_alert: tuple[str, str] | None = None
+        # swap-3 flip forensics, all in memory. Wall clock of the previous
+        # completed pass (the window a flip happened in); the parsed switch
+        # lines of claude-swap.log's tail keyed on its mtime; ghost flips per
+        # target slot, aged out by GHOST_FLIP_WINDOW_SECONDS; and the standing
+        # "login fight" as (slot, line), re-validated against that window on
+        # every read. `_wall` is the clock for all of it (tests swap it).
+        self._wall: Callable[[], float] = time.time
+        self._last_pass_wall: float | None = None
+        self._swap_log_cache: tuple[float, tuple[tuple[float, str, str], ...]] | None = None
+        self._ghost_flips: dict[str, deque[float]] = {}
+        self._login_fight: tuple[str, str] | None = None
+        # swap-1: slot -> (HTTP status, fetched_at) of the last qualifying
+        # refusal seen, so the hourly 429 upstream's backoff interleaves with
+        # the 403s (slot 6: four 403s, then an hour of 429) does not blink the
+        # note off. Holds only while the slot is still failing and has had no
+        # good fetch since; in memory only.
+        self._fetch_failing_seen: dict[int, tuple[int, Any]] = {}
         self._switchable: frozenset[int] = frozenset()
         self._alias_by_slot: dict[int, str] = {}
 
         self._engine: Any | None = None
         self._engine_policy_mtime: float | None = None
         self._policy_threshold: float | None = None  # W4
+        self._policy_models_cache: tuple[str, ...] = ()  # UX-1a
         self._next_tick_at: float = 0.0
 
         self._warned_main_thread = False
@@ -648,10 +842,55 @@ class SwapAccountSource:
             self._snapshot = snapshot
             self._snapshot_at = time.monotonic()
             self._last_error = None
-        self._note_external_switch(previous, current, expected)
+            since, self._last_pass_wall = self._last_pass_wall, self._wall()
+        if not self._note_reverted_switch(expected, current, since=since):
+            self._note_external_switch(previous, current, expected, since=since)
+
+    def _note_reverted_switch(
+        self, expected: str | None, current: str | None, *, since: float | None = None
+    ) -> bool:
+        """Report a switch of ours that did not survive to this pass (swap-2).
+
+        ``expected`` is the slot an engine or menu switch just landed on. If a
+        completed pass reads a DIFFERENT active slot, something put the old
+        login back in between - on 2026-09-24 twice within a minute, while the
+        recent-events block claimed the switch had happened. The one-shot
+        expectation used to be consumed here without a word. Returns whether
+        it reported, so the external-switch check does not report it twice.
+
+        The revert is itself a flip, classified like any other (swap-3): with
+        no ``Switched from account {expected} to {current}`` line in
+        claude-swap.log it is a config-only rewrite and counts toward the
+        login fight - on 2026-09-24 the engine's 1 -> 5 at 20:24:38 was put
+        back to 1 by 20:25:37, before any pass saw slot 5, and a revert that
+        skipped the ghost counter could hold the fight alert back.
+        """
+        if expected is None or expected == _ANY_SLOT or current is None:
+            return False
+        if current == expected:
+            return False
+        LOGGER.warning(
+            "accounts: switch to %s did not stick: active is %s (reverted "
+            "before the next pass)",
+            expected,
+            current,
+        )
+        if self._classify_flip(expected, current, since) == "ghost":
+            self._note_ghost_flip(expected, current, reverted=True)
+            return True
+        line = f"{_stamp()} switch →{expected} reverted to {current}"
+        with self._lock:
+            self._event_log.append(line)
+            self._external_alert = (ALERT_EXTERNAL_SWITCH, line)
+        return True
 
     def _note_external_switch(
-        self, previous: str | None, current: str | None, expected: str | None
+        self,
+        previous: str | None,
+        current: str | None,
+        expected: str | None,
+        *,
+        since: float | None = None,
     ) -> None:
         """Report an active-account change the widget did not cause.
 
@@ -674,17 +913,140 @@ class SwapAccountSource:
             return
         if expected is not None and expected in (current, _ANY_SLOT):
             return
+        # swap-3: WHO moved it decides the remedy. A real `cswap` switch logs
+        # "Switched from account X to Y" in claude-swap.log; a running Claude
+        # Code session rewriting ~/.claude.json to its own login logs nothing
+        # (2026-09-24: six flips to account 1, none logged). Unknown (log
+        # unreadable) keeps the generic verdict - never a guess.
+        verdict = self._classify_flip(previous, current, since)
+        if verdict == "ghost":
+            self._note_ghost_flip(previous, current)
+            return
         LOGGER.warning(
-            "accounts: active changed outside the widget: %s -> %s (no engine "
-            "or manual switch; a running session's token refresh or another "
-            "cswap actor)",
+            "accounts: active changed outside the widget: %s -> %s (%s)",
             previous,
             current,
+            "claude-swap.log records it: another cswap actor"
+            if verdict == "cswap"
+            else "no engine or manual switch; a running session's token "
+            "refresh or another cswap actor",
         )
         line = f"{_stamp()} active {previous}\u2192{current} (external)"
         with self._lock:
             self._event_log.append(line)
             self._external_alert = (ALERT_EXTERNAL_SWITCH, line)
+
+    def _alias_or_slot(self, slot: str) -> str:
+        """Display alias of *slot* from the last built rows, else ``account-N``."""
+        with self._lock:
+            alias = self._alias_by_slot.get(_safe_int(slot, default=-1))
+        return alias or f"account-{slot}"
+
+    def _note_ghost_flip(
+        self, previous: str, current: str, *, reverted: bool = False
+    ) -> None:
+        """Report a config-only flip; at the fight count, a standing alert.
+
+        Never pauses the engine: the flip is reported, the engine's repair is
+        still its own call. The per-slot deque is in memory only and ages out
+        by :data:`GHOST_FLIP_WINDOW_SECONDS`. ``reverted`` marks a flip that
+        undid a switch of ours before a pass saw it (``previous`` is then the
+        slot we switched to); the per-flip line says so.
+        """
+        now = self._wall()
+        target, holder = self._alias_or_slot(current), self._alias_or_slot(previous)
+        with self._lock:
+            flips = self._ghost_flips.setdefault(current, deque())
+            while flips and now - flips[0] > GHOST_FLIP_WINDOW_SECONDS:
+                flips.popleft()
+            flips.append(now)
+            count = len(flips)
+        LOGGER.warning(
+            "accounts: active changed outside the widget: %s -> %s (config-only: "
+            "no cswap switch in claude-swap.log; a running Claude Code session "
+            "rewrote ~/.claude.json) [%d in the last hour onto %s]",
+            previous,
+            current,
+            count,
+            current,
+        )
+        undone = f"switch \u2192{previous} reverted: " if reverted else ""
+        line = (
+            f"{_stamp()} {undone}~/.claude.json rewritten to {target} by a running "
+            f"Claude Code session; keychain still holds {holder}"
+        )
+        fight: tuple[str, str] | None = None
+        if count >= GHOST_FLIP_FIGHT_COUNT:
+            line = (
+                f"{_stamp()} {LOGIN_FIGHT_MARK} running Claude Code sessions restored "
+                f"{target} (slot {current}) {count}\u00d7 in the last hour "
+                f"(~/.claude.json rewritten; keychain still holds {holder}). Fix: "
+                f"per-terminal profiles (`cswap map <N> <dir>` + `cswap run <N> "
+                f"--share-history`), or restart sessions started before the last "
+                f"switch"
+            )
+            fight = (current, line)
+        with self._lock:
+            self._event_log.append(line)
+            self._external_alert = (ALERT_GHOST_FLIP, line)
+            if fight is not None:
+                self._login_fight = fight
+
+    def _standing_login_fight(self) -> tuple[str, str] | None:
+        """The login-fight alert while its window still holds the count.
+
+        It must outlive the engine's own repair switch (which retracts the
+        per-flip alert within a minute), and must end on its own once the
+        flips age out - so it is re-validated on every read, not remembered.
+        """
+        now = self._wall()
+        with self._lock:
+            fight = self._login_fight
+            if fight is None:
+                return None
+            flips = self._ghost_flips.get(fight[0], deque())
+            while flips and now - flips[0] > GHOST_FLIP_WINDOW_SECONDS:
+                flips.popleft()
+            if len(flips) >= GHOST_FLIP_FIGHT_COUNT:
+                return (ALERT_GHOST_FLIP, fight[1])
+            self._login_fight = None
+            return None
+
+    def _classify_flip(
+        self, previous: str, current: str, since: float | None
+    ) -> str | None:
+        """``"cswap"``, ``"ghost"``, or ``None`` when the log cannot say.
+
+        Reads only the last :data:`_SWAP_LOG_TAIL_BYTES` of claude-swap.log,
+        and only when its mtime changed since the last read; the parsed switch
+        lines are cached against that mtime. A line ``Switched from account
+        {previous} to {current}`` stamped inside the interval since the last
+        completed pass (\u00b1 :data:`_SWAP_LOG_SLACK_S`) means a cswap actor.
+        """
+        try:
+            backend = self._backend_or_none()
+            if backend is None:
+                return None
+            path = Path(backend.backup_dir) / _SWAP_LOG_NAME
+            mtime = path.stat().st_mtime
+            with self._lock:
+                cached = self._swap_log_cache
+            if cached is not None and cached[0] == mtime:
+                switches = cached[1]
+            else:
+                switches = _read_switch_lines(path)
+                with self._lock:
+                    self._swap_log_cache = (mtime, switches)
+        except Exception as exc:
+            self._log.debug("accounts: claude-swap.log unreadable: %r", exc)
+            return None
+        now = self._wall()
+        low = (since if since is not None else now) - _SWAP_LOG_SLACK_S
+        high = now + _SWAP_LOG_SLACK_S
+        for when, source, target in switches:
+            if source == previous and target == current and low <= when <= high:
+                return "cswap"
+        return "ghost"
 
     def rows(self) -> tuple[AccountRow, ...]:
         """All accounts, ordered by :attr:`AccountRow.slot` ascending.
@@ -777,6 +1139,9 @@ class SwapAccountSource:
             rows.append(row)
             aliases[row.slot] = row.alias
             derived = self._sentinel_note(account, backend)
+            if derived is None:
+                # swap-1: no upstream word for it, so the refusal is named here.
+                derived = self._fetch_failure_note(account)
             if derived is not None:
                 kind, note = derived
                 sentinels[row.slot] = note
@@ -820,7 +1185,24 @@ class SwapAccountSource:
         five_hour = _window(last_good, "five_hour")
         # Weekly windows only: the 5-hour window has no fixed weekly cadence to
         # roll forward from, so upstream never rolls it either.
-        seven_day = _safe_roll(roll, _window(last_good, "seven_day"), now)
+        raw_seven_day = _window(last_good, "seven_day")
+        seven_day = _safe_roll(roll, raw_seven_day, now)
+
+        # swap-1: a window whose reset already passed describes a window that
+        # has ENDED. Judged on what is shown (post-roll): upstream's roll turns
+        # a passed weekly reset into an honest 0% for a slot that is being
+        # polled - but for a slot whose fetches keep failing that 0% is as
+        # unverified as the old figure, so the RAW reset counts there too.
+        failing = self._fetch_failing(slot, entry) is not None
+
+        def ended(shown: Any, raw: Any) -> bool:
+            return _reset_passed(shown, now) or (failing and _reset_passed(raw, now))
+
+        expired: list[str] = []
+        if ended(five_hour, five_hour):
+            expired.append("five_hour")
+        if ended(seven_day, raw_seven_day):
+            expired.append("seven_day")
 
         scoped_windows: list[tuple[str, Pct]] = []
         scoped_resets: list[tuple[str, str]] = []
@@ -839,9 +1221,20 @@ class SwapAccountSource:
                     continue
                 scoped_windows.append((name, pct))
                 scoped_rolled.append((name, window))
+                if ended(window, raw) and name not in expired:
+                    expired.append(name)
                 clock = self._reset_clock(window, backend)
                 if clock:
                     scoped_resets.append((name, clock))
+
+        # F2a: extra-usage spend, read-only from the same cached lastGood.
+        raw_spend = last_good.get("spend") if last_good is not None else None
+        spend = _spend(raw_spend)
+        spend_resets_at = (
+            self._reset_clock(raw_spend, backend)
+            if spend is not None and _iso_ts(raw_spend.get("resets_at")) is not None
+            else None
+        )
 
         return AccountRow(
             slot=slot,
@@ -869,6 +1262,12 @@ class SwapAccountSource:
             scoped_resets_at=tuple(scoped_resets),
             usage_age_seconds=_usage_age(entry, now),
             pace_ahead=_pace_ahead(entry, seven_day, scoped_rolled),
+            expired_windows=tuple(expired),
+            spend_used=spend[0] if spend is not None else None,
+            spend_limit=spend[1] if spend is not None else None,
+            spend_pct=spend[2] if spend is not None else None,
+            spend_currency=spend[3] if spend is not None else None,
+            spend_resets_at=spend_resets_at,
         )
 
     def _reset_clock(
@@ -919,6 +1318,82 @@ class SwapAccountSource:
             return sentinel, str(notes.get(sentinel, sentinel))
         except Exception:  # pragma: no cover - defensive
             return sentinel, sentinel
+
+    def _fetch_failure_note(self, account: Any) -> tuple[str, str] | None:
+        """``(FETCH_FAILING_KIND, note)`` for a slot whose polls keep being
+        refused, or ``None``. Same shape as :meth:`_sentinel_note`.
+
+        Derived on every build from claude-swap's cache entry (``last_error``,
+        ``consecutive_failures``, ``fetched_at``) and never stored, so it
+        clears on the first build after the slot recovers. The note spells
+        out that ``cswap disable`` does NOT stop the polling (only ``remove``
+        does), because that is the remedy an operator reaches for first.
+        """
+        try:
+            entry = getattr(account, "usage", None)
+            code = self._fetch_failing(_safe_int(getattr(account, "number", "")), entry)
+            if code is None:
+                return None
+            failures = int(getattr(entry, "consecutive_failures", 0))
+            number = str(getattr(account, "number", "") or "").strip() or "N"
+            email = str(getattr(account, "email", "") or "").strip() or "that account"
+            what = "forbidden" if code == 403 else "refused"
+            since = ""
+            fetched = getattr(entry, "fetched_at", None)
+            if isinstance(fetched, (int, float)) and not isinstance(fetched, bool):
+                local = time.localtime(float(fetched))
+                since = f" since {time.strftime('%b', local)} {local.tm_mday}"
+            head = f"usage {what} (HTTP {code}){since}"
+            if code == 429 and since:
+                # Only the backoff is visible - say what is known, no more.
+                days = int((time.time() - float(fetched)) // 86400)
+                head = (
+                    f"usage refused for {days} days{since} (last error HTTP 429, "
+                    f"upstream backoff)"
+                )
+            note = (
+                f"{head} · {failures} failed polls "
+                f"— plan lapsed or access revoked? log in as {email} and run "
+                f"`cswap add`, or `cswap remove {number}` to stop polling "
+                f"(`cswap disable` only takes it out of rotation; it is still polled)"
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            self._log.debug("accounts: fetch-failure note failed: %r", exc)
+            return None
+        return FETCH_FAILING_KIND, note
+
+    def _fetch_failing(self, slot: int, entry: Any) -> int | None:
+        """HTTP status of *slot*'s standing fetch refusal, or ``None``.
+
+        A qualifying refusal (:func:`_fetch_failing_code`) is remembered with
+        the entry's ``fetched_at``. While the slot keeps failing with anything
+        else - upstream's own 429 budget backoff, a network blip - and has had
+        no good fetch since (``fetched_at`` unchanged), the refusal still
+        stands: on 2026-09-25 slot 6's ``lastError`` read ``http-429`` for an
+        hour after every four 403s. A 429 starts it only when the entry has
+        not fetched for a day (:func:`_cold_backoff_code`) - the cold-start
+        case, where no 403 was ever seen in this process.
+        Idempotent for one entry, so the row and the note agree.
+        """
+        code = _fetch_failing_code(entry)
+        fetched = getattr(entry, "fetched_at", None) if entry is not None else None
+        with self._lock:
+            if code is not None:
+                self._fetch_failing_seen[slot] = (code, fetched)
+                return code
+            seen = self._fetch_failing_seen.get(slot)
+            still_failing = bool(getattr(entry, "last_error", None)) if entry is not None else False
+            if seen is not None and still_failing and seen[1] == fetched:
+                return seen[0]
+            # Nothing seen in this process (a cold start inside the backoff
+            # hour): the persisted entry alone can still prove a standing
+            # refusal - a day and more of failures with no good fetch.
+            cold = _cold_backoff_code(entry, time.time())
+            if cold is not None:
+                self._fetch_failing_seen[slot] = (cold, fetched)
+                return cold
+            self._fetch_failing_seen.pop(slot, None)
+            return None
 
     # -- extras beyond the protocol ---------------------------------------
 
@@ -985,12 +1460,19 @@ class SwapAccountSource:
             # verdict, so it survives the toggle - and autoswitch is OFF by
             # default, which is precisely when a rival actor owns the login.
             # Every other verdict belongs to the engine and dies with it.
-            return external
+            return external or self._standing_login_fight()
         # Precedence is deliberate: a live verdict outranks the state file.
         # An engine that will not start is the most urgent of all — nothing is
         # switching for ANY account — so it legitimately hides a per-account
         # quarantine, which is still spelled out on that account's own row.
-        return alert or external or self._persisted_quarantine_alert()
+        # A login fight is the widget's own observation too, and stands past
+        # the engine's repair switch that retracts `external` (swap-3).
+        return (
+            alert
+            or external
+            or self._standing_login_fight()
+            or self._persisted_quarantine_alert()
+        )
 
     def _autoswitch_state_path(self) -> Path | None:
         """claude-swap's ``autoswitch_state.json``, or ``None`` if unavailable."""
@@ -1173,6 +1655,19 @@ class SwapAccountSource:
         """
         with self._lock:
             return self._policy_threshold
+
+    def cached_autoswitch_models(self) -> tuple[str, ...]:  # UX-1a
+        """The per-model weekly windows the live engine binds on, or ``()``.
+
+        ``autoswitch.model`` (e.g. ``("Fable",)``), split by upstream's own
+        parser and captured in :meth:`_ensure_engine` from the same policy
+        object as :meth:`cached_autoswitch_threshold` - no file read here, so
+        it is safe on every UI tick. ``()`` until an engine has been built
+        (autoswitch off) or when the policy names no model: "compare 5h/7d
+        only", never a guess at which models matter.
+        """
+        with self._lock:
+            return self._policy_models_cache
 
     def autoswitch_state_path(self) -> Path | None:
         """The shared ``autoswitch_state.json`` this adapter's engine uses.
@@ -1734,6 +2229,7 @@ class SwapAccountSource:
                 self._policy_threshold = float(policy.threshold)
             except (AttributeError, TypeError, ValueError):
                 self._policy_threshold = None
+            self._policy_models_cache = _parse_policy_models(policy)
         self._log.info(
             "accounts: autoswitch engine started (threshold %s, interval %ss)",
             getattr(policy, "threshold", "?"),

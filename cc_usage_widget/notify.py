@@ -51,6 +51,7 @@ CLI::
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import stat
@@ -66,9 +67,13 @@ from typing import Any, Callable, Final, Iterable, Mapping, Sequence
 
 from .contracts import (
     ATTENTION_PCT,
+    ATTENTION_REARM_SECONDS,
+    NOTIFY_EXPIRING_SECONDS,
     SETTINGS_DEFAULTS,
+    VENDOR_CODEX,
     WIDGET_HOME,
     format_pct,
+    format_tokens,
     vendor_label,
 )
 
@@ -132,8 +137,15 @@ _WINDOW_LABELS: Final[Mapping[str, str]] = {
 
 SCOPE_SENTINEL: Final[str] = "sentinel"
 SCOPE_AUDIT: Final[str] = "audit"
-"""Scopes for the two conditions that are facts about the SNAPSHOT rather than
-about one account row. Every other scope is a row key."""
+SCOPE_COST: Final[str] = "cost"
+"""Scopes for the conditions that are facts about the SNAPSHOT rather than
+about one account row. Every other scope is a row key. ``cost`` is observed
+only by a snapshot carrying a COMPLETE cost breakdown: a tick still indexing
+(or with cost tracking off) cannot say a model stopped being unpriced."""
+
+SPEND_CAP_PCT: Final[float] = 100.0
+"""An extra-usage spend limit at or past this is ``crit``: the next request is
+billed past the limit the operator set, or refused."""
 
 LEDGER_MAX_AGE_SECONDS: Final[float] = 7 * 24 * 3600.0
 """Backstop on a held key whose scope has not been observed since — a Codex
@@ -175,7 +187,8 @@ class Event:
     key: str
     kind: str
     """``threshold`` | ``capped`` | ``back`` | ``attention`` | ``audit`` |
-    ``sentinel``. Machine-stable; the wording is not."""
+    ``sentinel`` | ``expiring`` | ``spend`` | ``unpriced`` | ``reset-usable``.
+    Machine-stable; the wording is not."""
     severity: str
     title: str
     subtitle: str = ""
@@ -301,6 +314,18 @@ def _threshold_of(settings: Mapping[str, Any] | None) -> float:
     return min(max(value, RECOVERY_PCT), ATTENTION_PCT)
 
 
+def _unpriced_floor_of(settings: Mapping[str, Any] | None) -> int:
+    """``unpriced_alert_min_tokens`` as a non-negative int; 0 means off."""
+    default = int(SETTINGS_DEFAULTS["unpriced_alert_min_tokens"])
+    raw = (settings or {}).get("unpriced_alert_min_tokens", default)
+    if isinstance(raw, bool):
+        return default
+    try:
+        return max(int(raw), 0)
+    except (TypeError, ValueError):
+        return default
+
+
 def _pct_events(
     previous: Any, current: Any, *, threshold: float
 ) -> list[Event]:
@@ -368,17 +393,36 @@ def _pct_events(
     return events
 
 
-def _standing_conditions(snapshot: Any) -> dict[str, Event]:
+def _standing_conditions(
+    snapshot: Any,
+    *,
+    now: float | None = None,
+    threshold: float | None = None,
+    unpriced_min_tokens: int | None = None,
+) -> dict[str, Event]:
     """Conditions that are simply TRUE of one snapshot, keyed by ledger key.
 
     Unlike the percentage rules these need no history: a warn-level
     ``attention_note`` is a fact about the row in front of us. The ledger, not
     the previous snapshot, is what makes them fire once — which is also what
     makes them survive a restart without re-announcing a standing fault.
+
+    The keyword arguments switch on the rules that need an input the snapshot
+    does not carry: *now* the pre-expiry rule, *threshold* the spend rule,
+    *unpriced_min_tokens* (> 0) the unpriced-model rule. Left ``None`` each rule
+    is simply absent, so this stays pure and clock-free for a caller that does
+    not ask.
     """
     out: dict[str, Event] = {}
     if snapshot is None:
         return out
+    if now is not None:
+        out.update(_expiring_conditions(snapshot, now=now))
+    if threshold is not None:
+        out.update(_spend_conditions(snapshot, threshold=threshold))
+    if unpriced_min_tokens:
+        out.update(_unpriced_conditions(snapshot, min_tokens=unpriced_min_tokens))
+    out.update(_reset_usable_conditions(snapshot))
 
     for key, row in _rows(snapshot).items():
         note = (getattr(row, "attention_note", "") or "").strip()
@@ -445,7 +489,250 @@ def _standing_conditions(snapshot: Any) -> dict[str, Event]:
     return out
 
 
-def detect(previous: Any, current: Any, *, threshold: float | None = None) -> list[Event]:
+def _format_expiry(epoch: float) -> str:
+    """``"Sep 20 11:13"`` (local time), or ``""`` for an absurd epoch."""
+    try:
+        when = dt.datetime.fromtimestamp(float(epoch))
+    except (OSError, OverflowError, TypeError, ValueError):
+        return ""
+    return f"{when:%b} {when.day} {when:%H:%M}"
+
+
+def _expiring_conditions(snapshot: Any, *, now: float) -> dict[str, Event]:
+    """``expiring:<row>`` — a Codex login inside :data:`NOTIFY_EXPIRING_SECONDS`.
+
+    Lifecycle of the ledger key (CX-6):
+
+    * **set by** the first tick on which ``0 < credential_expires_at - now <
+      NOTIFY_EXPIRING_SECONDS`` while the row carries an ``info`` attention (the
+      dim ``relogin in …`` countdown) and no ``warn``/``crit`` one;
+    * **cleared by** the condition going false: ``credential_expires_at`` moves
+      later (a refresh or a relogin wrote a new token), the token actually
+      expires (the row then carries the ``warn`` ``relogin`` verdict, whose own
+      ``attention:`` key takes over), or any ``warn``/``crit`` note appears;
+    * **persisted** in ``notify_state.json`` like every other key, so a restart
+      inside the window does not announce it twice; **aged** by the ledger's
+      unobserved-scope backstop only;
+    * **producer off** (no ``credential_expires_at`` on the row — the field is
+      read with ``getattr`` because it lands from lane codex-credentials):
+      nothing fires.
+
+    Why the ``info`` gate rather than "no note at all": the live source
+    rotates a token itself inside ``REFRESH_PROACTIVE_SECONDS`` (24 h, the same
+    width as this window) and suppresses its countdown whenever it expects to
+    manage that (a healthy refresh, or the desktop app's own login). A row
+    with no countdown is therefore one the source is about to renew, and
+    announcing it would notify once per account per token lifetime about a
+    login nobody has to touch. Kind-based, never wording-based.
+    """
+    out: dict[str, Event] = {}
+    for key, row in _rows(snapshot).items():
+        if getattr(row, "vendor", "") != VENDOR_CODEX:
+            continue
+        expires = getattr(row, "credential_expires_at", None)
+        if expires is None:
+            continue
+        try:
+            left = float(expires) - float(now)
+        except (TypeError, ValueError):
+            continue
+        if not 0.0 < left < NOTIFY_EXPIRING_SECONDS:
+            continue
+        kind = (getattr(row, "attention_kind", "") or "").strip()
+        if kind != SEVERITY_INFO:
+            continue
+        ledger_key = f"expiring:{key}"
+        when = _format_expiry(float(expires))
+        out[ledger_key] = Event(
+            key=ledger_key,
+            kind="expiring",
+            severity=SEVERITY_WARN,
+            scope=key,
+            title=f"{vendor_label(VENDOR_CODEX)} {_display_name(row)}",
+            subtitle=f"login expires {when}" if when else "login expires within a day",
+            message="Log in again from the menu",
+        )
+    return out
+
+
+def _money(amount: float, currency: str) -> str:
+    """``480.00`` + ``USD`` -> ``"$480.00"``; any other code rides verbatim
+    (``"480.00 EUR"``). The figure itself is the source's, never recomputed."""
+    if currency.upper() == "USD":
+        return f"${amount:,.2f}"
+    return f"{amount:,.2f} {currency}".rstrip()
+
+
+def _spend_conditions(snapshot: Any, *, threshold: float) -> dict[str, Event]:
+    """``spend:<row>:threshold`` / ``spend:<row>:capped`` — extra-usage spend.
+
+    Reads ``AccountRow.spend_*`` (lane swap-forensics; ``getattr`` because the
+    fields land from that branch). A row with no ``spend_limit`` or no
+    ``spend_pct`` is a row with no spend limit, and says nothing. At or past
+    :data:`SPEND_CAP_PCT` only the ``capped`` key stands, so a jump straight to
+    100 % is one ``crit`` rather than a warn and a crit in the same batch;
+    :func:`retained_keys` holds the threshold key too while capped. Released
+    when the percentage drops back under (a new billing period), which re-arms
+    both.
+    """
+    out: dict[str, Event] = {}
+    for key, row in _rows(snapshot).items():
+        limit = getattr(row, "spend_limit", None)
+        pct = getattr(row, "spend_pct", None)
+        used = getattr(row, "spend_used", None)
+        if limit is None or pct is None:
+            continue
+        try:
+            pct_value = float(pct)
+        except (TypeError, ValueError):
+            continue
+        if pct_value >= SPEND_CAP_PCT:
+            level, severity, message = "capped", SEVERITY_CRIT, "extra-usage limit reached"
+        elif pct_value >= threshold:
+            level, severity, message = "threshold", SEVERITY_WARN, f"crossed {threshold:g}% of the extra-usage limit"
+        else:
+            continue
+        currency = str(getattr(row, "spend_currency", "") or "")
+        try:
+            figures = (
+                f"{_money(float(used), currency)} / {_money(float(limit), currency)}"
+                if used is not None
+                else f"limit {_money(float(limit), currency)}"
+            )
+        except (TypeError, ValueError):
+            continue
+        ledger_key = f"spend:{key}:{level}"
+        out[ledger_key] = Event(
+            key=ledger_key,
+            kind="spend",
+            severity=severity,
+            scope=key,
+            title=f"{vendor_label(getattr(row, 'vendor', 'claude'))} {_display_name(row)}",
+            subtitle=f"extra usage {figures} ({format_pct(pct_value)})",
+            message=message,
+        )
+    return out
+
+
+def _unpriced_buckets(snapshot: Any) -> list[tuple[str, tuple[str, ...], int]]:
+    """``(vendor, raw model names, today's tokens)`` per unpriced bucket.
+
+    Empty unless the snapshot carries a COMPLETE breakdown: while the first
+    index is still filling in, today's figure is a partial count and the
+    alert would fire on a number that is still growing for a reason other
+    than use.
+    """
+    cost = getattr(snapshot, "cost", None)
+    if cost is None or getattr(cost, "is_partial", True):
+        return []
+    out: list[tuple[str, tuple[str, ...], int]] = []
+    for model_row in getattr(cost, "by_model", ()) or ():
+        if not getattr(model_row, "is_unknown", False):
+            continue
+        names = tuple(name for name in (getattr(model_row, "raw_models", ()) or ()) if name)
+        if not names:
+            continue
+        try:
+            tokens = int(getattr(model_row, "total_tokens", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        out.append((str(getattr(model_row, "vendor", "") or ""), names, tokens))
+    return out
+
+
+def _unpriced_conditions(snapshot: Any, *, min_tokens: int) -> dict[str, Event]:
+    """``unpriced:<model>`` — a model with no published rate, over the floor.
+
+    ``by_model`` is today, and the rollup folds every unrecognised model of one
+    vendor into ONE bucket, so a bucket with two names cannot say how its
+    tokens split. The message therefore quotes the bucket's figure as the
+    bucket's ("between them"), never as one model's, and every name in it gets
+    its own key so a NEW unpriced model joining an old one still announces
+    itself. Held (see :func:`retained_keys`) while the name is in the 30-day
+    ``unknown_models`` list, so a model that stays unpriced notifies once, not
+    once a day. No network: the names and counts are the rollup's.
+    """
+    out: dict[str, Event] = {}
+    for vendor, names, tokens in _unpriced_buckets(snapshot):
+        if tokens < min_tokens:
+            continue
+        figure = f"{format_tokens(tokens)} tokens today"
+        if len(names) > 1:
+            figure = f"{figure} between {', '.join(names)}"
+        for name in names:
+            ledger_key = f"unpriced:{name}"
+            out[ledger_key] = Event(
+                key=ledger_key,
+                kind="unpriced",
+                severity=SEVERITY_WARN,
+                scope=SCOPE_COST,
+                title=f"{APP_TITLE} · unpriced model",
+                subtitle=f"{vendor_label(vendor) if vendor else ''} {name}".strip(),
+                message=f"{figure}, counted at $0 (no published rate)",
+            )
+    return out
+
+
+def _reset_usable_conditions(snapshot: Any) -> dict[str, Event]:
+    """``reset-usable:<row>`` — a Codex reset credit that can be spent now.
+
+    Reads ``AccountRow.reset_credits_usable`` (lane codex-resets) with
+    ``getattr``: ``None`` means "not reported" and never fires. Standing while
+    the count is >= 1; released when it returns to 0, which re-arms it. The
+    ledger makes it once per transition and once across a restart.
+    """
+    out: dict[str, Event] = {}
+    for key, row in _rows(snapshot).items():
+        if getattr(row, "vendor", "") != VENDOR_CODEX:
+            continue
+        usable = getattr(row, "reset_credits_usable", None)
+        if usable is None or isinstance(usable, bool):
+            continue
+        try:
+            count = int(usable)
+        except (TypeError, ValueError):
+            continue
+        if count < 1:
+            continue
+        noun = "reset credit" if count == 1 else "reset credits"
+        message = f"{_display_name(row)}: {count} {noun} usable now"
+        weekly = _pct_of(row, _SEVEN_DAY_KEY)
+        if weekly is not None:
+            message = f"{message} — weekly {format_pct(weekly)}"
+        ledger_key = f"reset-usable:{key}"
+        out[ledger_key] = Event(
+            key=ledger_key,
+            kind="reset-usable",
+            severity=SEVERITY_INFO,
+            scope=key,
+            title="Codex reset available",
+            subtitle="",
+            message=message,
+        )
+    return out
+
+
+def rearms(key: str) -> bool:
+    """Whether a held *key* is sent again after :data:`ATTENTION_REARM_SECONDS`.
+
+    Codex ``warn`` attention keys only (``attention:codex:<slot>:<alias>:warn``):
+    a dead login, no access, offline. Claude sentinel keys (``sentinel:*``) are
+    deliberately NOT re-armed - claude-swap owns those faults and their
+    remedies, and the same constant is not applied to them unless someone
+    decides to on purpose. ``crit`` (a capped plan) is a wall with its own
+    ``back`` event, not a thing to be reminded of.
+    """
+    return key.startswith(f"attention:{VENDOR_CODEX}:") and key.endswith(f":{SEVERITY_WARN}")
+
+
+def detect(
+    previous: Any,
+    current: Any,
+    *,
+    threshold: float | None = None,
+    now: float | None = None,
+    unpriced_min_tokens: int | None = None,
+) -> list[Event]:
     """Everything that became true between *previous* and *current*. PURE.
 
     No I/O, no clock, no ledger, no sending. ``previous`` may be ``None`` (the
@@ -456,6 +743,10 @@ def detect(previous: Any, current: Any, *, threshold: float | None = None) -> li
         previous: the snapshot last published, or ``None``.
         current: the snapshot being published now.
         threshold: alert percentage; defaults to the settings default.
+        now: the instant to judge a login's expiry against. ``None`` (no
+            clock) leaves the pre-expiry rule out, which keeps this pure.
+        unpriced_min_tokens: the unpriced-model floor; ``None`` means the
+            settings default, 0 turns the rule off.
 
     Returns:
         Events in a stable order: percentage transitions first, then standing
@@ -463,23 +754,50 @@ def detect(previous: Any, current: Any, *, threshold: float | None = None) -> li
         produce the same list.
     """
     limit = _threshold_of({"notification_threshold_pct": threshold} if threshold is not None else None)
+    floor = _unpriced_floor_of(
+        {"unpriced_alert_min_tokens": unpriced_min_tokens} if unpriced_min_tokens is not None else None
+    )
     events = _pct_events(previous, current, threshold=limit)
-    before = _standing_conditions(previous)
-    standing = _standing_conditions(current)
+    options = {"now": now, "threshold": limit, "unpriced_min_tokens": floor}
+    before = _standing_conditions(previous, **options)
+    standing = _standing_conditions(current, **options)
     for key in sorted(standing):
         if key not in before:
             events.append(standing[key])
     return events
 
 
-def retained_keys(snapshot: Any, *, threshold: float) -> set[str]:
+def retained_keys(
+    snapshot: Any,
+    *,
+    threshold: float,
+    now: float | None = None,
+    unpriced_min_tokens: int | None = None,
+) -> set[str]:
     """Ledger keys whose condition is still true of *snapshot*.
 
     The ledger releases everything else — subject to the throttle, and to
     :func:`observed_scopes`, which is what stops a tick that saw nothing from
     counting as a tick that saw the problem go away.
     """
-    keys: set[str] = set(_standing_conditions(snapshot))
+    keys: set[str] = set(
+        _standing_conditions(
+            snapshot, now=now, threshold=threshold, unpriced_min_tokens=unpriced_min_tokens
+        )
+    )
+    for key in list(keys):
+        if key.startswith("spend:") and key.endswith(":capped"):
+            # A capped spend limit still stands past the threshold: dropping
+            # the threshold key here would let it fire the moment the
+            # percentage slips back from 100 to 99.
+            keys.add(key[: -len("capped")] + "threshold")
+    cost = getattr(snapshot, "cost", None) if snapshot is not None else None
+    if cost is not None and not getattr(cost, "is_partial", True):
+        # Once per model name, not once per day: the key is held for as long
+        # as the name is still in the 30-day unpriced list.
+        for name in getattr(cost, "unknown_models", ()) or ():
+            if name:
+                keys.add(f"unpriced:{name}")
     rows = _rows(snapshot)
     for key, row in rows.items():
         for window_key, _label, pct, _resets in _windows(row):
@@ -504,6 +822,9 @@ def observed_scopes(snapshot: Any) -> set[str]:
     """
     scopes: set[str] = set(_rows(snapshot))
     scopes.add(SCOPE_AUDIT)  # a snapshot always answers "is there drift"
+    cost = getattr(snapshot, "cost", None) if snapshot is not None else None
+    if cost is not None and not getattr(cost, "is_partial", True):
+        scopes.add(SCOPE_COST)
     notes = getattr(snapshot, "account_notes", None)
     if (notes and isinstance(notes, Mapping)) or (getattr(snapshot, "accounts", ()) or ()):
         scopes.add(SCOPE_SENTINEL)
@@ -603,6 +924,16 @@ class _Ledger:
     def suppressed(self, key: str) -> bool:
         """True when *key* has already been announced and not yet released."""
         return key in self._load()
+
+    def age(self, key: str, now: float) -> float | None:
+        """Seconds since *key* was last sent, or ``None`` when it is not held.
+
+        What the per-kind re-arm reads (:func:`rearms`): a held key is released
+        only when its condition goes false, so a condition that never goes
+        false needs its age, not its presence, to be sent again.
+        """
+        entry = self._load().get(key)
+        return None if entry is None else float(now) - entry[0]
 
     def commit(
         self,
@@ -885,9 +1216,19 @@ class Notifier:
 
     # -- detection (pure) --------------------------------------------------
 
-    def observe(self, previous: Any, current: Any) -> list[Event]:
-        """:func:`detect` at the configured threshold. Pure: no I/O, no sends."""
-        return detect(previous, current, threshold=self.threshold())
+    def observe(self, previous: Any, current: Any, *, now: float | None = None) -> list[Event]:
+        """:func:`detect` at the configured threshold and unpriced floor, judged
+        at *now* (default: the injected clock). No I/O, no sends."""
+        return detect(
+            previous,
+            current,
+            threshold=self.threshold(),
+            now=float(self._clock()) if now is None else float(now),
+            unpriced_min_tokens=self.unpriced_floor(),
+        )
+
+    def unpriced_floor(self) -> int:
+        return _unpriced_floor_of(self._current_settings())
 
     def threshold(self) -> float:
         return _threshold_of(self._current_settings())
@@ -912,16 +1253,32 @@ class Notifier:
         if not bool(settings.get("notifications_enabled", SETTINGS_DEFAULTS["notifications_enabled"])):
             return []
         threshold = self.threshold()
-        events = self.observe(previous, current)
+        floor = self.unpriced_floor()
+        now = float(self._clock())
+        events = self.observe(previous, current, now=now)
         fresh = [event for event in events if not self._ledger.suppressed(event.key)]
+        # Per-kind re-arm (CX-6): a standing Codex warn that has been held for
+        # ATTENTION_REARM_SECONDS is sent again. `detect` cannot see it - the
+        # condition was already true of `previous` - so it is read from the
+        # standing set directly, and committing it below restamps its age.
+        sent = {event.key for event in fresh}
+        standing = _standing_conditions(
+            current, now=now, threshold=threshold, unpriced_min_tokens=floor
+        )
+        for key in sorted(standing):
+            if key in sent or not rearms(key):
+                continue
+            age = self._ledger.age(key, now)
+            if age is not None and age >= ATTENTION_REARM_SECONDS:
+                fresh.append(standing[key])
         # Reconcile on every publish, fired or not: releasing a key whose
         # condition just went false is what lets the same account notify again
         # the next time it walls, and that release happens on a quiet tick.
         self._ledger.commit(
             fresh,
-            retained_keys(current, threshold=threshold),
+            retained_keys(current, threshold=threshold, now=now, unpriced_min_tokens=floor),
             observed_scopes(current),
-            now=float(self._clock()),
+            now=now,
         )
         if not fresh:
             return []
@@ -942,9 +1299,16 @@ class Notifier:
             mac = self._mac_sender = MacSender(log=self._log)
         for event in events:
             try:
-                mac.send(event)
+                ok = mac.send(event)
             except Exception as exc:  # a sender must not kill the batch
                 self._log(f"notify: macOS send raised {type(exc).__name__}")
+                continue
+            if ok:
+                # The KEY, never the wording: it is machine-stable, carries no
+                # figure that could be stale in a log, and is how a later
+                # reader proves an announcement happened (0 such lines existed
+                # before CX-6, so nothing proved Sep 20 was ever sent).
+                self._log(f"notify: sent {event.key}")
         if not telegram:
             return
         sender = self._telegram()
@@ -952,9 +1316,12 @@ class Notifier:
             return
         for event in events:
             try:
-                sender.send(event)
+                ok = sender.send(event)
             except Exception:
                 self._log("notify: telegram send raised")
+                continue
+            if ok:
+                self._log(f"notify: sent {event.key} via telegram")
 
     def _telegram(self) -> Any | None:
         if self._telegram_resolved:

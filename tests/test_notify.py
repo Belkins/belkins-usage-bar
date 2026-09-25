@@ -42,6 +42,8 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+os.environ.setdefault("CC_USAGE_WIDGET_NO_REVEAL", "1")  # never open Finder from a test
+
 sys.path.insert(0, str(REPO_ROOT))
 
 from cc_usage_widget import notify as notify_mod  # noqa: E402
@@ -968,6 +970,297 @@ def test_a_worker_with_no_notifier_behaves_exactly_as_before() -> None:
     worker = BackgroundWorker(publish=published.append, snapshot=UiSnapshot())
     worker._publish(replace(UiSnapshot(), cost_error="x"))
     assert len(published) == 1
+
+
+# ---------------------------------------------------------------------------
+# 7. Lane codex-relogin-ux: pre-expiry, daily re-arm, 'notify: sent', spend,
+#    unpriced models, usable Codex resets (CX-6, F2c, F8, RS-2)
+# ---------------------------------------------------------------------------
+#
+# The fields these rules read (credential_expires_at, spend_*,
+# reset_credits_usable) land on AccountRow from three OTHER lanes. `XRow` is an
+# AccountRow that carries them either way, so these tests run on this branch
+# and keep running after the merge, when the real fields exist.
+
+
+@dataclass(frozen=True)
+class XRow(AccountRow):
+    credential_expires_at: float | None = None
+    spend_used: float | None = None
+    spend_limit: float | None = None
+    spend_pct: float | None = None
+    spend_currency: str | None = None
+    reset_credits_usable: int | None = None
+
+
+NOW = 1_000_000.0
+
+
+def xrow(**fields: Any) -> XRow:
+    base = dict(
+        slot=-1, alias="vlad", email="", is_active=False,
+        vendor=VENDOR_CODEX, switchable=False,
+    )
+    base.update(fields)
+    return XRow(**base)
+
+
+def countdown(**fields: Any) -> XRow:
+    """A live Codex row showing the dim ``relogin in …`` countdown (kind info)."""
+    return xrow(attention_note="relogin in 20h", attention_kind="info", **fields)
+
+
+def test_a_login_inside_a_day_of_expiry_notifies_once() -> None:
+    before = snap(countdown(credential_expires_at=NOW + 30 * 3600))
+    after = snap(countdown(credential_expires_at=NOW + 20 * 3600))
+    events = notify_mod.detect(before, after, now=NOW)
+    assert [e.key for e in events] == ["expiring:codex:-1:vlad"], events
+    assert events[0].kind == "expiring" and events[0].severity == notify_mod.SEVERITY_WARN
+    # The second identical tick says nothing: the condition was already true.
+    assert notify_mod.detect(after, after, now=NOW + 60) == []
+    # Through the ledger, across a restart, it stays once.
+    with tempfile.TemporaryDirectory() as name:
+        first, mac = make_notifier(Path(name), clock=lambda: NOW)
+        assert [e.kind for e in first.notify(before, after)] == ["expiring"]
+        assert first.notify(after, after) == []
+        second, mac_two = make_notifier(Path(name), clock=lambda: NOW + 120)
+        assert second.notify(None, after) == [] and mac_two.events == []
+
+
+def test_the_expiry_rule_is_kind_based_and_can_fail() -> None:
+    """Negative controls: each one flips ONE input and the event must vanish."""
+    fires = snap(countdown(credential_expires_at=NOW + 20 * 3600))
+    assert len(notify_mod.detect(None, fires, now=NOW)) == 1, "the positive case must fire"
+    # No clock -> the rule is absent (detect stays pure for a caller without one).
+    assert notify_mod.detect(None, fires) == []
+    # Outside the window, already expired, unknown expiry: nothing.
+    for exp in (NOW + 30 * 3600, NOW - 1, None):
+        assert notify_mod.detect(None, snap(countdown(credential_expires_at=exp)), now=NOW) == [], exp
+    # A warn note owns the row (the relogin verdict has its own key).
+    warned = xrow(attention_note="relogin", attention_kind="warn", credential_expires_at=NOW + 3600)
+    assert [e.kind for e in notify_mod.detect(None, snap(warned), now=NOW)] == ["attention"]
+    # No countdown = the source expects to renew it itself; same wording, other kind.
+    quiet = xrow(attention_note="relogin in 20h", attention_kind="", credential_expires_at=NOW + 3600)
+    assert notify_mod.detect(None, snap(quiet), now=NOW) == []
+    # A Claude row never carries a Codex login.
+    claude = xrow(vendor="claude", switchable=True, slot=1, attention_kind="info",
+                  attention_note="x", credential_expires_at=NOW + 3600)
+    assert notify_mod.detect(None, snap(claude), now=NOW) == []
+
+
+def test_the_expiring_key_is_released_when_the_expiry_moves_later() -> None:
+    with tempfile.TemporaryDirectory() as name:
+        clock = [NOW]
+        notifier, mac = make_notifier(Path(name), clock=lambda: clock[0])
+        near = snap(countdown(credential_expires_at=NOW + 20 * 3600))
+        assert len(notifier.notify(None, near)) == 1
+        clock[0] += 300
+        renewed = snap(xrow(credential_expires_at=NOW + 10 * 86_400))
+        assert notifier.notify(near, renewed) == []
+        state = json.loads((Path(name) / "notify_state.json").read_text())
+        assert "expiring:codex:-1:vlad" not in state["fired"], state
+        # Ten days later the next token nears its end: it announces again.
+        clock[0] = NOW + 10 * 86_400 - 20 * 3600
+        again = snap(countdown(credential_expires_at=NOW + 10 * 86_400))
+        assert [e.kind for e in notifier.notify(renewed, again)] == ["expiring"]
+
+
+def test_a_standing_codex_warn_is_sent_again_after_a_day() -> None:
+    dead = snap(xrow(attention_note="relogin", attention_kind="warn"))
+    with tempfile.TemporaryDirectory() as name:
+        clock = [NOW]
+        notifier, mac = make_notifier(Path(name), clock=lambda: clock[0])
+        assert [e.key for e in notifier.notify(None, dead)] == ["attention:codex:-1:vlad:warn"]
+        clock[0] += notify_mod.ATTENTION_REARM_SECONDS - 60
+        assert notifier.notify(dead, dead) == [], "not yet a day"
+        clock[0] += 120
+        again = notifier.notify(dead, dead)
+        assert [e.key for e in again] == ["attention:codex:-1:vlad:warn"], again
+        # Restamped: the next reminder is a day after THIS one, not every tick.
+        clock[0] += 60
+        assert notifier.notify(dead, dead) == []
+        assert len(mac.events) == 2
+        # A restart a day later reminds too (the ledger holds the age).
+        clock[0] += notify_mod.ATTENTION_REARM_SECONDS + 1
+        fresh, mac_two = make_notifier(Path(name), clock=lambda: clock[0])
+        assert len(fresh.notify(None, dead)) == 1
+
+
+def test_claude_sentinels_and_codex_crit_are_not_re_armed() -> None:
+    """Documented choice: the daily re-arm is Codex ``warn`` only."""
+    assert notify_mod.rearms("attention:codex:-1:vlad:warn")
+    assert not notify_mod.rearms("attention:codex:-1:vlad:crit")
+    assert not notify_mod.rearms("sentinel:3:fetch-failing")
+    assert not notify_mod.rearms("attention:claude:1:main:warn")
+    sentinel = Snap(account_notes={3: "usage forbidden"}, account_note_kinds={3: "fetch-failing"},
+                    accounts=(row(slot=3, alias="work", vendor="claude"),))
+    with tempfile.TemporaryDirectory() as name:
+        clock = [NOW]
+        notifier, _mac = make_notifier(Path(name), clock=lambda: clock[0])
+        assert len(notifier.notify(None, sentinel)) == 1
+        clock[0] += 3 * notify_mod.ATTENTION_REARM_SECONDS
+        assert notifier.notify(sentinel, sentinel) == []
+
+
+def test_a_successful_send_is_logged_by_key_without_its_wording() -> None:
+    logs: list[str] = []
+    with tempfile.TemporaryDirectory() as name:
+        mac = RecordingSender()
+        notifier = notify_mod.Notifier(
+            settings=lambda: normalize_settings({}),
+            ledger_path=Path(name) / "notify_state.json",
+            credentials_path=Path(name) / "notify.json",
+            mac_sender=mac,
+            clock=lambda: NOW,
+            dispatch=lambda work: work(),
+            log=logs.append,
+        )
+        dead = snap(xrow(attention_note="relogin", attention_kind="warn"))
+        notifier.notify(None, dead)
+    assert logs == ["notify: sent attention:codex:-1:vlad:warn"], logs
+    assert not any("needs attention" in line or "relogin" == line for line in logs)
+
+    class Refusing:
+        def send(self, event: Any) -> bool:
+            return False
+
+    refused: list[str] = []
+    with tempfile.TemporaryDirectory() as name:
+        notifier = notify_mod.Notifier(
+            settings=lambda: normalize_settings({}),
+            ledger_path=Path(name) / "notify_state.json",
+            credentials_path=Path(name) / "notify.json",
+            mac_sender=Refusing(),
+            clock=lambda: NOW,
+            dispatch=lambda work: work(),
+            log=refused.append,
+        )
+        notifier.notify(None, snap(xrow(attention_note="relogin", attention_kind="warn")))
+    assert refused == [], "a failed send must not be logged as sent"
+
+
+def spender(pct: float | None, *, used: float | None = 480.00, limit: float | None = 500.00) -> XRow:
+    return xrow(vendor="claude", switchable=True, slot=1, alias="main",
+                spend_used=used, spend_limit=limit, spend_pct=pct, spend_currency="USD")
+
+
+def test_extra_usage_spend_crossing_the_threshold_notifies_once_then_at_the_cap() -> None:
+    low, high, cap = snap(spender(80.0, used=400.00)), snap(spender(95.6)), snap(spender(100.0, used=500.00))
+    events = notify_mod.detect(low, high, threshold=85.0)
+    assert [(e.kind, e.severity) for e in events] == [("spend", notify_mod.SEVERITY_WARN)], events
+    assert "$480.00 / $500.00" in events[0].text, events[0].text
+    assert notify_mod.detect(high, high, threshold=85.0) == []
+    capped = notify_mod.detect(high, cap, threshold=85.0)
+    assert [(e.kind, e.severity) for e in capped] == [("spend", notify_mod.SEVERITY_CRIT)], capped
+    with tempfile.TemporaryDirectory() as name:
+        notifier, mac = make_notifier(Path(name), settings={"notification_threshold_pct": 85})
+        assert len(notifier.notify(low, high)) == 1
+        assert notifier.notify(high, high) == []
+        assert len(notifier.notify(high, cap)) == 1
+        assert notifier.notify(cap, cap) == []
+        assert [e.severity for e in mac.events] == ["warn", "crit"]
+
+
+def test_spend_without_a_limit_or_under_the_threshold_says_nothing() -> None:
+    assert notify_mod.detect(None, snap(spender(96.0, limit=None)), threshold=85.0) == []
+    assert notify_mod.detect(None, snap(spender(None)), threshold=85.0) == []
+    assert notify_mod.detect(None, snap(spender(84.0)), threshold=85.0) == []
+    # Negative control for the three above: the same row over the line fires.
+    assert len(notify_mod.detect(None, snap(spender(86.0)), threshold=85.0)) == 1
+    # Currency rides verbatim when it is not USD.
+    euro = replace(spender(90.0), spend_currency="EUR")
+    assert "480.00 EUR / 500.00 EUR" in notify_mod.detect(None, snap(euro), threshold=85.0)[0].text
+
+
+def _cost(*buckets: tuple[str, tuple[str, ...], int], partial: bool = False) -> Any:
+    from cc_usage_widget.contracts import (
+        UNKNOWN_MODEL, CostBreakdown, IndexProgress, ModelCostRow, ModelUsage, WindowCost,
+    )
+
+    window = WindowCost(label="Today", usd=0.0, total_tokens=0, window_days=1, days_counted=1)
+    rows = tuple(
+        ModelCostRow(model=UNKNOWN_MODEL, display_name=names[0], usage=ModelUsage(input=tokens),
+                     usd=0.0, is_unknown=True, raw_models=names, vendor=vendor)
+        for vendor, names, tokens in buckets
+    )
+    return CostBreakdown(
+        today=window, last_7d=window, last_30d=window, by_model=rows,
+        unknown_models=tuple(sorted({n for _v, names, _t in buckets for n in names})),
+        progress=IndexProgress(complete=not partial),
+    )
+
+
+@dataclass(frozen=True)
+class CostSnap(Snap):
+    cost: Any = None
+
+
+def test_an_unpriced_model_over_the_floor_notifies_once() -> None:
+    model = "SYNTHETIC-unpriced-model"
+    big = CostSnap(cost=_cost((VENDOR_CODEX, (model,), 2_000_000)))
+    events = notify_mod.detect(CostSnap(), big)
+    assert [e.key for e in events] == [f"unpriced:{model}"], events
+    assert "2.0M tokens today" in events[0].message
+    assert notify_mod.detect(big, big) == []
+    with tempfile.TemporaryDirectory() as name:
+        clock = [NOW]
+        notifier, mac = make_notifier(Path(name), clock=lambda: clock[0])
+        assert len(notifier.notify(CostSnap(), big)) == 1
+        # The next day starts at 0 tokens: the name is still in the 30-day
+        # unpriced list, so the key is held and tomorrow's crossing is silent.
+        clock[0] += 86_400
+        tomorrow_empty = CostSnap(cost=_cost((VENDOR_CODEX, (model,), 0)))
+        assert notifier.notify(big, tomorrow_empty) == []
+        clock[0] += 3_600
+        assert notifier.notify(tomorrow_empty, big) == []
+        assert len(mac.events) == 1
+
+
+def test_the_unpriced_rule_respects_its_floor_its_switch_and_a_partial_index() -> None:
+    model = "SYNTHETIC-unpriced-model"
+    small = CostSnap(cost=_cost((VENDOR_CODEX, (model,), 999_999)))
+    assert notify_mod.detect(None, small) == []
+    big = CostSnap(cost=_cost((VENDOR_CODEX, (model,), 1_000_000)))
+    assert len(notify_mod.detect(None, big)) == 1, "negative control: at the floor it fires"
+    assert notify_mod.detect(None, big, unpriced_min_tokens=0) == [], "0 = off"
+    partial = CostSnap(cost=_cost((VENDOR_CODEX, (model,), 5_000_000), partial=True))
+    assert notify_mod.detect(None, partial) == [], "a half-built index is not a figure"
+    # Two names in one bucket: the figure is the bucket's, said to be shared.
+    shared = CostSnap(cost=_cost((VENDOR_CODEX, ("SYNTHETIC-a", "SYNTHETIC-b"), 3_000_000)))
+    keys = sorted(e.key for e in notify_mod.detect(None, shared))
+    assert keys == ["unpriced:SYNTHETIC-a", "unpriced:SYNTHETIC-b"], keys
+    assert "between SYNTHETIC-a, SYNTHETIC-b" in notify_mod.detect(None, shared)[0].message
+    # The settings key exists (normalize_settings drops undeclared keys).
+    assert normalize_settings({"unpriced_alert_min_tokens": 5})["unpriced_alert_min_tokens"] == 5
+    assert SETTINGS_DEFAULTS["unpriced_alert_min_tokens"] == 1_000_000
+
+
+def resets(usable: int | None, *, weekly: float | None = 87.0) -> XRow:
+    return xrow(reset_credits_usable=usable, seven_day_pct=weekly)
+
+
+def test_a_codex_reset_credit_becoming_usable_notifies_once_per_transition() -> None:
+    events = notify_mod.detect(snap(resets(0)), snap(resets(1)))
+    assert [e.key for e in events] == ["reset-usable:codex:-1:vlad"], events
+    assert events[0].title == "Codex reset available"
+    assert events[0].message == "vlad: 1 reset credit usable now — weekly 87%", events[0].message
+    assert notify_mod.detect(snap(resets(1)), snap(resets(1))) == []
+    assert notify_mod.detect(snap(resets(None)), snap(resets(None))) == []
+    assert notify_mod.detect(None, snap(resets(None))) == [], "None never fires"
+    assert notify_mod.detect(None, snap(resets(0))) == []
+    no_weekly = notify_mod.detect(None, snap(resets(2, weekly=None)))
+    assert no_weekly[0].message == "vlad: 2 reset credits usable now", no_weekly[0].message
+    with tempfile.TemporaryDirectory() as name:
+        clock = [NOW]
+        notifier, mac = make_notifier(Path(name), clock=lambda: clock[0])
+        assert len(notifier.notify(snap(resets(0)), snap(resets(1)))) == 1
+        restarted, mac_two = make_notifier(Path(name), clock=lambda: clock[0] + 60)
+        assert restarted.notify(None, snap(resets(1))) == [], "no repeat across a restart"
+        clock[0] += 3_600
+        restarted.notify(snap(resets(1)), snap(resets(0)))   # spent: re-armed
+        clock[0] += 86_400
+        assert len(restarted.notify(snap(resets(0)), snap(resets(1)))) == 1
+        assert len(mac.events) + len(mac_two.events) == 2
 
 
 def _tests() -> list[tuple[str, Any]]:

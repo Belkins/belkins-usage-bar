@@ -67,11 +67,12 @@ jobs:
           done
 
       # claude-swap is NOT installed here. It is an optional dependency (the
-      # account features), it is not on PyPI, and the widget degrades without
-      # it - so CI is the right place to check that degradation. Four tests in
-      # tests/test_fleet.py exercise upstream's own helpers and report as
-      # `skip` in the log with a counted summary line; they are never counted
-      # as passes. Everything else must be green.
+      # account features) and the widget degrades without it - so CI is the
+      # right place to check that degradation. Four tests in
+      # tests/test_fleet.py exercise upstream's own helpers, and
+      # tests/test_ops.py's claude-swap contract test resolves upstream's
+      # symbols; all five report as `skip` in the log with a counted summary
+      # line and are never counted as passes. Everything else must be green.
       - name: Run every test module
         # One process per module, because each is its own runner and exits
         # non-zero on a failure or an uncollected test. `set -e` is not enough:

@@ -620,6 +620,100 @@ def test_the_dashboard_is_written_beside_the_store_it_describes() -> None:
 
 
 # ---------------------------------------------------------------------------
+# F1 (2026-09-25): the workflow table. Every name below is SYNTHETIC.
+# ---------------------------------------------------------------------------
+
+_WF_SESSION = "5e55a0a1-synthetic"
+_WF_RUN = "wf_0badc0de-syn"
+
+
+def _swarm_cache(root: Path) -> DailyRollupStore:
+    """A store plus the attribution cache beside it holding one two-agent run,
+    and that run's journal under ``root/projects``."""
+    import json
+
+    from cc_usage_widget.attribution import Attribution, AttributionStore, attribution_path_for
+    from cc_usage_widget.contracts import VENDOR_CLAUDE
+
+    store = _store(root)
+    store.merge([_day(TODAY, **{FABLE: ModelUsage(input=3_000_000)})])
+    cache = AttributionStore(path=attribution_path_for(store.path))
+    for agent, tokens in (("a1", 1_000_000), ("a2", 2_000_000)):
+        scope = Attribution(
+            vendor=VENDOR_CLAUDE, project="SYNTHETIC_proj", session=_WF_SESSION,
+            workflow=_WF_RUN, agent=agent,
+        )
+        cache.merge([(scope, _day(TODAY, **{FABLE: ModelUsage(input=tokens)}))])
+    cache.save(force=True)
+    run = root / "projects" / "-SYNTHETIC-proj" / _WF_SESSION / "subagents" / "workflows" / _WF_RUN
+    run.mkdir(parents=True)
+    (run / "journal.jsonl").write_text(
+        "\n".join(
+            json.dumps(record)
+            for record in (
+                {"type": "launched"},
+                {"type": "started", "agentId": "a1", "label": "<b>SYNTHETIC</b>", "phase": "Review"},
+                {"type": "started", "agentId": "a2", "label": "build:SYNTHETIC", "phase": "Build"},
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return store
+
+
+def test_the_workflow_table_is_absent_without_a_run() -> None:
+    """No run, no heading - the page a machine without swarms drew before F1."""
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        store = _store(root)
+        store.merge([_day(TODAY, **{FABLE: ModelUsage(input=9_000)})])
+        page = render_dashboard(None, store, now=NOW, pricing=DEFAULT_PRICING)
+        assert "Workflow runs" not in page
+        assert dash.WORKFLOW_NOTE not in page
+        # build_dashboard with no cache beside the store neither shows the
+        # table nor creates the cache file.
+        written = build_dashboard(
+            None, store, (), (), now=NOW, pricing=DEFAULT_PRICING,
+            projects_dir=root / "projects",
+        )
+        assert "Workflow runs" not in written.read_text(encoding="utf-8")
+        assert not (root / "attribution.json").exists(), "the dashboard created the cache"
+
+
+def test_the_workflow_table_shows_each_run_with_its_phases_and_models() -> None:
+    """One row per run whose tokens are its agents' sum, split per phase (from
+    the journal) and per model; journal text is escaped; the cache and the
+    journal are read, never written."""
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        store = _swarm_cache(root)
+        cache = root / "attribution.json"
+        before = cache.read_bytes()
+        written = build_dashboard(
+            None, store, (), (), now=NOW, pricing=DEFAULT_PRICING,
+            projects_dir=root / "projects",
+        )
+        page = written.read_text(encoding="utf-8")
+        assert "Workflow runs" in page and dash.WORKFLOW_NOTE in page
+        assert "wf_0badc0de · SYNTHETIC_proj" in page, page
+        assert ">3,000,000<" in page, "the run's exact token sum"
+        assert "phase: Review" in page and "phase: Build" in page
+        assert "model: Fable 5" in page
+        assert "&lt;b&gt;SYNTHETIC&lt;/b&gt;" in page and "<b>SYNTHETIC" not in page
+        assert cache.read_bytes() == before, "the cache is read-only here"
+        # Rendering straight from the runs is the same table (pure seam).
+        from cc_usage_widget.attribution import AttributionStore
+
+        loaded = AttributionStore(path=cache)
+        loaded.load()
+        runs = loaded.workflow_runs(DEFAULT_PRICING, projects_dir=root / "projects")
+        assert "phase: Review" in render_dashboard(
+            None, store, now=NOW, pricing=DEFAULT_PRICING, workflow_runs=runs
+        )
+
+
+# ---------------------------------------------------------------------------
 # 5. The wiring in app.py
 # ---------------------------------------------------------------------------
 

@@ -28,7 +28,10 @@ caller falls back to the plain-text labels it already had.
 from __future__ import annotations
 
 import datetime as dt
+import textwrap
 from typing import Any, Iterable, Sequence
+
+from .contracts import ATTENTION_PCT
 
 # Bars are drawn with block glyphs so they align in any monospaced font and
 # cost nothing to render. Eighth-blocks give sub-cell resolution.
@@ -124,6 +127,11 @@ TITLE_RESET_GLYPH = "↺"
 has no room for "resets in", and the arrow is the shape the account rows
 already use for the same fact."""
 
+TITLE_RESET_NOW = f"{TITLE_RESET_GLYPH}now"
+"""Replaces the ``↺<duration>`` countdown when the ACTIVE Codex account is
+capped and holds a reset credit it can use right now (design wave 2). Four
+characters: the whole :data:`TITLE_RESET_SUFFIX_MAX` budget, never more."""
+
 TITLE_RESET_SUFFIX_MAX = 4
 """Hard ceiling on the width :func:`title_reset_suffix` may add to the title.
 
@@ -195,6 +203,29 @@ def coarse_duration(seconds: float) -> str:
     return "<1m"
 
 
+def wrap_note(text: str, width: int) -> list[str]:
+    """*text* as menu lines of at most *width* characters, cut between words.
+
+    A note that fits comes back as its one line, unchanged. A longer one is
+    wrapped instead of sliced: a slice at *width* cut the SMC-4 cold-429 note
+    mid-sentence and took its remedy (the ``cswap add`` / ``cswap remove``
+    commands) with it. The remedy after the first `` — `` starts its own line,
+    so the statement of what is wrong stays whole on the first.
+    """
+    width = max(1, int(width))
+    if len(text) <= width:
+        return [text]
+    head, dash, rest = text.partition(" — ")
+    parts = [head, f"— {rest}"] if dash else [head]
+    lines: list[str] = []
+    for part in parts:
+        lines.extend(
+            textwrap.wrap(part, width, break_long_words=True, break_on_hyphens=False)
+            or [part[:width]]
+        )
+    return lines
+
+
 def title_reset_suffix(reset_at: float | None, now: float) -> str:
     """``"↺4d"`` for the menu bar, or ``""`` when there is no reported reset.
 
@@ -247,6 +278,47 @@ def fleet_reset_label(reset_at: float | None, now: float) -> str:
     if 0 < days < 7:
         return f"{when:%a} {when:%H:%M}"
     return f"{when:%b} {when.day} {when:%H:%M}"
+
+
+RESET_MARK_OVERDUE = f"{TITLE_RESET_GLYPH} overdue"
+"""A reset instant that has already passed: the window is overdue, not
+reopening at a time we could print (the expired-window vocabulary)."""
+
+
+def reset_mark(reset_at: float | None, now: float) -> str:
+    """``"↺ 14:50"`` / ``"↺ Thu 20:25"`` / ``"↺ Oct 2 10:49"`` — the ONE reset
+    format the glance menu uses on every surface (design wave 2, spec §3).
+
+    Built on :func:`fleet_reset_label`, so a reset reads the same on a row, a
+    section header and a card. ``None`` — a reset the source did not report —
+    is ``""``: the caller omits the note and nothing invents a time (SPEC 4.3).
+    A reset already in the past is :data:`RESET_MARK_OVERDUE`. The time is kept
+    even beyond a week (the brief's example ``↺ Oct 1`` dropped it): a weekly
+    window's hour matters and one formatter serves every surface.
+    """
+    if reset_at is None:
+        return ""
+    if reset_at <= now:
+        return RESET_MARK_OVERDUE
+    label = fleet_reset_label(reset_at, now)
+    return f"{TITLE_RESET_GLYPH} {label}" if label else ""
+
+
+PLAN_LABELS: dict[str, str] = {
+    "pro": "Pro",
+    "self_serve_business_prolite": "Business",
+}
+"""Display names for the plan strings the Codex endpoint has actually been
+seen to send (UX-9). Only OBSERVED values are mapped; any other plan string is
+printed verbatim, because renaming a plan we have never seen would be a guess."""
+
+
+def plan_label(raw: str | None) -> str:
+    """``"pro"`` -> ``"Pro"``, ``"self_serve_business_prolite"`` -> ``"Business"``;
+    anything else verbatim; ``None``/empty -> ``""``."""
+    if not raw:
+        return ""
+    return PLAN_LABELS.get(raw, raw)
 
 
 # --------------------------------------------------------------------------
@@ -315,7 +387,13 @@ def _color(kind: str) -> Any | None:
             return AppKit.NSColor.secondaryLabelColor()
         if kind == "accent":
             return AppKit.NSColor.controlAccentColor()
-        return AppKit.NSColor.systemGreenColor()
+        if kind == "good":
+            # Green is RESERVED for the one positive signal the menu has: a
+            # reset credit that is usable right now (design wave 2). A healthy
+            # percentage is not news, so it draws in the ordinary label colour.
+            return AppKit.NSColor.systemGreenColor()
+        # "ok" and any unknown kind: the label colour, which follows light/dark.
+        return AppKit.NSColor.labelColor()
     except Exception:
         return None
 
@@ -393,6 +471,20 @@ def apply_attributed(menu_item: Any, segments: Iterable[tuple[str, str | None]])
         return False
 
 
+def bar_pct_text(pct: float | None) -> str:
+    """``" 27%"`` — the right-aligned figure beside a bar, ``"  --"`` for None.
+
+    "100%" is reserved for pct >= 100 (same boundary-honesty rule as
+    contracts.format_pct): the engine's at-limit escape can land on a 99.x%
+    account, and a rounded-up 100% here contradicted that switch.
+    """
+    if pct is None:
+        return "  --"
+    if pct < 100 and round(pct) >= 100:
+        return f"{99:>3d}%"
+    return f"{pct:>3.0f}%"
+
+
 def window_line(
     label: str,
     pct: float | None,
@@ -409,6 +501,13 @@ def window_line(
     window gets a ``(!)`` so it reads at a glance even in greyscale — colour
     alone is not an accessible signal.
 
+    The ``(!)`` boundary is :data:`~cc_usage_widget.contracts.ATTENTION_PCT`
+    (100), the one the title, the Switch account submenu and the VoiceOver
+    label already use; until 2026-09-25 this line marked it at
+    :data:`CRIT_PCT` (90), so one account read "at limit" here and fine one
+    row away. The colour still turns red at :data:`CRIT_PCT` — that is the
+    early warning, the marker is the wall.
+
     *expired* means the window's reset instant has already passed
     (``AccountRow.expired_windows``): the figure describes a window that has
     ENDED, so the whole line renders dimmed and the live ``(!)``/severity
@@ -420,16 +519,10 @@ def window_line(
     with itself.
     """
     kind = "dim" if expired else severity(pct)
-    # "100%" is reserved for pct >= 100 (same boundary-honesty rule as
-    # contracts.format_pct): the engine's at-limit escape can land on a
-    # 99.x% account, and a rounded-up 100% here contradicted that switch.
-    if pct is None:
-        pct_text = "  --"
-    elif pct < 100 and round(pct) >= 100:
-        pct_text = f"{99:>3d}%"
-    else:
-        pct_text = f"{pct:>3.0f}%"
-    marker = "  (!)" if kind == "crit" else ""
+    pct_text = bar_pct_text(pct)
+    marker = (
+        "  (!)" if not expired and pct is not None and pct >= ATTENTION_PCT else ""
+    )
     segs: list[tuple[str, str | None]] = [
         (f"   {label:<{label_width}} ", "dim"),
         (bar(pct), kind),
@@ -456,7 +549,14 @@ def account_header(
     is_active: bool,
     age_note: str = "",
 ) -> list[tuple[str, str | None]]:
-    """``1  main (jane@work.com)   · active``"""
+    """``1  main (jane@work.com)   ● active``, ``2  vlad (…)   · 3m old``.
+
+    *age_note* is appended for the active slot too (2026-09-25): the active
+    slot is the one whose ``⚠ relogin`` matters most, and dropping it there
+    left the bars below reading as live. The caller decides what goes in it —
+    the app does not pass a mere staleness age for the active slot, so a
+    healthy active header is byte-for-byte what it was.
+    """
     segs: list[tuple[str, str | None]] = [
         (f"{slot}  ", "dim"),
         (name, "accent" if is_active else None),
@@ -464,7 +564,7 @@ def account_header(
     ]
     if is_active:
         segs.append(("   ● active", "accent"))
-    elif age_note:
+    if age_note:
         segs.append((f"   · {age_note}", "dim"))
     return segs
 
@@ -517,3 +617,337 @@ def quota_header(
     if note:
         segs.append((f"   · {note}", NOTE_KIND_COLORS.get(note_kind, "dim")))
     return segs
+
+
+# --------------------------------------------------------------------------
+# Design wave 2 (2026-09-25): the glance layout's one-line rows, and the
+# guarded native polish. Every builder below is pure string/segment work; every
+# native call is behind hasattr/respondsToSelector_ and falls back to the plain
+# title the caller already set, which is what CI (no window server) exercises.
+# --------------------------------------------------------------------------
+
+ONE_LINE_BAR_WIDTH = 10
+"""Bar cells on a one-line glance row: short enough that name, window, bar,
+figure and reset fit one menu line; the full 18-cell bars stay one submenu
+away (``All Claude bars ▸`` / ``All Codex bars ▸``)."""
+
+
+def account_line(
+    slot: int | str,
+    name: str,
+    *,
+    name_width: int,
+    label: str | None,
+    pct: float | None,
+    reset: str = "",
+    tail: str = "",
+    disabled: bool = False,
+) -> list[tuple[str, str | None]]:
+    """``5  synthetic-slot  7d    █▏░░░░░░░░  11%  ↺ Thu 21:59`` (spec §5.1).
+
+    *label*/*pct* are the BINDING window (the caller's ``_binding_window``); a
+    row with none reports ``no window reported`` dim rather than a bar at 0.
+    The bar and figure carry the severity colour; a ``cswap disable``d row is
+    dim throughout and never carries ``(!)`` — it is out of rotation, so its
+    figure is not a wall the operator is about to hit.
+    """
+    if label is None:
+        return [(f"{slot}  {name}  no window reported{tail}", "dim")]
+    kind = "dim" if disabled else severity(pct)
+    segs: list[tuple[str, str | None]] = [
+        (f"{slot}  ", "dim"),
+        (f"{name:<{name_width}}  ", "dim" if disabled else None),
+        (f"{label:<5} ", "dim"),
+        (bar(pct, ONE_LINE_BAR_WIDTH), kind),
+        (f" {bar_pct_text(pct)}", kind),
+    ]
+    if not disabled and pct is not None and pct >= ATTENTION_PCT:
+        segs.append(("  (!)", "crit"))
+    if reset:
+        segs.append((f"  {reset}", "dim"))
+    if tail:
+        segs.append((tail, "dim"))
+    return segs
+
+
+def quota_line(
+    head: str,
+    *,
+    head_width: int = 0,
+    active: bool = False,
+    label: str | None,
+    pct: float | None = None,
+    reset: str = "",
+    expired: bool = False,
+    note: str = "",
+    note_kind: str = "",
+) -> list[tuple[str, str | None]]:
+    """``vlad (Pro)   weekly █████████▊  97%  ↺ Wed 10:08`` (spec §5.1).
+
+    *head* is ``alias (Plan)``. With no window (*label* ``None``) the row is its
+    one note — the age of a withheld reading, or an ``info`` sentinel — drawn
+    dim with no bar: a sentinel REPLACES a figure, it never sits beside one. An
+    expired window is dim with no ``(!)`` (the window has ended).
+    """
+    segs: list[tuple[str, str | None]] = [
+        (f"{head:<{head_width}}  ", "dim" if label is None else None)
+    ]
+    if active:
+        segs.append(("· active  ", "dim"))
+    if label is None:
+        if note:
+            segs.append((f"· {note}", NOTE_KIND_COLORS.get(note_kind, "dim")))
+        return segs
+    kind = "dim" if expired else severity(pct)
+    segs.extend(
+        [
+            (f"{label} ", "dim"),
+            (bar(pct, ONE_LINE_BAR_WIDTH), kind),
+            (f" {bar_pct_text(pct)}", kind),
+        ]
+    )
+    if not expired and pct is not None and pct >= ATTENTION_PCT:
+        segs.append(("  (!)", "crit"))
+    if reset:
+        segs.append((f"  {reset}", "dim"))
+    return segs
+
+
+def join_title_tokens(tokens: Iterable[Sequence[tuple[str, str | None]]]) -> str:
+    """The plain title a token list spells: runs concatenated, tokens joined by
+    one space, empty tokens dropped. ``render_title`` is exactly this, so the
+    colour pass can never change a character of the title."""
+    words = ("".join(text for text, _kind in token) for token in tokens)
+    return " ".join(word for word in words if word)
+
+
+def title_attributed(tokens: Iterable[Sequence[tuple[str, str | None]]]) -> Any | None:
+    """The status-item title as one NSAttributedString, or ``None``.
+
+    Font: ``NSFont.menuBarFontOfSize_(0)`` on EVERY run (the system menu-bar
+    font, so the advance width is the plain title's). Colour only on runs whose
+    kind is not ``None``/``"ok"``: a healthy figure keeps the bar's own
+    colour, which is what lets the tinted menu bar draw it correctly.
+    """
+    AppKit = _appkit()
+    if AppKit is None:
+        return None
+    try:
+        font = AppKit.NSFont.menuBarFontOfSize_(0.0)
+        out = AppKit.NSMutableAttributedString.alloc().init()
+        base: dict[Any, Any] = {}
+        if font is not None:
+            base[AppKit.NSFontAttributeName] = font
+        first = True
+        for token in tokens:
+            if not "".join(text for text, _kind in token):
+                continue
+            if not first:
+                out.appendAttributedString_(
+                    AppKit.NSAttributedString.alloc().initWithString_attributes_(" ", base)
+                )
+            first = False
+            for text, kind in token:
+                if not text:
+                    continue
+                attrs = dict(base)
+                if kind and kind != "ok":
+                    col = _color(kind)
+                    if col is not None:
+                        attrs[AppKit.NSForegroundColorAttributeName] = col
+                out.appendAttributedString_(
+                    AppKit.NSAttributedString.alloc().initWithString_attributes_(text, attrs)
+                )
+        return out
+    except Exception:
+        return None
+
+
+def title_recolored(
+    plain: Any, tokens: Iterable[Sequence[tuple[str, str | None]]]
+) -> Any | None:
+    """Colour the button's OWN plain title run by run, or ``None``.
+
+    Preferred over :func:`title_attributed`: the status bar draws a plain title
+    at 13 pt with its own paragraph style while ``menuBarFontOfSize_(0)`` and
+    ``button.font()`` both report 14 pt, so a rebuilt string was ~8 pt wider
+    and visibly larger than every other menu-bar item (measured 2026-09-25:
+    fitting width 127 plain vs 135 rebuilt for the same text). Recolouring a
+    mutable copy keeps font, paragraph style and width exactly; only
+    ``NSForegroundColorAttributeName`` changes, on non-``ok`` runs.
+    """
+    AppKit = _appkit()
+    if AppKit is None or plain is None:
+        return None
+    try:
+        tokens = [list(token) for token in tokens]
+        if str(plain.string()) != join_title_tokens(tokens):
+            return None
+        out = plain.mutableCopy()
+        offset = 0  # in UTF-16 units, as NSString ranges are
+        first = True
+        for token in tokens:
+            if not "".join(text for text, _kind in token):
+                continue
+            if not first:
+                offset += 1  # the joining space
+            first = False
+            for text, kind in token:
+                size = len(text.encode("utf-16-le")) // 2
+                if size and kind and kind != "ok":
+                    col = _color(kind)
+                    if col is not None:
+                        out.addAttribute_value_range_(
+                            AppKit.NSForegroundColorAttributeName, col, (offset, size)
+                        )
+                offset += size
+        return out
+    except Exception:
+        return None
+
+
+def _native_item(item: Any) -> Any | None:
+    return getattr(item, "_menuitem", None)
+
+
+def _responds(obj: Any, selector: str) -> bool:
+    try:
+        return bool(obj.respondsToSelector_(selector))
+    except Exception:
+        return False
+
+
+def alert_badge_text(count: int) -> str:
+    """``"1 alert"`` / ``"3 alerts"`` — the words AppKit's
+    ``alertsWithCount_`` draws (probed on macOS 15.8), for the plain title
+    and for the text fallback where the badge API is absent."""
+    return f"{count} alert{'' if count == 1 else 's'}"
+
+
+def set_badge(item: Any, text: str) -> bool:
+    """Put a string ``NSMenuItemBadge`` on *item* (macOS 14+). ``True`` if it took."""
+    AppKit = _appkit()
+    native = _native_item(item)
+    if AppKit is None or native is None or not text:
+        return False
+    badge_cls = getattr(AppKit, "NSMenuItemBadge", None)
+    if badge_cls is None or not _responds(native, "setBadge:"):
+        return False
+    try:
+        native.setBadge_(badge_cls.alloc().initWithString_(text))
+        return True
+    except Exception:
+        return False
+
+
+def set_alert_badge(item: Any, count: int) -> bool:
+    """``NSMenuItemBadge.alertsWithCount_(count)`` on *item*; nothing at 0."""
+    AppKit = _appkit()
+    native = _native_item(item)
+    if AppKit is None or native is None or count <= 0:
+        return False
+    badge_cls = getattr(AppKit, "NSMenuItemBadge", None)
+    factory = getattr(badge_cls, "alertsWithCount_", None) if badge_cls is not None else None
+    if factory is None or not _responds(native, "setBadge:"):
+        return False
+    try:
+        native.setBadge_(factory(int(count)))
+        return True
+    except Exception:
+        return False
+
+
+_SYMBOL_CACHE: dict[tuple[str, str], Any] = {}
+"""SF Symbol images by ``(name, description)``: resolved once per process,
+so a rebuild hands AppKit an existing NSImage instead of loading a symbol."""
+
+
+def set_symbol(item: Any, name: str, description: str) -> bool:
+    """A 16 pt SF Symbol image on *item*. ``True`` if it took."""
+    AppKit = _appkit()
+    native = _native_item(item)
+    if AppKit is None or native is None:
+        return False
+    key = (name, description)
+    image = _SYMBOL_CACHE.get(key)
+    if image is None:
+        getter = getattr(AppKit.NSImage, "imageWithSystemSymbolName_accessibilityDescription_", None)
+        if getter is None:
+            return False
+        try:
+            image = getter(name, description)
+            if image is None:
+                return False
+            image.setSize_(AppKit.NSMakeSize(16.0, 16.0))
+        except Exception:
+            return False
+        _SYMBOL_CACHE[key] = image
+    try:
+        native.setImage_(image)
+        return True
+    except Exception:
+        return False
+
+
+def set_tooltip(item: Any, text: str) -> bool:
+    """``NSMenuItem.setToolTip_`` on *item*. ``True`` if it took."""
+    native = _native_item(item)
+    if native is None or not text or not _responds(native, "setToolTip:"):
+        return False
+    try:
+        native.setToolTip_(text)
+        return True
+    except Exception:
+        return False
+
+
+try:  # rumps is the app's own dependency; render must still import without it
+    import rumps as _rumps
+except Exception:  # pragma: no cover - a host without rumps never builds menus
+    _rumps = None
+
+
+if _rumps is not None:
+
+    class _SectionHeader(_rumps.MenuItem):  # type: ignore[misc, name-defined]
+        """A ``rumps.MenuItem`` whose NSMenuItem is a native section header.
+
+        rumps' own ``SeparatorMenuItem`` pattern: build the ordinary item, then
+        swap ``_menuitem`` for ``NSMenuItem.sectionHeaderWithTitle_`` (macOS
+        14+). ``title`` still reads the native item, so ``_dedupe_titles`` and
+        the menu's title keys work unchanged. Without the selector — macOS 13,
+        or any exception — the item stays the greyed ``_info``-style line it
+        was built as, which is the plain-text fallback.
+        """
+
+        def __init__(self, title: str) -> None:
+            super().__init__(title, callback=None)
+            AppKit = _appkit()
+            factory = (
+                getattr(AppKit.NSMenuItem, "sectionHeaderWithTitle_", None)
+                if AppKit is not None
+                else None
+            )
+            if factory is None:
+                return
+            try:
+                native = factory(title)
+            except Exception:
+                return
+            if native is None:
+                return
+            self._menuitem = native
+            try:
+                self.set_callback(None)  # register the swapped item with rumps
+            except Exception:
+                pass
+
+
+def section_header(title: str) -> Any:
+    """A section header item (native on macOS 14+, a greyed line otherwise)."""
+    if _rumps is None:  # pragma: no cover
+        return None
+    try:
+        return _SectionHeader(title)
+    except Exception:
+        return _rumps.MenuItem(title, callback=None)

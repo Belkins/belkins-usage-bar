@@ -21,33 +21,49 @@
 # a new source file that is genuinely missing fails the check below loudly.
 #
 # Usage:  ./package.sh [version]        (default: 1.0.0)
+#         ./package.sh --dry-run        print the file list and run the checks;
+#                                       build nothing
 
 set -euo pipefail
 
 cd "$(dirname "$0")"
+DRY_RUN=0
+if [ "${1:-}" = "--dry-run" ]; then
+  DRY_RUN=1
+  shift
+fi
 VERSION="${1:-1.0.0}"
 NAME="cc-usage-widget-${VERSION}"
 OUT="dist/${NAME}.zip"
 
 # --- the allowlist ---------------------------------------------------------
-FILES=(
-  cc_usage_widget/__init__.py
-  cc_usage_widget/__main__.py
-  cc_usage_widget/accounts.py
-  cc_usage_widget/app.py
-  cc_usage_widget/codex_indexer.py
-  cc_usage_widget/contracts.py
-  cc_usage_widget/indexer.py
-  cc_usage_widget/pricing.py
-  cc_usage_widget/render.py
-  cc_usage_widget/rollup.py
-  cc_usage_widget/state.py
-  tests/test_codex.py
-  tests/test_privacy.py
-  tests/test_cost_math.py
-  tests/test_regressions.py
-  SPEC.md
-  SPEC-CODEX.md
+# The code half is DERIVED: every tracked .py in the package and in tests/.
+# A hand-kept list went stale (it had 11 of 20 modules - codex_accounts.py,
+# codex_login.py, fleet.py and the rest were missing, so the check below
+# refused every build) and a new module is the one thing it must never miss.
+# Outside a git checkout (an unpacked release) the .py files on disk are the
+# list. Runtime state never lives under these two directories.
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  CODE="$(git ls-files -- 'cc_usage_widget/*.py' 'tests/*.py')"
+else
+  CODE="$(find cc_usage_widget tests -name '*.py' -not -path '*__pycache__*' | sort)"
+fi
+[ -n "$CODE" ] || { echo "no source files found - wrong directory?" >&2; exit 1; }
+FILES=()
+while IFS= read -r file; do
+  FILES+=("$file")
+done <<<"$CODE"
+# The documents and scripts stay an explicit list. The SPECs sit at the root
+# here and under docs/ in the public repository (REPO-PLAN §2); take whichever
+# exists, and let the absence check below name the root path when neither does.
+for spec in SPEC.md SPEC-CODEX.md; do
+  if [ ! -f "$spec" ] && [ -f "docs/$spec" ]; then
+    FILES+=("docs/$spec")
+  else
+    FILES+=("$spec")
+  fi
+done
+FILES+=(
   README.md
   CHANGELOG.md
   CONTRIBUTING.md
@@ -57,7 +73,8 @@ FILES=(
   package.sh
 )
 
-# Every .py under cc_usage_widget/ must be listed, or a new module ships broken.
+# Every .py under cc_usage_widget/ and tests/ must be listed: an untracked new
+# module would otherwise ship broken, so it fails here until it is committed.
 missing=0
 while IFS= read -r found; do
   case " ${FILES[*]} " in
@@ -70,6 +87,12 @@ done < <(find cc_usage_widget tests -name '*.py' -not -path '*__pycache__*' | so
 for file in "${FILES[@]}"; do
   [ -f "$file" ] || { echo "allowlisted but absent: ${file}" >&2; exit 1; }
 done
+
+if [ "$DRY_RUN" = 1 ]; then
+  printf '%s\n' "${FILES[@]}"
+  echo "dry run: ${#FILES[@]} files would go into ${OUT}; nothing written" >&2
+  exit 0
+fi
 
 # The archive must contain ONE top-level directory. Zipping from *inside* the
 # staging dir (`cd dist/$NAME && zip -r ../x.zip .`) flattens it, so `unzip`

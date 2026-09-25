@@ -1119,20 +1119,31 @@ class CodexIndexer:
             self._states_dirty = False
 
     def _atomic_write_json(self, path: str, payload: Any) -> bool:
-        """Temp file + ``os.replace``. Never raises; returns success."""
+        """Temp file + ``os.replace``; returns success.
+
+        Bytes first (OPS-2): serialise before the tmp exists, then one write,
+        so a failure mid-serialisation cannot leave a truncated
+        ``<path>.tmp.<pid>`` behind. Never raises on an I/O failure (returns
+        False and the dirty flag survives); anything else - an unserialisable
+        payload, ``KeyboardInterrupt``/``SystemExit`` mid-write - unlinks the
+        tmp and propagates, like ``rollup._atomic_write_json``.
+        """
+        text = json.dumps(payload, separators=(",", ":"))
         tmp = f"{path}.tmp.{os.getpid()}"
         try:
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
             with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(payload, fh, separators=(",", ":"))
+                fh.write(text)
             os.replace(tmp, path)
             return True
-        except OSError:
+        except BaseException as exc:
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
-            return False
+            if isinstance(exc, OSError):
+                return False
+            raise
 
     # -- quota sidecar --------------------------------------------------
 

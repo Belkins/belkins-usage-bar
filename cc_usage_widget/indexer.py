@@ -353,6 +353,36 @@ def _local_midnight_epoch(day: dt.date) -> float:
     return dt.datetime.combine(day, dt.time.min).timestamp()
 
 
+def _write_json_atomic(path: str, payload: Any) -> bool:
+    """Serialise, then ONE write to ``<path>.tmp.<pid>`` + ``os.replace``.
+
+    Bytes first (OPS-2, 2026-09-25): ``json.dump`` streamed into an open tmp,
+    so a failure mid-serialisation - or a kill mid-stream - left a truncated
+    ``*.tmp.<pid>`` behind (one was 49,245 bytes, stamped to the second of a
+    SIGTERM). Serialising before the file exists shrinks the window to one
+    ``write``; any exception after it unlinks the tmp, like
+    ``rollup._atomic_write_json``. Returns False on an I/O failure (the caller
+    keeps its dirty flag and retries); anything else - an unserialisable
+    payload, ``KeyboardInterrupt``/``SystemExit`` mid-write - propagates.
+    """
+    text = json.dumps(payload, separators=(",", ":"))
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+        return True
+    except BaseException as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        if isinstance(exc, OSError):
+            return False
+        raise
+
+
 class Indexer:
     """Incremental ``**/*.jsonl`` scanner implementing ``TranscriptIndexer``.
 
@@ -442,11 +472,13 @@ class Indexer:
         self._dedup_loaded = False
         self._dedup_path = f"{os.path.splitext(self._state_path)[0]}_dedup.json"
         """Sidecar holding the *current local day's* dedup counters. Written by
-        :meth:`flush_dedup` at shutdown and read once at startup, so a graceful
-        restart in the middle of a request's streaming snapshots still credits
-        only the growth of the later snapshot. It is deliberately NOT written per
-        tick: it is worth nothing to the steady-state budget and everything to a
-        clean restart."""
+        :meth:`flush_dedup` after every offsets commit that landed and at
+        shutdown, replaced atomically, and read once at startup, so a restart in
+        the middle of a request's streaming snapshots still credits only the
+        growth of the later snapshot. While the shutdown flush was its only
+        writer it sat on 2026-09-18 for a week (a quit that overruns launchd's
+        exit timeout never gets there). A tick that commits nothing writes
+        nothing, so the steady idle budget is unchanged."""
 
         # Dedup snapshots belonging to a file whose read was cut short. Keyed by
         # path so a RESUMED read sees the requests the earlier chunk already
@@ -785,7 +817,7 @@ class Indexer:
         self._ensure_states_loaded()
         return not self._states_at_load
 
-    def commit_state(self) -> None:
+    def commit_state(self) -> bool:
         """Persist the advanced offsets (SPEC 3.2 step 8).
 
         Only needed when the indexer was built with ``defer_state_commit=True``:
@@ -793,11 +825,16 @@ class Indexer:
         :meth:`scan_once` are durable, so a crash can only ever cost a re-read
         (harmless) instead of consumed-but-unmerged bytes (a silent, permanent
         undercount that survives restarts).
+
+        Returns True only when this call durably wrote advanced offsets. The
+        owner keys the dedup sidecar on it (drift-1): the sidecar is persisted
+        right after a commit that landed, and a tick that advanced nothing pays
+        for neither file.
         """
         with self._scan_lock:
-            self._save_states()
+            return self._save_states()
 
-    def _save_states(self) -> None:
+    def _save_states(self) -> bool:
         """Persist the scan state atomically (SPEC 3.2 step 8).
 
         ``fsync`` is intentionally skipped: ``os.replace`` already gives readers
@@ -808,7 +845,7 @@ class Indexer:
         the SPEC 2.1 tick budget.
         """
         if not self._states_dirty:
-            return
+            return False
         payload = scan_state_to_json(self._states)
         if self._state_saver is not None:
             # Clear the dirty flag ONLY on a durable write. The saver returns
@@ -822,19 +859,12 @@ class Indexer:
             # ``is not False`` keeps a saver that returns None working.
             if self._state_saver(payload) is not False:
                 self._states_dirty = False
-            return
-        tmp = f"{self._state_path}.tmp.{os.getpid()}"
-        try:
-            os.makedirs(os.path.dirname(self._state_path) or ".", exist_ok=True)
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(payload, fh, separators=(",", ":"))
-            os.replace(tmp, self._state_path)
+                return True
+            return False
+        if _write_json_atomic(self._state_path, payload):
             self._states_dirty = False
-        except OSError:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+            return True
+        return False
 
     # -- dedup sidecar --------------------------------------------------
 
@@ -899,14 +929,17 @@ class Indexer:
         return day, out, owners
 
     def flush_dedup(self) -> None:
-        """Persist the current day's dedup counters (call at shutdown).
+        """Persist the current day's dedup counters.
 
         Complements the per-file offsets: the offsets say "these bytes are
         consumed", and this says "and these requests were credited these
         amounts". Without it, a restart landing between two streaming snapshots
         of one request credits the later snapshot **whole** instead of only its
-        growth. Never raises - losing this file costs at most one over-credited
-        in-flight request.
+        growth. The owner calls it after every offsets commit that landed and
+        once more at shutdown (drift-1), so the sidecar is never older than the
+        offsets it pairs with. Never raises on an I/O failure - losing this
+        file costs at most one over-credited in-flight request; an
+        unserialisable map is a bug and propagates (with its tmp removed).
         """
         day = self._dedup_day
         if day is None:
@@ -917,26 +950,10 @@ class Indexer:
         owners = {
             path: sorted(ids) for path, ids in self._dedup_owners.items() if ids
         }
-        tmp = f"{self._dedup_path}.tmp.{os.getpid()}"
-        try:
-            os.makedirs(os.path.dirname(self._dedup_path) or ".", exist_ok=True)
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(
-                    {
-                        "v": _DEDUP_SCHEMA,
-                        "day": day,
-                        "requests": usage,
-                        "owners": owners,
-                    },
-                    fh,
-                    separators=(",", ":"),
-                )
-            os.replace(tmp, self._dedup_path)
-        except OSError:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+        _write_json_atomic(
+            self._dedup_path,
+            {"v": _DEDUP_SCHEMA, "day": day, "requests": usage, "owners": owners},
+        )
 
     def _forget_dedup_for_path(self, path: str) -> None:
         """Un-credit everything *path* contributed to today's dedup state.

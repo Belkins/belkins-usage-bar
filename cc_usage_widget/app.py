@@ -70,7 +70,7 @@ import threading
 import time
 import traceback
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Final, Iterator, Sequence
+from typing import Any, Callable, Final, Iterator, NamedTuple, Sequence
 
 import rumps
 
@@ -79,6 +79,7 @@ from .contracts import (
     ALERT_ACCOUNT_QUARANTINED,
     ALERT_ALL_EXHAUSTED,
     ALERT_EXTERNAL_SWITCH,
+    ALERT_GHOST_FLIP,
     ALERT_NO_TARGET,
     ATTENTION_PCT,
     CODEX_SCAN_STATE_PATH,
@@ -128,6 +129,18 @@ except Exception:  # pragma: no cover - codex_accounts is optional at import tim
     def _pricing_tier_note(settings: Any = None) -> str:
         """No module, no claim about a tier: the heading keeps its old shape."""
         return ""
+
+
+try:  # UX-5: the one "best Codex account" ranking, shared with `codex_accounts best`
+    from .codex_accounts import best_codex_row
+except Exception:  # pragma: no cover - codex_accounts is optional at import time
+    best_codex_row = None  # type: ignore[assignment]
+
+
+try:  # CX-5/CX-7b: Codex relogin UX, optional the same way
+    from . import codex_login as _codex_login
+except Exception:  # pragma: no cover - codex_login is optional at import time
+    _codex_login = None  # type: ignore[assignment]
 
 
 __all__ = [
@@ -224,7 +237,18 @@ _TITLE_TOGGLES = (
     # have named a number the title no longer shows.
     ("title_show_codex_pct", "Active Codex account %"),
     ("title_show_fleet", "Fleet headroom (when at limit)"),
+    # Design wave 2. The merge NARROWS the title (C⚠ + ⚠ -> one ⚠N); the
+    # credit marker is listed only where Codex exists (see `_settings_submenu`).
+    ("title_merge_alerts", "Merge alerts into ⚠N"),
+    ("title_show_reset_credit", "Reset-credit marker (↺now)"),
 )
+
+_VENDOR_TITLE_TOGGLES = ("title_show_codex_pct", "title_show_reset_credit")
+"""Title toggles that only mean something where a Codex source exists."""
+
+_CLASSIC_LAYOUT_LABEL = "Classic menu layout"
+"""Settings item for ``menu_layout_classic`` (design wave 2): the rollback to
+today's menu order, wording and ``resets …`` format."""
 
 _COMPACT_TITLE_LABEL = "Compact (V\u00b7C 100/100)"
 """The Title submenu's name for ``title_compact``.
@@ -306,6 +330,9 @@ first version of the export shipped calling them from the worker). So the
 worker parks ``(action, path)`` and the AppKit thread's own repaint tick makes
 the call - the same shape as ``_publish``, which hands a snapshot back rather
 than painting from the worker."""
+
+_DESKTOP_TERMINAL = "terminal"  # CX-5: a codex_login .command, opened in Terminal
+_CMD_CODEX_LOGIN = "codex_login"  # CX-5: payload = account_id | None
 
 
 def _log(message: str) -> None:
@@ -553,6 +580,27 @@ def _autoswitch_threshold_of(source: Any) -> float | None:  # W4
     return float(value) if isinstance(value, (int, float)) else None
 
 
+def _autoswitch_models_of(source: Any) -> tuple[str, ...]:  # UX-1b
+    """The adapter's CACHED ``autoswitch.models``, or ``()``.
+
+    Sibling of :func:`_autoswitch_threshold_of` and cached for the same reason
+    (no per-tick policy read, SPEC 2.1). ``()`` — an adapter without the
+    accessor, a policy not read yet, a policy naming no models — means the
+    engine binds on max(5h, 7d), which is exactly what
+    :func:`_binding_window` does with an empty tuple.
+    """
+    getter = getattr(source, "cached_autoswitch_models", None)
+    if not callable(getter):
+        return ()
+    try:
+        value = getter()
+    except Exception:
+        return ()
+    if not isinstance(value, (tuple, list)):
+        return ()
+    return tuple(str(name) for name in value if isinstance(name, str) and name)
+
+
 def _title_note(note: str, kind: str = "") -> str:
     """Menu-bar form of a derived-usage state: short, unmistakably not a pct.
 
@@ -561,6 +609,10 @@ def _title_note(note: str, kind: str = "") -> str:
     long human sentence; matching it meant a wording change there silently
     demoted a re-login warning to a generic bucket (2026-08-26).
     """
+    if kind == "fetch-failing":  # accounts.FETCH_FAILING_KIND (swap-1)
+        # The HTTP status IS the short form ("⚠ 403"); the note carries it.
+        code = re.search(r"HTTP (\d{3})", note)
+        return f"⚠ {code.group(1)}" if code else "⚠ fetch"
     low = (kind or note).lower()
     if "re-login" in low or "relogin" in low:
         return "⚠ relogin"
@@ -583,6 +635,8 @@ def _title_alert(kind: str) -> str:
         return "⚠ quarantine"
     if kind == ALERT_EXTERNAL_SWITCH:
         return "⚠ ext"
+    if kind == ALERT_GHOST_FLIP:
+        return "⚠ ghost"
     if kind == ALERT_NO_TARGET:
         return "⚠ no target"
     return "⚠ autoswitch"
@@ -698,6 +752,13 @@ class UiSnapshot:
     fallback decides only how a count is bucketed, never what a percentage
     says; when it is in force the count may bucket differently from a policy
     the widget has not read.
+    """
+    autoswitch_models: tuple[str, ...] = ()  # UX-1b
+    """claude-swap's ``autoswitch.models`` (scoped windows the engine binds on).
+
+    From ``SwapAccountSource.cached_autoswitch_models`` — the same cached
+    policy the threshold comes from. ``()`` means the engine binds on
+    max(5h, 7d); see :func:`_binding_window`.
     """
     sessions: tuple[fleet.SessionRow, ...] = ()  # W3
     """Live Claude Code instances and the account each one is spending.
@@ -825,12 +886,18 @@ def _primary_reset(row: AccountRow) -> str | None:
     return None
 
 
-def _reset_note(row: AccountRow, window: str) -> str:
+def _reset_note(
+    row: AccountRow, window: str, style: str = "classic", now: float | None = None
+) -> str:
     """The reset string for one window, verbatim, prefixed ``resets``.
 
     *window* is ``"five_hour"``, ``"seven_day"``, or a scoped window's reported
     name (e.g. ``"Fable"``). Empty string when the API reported no reset for it —
     the row simply omits the note rather than inventing a time (SPEC 4.3).
+
+    *style* ``"mark"`` (the glance layout, design wave 2) re-expresses the same
+    instant as :func:`_reset_mark_text` (``↺ 14:50``); ``"classic"`` is today's
+    ``resets 14:50``, byte for byte.
     """
     if window == "five_hour":
         raw = row.five_hour_resets_at
@@ -838,29 +905,216 @@ def _reset_note(row: AccountRow, window: str) -> str:
         raw = row.seven_day_resets_at
     else:
         raw = next((r for name, r in row.scoped_resets_at if name == window), None)
+    if style == "mark":
+        return _reset_mark_text(raw, now)
     return f"resets {raw}" if raw else ""
 
 
-def _account_row_label(row: AccountRow, name_width: int = 10) -> str:
+def _reset_mark_text(raw: str | None, now: float | None = None) -> str:
+    """A claude-swap reset string as the glance layout's one reset mark.
+
+    ``"14:50"`` -> ``"↺ 14:50"``, ``"Sep 26 13:59"`` -> ``"↺ Sat 13:59"``
+    (design wave 2, spec §3). The instant is upstream's, read back by
+    :func:`_reset_clock_epoch` and printed by :func:`render.reset_mark` — the
+    same re-expression precedent :func:`_scoped_fleet_heading` uses; only the
+    spelling changes. A string the parser rejects is printed verbatim after the
+    glyph (``"↺ soon"``) rather than guessed at; empty is ``""`` (SPEC 4.3).
+    """
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    when = time.time() if now is None else now
+    epoch = _reset_clock_epoch(text, when)
+    if epoch is None:
+        return f"{render.TITLE_RESET_GLYPH} {text}"
+    return render.reset_mark(epoch, when)
+
+
+plan_label = render.plan_label
+"""``pro`` -> ``Pro``, ``self_serve_business_prolite`` -> ``Business``, any
+other plan verbatim (UX-9). Lives in :mod:`render` beside the other pure
+display maps; re-exported here, where the menu builders use it."""
+
+
+_WINDOW_KEYS: Final[dict[str, str]] = {"5h": "five_hour", "7d": "seven_day"}
+"""Display label -> the key ``pace_ahead``/``expired_windows`` use. A scoped
+window's key is its reported name, so it maps to itself (``.get(n, n)``)."""
+
+
+def _binding_window(
+    row: AccountRow | None, models: Sequence[str] = ()
+) -> tuple[str, float] | None:  # UX-1b
+    """``(label, pct)`` of the window the autoswitch engine binds *row* on.
+
+    A mirror of ``claude_swap.oauth.relevant_windows`` + max — the engine's
+    single canonical window source: always the 5-hour (``"5h"``) and 7-day
+    (``"7d"``) windows, plus every scoped window *models* names (matched
+    case-insensitively; ``"all"`` names every one). ``models == ()`` is
+    max(5h, 7d). The highest reported one binds; the 5-hour window wins a tie,
+    so a 5h-bound title renders exactly as it did before this existed.
+    A window in ``row.expired_windows`` never binds: its reset already passed,
+    so its figure describes a window that has ENDED (2026-09-25: a slot's
+    Sep 12 ``5h 88%`` would otherwise hold the title at the wall and cost the
+    fleet a room). ``None`` when the row reports none of them live.
+    """
+    if row is None:
+        return None
+    dead = set(getattr(row, "expired_windows", ()) or ())
+    windows: list[tuple[str, float]] = []
+    for label, pct in (("5h", row.five_hour_pct), ("7d", row.seven_day_pct)):
+        if pct is not None and _WINDOW_KEYS[label] not in dead:
+            windows.append((label, float(pct)))
+    if models:
+        wanted = {str(name).lower() for name in models}
+        match_all = "all" in wanted
+        for name, pct in row.scoped_windows:
+            if pct is None or name in dead:
+                continue
+            if match_all or name.lower() in wanted:
+                windows.append((name, float(pct)))
+    if not windows:
+        return None
+    best = windows[0]
+    for window in windows[1:]:
+        if window[1] > best[1]:
+            best = window
+    return best
+
+
+def _window_reset(row: AccountRow, label: str) -> str | None:
+    """The verbatim reset string for one window, by its display label."""
+    if label == "5h":
+        return row.five_hour_resets_at
+    if label == "7d":
+        return row.seven_day_resets_at
+    return next((r for name, r in row.scoped_resets_at if name == label), None)
+
+
+def _account_status_note(row: AccountRow, note: str = "", note_kind: str = "") -> str:
+    """``⚠ relogin · last seen 3d ago`` / ``disabled`` / ``""`` (UX-2, UX-4).
+
+    The account header's short statement of why this slot is not an ordinary
+    one. A derived-usage note is shown in :func:`_title_note`'s short form —
+    the full remedy prose lives once, in the top alert line — followed by the
+    age of the read the bars come from, in claude-swap's own ``last seen …
+    ago`` wording (``switcher.last_seen_note``). A ``cswap disable``d slot
+    says so. Empty for every other row, which keeps them byte-for-byte.
+    """
+    parts: list[str] = []
+    if note:
+        parts.append(_title_note(note, note_kind))
+        if row.usage_age_seconds is not None:
+            parts.append(f"last seen {_age_label(row.usage_age_seconds)} ago")
+    if getattr(row, "disabled", False):
+        parts.append("disabled")
+    return " · ".join(parts)
+
+
+def _money(amount: float, currency: str | None) -> str:
+    """``$480.00`` for USD; any other currency is printed VERBATIM as a code
+    after the figure (``10.50 EUR``) — never a ``$`` we were not given."""
+    code = (currency or "").strip()
+    if code.upper() == "USD":
+        return f"${amount:,.2f}"
+    return f"{amount:,.2f} {code}".rstrip()
+
+
+def _spend_of(row: AccountRow) -> tuple[float, float, str | None] | None:
+    """``(used, limit, currency)`` of the row's extra-usage spend, or ``None``.
+
+    Read with ``getattr`` because ``AccountRow.spend_*`` is added by the
+    adapter lane (F2a); a row without them, or with no limit, has no line.
+    """
+    used = getattr(row, "spend_used", None)
+    limit = getattr(row, "spend_limit", None)
+    if isinstance(used, bool) or isinstance(limit, bool):
+        return None
+    if not isinstance(used, (int, float)) or not isinstance(limit, (int, float)):
+        return None
+    currency = getattr(row, "spend_currency", None)
+    return float(used), float(limit), currency if isinstance(currency, str) else None
+
+
+def _spend_pct(row: AccountRow) -> float | None:
+    pct = getattr(row, "spend_pct", None)
+    return float(pct) if isinstance(pct, (int, float)) and not isinstance(pct, bool) else None
+
+
+def _spend_reset_label(raw: Any) -> str:
+    """The extra-usage reset as a local clock, or the string verbatim.
+
+    An ISO instant is re-expressed the way claude-swap renders every other
+    reset (``reset_clock_string``: ``20:39`` same-day, else ``Jul 5 08:59``);
+    anything else is printed as given (SPEC 4.3)."""
+    if not isinstance(raw, str) or not raw.strip():
+        return ""
+    text = raw.strip()
+    try:
+        when = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text
+    if when.tzinfo is None:
+        return text
+    try:
+        local = when.astimezone()
+        today = dt.datetime.now().astimezone().date()
+    except (OSError, OverflowError, ValueError):  # pragma: no cover
+        return text
+    if local.date() == today:
+        return local.strftime("%H:%M")
+    return f"{local:%b} {local.day} {local:%H:%M}"
+
+
+def _account_row_label(
+    row: AccountRow,
+    name_width: int = 10,
+    *,
+    status: str = "",
+    noted: bool = False,
+    reset_style: str = "classic",
+    now: float | None = None,
+) -> str:
     """One account line (SPEC 4.2).
 
     ``2 vlad       5h  19% - 7d 33% - Fable  65%  resets 14:20``
 
     Every scoped window the API reported is rendered, in order; nothing
     hardcodes that there is exactly one (contract note on ``scoped_windows``).
+
+    This is the plain title VoiceOver reads, so it says what the attributed
+    block draws: an expired window and every window of a *noted* slot carry
+    no ``(!)`` (their bars are dim), the extra-usage spend is appended, and
+    *status* (:func:`_account_status_note`) closes the line — for a noted slot
+    it carries the age, so the ``(usage … old)`` suffix is not repeated.
     """
+    expired = set(getattr(row, "expired_windows", ()) or ())
+
+    def _mark(key: str, pct: float | None) -> str:
+        return "" if noted or key in expired else _attention(pct)
+
     windows = [
-        f"5h {format_pct(row.five_hour_pct):>4}{_attention(row.five_hour_pct)}",
-        f"7d {format_pct(row.seven_day_pct):>4}{_attention(row.seven_day_pct)}",
+        f"5h {format_pct(row.five_hour_pct):>4}{_mark('five_hour', row.five_hour_pct)}",
+        f"7d {format_pct(row.seven_day_pct):>4}{_mark('seven_day', row.seven_day_pct)}",
     ]
     for name, pct in row.scoped_windows:
-        windows.append(f"{name} {format_pct(pct):>4}{_attention(pct)}")
+        windows.append(f"{name} {format_pct(pct):>4}{_mark(name, pct)}")
     label = f"{row.slot} {_display_name(row):<{name_width}} " + "  · ".join(windows)
     reset = _primary_reset(row)
     if reset:
-        label = f"{label}  resets {reset}"
-    if row.usage_is_stale:
+        if reset_style == "mark":
+            label = f"{label}  {_reset_mark_text(reset, now)}"
+        else:
+            label = f"{label}  resets {reset}"
+    if row.usage_is_stale and not noted:
         label = f"{label}  (usage {_age_label(row.usage_age_seconds)} old)"
+    spend = _spend_of(row)
+    if spend is not None:
+        used, limit, currency = spend
+        pct = _spend_pct(row)
+        tail = f" {format_pct(pct)}" if pct is not None else ""
+        label = f"{label}  · extra {_money(used, currency)} / {_money(limit, currency)}{tail}"
+    if status:
+        label = f"{label}  {status}"
     return label
 
 
@@ -898,10 +1152,14 @@ def _switch_targets(accounts: Sequence[AccountRow]) -> tuple[AccountRow, ...]:
         if not row.is_active and getattr(row, "switchable", True)
     ]
 
-    def _key(row: AccountRow) -> tuple[bool, float, bool, float, int]:
+    # A `cswap disable`d slot sorts LAST (UX-2, 2026-09-25): its windows read
+    # emptiest precisely because the engine never uses it, so ranking it on
+    # headroom put it at the top of the list. It stays a valid explicit target.
+    def _key(row: AccountRow) -> tuple[bool, bool, float, bool, float, int]:
         worst = row.max_pct
         five = row.five_hour_pct
         return (
+            bool(getattr(row, "disabled", False)),
             worst is None,
             worst if worst is not None else 0.0,
             five is None,
@@ -912,7 +1170,13 @@ def _switch_targets(accounts: Sequence[AccountRow]) -> tuple[AccountRow, ...]:
     return tuple(sorted(targets, key=_key))
 
 
-def _switch_target_label(row: AccountRow, name_width: int = 8) -> str:
+def _switch_target_label(
+    row: AccountRow,
+    name_width: int = 8,
+    *,
+    reset_style: str = "classic",
+    now: float | None = None,
+) -> str:
     """``"3 podol    5h 100% (!) ↺00:00 · 7d 20% · Fable 40% (at limit)"``.
 
     Before switch-ux this row carried the 5-hour percentage alone, so on a
@@ -935,7 +1199,10 @@ def _switch_target_label(row: AccountRow, name_width: int = 8) -> str:
     """
     five = f"5h {format_pct(row.five_hour_pct)}{_attention(row.five_hour_pct)}"
     if row.five_hour_resets_at:
-        five = f"{five} ↺{row.five_hour_resets_at}"
+        if reset_style == "mark":
+            five = f"{five} {_reset_mark_text(row.five_hour_resets_at, now)}"
+        else:
+            five = f"{five} ↺{row.five_hour_resets_at}"
     windows = [five, f"7d {format_pct(row.seven_day_pct)}{_attention(row.seven_day_pct)}"]
     windows.extend(
         f"{name} {format_pct(pct)}{_attention(pct)}" for name, pct in row.scoped_windows
@@ -945,6 +1212,9 @@ def _switch_target_label(row: AccountRow, name_width: int = 8) -> str:
         label = f"{label} (at limit)"
     if row.usage_is_stale:
         label = f"{label}  (usage {_age_label(row.usage_age_seconds)} old)"
+    if getattr(row, "disabled", False):
+        # Out of auto-rotation (`cswap disable`); still clickable by design.
+        label = f"{label}  (disabled)"
     return label
 
 
@@ -1087,7 +1357,9 @@ def _vendor_group_label(name: str, usd: float) -> str:
     return f"{left}{format_usd(usd):>10}"
 
 
-def _quota_windows(row: AccountRow) -> list[tuple[str, float | None, str, bool]]:
+def _quota_windows(
+    row: AccountRow, *, reset_style: str = "classic", now: float | None = None
+) -> list[tuple[str, float | None, str, bool]]:
     """``(label, pct, reset note, expired)`` for every window a quota row reports.
 
     ``expired`` is True when the source marked the window's reset instant as
@@ -1114,21 +1386,25 @@ def _quota_windows(row: AccountRow) -> list[tuple[str, float | None, str, bool]]
     """
     minutes = getattr(row, "window_minutes", None)
     dead = getattr(row, "expired_windows", ()) or ()
+
+    def _note(key: str) -> str:
+        if reset_style == "mark" and key in dead:
+            # The source's note for an ended window is ``overdue (<clock>)``;
+            # the glance layout's one word for it is ``↺ overdue``.
+            return render.RESET_MARK_OVERDUE
+        return _reset_note(row, key, reset_style, now)
+
     windows: list[tuple[str, float | None, str, bool]] = []
     if row.five_hour_pct is not None:
         label = render.window_minutes_label(FIVE_HOUR_WINDOW_MINUTES) or "5h"
-        windows.append(
-            (label, row.five_hour_pct, _reset_note(row, "five_hour"), "five_hour" in dead)
-        )
+        windows.append((label, row.five_hour_pct, _note("five_hour"), "five_hour" in dead))
     if row.seven_day_pct is not None:
         width = minutes if minutes else CODEX_WINDOW_MINUTES_WEEKLY
         label = render.window_minutes_label(width) or "7d"
-        windows.append(
-            (label, row.seven_day_pct, _reset_note(row, "seven_day"), "seven_day" in dead)
-        )
+        windows.append((label, row.seven_day_pct, _note("seven_day"), "seven_day" in dead))
     for name, pct in row.scoped_windows:
         if pct is not None:
-            windows.append((name, pct, _reset_note(row, name), name in dead))
+            windows.append((name, pct, _note(name), name in dead))
     return windows
 
 
@@ -1186,7 +1462,13 @@ def _quota_alarm(row: AccountRow) -> bool:
     return not _quota_windows(row)
 
 
-def _quota_row_label(row: AccountRow) -> str:
+def _quota_row_label(
+    row: AccountRow,
+    *,
+    reset_style: str = "classic",
+    plan_style: str = "raw",
+    now: float | None = None,
+) -> str:
     """One-line plain fallback for a quota block.
 
     ``Codex (pro)   weekly  12%  resets Aug 21 14:00``
@@ -1198,8 +1480,9 @@ def _quota_row_label(row: AccountRow) -> str:
     the only content there is (SPEC-CODEX 6).
     """
     head = row.alias or vendor_label(row.vendor)
-    if row.plan_type:
-        head = f"{head} ({row.plan_type})"
+    plan = plan_label(row.plan_type) if plan_style == "label" else row.plan_type
+    if plan:
+        head = f"{head} ({plan})"
     if row.is_active:
         # Same wording as the attributed header (`render.quota_header`), so the
         # fallback and the bar block cannot disagree about which login is live.
@@ -1213,7 +1496,11 @@ def _quota_row_label(row: AccountRow) -> str:
     ]
     text = f"{head}   " + "  · ".join(parts) if parts else head
     reset = _primary_reset(row)
-    if reset:
+    if reset_style == "mark":
+        mark = _quota_reset_mark(row, now)
+        if mark:
+            text = f"{text}  {mark}"
+    elif reset:
         text = f"{text}  resets {reset}"
     note, _kind = _quota_note(row)
     if note:
@@ -1221,6 +1508,10 @@ def _quota_row_label(row: AccountRow) -> str:
         # (`_decorate_quota_item` via `_quota_note`), so the fallback really
         # does say everything the bar block says.
         text = f"{text}  ({note})"
+    detail = _codex_login.relogin_detail(row) if _codex_login is not None else ""
+    if detail:
+        # CX-7b: the same dim line `_decorate_quota_item` draws (VoiceOver parity).
+        text = f"{text}  · {detail}"
     for line in getattr(row, "info_notes", ()) or ():
         # The dim lines of the bar block, flattened (roadmap 10/11/12). They
         # are facts, not verdicts, so they follow the note rather than
@@ -1228,6 +1519,91 @@ def _quota_row_label(row: AccountRow) -> str:
         # attributed block draws.
         text = f"{text}  · {line}"
     return text
+
+
+def _quota_reset_mark(row: AccountRow, now: float | None = None) -> str:
+    """The glance layout's reset mark for a quota row's plan window.
+
+    From the row's own EPOCH (``soonest_reset_at``) when the source carried
+    one — the live Codex rows — else upstream's display string read back
+    (the transcript row). An ended weekly window is ``↺ overdue``.
+    """
+    when = time.time() if now is None else now
+    if "seven_day" in (getattr(row, "expired_windows", ()) or ()):
+        return render.RESET_MARK_OVERDUE
+    epoch = getattr(row, "soonest_reset_at", None)
+    if epoch is not None:
+        return render.reset_mark(epoch, when)
+    return _reset_mark_text(_primary_reset(row), when)
+
+
+class _CodexFleetParts(NamedTuple):
+    """The facts behind the Codex fleet line, before any wording (design wave 2).
+
+    One source for three surfaces: the classic heading
+    (:func:`_codex_fleet_heading`), the glance layout's Codex section header,
+    and the Codex card's second line — so they cannot disagree.
+    """
+
+    room: int
+    total: int
+    next_at: float | None
+    next_alias: str
+    resets: str
+
+
+def _codex_fleet_parts(rows: Sequence[AccountRow], *, now: float) -> _CodexFleetParts | None:
+    """The counts :func:`_codex_fleet_heading` prints, or ``None`` with no live row.
+
+    ``resets`` is ``"1 reset usable"`` / ``"2 resets banked"`` / ``""``;
+    ``next_at`` is the soonest FUTURE reset among the capped rows, or ``None``
+    (then ``next_alias`` is ``""``). The rules are the heading's, unchanged —
+    see its docstring.
+    """
+    live = [row for row in rows if row.vendor != VENDOR_CLAUDE and row.slot < 0]
+    if not live:
+        return None
+    enabled = [row for row in live if not getattr(row, "disabled", False)]
+    resets = ""
+    for field_name, word in (
+        ("reset_credits_usable", "usable"),
+        ("reset_credits_available", "banked"),
+    ):
+        total = sum(getattr(row, field_name, None) or 0 for row in enabled)
+        if total > 0:
+            resets = f"{total} reset{'' if total == 1 else 's'} {word}"
+            break
+    room = sum(
+        1
+        for row in live
+        if getattr(row, "attention_kind", "") not in _ALARM_KINDS
+        and row.seven_day_pct is not None
+        and row.seven_day_pct < 100.0
+    )
+    capped = [
+        row
+        for row in live
+        if getattr(row, "soonest_reset_at", None) is not None
+        # A reset instant that has already passed is not a door about to open:
+        # the source has simply not re-read that account yet, and "next Sat
+        # 09:00" over a Saturday that has been and gone sends the operator to a
+        # login that is still at the wall. Dropped here as well as in
+        # `render.fleet_reset_label` so the choice of the SOONEST row is made
+        # among rows that still have a future - otherwise a stale epoch would
+        # win the `min` and silence the line for the accounts that do reopen.
+        and row.soonest_reset_at > now
+        and (
+            getattr(row, "attention_kind", "") == "crit"
+            or (row.seven_day_pct is not None and row.seven_day_pct >= 100.0)
+        )
+    ]
+    next_at: float | None = None
+    next_alias = ""
+    if capped:
+        soonest = min(capped, key=lambda row: row.soonest_reset_at)
+        next_at = soonest.soonest_reset_at
+        next_alias = soonest.alias or vendor_label(soonest.vendor)
+    return _CodexFleetParts(room, len(live), next_at, next_alias, resets)
 
 
 def _codex_fleet_heading(rows: Sequence[AccountRow], *, now: float) -> str:
@@ -1261,42 +1637,116 @@ def _codex_fleet_heading(rows: Sequence[AccountRow], *, now: float) -> str:
     has no fleet at all — and it is what a Codex-only, live-quota-off install
     shows, which must stay byte-for-byte as it was.
     """
-    live = [row for row in rows if row.vendor != VENDOR_CLAUDE and row.slot < 0]
-    if not live:
+    parts = _codex_fleet_parts(rows, now=now)
+    if parts is None:
         return ""
-    room = sum(
-        1
-        for row in live
-        if getattr(row, "attention_kind", "") not in _ALARM_KINDS
-        and row.seven_day_pct is not None
-        and row.seven_day_pct < 100.0
-    )
-    heading = f"{vendor_label(live[0].vendor)} {room}/{len(live)}"
-    capped = [
-        row
-        for row in live
-        if getattr(row, "soonest_reset_at", None) is not None
-        # A reset instant that has already passed is not a door about to open:
-        # the source has simply not re-read that account yet, and "next Sat
-        # 09:00" over a Saturday that has been and gone sends the operator to a
-        # login that is still at the wall. Dropped here as well as in
-        # `render.fleet_reset_label` so the choice of the SOONEST row is made
-        # among rows that still have a future - otherwise a stale epoch would
-        # win the `min` and silence the line for the accounts that do reopen.
-        and row.soonest_reset_at > now
-        and (
-            getattr(row, "attention_kind", "") == "crit"
-            or (row.seven_day_pct is not None and row.seven_day_pct >= 100.0)
-        )
-    ]
-    if not capped:
-        return heading
-    soonest = min(capped, key=lambda row: row.soonest_reset_at)
-    clock = render.fleet_reset_label(soonest.soonest_reset_at, now)
+    # Composed from `_codex_fleet_parts` (design wave 2) so the glance
+    # layout's section header and card cannot drift from this line. Reset
+    # credits (display only): `` · 1 reset usable`` outranks `` · 2 resets
+    # banked``; unknown (None) and 0 add nothing. A reset instant already in
+    # the past is not a door about to open, so it never becomes ``next``.
+    live = [row for row in rows if row.vendor != VENDOR_CLAUDE and row.slot < 0]
+    heading = f"{vendor_label(live[0].vendor)} {parts.room}/{parts.total}"
+    resets = f" · {parts.resets}" if parts.resets else ""
+    clock = render.fleet_reset_label(parts.next_at, now) if parts.next_at is not None else ""
     if not clock:
+        return heading + resets
+    return f"{heading} · next {clock} ({parts.next_alias}){resets}"
+
+
+def _reset_clock_epoch(text: str | None, now: float) -> float | None:
+    """Epoch of a claude-swap reset clock, or ``None`` when it cannot be read.
+
+    claude-swap renders a reset as ``"20:39"`` when it falls today and as
+    ``"Jul 5 08:59"`` otherwise (``oauth.reset_clock_string``, local time).
+    This reads that string BACK — a re-expression of upstream's own value for
+    ordering, never a new figure (SPEC 4.3). The year is *now*'s, rolled
+    forward when that would put the reset half a year in the past (a
+    ``Jan 2`` read in late December). Anything else is ``None``.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    try:
+        base = dt.datetime.fromtimestamp(now)
+    except (OSError, OverflowError, ValueError):  # pragma: no cover
+        return None
+    minutes = CCUsageWidgetApp._clock_minutes(raw)
+    if minutes is not None:
+        when = base.replace(hour=minutes // 60, minute=minutes % 60, second=0, microsecond=0)
+        return when.timestamp()
+    try:
+        when = dt.datetime.strptime(f"{base.year} {raw}", "%Y %b %d %H:%M")
+    except ValueError:
+        return None
+    if when < base - dt.timedelta(days=183):
+        try:
+            when = when.replace(year=base.year + 1)
+        except ValueError:  # Feb 29 into a common year
+            return None
+    return when.timestamp()
+
+
+def _scoped_fleet_heading(
+    rows: Sequence[AccountRow],
+    *,
+    name: str,
+    now: float,
+    notes: Any = (),
+) -> str:  # F4
+    """``Fable 2/5 · next Tue 09:00`` — one scoped window's fleet line.
+
+    The 2026-09-22 Fable run-out killed every Fable-pinned stage, and nothing
+    in the menu answered "how many of my logins still have Fable, and when
+    does the next one open" without reading five bars. Same two questions as
+    :func:`_codex_fleet_heading`, over the claude-swap rows:
+
+    * ``M`` counts rows that are switchable, not ``cswap disable``d, carry no
+      derived-usage note (*notes*, keyed by slot — the stored figures of a
+      noted slot are last-good values nobody can vouch for) and REPORT the
+      *name* window. A disabled or noted slot is simply not in the fleet the
+      engine can use, so it is in neither number;
+    * ``N`` counts those not at :data:`ATTENTION_PCT`. A full window whose
+      reset has already passed rolled over (the ``expired_windows`` mark, or
+      a reset clock in the past) — the adapter's roll path
+      (``menubar._rolled_weekly_window``) treats it as reset to 0, and so
+      does this count, so a past-reset 100% is room, not full;
+    * ``next`` is the soonest FUTURE reset among the full rows, read back from
+      upstream's clock by :func:`_reset_clock_epoch` and printed by
+      :func:`render.fleet_reset_label`. No readable future reset, no ``next``.
+
+    ``""`` when no counted row reports the window (a machine without scoped
+    windows, a Codex-only machine).
+    """
+    counted = [
+        row
+        for row in rows
+        if row.vendor == VENDOR_CLAUDE
+        and getattr(row, "switchable", True)
+        and not getattr(row, "disabled", False)
+        and row.slot not in notes
+        and row.scoped_pct(name) is not None
+    ]
+    if not counted:
+        return ""
+    room = 0
+    full_resets: list[float] = []
+    for row in counted:
+        pct = row.scoped_pct(name)
+        epoch = _reset_clock_epoch(_window_reset(row, name), now)
+        rolled = name in (getattr(row, "expired_windows", ()) or ()) or (
+            epoch is not None and epoch <= now
+        )
+        if pct is not None and pct >= ATTENTION_PCT and not rolled:
+            if epoch is not None:
+                full_resets.append(epoch)
+        else:
+            room += 1
+    heading = f"{name} {room}/{len(counted)}"
+    if not full_resets:
         return heading
-    alias = soonest.alias or vendor_label(soonest.vendor)
-    return f"{heading} · next {clock} ({alias})"
+    clock = render.fleet_reset_label(min(full_resets), now)
+    return f"{heading} · next {clock}" if clock else heading
 
 
 _WINDOW_LABEL_MAX = 12
@@ -1333,6 +1783,130 @@ def _window_label_width(rows: Sequence[AccountRow], quota_rows: Sequence[Account
     ]
     widths.append(2)  # "5h" / "7d"
     return max(widths)
+
+
+def _visible_quota_rows_of(snapshot: UiSnapshot) -> tuple[AccountRow, ...]:
+    """Pure body of :meth:`CCUsageWidgetApp._visible_quota_rows` (see there)."""
+    if not snapshot.settings.get("codex_tracking_enabled", True):
+        rows = tuple(row for row in snapshot.quota_rows if row.vendor == VENDOR_CLAUDE)
+    else:
+        rows = tuple(snapshot.quota_rows)
+    # The RENDERED note, not the raw field: a live row whose reading aged
+    # past CODEX_FETCH_EXPIRE_SECONDS has its bars withheld and no
+    # sentinel, and its age note is exactly what it has to say.
+    return tuple(row for row in rows if _quota_windows(row) or _quota_note(row)[0])
+
+
+def _quota_alias(row: AccountRow) -> str:
+    return row.alias or vendor_label(row.vendor)
+
+
+def _quota_head(row: AccountRow) -> str:
+    """``belkins work (Business)`` — alias and DISPLAY plan (UX-9)."""
+    plan = plan_label(row.plan_type)
+    return f"{_quota_alias(row)} ({plan})" if plan else _quota_alias(row)
+
+
+def _plan_window(row: AccountRow) -> tuple[str, float | None, bool] | None:
+    """``(label, pct, expired)`` of a quota row's plan window, or ``None``.
+
+    The weekly ``primary`` window when reported (the figure that answers "how
+    much of my subscription is gone"), else the first window the row reports.
+    """
+    windows = _quota_windows(row)
+    if not windows:
+        return None
+    # `_quota_windows` lists the 5-hour window first when reported, then the
+    # weekly one — so the weekly window's index is structural, not a lookup.
+    index = 1 if row.seven_day_pct is not None and row.five_hour_pct is not None else 0
+    label, pct, _note, expired = windows[index]
+    return label, pct, expired
+
+
+def _reset_badge_text(count: int, word: str = "") -> str:
+    """``1 reset`` / ``3 resets`` / ``1 reset usable`` (a Codex row's badge)."""
+    text = f"{count} reset{'' if count == 1 else 's'}"
+    return f"{text} {word}" if word else text
+
+
+_PACE_NOTE_PREFIX = "at this pace:"
+"""How ``codex_accounts.pace_note`` opens every forecast it writes (our own
+wording, not upstream prose), so the one-line row can rank it (spec §5.1)."""
+
+
+def _codex_fact_line(row: AccountRow) -> tuple[str, str] | None:
+    """At most ONE fact under a one-line Codex row, ``(text, colour kind)``.
+
+    Priority (spec §5.1): the usable-credit note (green — the one positive
+    signal), a ``crit`` verdict (``out of credits · Add credits``), the pace
+    forecast, then an ``info`` verdict (a ``relogin in 1d 4h`` countdown,
+    which must not vanish from the glance row), then the first other info note.
+    Every candidate stays in the row's tooltip and in ``All Codex bars ▸``.
+    """
+    notes = tuple(getattr(row, "info_notes", ()) or ())
+    if (getattr(row, "reset_credits_usable", None) or 0) > 0 and notes:
+        return notes[0], "good"
+    note = getattr(row, "attention_note", "") or ""
+    kind = getattr(row, "attention_kind", "") or ""
+    if note and kind == "crit":
+        return note, "crit"
+    pace = next((line for line in notes if line.startswith(_PACE_NOTE_PREFIX)), None)
+    if pace is not None:
+        return pace, "warn"
+    if note and kind == "info" and _quota_windows(row):
+        return note, "dim"
+    rest = [line for line in notes if not line.startswith(_PACE_NOTE_PREFIX)]
+    if rest:
+        return rest[0], "dim"
+    return None
+
+
+def needs_attention_rows(snapshot: UiSnapshot) -> list[tuple[str, Any]]:
+    """Every row the glance menu's Needs attention section lists, in order.
+
+    ``("claude", slot)`` for each slot in :attr:`UiSnapshot.account_notes` —
+    the ACTIVE slot included, since its note is the one that matters most —
+    then ``("codex", row)`` for each visible quota row with a standing alarm
+    (:func:`_quota_alarm`: a warn/crit verdict that REPLACED the figures). A
+    capped row that still carries its figure (``gmail 100%``) is a limit, not
+    a fault, and stays a live row. The length is the one N the menu uses
+    everywhere: the Claude card's badge + the Codex card's badge = the
+    ``⚠N`` a merged title prints (design wave 2, spec §5.1).
+    """
+    out: list[tuple[str, Any]] = [("claude", slot) for slot in sorted(snapshot.account_notes)]
+    out.extend(("codex", row) for row in _visible_quota_rows_of(snapshot) if _quota_alarm(row))
+    return out
+
+
+def _claude_room(snapshot: UiSnapshot) -> tuple[int, int] | None:
+    """``(N, M)``: Claude rooms with headroom, out of the rooms the engine may use.
+
+    Extracted from ``_title_fleet`` (design wave 2) so the title suffix, the
+    Claude card and the Claude section header count the same way. ``M`` =
+    switchable, not ``cswap disable``d; ``N`` = of those, no derived-usage
+    note, a KNOWN 5-hour figure, and a binding window (:func:`_binding_window`)
+    below the autoswitch threshold. ``None`` when ``M`` is 0.
+    """
+    threshold = snapshot.autoswitch_threshold
+    if threshold is None:
+        threshold = _TITLE_FLEET_THRESHOLD_DEFAULT
+    models = tuple(snapshot.autoswitch_models or ())
+    rows = [
+        row
+        for row in snapshot.accounts
+        if row.switchable and not getattr(row, "disabled", False)
+    ]
+    if not rows:
+        return None
+    notes = snapshot.account_notes
+
+    def _room(row: AccountRow) -> bool:
+        if row.slot in notes or row.five_hour_pct is None:
+            return False
+        window = _binding_window(row, models)
+        return window is not None and window[1] < threshold
+
+    return sum(1 for row in rows if _room(row)), len(rows)
 
 
 _REGISTRY_ATTRS = ("registry", "_registry")
@@ -1880,6 +2454,62 @@ class BackgroundWorker:
         other side, where the call actually is.
         """
         self._desktop.put((action, path))
+
+    def _adopt_pending_codex_logins(self) -> None:
+        """Adopt a finished ``codex login`` the script did not (CX-5). **Worker.**
+
+        The ``.command`` adopts on its own the moment the login returns; this
+        is the fallback for a Terminal closed before that, so a relogin still
+        lands within one tick. One ``listdir`` when nothing is pending, and
+        nothing at all on a machine with no live Codex source.
+        """
+        if _codex_login is None:
+            return
+        try:
+            registry = _codex_registry(self._sources)
+            if registry is None:
+                return
+            accounts_dir = _codex_login.accounts_dir_for(self._sources)
+            if not _codex_login.has_pending(accounts_dir):
+                return
+            result = _codex_login.adopt_pending(
+                accounts_dir,
+                registry,
+                replace=True,
+                min_age_seconds=_codex_login.ADOPT_SETTLE_SECONDS,
+            )
+            # Outcomes once; a refusal only when it changes, or an abandoned
+            # new-* dir would write the same line on every tick.
+            changed = result.refused != getattr(self, "_codex_login_refused", ())
+            self._codex_login_refused = result.refused
+            for line in result.log_lines(include_refused=changed):
+                _log(line)
+        except Exception as exc:  # a login helper must never break the tick
+            _log(f"codex login: adopt failed: {_describe(exc)}")
+
+    def _start_codex_login(self, account_id: str | None) -> None:
+        """Write the login ``.command`` and ask the AppKit thread to open it.
+
+        **Worker thread** (it writes a file). The script holds paths only; the
+        codex binary is resolved here because the LaunchAgent's ``PATH`` does
+        not include ``/usr/local/bin`` (:func:`codex_login.resolve_codex_binary`).
+        """
+        if _codex_login is None:
+            return
+        codex = _codex_login.resolve_codex_binary()
+        if codex is None:
+            _log("codex login: no codex binary found (PATH, /usr/local/bin, /opt/homebrew/bin, ChatGPT.app)")
+            return
+        registry = _codex_registry(self._sources)
+        path = _codex_login.write_login_command(
+            _codex_login.accounts_dir_for(self._sources),
+            sys.executable,
+            codex,
+            account_id,
+            registry_path=getattr(registry, "path", None),
+        )
+        _log(f"codex login: wrote {path.name}")
+        self._ask_desktop(_DESKTOP_TERMINAL, path)
 
     # -- cost attribution (roadmap item 6) ---------------------------------
 
@@ -2447,6 +3077,7 @@ class BackgroundWorker:
                 _log(f"quota_rows failed: {_describe(exc, 'quota')}")
         self._available_vendors = tuple(present)
         self._source_diagnostics = self._read_source_diagnostics()
+        self._adopt_pending_codex_logins()  # CX-5: before the registry re-read
         self._codex_accounts = _codex_registry_entries(self._sources)
         # Last, and on every tick: the transcript-derived Codex row and a live
         # per-account row for the same login must never be two numbers for one
@@ -2764,6 +3395,7 @@ class BackgroundWorker:
                         recent_events=_recent_events_of(accounts),
                         switch_note=_switch_note_of(accounts),
                         autoswitch_threshold=_autoswitch_threshold_of(accounts),
+                        autoswitch_models=_autoswitch_models_of(accounts),
                     )
                 )
                 return
@@ -2809,14 +3441,8 @@ class BackgroundWorker:
             except Exception as exc:
                 _log(f"final rollup save failed: {_describe(exc)}")
         # Offsets last, and only now that the tokens they consumed are durable.
-        self._commit_scan_state()
-        for _vendor, scanner in self._all_scanners():
-            flush_dedup = getattr(scanner, "flush_dedup", None)
-            if callable(flush_dedup):
-                try:
-                    flush_dedup()
-                except Exception as exc:
-                    _log(f"dedup flush failed: {_describe(exc)}")
+        # ``final`` also flushes every dedup sidecar, committed or not.
+        self._commit_scan_state(final=True)
 
     def _all_scanners(self) -> list[tuple[Vendor, Any]]:
         """Every scanner ever wired, available or not.
@@ -2834,7 +3460,7 @@ class BackgroundWorker:
             out.append((getattr(source, "vendor", VENDOR_CODEX), source))
         return out
 
-    def _commit_scan_state(self) -> None:
+    def _commit_scan_state(self, *, final: bool = False) -> None:
         """Persist every scanner's offsets, for those that defer it to us.
 
         Ordering is the whole point: the rollup must be on disk *before* the
@@ -2843,15 +3469,32 @@ class BackgroundWorker:
         restarts and is only curable via ``Rebuild cost index``. With two
         vendors the rule is unchanged and now applies to both - one shared
         ``rollups.json``, one scan-state file per vendor (SPEC-CODEX 4).
+
+        drift-1: each scanner's dedup sidecar is flushed right after its own
+        offsets commit lands (``commit_state`` returned anything but False), so
+        the sidecar is never older than the offsets it pairs with; before this
+        the shutdown flush was its only writer. *final* (the quit path) flushes
+        every sidecar regardless, as the old shutdown loop did.
         """
         for _vendor, scanner in self._all_scanners():
             commit = getattr(scanner, "commit_state", None)
-            if not callable(commit):
+            committed: Any = None
+            if callable(commit):
+                try:
+                    committed = commit()
+                except Exception as exc:
+                    _log(f"scan-state commit failed: {_describe(exc)}")
+                    committed = False
+            elif not final:
                 continue
-            try:
-                commit()
-            except Exception as exc:
-                _log(f"scan-state commit failed: {_describe(exc)}")
+            if committed is False and not final:
+                continue
+            flush_dedup = getattr(scanner, "flush_dedup", None)
+            if callable(flush_dedup):
+                try:
+                    flush_dedup()
+                except Exception as exc:
+                    _log(f"dedup flush failed: {_describe(exc)}")
 
     def _ui_interval(self) -> float:
         low, high = SETTINGS_BOUNDS["ui_interval_seconds"]
@@ -2929,6 +3572,9 @@ class BackgroundWorker:
             if name == _CMD_OPEN_DASHBOARD:  # roadmap item 9
                 self._open_dashboard()
                 return True, False
+            if name == _CMD_CODEX_LOGIN:  # CX-5
+                self._start_codex_login(str(payload) if payload else None)
+                return False, False
         except Exception as exc:
             self._publish(replace(self._snapshot, accounts_error=_describe(exc)))
         else:
@@ -3323,6 +3969,7 @@ class BackgroundWorker:
                     recent_events=_recent_events_of(self._accounts),
                     switch_note=_switch_note_of(self._accounts),
                     autoswitch_threshold=_autoswitch_threshold_of(self._accounts),
+                    autoswitch_models=_autoswitch_models_of(self._accounts),
                     sessions=fleet_snapshot.sessions,  # W3
                     mappings=fleet_snapshot.mappings,  # W3
                     fleet_notes=fleet_snapshot.notes,  # W3
@@ -4109,8 +4756,22 @@ class BackgroundWorker:
             # thread, so a slow corpus cannot starve the accounts tick.
             self._maybe_run_audit(rollups, scanners, today=today, settings=settings,
                                   progress=progress)
+            # OPS-7: bound launchd's append-forever log once per local day, not
+            # only at launch. Beside the store (as history_path_for does), so a
+            # test's temp store never touches the installed widget's log.
+            if getattr(self, "_log_bound_day", None) != today:
+                self._log_bound_day = today
+                store_path = getattr(rollups, "path", None)
+                if store_path is not None:
+                    try:
+                        from .__main__ import _bound_widget_log
 
-            breakdown = rollups.cost_breakdown(pricing, today=today, progress=progress)
+                        _bound_widget_log(log_path=os.path.join(
+                            os.path.dirname(os.fspath(store_path)), "logs", "widget.log"))
+                    except Exception as exc:
+                        _log(f"log bound failed: {_describe(exc)}")
+
+            breakdown =rollups.cost_breakdown(pricing, today=today, progress=progress)
             note = " | ".join(
                 self._scan_note(vendor, result, labelled=len(scanners) > 1)
                 for (vendor, _scanner), result in zip(due, results)
@@ -4449,7 +5110,9 @@ class CCUsageWidgetApp(rumps.App):
         themselves, so a test that forgets to install the seam still opens
         nothing.
         """
-        if action == _DESKTOP_OPEN:
+        if action in (_DESKTOP_OPEN, _DESKTOP_TERMINAL):
+            # CX-5: a `.command` opened through NSWorkspace runs in Terminal -
+            # the same `openURL:` behind the same CC_USAGE_WIDGET_NO_REVEAL guard.
             return _open_in_browser(path)
         return _reveal_in_finder(path)
 
@@ -4533,40 +5196,73 @@ class CCUsageWidgetApp(rumps.App):
         the user finds this widget by its glyph.
         """
         snapshot = snapshot or self.snapshot()
+        # The text is the join of the tokens (design wave 2): the colour pass
+        # reads the same tokens, so it can never change a character.
+        text = render.join_title_tokens(self.title_tokens(snapshot))
+        if text:
+            return text
+        # Every text component off: with a real NSImage on the status item the
+        # right answer is NO text (an icon-only ~33pt item that fits a saturated
+        # bar without evicting a neighbour — RCA 2026-08-17). The glyph fallback
+        # only guards the case where the image could not be installed, because
+        # an item with neither image nor title is zero-width and invisible.
+        return "" if getattr(self, "_icon_image_set", False) else TITLE_ICON
+
+    def title_tokens(
+        self, snapshot: UiSnapshot | None = None
+    ) -> list[list[tuple[str, str | None]]]:
+        """The title as tokens of ``(text, colour kind)`` runs (design wave 2).
+
+        :meth:`render_title` is ``render.join_title_tokens`` of this and
+        nothing else, so the plain title — the VoiceOver label and the width
+        the tests measure — is byte-for-byte what it was; the kinds only feed
+        :meth:`_apply_title_attributes`. Kinds: alias/icon/cost ``None``; a
+        percentage its :func:`render.severity`; a replacing note, ``C⚠``, the
+        bare ``⚠`` and ``⚠N`` ``warn`` (``crit`` when the row's kind is crit);
+        the engine verdict ``crit`` for all-exhausted, else ``warn``; a
+        ``↺<duration>`` countdown and the fleet suffix ``dim``; ``↺now``
+        ``good`` — the one green thing in the bar.
+        """
+        snapshot = snapshot or self.snapshot()
         settings = snapshot.settings
         if settings.get("title_compact", False):
-            return self._compact_title(snapshot)
-        parts: list[str] = []
+            return self._compact_tokens(snapshot)
+        merge = bool(settings.get("title_merge_alerts", False))
+        parts: list[list[tuple[str, str | None]]] = []
         if settings.get("title_show_icon", True):
-            parts.append(TITLE_ICON)
+            parts.append([(TITLE_ICON, None)])
         active = snapshot.active
         notes = snapshot.account_notes
         if active is not None:
             if settings.get("title_show_alias", True):
-                parts.append(_display_name(active))
+                parts.append([(_display_name(active), None)])
             note = notes.get(active.slot)
             if note:
                 # A derived state replaces the figures (contract on
                 # UiSnapshot.account_notes): "vlad ⚠ relogin", never "vlad 0%".
                 parts.append(
-                    _title_note(note, snapshot.account_note_kinds.get(active.slot, ""))
+                    [(_title_note(note, snapshot.account_note_kinds.get(active.slot, "")), "warn")]
                 )
             else:
                 if settings.get("title_show_five_hour_pct", True) and active.five_hour_pct is not None:
-                    parts.append(_title_pct(active.five_hour_pct))
+                    parts.append(
+                        [(_title_pct(active.five_hour_pct), render.severity(active.five_hour_pct))]
+                    )
                 if settings.get("title_show_scoped_pct", True):
                     window = active.primary_scoped_window
                     if window is not None:
                         name, pct = window
-                        parts.append(f"{active.scoped_abbrev(name)}{_title_pct(pct)}")
+                        parts.append(
+                            [(f"{active.scoped_abbrev(name)}{_title_pct(pct)}", render.severity(pct))]
+                        )
         if settings.get("title_show_codex_pct", False):
-            codex = self._title_vendor_pct(snapshot)
+            codex = self._title_vendor_tokens(snapshot, merge=merge)
             if codex:
                 parts.append(codex)
         if settings.get("title_show_cost", True) and settings.get("cost_tracking_enabled", True):
             cost_part = self._title_cost(snapshot)
             if cost_part:
-                parts.append(cost_part)
+                parts.append([(cost_part, None)])
         # Standing problems always reach the bar, whatever the toggles say:
         # the engine's verdict first, else a bare "⚠" when a slot other than
         # the active one needs the operator (its note is in the menu).
@@ -4577,14 +5273,37 @@ class CCUsageWidgetApp(rumps.App):
         # the first did not. The active Codex account is deliberately not
         # counted here - it has its own "C⚠" component above, which names the
         # vendor instead of leaving the user to hunt.
-        if snapshot.alert is not None:
-            parts.append(_title_alert(snapshot.alert[0]))
-        elif any(slot != getattr(active, "slot", None) for slot in notes) or any(
-            _quota_alarm(row)
-            for row in self._visible_quota_rows(snapshot)
-            if not row.is_active
-        ):
-            parts.append("⚠")
+        #
+        # `title_merge_alerts` (design wave 2) folds "C⚠" and the bare "⚠"
+        # into ONE "⚠N" whose N is the Needs attention row count, so the bar
+        # and the menu say the same number. The engine verdict is never merged.
+        alert_kind = self._title_alert_kind(snapshot)
+        verdict = (
+            [(_title_alert(alert_kind), "crit" if alert_kind == ALERT_ALL_EXHAUSTED else "warn")]
+            if alert_kind is not None
+            else None
+        )
+        if merge:
+            needs = needs_attention_rows(snapshot)
+            if needs:
+                crit = any(
+                    vendor == "codex" and getattr(row, "attention_kind", "") == "crit"
+                    for vendor, row in needs
+                )
+                parts.append([(f"⚠{len(needs)}", "crit" if crit else "warn")])
+            if verdict is not None:
+                parts.append(verdict)
+        elif verdict is not None:
+            parts.append(verdict)
+        else:
+            others = [
+                row
+                for row in self._visible_quota_rows(snapshot)
+                if not row.is_active and _quota_alarm(row)
+            ]
+            if others or any(slot != getattr(active, "slot", None) for slot in notes):
+                crit = any(getattr(row, "attention_kind", "") == "crit" for row in others)
+                parts.append([("⚠", "crit" if crit else "warn")])
         # Last, and only when the active room is full: "is there another room,
         # and when does one open" is the only question left at that point, and
         # answering it at the wall saves opening the menu (2026-09-01: a title
@@ -4598,17 +5317,10 @@ class CCUsageWidgetApp(rumps.App):
         # extend it. The alert block above is the one standing-problem
         # exception, and it is a glyph.
         if parts and settings.get("title_show_fleet", True):
-            fleet = self._title_fleet(snapshot, base=" ".join(parts))
+            fleet = self._title_fleet(snapshot, base=render.join_title_tokens(parts))
             if fleet:
-                parts.append(fleet)
-        if parts:
-            return " ".join(parts)
-        # Every text component off: with a real NSImage on the status item the
-        # right answer is NO text (an icon-only ~33pt item that fits a saturated
-        # bar without evicting a neighbour — RCA 2026-08-17). The glyph fallback
-        # only guards the case where the image could not be installed, because
-        # an item with neither image nor title is zero-width and invisible.
-        return "" if getattr(self, "_icon_image_set", False) else TITLE_ICON
+                parts.append([(fleet, "dim")])
+        return parts
 
     def _compact_title(self, snapshot: UiSnapshot) -> str:
         """``"V·C 100/100"`` — the narrow-bar title (roadmap item 16).
@@ -4634,7 +5346,19 @@ class CCUsageWidgetApp(rumps.App):
         standing-problem glyph, which is deliberately outside the budget for
         the same reason it is exempt from the toggles.
         """
-        figures: list[tuple[str, str]] = []
+        title = render.join_title_tokens(self._compact_tokens(snapshot))
+        if title:
+            return title
+        return "" if getattr(self, "_icon_image_set", False) else TITLE_ICON
+
+    def _compact_tokens(self, snapshot: UiSnapshot) -> list[list[tuple[str, str | None]]]:
+        """:meth:`_compact_title` as colour tokens; joined, exactly its text.
+
+        ``render.compact_title`` spelled out run by run: the initials, then the
+        figures joined by ``/`` — plus, under the ``↺now`` condition, a green
+        ``↺`` after the figures and before the alert glyph (design wave 2).
+        """
+        figures: list[tuple[str, str, str | None]] = []
         active = snapshot.active
         if active is not None:
             # The alias's initial here, unlike `_title_vendor_pct`'s vendor
@@ -4644,25 +5368,100 @@ class CCUsageWidgetApp(rumps.App):
             initial = _display_name(active)[:1].upper()
             note = snapshot.account_notes.get(active.slot)
             if note:
-                figures.append((initial, COMPACT_ATTENTION))
+                figures.append((initial, COMPACT_ATTENTION, "warn"))
             elif active.five_hour_pct is not None:
-                figures.append((initial, _compact_pct(active.five_hour_pct)))
-        row = self._active_quota_row(snapshot) or self._transcript_quota_row(snapshot)
+                figures.append(
+                    (initial, _compact_pct(active.five_hour_pct), render.severity(active.five_hour_pct))
+                )
+        identified = self._active_quota_row(snapshot)
+        row = identified or self._transcript_quota_row(snapshot)
+        credit = False
         if row is not None:
             initial = vendor_label(row.vendor)[:1].upper()
             if _quota_alarm(row):
-                figures.append((initial, COMPACT_ATTENTION))
+                kind = "crit" if getattr(row, "attention_kind", "") == "crit" else "warn"
+                figures.append((initial, COMPACT_ATTENTION, kind))
             elif row.seven_day_pct is not None:
-                figures.append((initial, _compact_pct(row.seven_day_pct)))
-        title = render.compact_title(figures)
-        if snapshot.alert is not None:
+                figures.append(
+                    (initial, _compact_pct(row.seven_day_pct), render.severity(row.seven_day_pct))
+                )
+                if identified is not None and self._credit_usable(snapshot, row):
+                    expired = "seven_day" in (getattr(row, "expired_windows", ()) or ())
+                    credit = (
+                        self._title_reset(row, expired=expired, credit=True)
+                        == render.TITLE_RESET_NOW
+                    )
+        pairs = [(initial, figure, kind) for initial, figure, kind in figures if initial and figure]
+        tokens: list[list[tuple[str, str | None]]] = []
+        if pairs:
+            tokens.append(
+                [(render.COMPACT_TITLE_SEPARATOR.join(initial for initial, _f, _k in pairs), None)]
+            )
+            values: list[tuple[str, str | None]] = []
+            for index, (_initial, figure, kind) in enumerate(pairs):
+                if index:
+                    values.append(("/", None))
+                values.append((figure, kind))
+            if credit:
+                values.append((render.TITLE_RESET_GLYPH, "good"))
+            tokens.append(values)
+        alert_kind = self._title_alert_kind(snapshot)
+        if alert_kind is not None:
             # The glyph only - `_title_alert` also carries a word, which is
             # wider than everything else in this title put together.
-            glyph = _title_alert(snapshot.alert[0]).split(" ", 1)[0]
-            title = f"{title} {glyph}".strip()
-        if title:
-            return title
-        return "" if getattr(self, "_icon_image_set", False) else TITLE_ICON
+            glyph = _title_alert(alert_kind).split(" ", 1)[0]
+            tokens.append([(glyph, "crit" if alert_kind == ALERT_ALL_EXHAUSTED else "warn")])
+        return tokens
+
+    @staticmethod
+    def _credit_usable(snapshot: UiSnapshot, row: AccountRow) -> bool:
+        """``title_show_reset_credit`` on and *row* reports a usable reset credit.
+
+        ``None`` is unknown and counts as none (never invented as a credit)."""
+        if not snapshot.settings.get(
+            "title_show_reset_credit", SETTINGS_DEFAULTS["title_show_reset_credit"]
+        ):
+            return False
+        return (getattr(row, "reset_credits_usable", None) or 0) > 0
+
+    @staticmethod
+    def _title_threshold(snapshot: UiSnapshot) -> float:
+        """claude-swap's threshold, or its documented default when unread."""
+        threshold = snapshot.autoswitch_threshold
+        return _TITLE_FLEET_THRESHOLD_DEFAULT if threshold is None else threshold
+
+    def _title_alert_kind(self, snapshot: UiSnapshot) -> str | None:
+        """The standing verdict the title badges, or ``None`` (UX-6).
+
+        Every verdict badges, except an external flip onto a slot that does
+        not need the operator. With ~22 flips a day (2026-09-24) ``⚠ ext``
+        sat on the bar most of the time, including after benign flips to a
+        healthy slot, so it stopped meaning anything. It now badges only when
+        the slot we were flipped ONTO carries a derived-usage note or its
+        binding window (:func:`_binding_window`) is at or over the autoswitch
+        threshold. With no active row to judge, it badges as before. The menu
+        line and the Recent switches history are unaffected.
+
+        A single ghost flip (``ALERT_GHOST_FLIP``, a config-only rewrite -
+        swap-3 now labels most benign flips so; all six on 2026-09-24 were)
+        follows the same rule. The standing login fight (3+ flips onto one
+        slot in an hour, its line carrying ``accounts.LOGIN_FIGHT_MARK``)
+        always badges: that is the operator's to fix.
+        """
+        if snapshot.alert is None:
+            return None
+        kind, line = snapshot.alert[0], str(snapshot.alert[1] or "")
+        if kind == ALERT_GHOST_FLIP and "login fight:" in line:  # LOGIN_FIGHT_MARK
+            return kind
+        if kind not in (ALERT_EXTERNAL_SWITCH, ALERT_GHOST_FLIP):
+            return kind
+        active = snapshot.active
+        if active is None or active.slot in snapshot.account_notes:
+            return kind
+        binding = _binding_window(active, snapshot.autoswitch_models)
+        if binding is not None and binding[1] >= self._title_threshold(snapshot):
+            return kind
+        return None
 
     def _title_fleet(
         self,
@@ -4674,18 +5473,28 @@ class CCUsageWidgetApp(rumps.App):
         """``"0/4 · next 00:00"`` — rooms with headroom, and when one opens.
 
         Shown only while there is a decision to make: the active account's
-        5-hour window is at or over claude-swap's autoswitch threshold, or the
-        engine's standing verdict is one of :data:`_TITLE_FLEET_ALERT_KINDS`.
-        A healthy fleet renders nothing at all, so the SPEC 4.1 title is
-        unchanged in the steady state.
+        BINDING window (:func:`_binding_window` — the one the engine decides
+        on: max of 5h, 7d and the scoped windows ``autoswitch.models`` names)
+        is at or over claude-swap's autoswitch threshold, or the engine's
+        standing verdict is one of :data:`_TITLE_FLEET_ALERT_KINDS`. A healthy
+        fleet renders nothing at all, so the SPEC 4.1 title is unchanged in
+        the steady state. Until 2026-09-25 this read the 5-hour window alone:
+        5h 7% / Fable 90% drew nothing while the engine was about to fail
+        over, and that flip reached the operator unannounced.
+
+        When the binding window is not the 5-hour one, the suffix is led by it,
+        labelled (``F90%``, ``7d92%``), unless the title already shows that
+        token — the operator must see WHICH wall is closing.
 
         Nothing here is derived beyond the rows' own numbers (SPEC 4.3):
 
         * ``M`` counts the switchable rows already in the snapshot — the same
           fact that makes a row clickable, so the count cannot promise a room
           the menu would refuse to switch to;
-        * ``N`` counts those whose 5-hour percentage is *known*, *trusted* and
-          below the threshold. A row whose window the API did not report is
+        * ``M`` leaves out a ``cswap disable``d slot (``AccountRow.disabled``,
+          UX-2): the engine never picks it, so it is not a room;
+        * ``N`` counts those whose 5-hour percentage is *known* and whose
+          binding window is *trusted* and below the threshold. A row whose window the API did not report is
           not room, and neither is a row carrying an
           :attr:`UiSnapshot.account_notes` entry: that note REPLACES the
           slot's figures everywhere else in the title precisely because the
@@ -4694,15 +5503,14 @@ class CCUsageWidgetApp(rumps.App):
           hours). Counting one as a free room would advertise a dead login as
           the way out, at the moment the operator is deciding whether to keep
           working. A noted slot stays in ``M``: it exists, it just is not room;
-        * ``next`` is one row's ``five_hour_resets_at`` string reprinted
+        * ``next`` is one row's BINDING-window reset string reprinted
           VERBATIM — claude-swap already rendered it in local time. Ordering
           uses a clock-only reading of that string; a row whose reset is not a
           plain ``HH:MM`` (a next-day ``"Aug 24 14:50"``) is not a candidate,
           and when none is, the ``next`` half is simply omitted. Noted slots
           are excluded here too — the same untrusted read produced the reset.
 
-        Two limits this suffix does NOT show, so they are recorded instead of
-        implied:
+        Limits this suffix does NOT show, recorded instead of implied:
 
         * **Age.** Non-active slots are served from claude-swap's store
           without a fetch while the engine is running, so an ``N`` can be
@@ -4713,39 +5521,39 @@ class CCUsageWidgetApp(rumps.App):
           a menu-bar suffix and dropping stale rows would usually zero the
           count outright, so the menu — which does print ``<n>m old`` per row
           (SPEC 4.3) — stays the place to check freshness.
-        * **Enablement.** ``switchable`` is upstream's "has credentials and a
-          config backup", which is not the same as "in rotation": a slot the
-          operator ran ``cswap disable`` on is still switchable and is still
-          counted here, while the autoswitch engine will never pick it. The
-          widget does not read ``disabled`` anywhere yet; fixing that needs an
-          ``AccountRow.enabled`` field, which is outside this renderer's
-          change (flagged 2026-09-01 for the plan owner).
+        * **Enablement** (flagged 2026-09-01) is no longer one of them: since
+          2026-09-25 ``AccountRow.disabled`` keeps a ``cswap disable``d slot
+          out of both numbers.
 
         ``base`` is the title rendered so far, and ``now_minutes`` (minutes
         since local midnight) exists for tests; both default to the live case.
         """
         active = snapshot.active
-        threshold = snapshot.autoswitch_threshold
-        if threshold is None:
-            threshold = _TITLE_FLEET_THRESHOLD_DEFAULT
-        active_pct = active.five_hour_pct if active is not None else None
-        at_limit = active_pct is not None and active_pct >= threshold
+        threshold = self._title_threshold(snapshot)
+        models = tuple(snapshot.autoswitch_models or ())
+        binding = _binding_window(active, models)
+        at_limit = binding is not None and binding[1] >= threshold
         alert_kind = snapshot.alert[0] if snapshot.alert is not None else ""
         if not at_limit and alert_kind not in _TITLE_FLEET_ALERT_KINDS:
             return ""
 
-        rows = [row for row in snapshot.accounts if row.switchable]
-        if not rows:
+        rows = [
+            row
+            for row in snapshot.accounts
+            if row.switchable and not getattr(row, "disabled", False)
+        ]
+        counts = _claude_room(snapshot)
+        if not rows or counts is None:
             return ""
         notes = snapshot.account_notes
-        room = sum(
-            1
-            for row in rows
-            if row.slot not in notes
-            and row.five_hour_pct is not None
-            and row.five_hour_pct < threshold
-        )
-        count = f"{room}/{len(rows)}"
+        count = f"{counts[0]}/{counts[1]}"
+        # The binding window, labelled, when it is not the 5-hour one.
+        lead = ""
+        if at_limit and binding is not None and binding[0] != "5h" and active is not None:
+            abbrev = "7d" if binding[0] == "7d" else active.scoped_abbrev(binding[0])
+            token = f"{abbrev}{_title_pct(binding[1])}"
+            if token not in base.split():
+                lead = token
 
         if now_minutes is None:
             local = time.localtime()
@@ -4756,10 +5564,12 @@ class CCUsageWidgetApp(rumps.App):
                 # A noted slot's reset comes off the same last-good read its
                 # percentage does; "next 00:00" from it would be a guess.
                 continue
-            pct = row.five_hour_pct
-            if pct is None or pct < threshold:
+            window = _binding_window(row, models)
+            if window is None or window[1] < threshold:
                 continue
-            clock = row.five_hour_resets_at
+            # The binding window's own reset — for a 7d/scoped binding that is
+            # usually a dated string, which `_clock_minutes` rejects.
+            clock = _window_reset(row, window[0])
             minutes = self._clock_minutes(clock)
             if minutes is None:
                 continue
@@ -4775,6 +5585,14 @@ class CCUsageWidgetApp(rumps.App):
         # time is the detail. Charged against the tail's NOMINAL width, not
         # `len(tail)` — otherwise a title with no usable reset drops its count
         # at an overshoot the same title with a reset survives.
+        # The binding label is charged first; if the title cannot afford it
+        # the suffix falls back to exactly the unlabelled shedding rule.
+        if lead:
+            over = len(base) + len(lead) + 1 - _TITLE_FLEET_BASE_BUDGET
+            if over <= 0:
+                return f"{lead} {count}{tail}"
+            if over <= _TITLE_FLEET_TAIL_BUDGET:
+                return f"{lead} {count}"
         over = len(base) - _TITLE_FLEET_BASE_BUDGET
         if over <= 0:
             return count + tail
@@ -4802,7 +5620,7 @@ class CCUsageWidgetApp(rumps.App):
             return None
         return hours * 60 + minutes
 
-    def _title_vendor_pct(self, snapshot: UiSnapshot) -> str:
+    def _title_vendor_pct(self, snapshot: UiSnapshot, *, merge: bool = False) -> str:
         """``"C12%"`` — the ACTIVE Codex account's window in the menu bar.
 
         Off by default (``title_show_codex_pct``): the title is already five
@@ -4840,12 +5658,22 @@ class CCUsageWidgetApp(rumps.App):
         still shows its number but never the ``(!)`` — that marker means "you
         are capped NOW", which a window that has already ended cannot prove.
         """
+        return render.join_title_tokens([self._title_vendor_tokens(snapshot, merge=merge)])
+
+    def _title_vendor_tokens(
+        self, snapshot: UiSnapshot, *, merge: bool = False
+    ) -> list[tuple[str, str | None]]:
+        """:meth:`_title_vendor_pct` as colour runs (design wave 2).
+
+        *merge* (``title_merge_alerts``) drops the ``C⚠`` alarm form — the
+        merged ``⚠N`` counts that row instead; a healthy figure still renders.
+        """
         row = self._active_quota_row(snapshot)
         identified = row is not None
         if row is None:
             row = self._transcript_quota_row(snapshot)
         if row is None:
-            return ""
+            return []
         # The VENDOR's initial, never the alias's. Before SPEC-CODEX 6 the only
         # quota row was aliased "Codex" and the two were the same letter by
         # accident; with per-account aliases they are not, and a title that
@@ -4854,12 +5682,15 @@ class CCUsageWidgetApp(rumps.App):
         # menu is where the account is named.
         initial = vendor_label(row.vendor)[:1].upper()
         if _quota_alarm(row):
-            return f"{initial}⚠"
+            if merge:
+                return []
+            kind = "crit" if getattr(row, "attention_kind", "") == "crit" else "warn"
+            return [(f"{initial}⚠", kind)]
         if identified and row.usage_is_stale:
-            return ""
+            return []
         windows = _quota_windows(row)
         if not windows:
-            return ""
+            return []
         # The plan window (Codex's weekly ``primary``) is the figure that
         # answers "how much of my subscription have I used"; anything else
         # this row happens to report is a fallback, never a substitute.
@@ -4869,10 +5700,21 @@ class CCUsageWidgetApp(rumps.App):
         else:
             _label, pct, _note, expired = windows[0]
         text = format_pct(pct) if expired else _title_pct(pct)
-        return f"{initial}{text}{self._title_reset(row, expired=expired)}"
+        # ↺now only for the IDENTIFIED active login: the transcript row has no
+        # identity, so a credit could not be said to belong to it.
+        credit = identified and self._credit_usable(snapshot, row)
+        suffix = self._title_reset(row, expired=expired, credit=credit)
+        segs: list[tuple[str, str | None]] = [
+            (initial, None),
+            (text, "dim" if expired else render.severity(pct)),
+        ]
+        if suffix:
+            segs.append((suffix, "good" if suffix == render.TITLE_RESET_NOW else "dim"))
+        return segs
 
-    @staticmethod
-    def _title_reset(row: AccountRow, *, expired: bool, now: float | None = None) -> str:
+    def _title_reset(
+        self, row: AccountRow, *, expired: bool, now: float | None = None, credit: bool = False
+    ) -> str:
         """``"↺4d"`` on a CAPPED Codex row, else ``""`` (roadmap 4).
 
         At the wall the only question left is when the room reopens, and it is
@@ -4890,6 +5732,10 @@ class CCUsageWidgetApp(rumps.App):
         not carry an epoch (claude-swap, the transcript-derived Codex row)
         leaves ``soonest_reset_at`` ``None`` and gets no suffix — which is what
         keeps a Codex-only machine's title byte-for-byte today's.
+
+        With no *now* the clock is :meth:`_now`, the same seam every menu reset
+        mark reads - so a test that pins it pins the title too, and the title
+        and the menu can never disagree about whether a reset has passed.
         """
         if expired:
             return ""
@@ -4898,8 +5744,13 @@ class CCUsageWidgetApp(rumps.App):
         )
         if not capped:
             return ""
+        if credit:
+            # Design wave 2: capped, and a reset credit could reopen it NOW —
+            # the countdown is no longer the answer. *credit* is decided by the
+            # caller (setting + usable counter); display only, nothing spends it.
+            return render.TITLE_RESET_NOW
         return render.title_reset_suffix(
-            getattr(row, "soonest_reset_at", None), time.time() if now is None else now
+            getattr(row, "soonest_reset_at", None), self._now() if now is None else now
         )
 
     def _active_quota_row(self, snapshot: UiSnapshot) -> AccountRow | None:
@@ -4938,11 +5789,56 @@ class CCUsageWidgetApp(rumps.App):
     # -- menu (SPEC 4.2) ---------------------------------------------------
 
     def rebuild_menu(self, snapshot: UiSnapshot | None = None) -> None:
-        """Rebuild the whole menu from *snapshot*. Main thread only."""
+        """Rebuild the whole menu from *snapshot*. Main thread only.
+
+        Two layouts (design wave 2): the glance layout is the default; the
+        classic one is today's menu byte for byte, chosen by
+        ``menu_layout_classic`` or automatically when there is nothing for the
+        glance layout to summarise (:meth:`_menu_layout`). Both are pure item
+        builders over the snapshot - no I/O on this thread (SPEC 2.3).
+        """
         snapshot = snapshot or self.snapshot()
         self.title = self.render_title(snapshot)
         self._install_icon_once()
+        if self._menu_layout(snapshot) == "classic":
+            items = self._rebuild_classic(snapshot)
+        else:
+            items = self._rebuild_glance(snapshot)
+        self.menu.clear()
+        self.menu = _dedupe_titles(items)
+        # Last: rumps' title setter calls `setTitle_`, which wipes attributes.
+        self._apply_title_attributes(snapshot)
 
+    def _now(self) -> float:
+        """The wall clock the menu builders read — one seam, so a test can pin
+        the reset marks (``↺ 14:50`` depends on what "today" is)."""
+        return time.time()
+
+    def _menu_layout(self, snapshot: UiSnapshot) -> str:
+        """``"classic"`` or ``"glance"`` for *snapshot* (spec §5.4).
+
+        Classic when the operator asked for it, OR when the snapshot has no
+        Claude accounts and no LIVE Codex row: the glance cards would have
+        nothing to summarise, and this is what keeps the Codex-only
+        features-off machine and the never-onboarded machine byte-for-byte
+        (SPEC-CODEX 6 item 4).
+        """
+        if snapshot.settings.get("menu_layout_classic", SETTINGS_DEFAULTS["menu_layout_classic"]):
+            return "classic"
+        if not snapshot.accounts and not self._live_quota_rows(snapshot):
+            return "classic"
+        return "glance"
+
+    def _live_quota_rows(self, snapshot: UiSnapshot) -> tuple[AccountRow, ...]:
+        """Visible per-account Codex rows (negative slots), in row order."""
+        return tuple(
+            row
+            for row in self._visible_quota_rows(snapshot)
+            if row.vendor != VENDOR_CLAUDE and row.slot < 0
+        )
+
+    def _rebuild_classic(self, snapshot: UiSnapshot) -> list[Any]:
+        """Today's menu, verbatim: every builder at its classic defaults."""
         items: list[Any] = [self._header_item(snapshot)]
         items.extend(self._alert_items(snapshot))
         items.append(None)
@@ -4950,11 +5846,14 @@ class CCUsageWidgetApp(rumps.App):
         # Sections, each preceded by its own separator and each free to be
         # empty. A Claude-only machine yields exactly the pre-Codex layout
         # (accounts, cost); a Codex-only one drops the accounts section rather
-        # than showing an empty one (SPEC-CODEX 5.5).
+        # than showing an empty one (SPEC-CODEX 5.5). Recent switches sit
+        # BELOW the account and quota blocks (UX-6): they are forensics, and
+        # five of them above Accounts pushed the figures the menu is opened for
+        # off the first screen.
         for section in (
-            self._recent_switch_items(snapshot),
             self._account_items(snapshot),
             self._quota_items(snapshot),
+            self._recent_switch_items(snapshot),
             self._cost_items(snapshot),
             self._session_items(snapshot),  # W3
         ):
@@ -4970,9 +5869,556 @@ class CCUsageWidgetApp(rumps.App):
         items.append(rumps.MenuItem("Refresh now", callback=self._on_refresh_now))
         items.append(self._settings_submenu(snapshot))
         items.append(rumps.MenuItem("Quit", callback=self._on_quit))
+        return items
 
-        self.menu.clear()
-        self.menu = _dedupe_titles(items)
+    # -- glance layout (design wave 2) --------------------------------------
+
+    def _rebuild_glance(self, snapshot: UiSnapshot) -> list[Any]:
+        """The glance layout: cards, then one separator before each group."""
+        items: list[Any] = []
+        for _name, section in self._glance_sections(snapshot):
+            if items:
+                items.append(None)
+            items.extend(section)
+        return items
+
+    def _glance_sections(self, snapshot: UiSnapshot) -> list[tuple[str, list[Any]]]:
+        """``(name, items)`` per non-empty group, in menu order (spec §5.2).
+
+        ``cards, needs, claude, codex, activity, problems, tools``; a group
+        with nothing to say is ABSENT, never an empty heading. Named so tests
+        can assert the order without AppKit.
+        """
+        sections: list[tuple[str, list[Any]]] = []
+        for name, builder in (
+            ("cards", self._glance_cards),
+            ("needs", self._needs_attention_items),
+            ("claude", self._claude_section),
+            ("codex", self._codex_section),
+            ("activity", self._activity_items),
+            ("problems", self._problem_items),
+            ("tools", self._tools_items),
+        ):
+            items = builder(snapshot)
+            if items:
+                sections.append((name, items))
+        return sections
+
+    def _two_line_item(
+        self,
+        line1: list[tuple[str, str | None]],
+        line2: list[tuple[str, str | None]] | None = None,
+        *,
+        callback: Callable[[Any], None] | None = None,
+        badge: str = "",
+        alerts: int = 0,
+        symbol: tuple[str, str] | None = None,
+        tooltip: str = "",
+        plain: str = "",
+    ) -> rumps.MenuItem:
+        """One menu item whose attributed title is *line1* + ``\n`` + *line2*.
+
+        The plain title — VoiceOver's label and the fallback — is the same
+        words on one line joined by `` · ``, with the badge text appended, so
+        a machine where the badge API is absent still says the count. Native
+        polish (badge, SF Symbol, tooltip) is best-effort; when the badge does
+        not take, its text is drawn as a dim run instead. *plain*, when given,
+        replaces the joined lines as the plain title (the badge text is still
+        appended).
+        """
+        text1 = "".join(text for text, _kind in line1).strip()
+        text2 = "".join(text for text, _kind in (line2 or ())).strip()
+        badge_text = badge or (render.alert_badge_text(alerts) if alerts > 0 else "")
+        plain = " · ".join(part for part in (plain or text1, "" if plain else text2, badge_text) if part)
+        item = rumps.MenuItem(plain, callback=callback)
+        took = False
+        if badge:
+            took = render.set_badge(item, badge)
+        elif alerts > 0:
+            took = render.set_alert_badge(item, alerts)
+        if symbol is not None:
+            render.set_symbol(item, symbol[0], symbol[1])
+        if tooltip:
+            render.set_tooltip(item, tooltip)
+        segments = list(line1)
+        if badge_text and not took:
+            segments.append((f" · {badge_text}", "dim"))
+        if line2:
+            segments.append(("\n", None))
+            segments.extend(line2)
+        render.apply_attributed(item, segments)
+        return item
+
+    @staticmethod
+    def _joined(parts: Sequence[list[tuple[str, str | None]]]) -> list[tuple[str, str | None]]:
+        """A card's second line: ``  a · b · c`` from runs, or ``[]``."""
+        out: list[tuple[str, str | None]] = []
+        for part in parts:
+            if not part:
+                continue
+            out.append(("  " if not out else " · ", "dim"))
+            out.extend(part)
+        return out
+
+    def _scoped_headings(self, snapshot: UiSnapshot, now: float) -> list[str]:
+        """Each scoped window's fleet heading (F4), in first-seen order."""
+        names: list[str] = []
+        for row in snapshot.accounts:
+            for name, _pct in row.scoped_windows:
+                if name not in names:
+                    names.append(name)
+        headings = [
+            _scoped_fleet_heading(
+                snapshot.accounts, name=name, now=now, notes=snapshot.account_notes
+            )
+            for name in names
+        ]
+        return [heading for heading in headings if heading]
+
+    def _glance_cards(self, snapshot: UiSnapshot) -> list[rumps.MenuItem]:
+        """L1 (Claude) and L2 (Codex): the four at-a-glance answers (spec §5.2)."""
+        now = self._now()
+        cards: list[rumps.MenuItem] = []
+        if snapshot.accounts:
+            line1, line2 = self._claude_card_lines(snapshot, now)
+            cards.append(
+                self._two_line_item(
+                    line1,
+                    line2,
+                    alerts=len(snapshot.account_notes),
+                    symbol=("person.crop.circle", "Claude"),
+                )
+            )
+        live = self._live_quota_rows(snapshot)
+        if live:
+            line1, line2 = self._codex_card_lines(snapshot, now)
+            active = self._active_quota_row(snapshot)
+            usable = (getattr(active, "reset_credits_usable", None) or 0) if active else 0
+            alarmed = sum(1 for row in self._visible_quota_rows(snapshot) if _quota_alarm(row))
+            cards.append(
+                self._two_line_item(
+                    line1,
+                    line2,
+                    badge=_reset_badge_text(usable, "usable") if usable > 0 else "",
+                    alerts=0 if usable > 0 else alarmed,
+                    symbol=("terminal", "Codex"),
+                )
+            )
+        return cards
+
+    def _claude_card_lines(
+        self, snapshot: UiSnapshot, now: float
+    ) -> tuple[list[tuple[str, str | None]], list[tuple[str, str | None]]]:
+        """L1: which Claude account, how close to its BINDING window, what next."""
+        models = tuple(snapshot.autoswitch_models or ())
+        notes = snapshot.account_notes
+        active = snapshot.active
+        line1: list[tuple[str, str | None]] = [("Claude · ", "dim")]
+        if active is None:
+            line1.append(("no active account", "dim"))
+        else:
+            line1.append((_display_name(active), "accent"))
+            note = notes.get(active.slot)
+            if note:
+                # A note REPLACES the figures (SPEC 4.3): the status, no pct.
+                status = _account_status_note(
+                    active, note, snapshot.account_note_kinds.get(active.slot, "")
+                )
+                line1.append((f"  {status}", "warn"))
+            else:
+                binding = _binding_window(active, models)
+                if binding is None:
+                    line1.append(("  no window reported", "dim"))
+                else:
+                    label, pct = binding
+                    line1.append((f"  {label} ", "dim"))
+                    line1.append((format_pct(pct), render.severity(pct)))
+                    if pct >= ATTENTION_PCT:
+                        line1.append(("  (!)", "crit"))
+                    mark = _reset_mark_text(_window_reset(active, label), now)
+                    if mark:
+                        line1.append((f"  {mark}", "dim"))
+                if active.usage_is_stale:
+                    line1.append((f" · usage {_age_label(active.usage_age_seconds)} old", "dim"))
+        parts: list[list[tuple[str, str | None]]] = []
+        target = next(
+            (
+                row
+                for row in _switch_targets(snapshot.accounts)
+                if not getattr(row, "disabled", False) and row.slot not in notes
+            ),
+            None,
+        )
+        if target is not None:
+            window = _binding_window(target, models)
+            text = f"next: {_display_name(target)}"
+            if window is not None:
+                text = f"{text} {window[0]} {format_pct(window[1])}"
+            parts.append([(text, None)])
+        room = _claude_room(snapshot)
+        if room is not None:
+            parts.append([(f"{room[0]}/{room[1]} room", None)])
+        if snapshot.settings.get("scoped_fleet_line_enabled", True):
+            parts.extend([(heading, None)] for heading in self._scoped_headings(snapshot, now))
+        spend = _spend_pct(active) if active is not None else None
+        if spend is not None and spend >= render.WARN_PCT:
+            parts.append([(f"extra {format_pct(spend)}", render.severity(spend))])
+        return line1, self._joined(parts)
+
+    def _codex_card_lines(
+        self, snapshot: UiSnapshot, now: float
+    ) -> tuple[list[tuple[str, str | None]], list[tuple[str, str | None]]]:
+        """L2: is Codex usable, on which account, and is a reset usable now."""
+        active = self._active_quota_row(snapshot)
+        line1: list[tuple[str, str | None]] = [("Codex · ", "dim")]
+        if active is None:
+            line1.append(("active login not identified", "dim"))
+        else:
+            line1.append((_quota_head(active), None))
+            if _quota_alarm(active):
+                kind = "crit" if getattr(active, "attention_kind", "") == "crit" else "warn"
+                line1.append((f"  ⚠ {active.attention_note}", kind))
+            else:
+                window = _plan_window(active)
+                if window is None:
+                    # A withheld reading (stale past expiry) or an info
+                    # sentinel: its one note, never a figure beside it.
+                    note, note_kind = _quota_note(active)
+                    if note:
+                        line1.append((f" · {note}", render.NOTE_KIND_COLORS.get(note_kind, "dim")))
+                else:
+                    _label, pct, expired = window
+                    line1.append(("  ", None))
+                    line1.append((format_pct(pct), "dim" if expired else render.severity(pct)))
+                    if not expired and pct is not None and pct >= ATTENTION_PCT:
+                        line1.append(("  (!)", "crit"))
+                    mark = _quota_reset_mark(active, now)
+                    if mark:
+                        line1.append((f"  {mark}", "dim"))
+        parts: list[list[tuple[str, str | None]]] = []
+        if active is not None and (getattr(active, "reset_credits_usable", None) or 0) > 0:
+            notes = tuple(getattr(active, "info_notes", ()) or ())
+            if notes:
+                # The source leads the notes with the usable-credit line
+                # (codex_accounts.info_notes); verbatim, and green.
+                parts.append([(notes[0], "good")])
+        live = self._live_quota_rows(snapshot)
+        best = best_codex_row(live) if best_codex_row is not None else None
+        if best is not None and best is not active:
+            parts.append([(f"best: {_quota_alias(best)} {format_pct(best.seven_day_pct)}", None)])
+        if snapshot.settings.get("codex_fleet_line_enabled", True):
+            fleet_parts = _codex_fleet_parts(self._visible_quota_rows(snapshot), now=now)
+            if fleet_parts is not None:
+                parts.append([(f"{fleet_parts.room}/{fleet_parts.total} room", None)])
+                mark = render.reset_mark(fleet_parts.next_at, now)
+                if mark:
+                    parts.append([(f"next {mark} ({fleet_parts.next_alias})", None)])
+                if fleet_parts.resets:
+                    parts.append([(fleet_parts.resets, None)])
+        return line1, self._joined(parts)
+
+    def _codex_login_callback(self, row: AccountRow) -> Callable[[Any], None] | None:
+        """CX-5: a dead login's click is ``Log in again…``, never a switch."""
+        if _codex_login is not None and row.slot < 0 and _codex_login.needs_login(row):
+            return self._make_codex_login(
+                _codex_login.account_id_for_slot(self._worker.codex_accounts, row.slot)
+            )
+        return None
+
+    def _needs_attention_items(self, snapshot: UiSnapshot) -> list[rumps.MenuItem]:
+        """``Needs attention``: every row that is waiting on the operator.
+
+        Noted Claude slots (the verbatim remedy as a dim second line and the
+        tooltip), alarmed Codex rows, then today's non-slot alert lines
+        verbatim. ABSENT when nothing needs the operator (spec §5.2).
+        """
+        rows = needs_attention_rows(snapshot)
+        # `_alert_items` lists one line per noted slot first; the rest (the
+        # engine verdict, the switch note) is carried over unchanged.
+        extra = self._alert_items(snapshot)[len(snapshot.account_notes):]
+        if not rows and not extra:
+            return []
+        items: list[Any] = [render.section_header("Needs attention")]
+        by_slot = {row.slot: row for row in snapshot.accounts}
+        for vendor, key in rows:
+            if vendor == "claude":
+                slot = key
+                row = by_slot.get(slot)
+                note = snapshot.account_notes[slot]
+                kind = snapshot.account_note_kinds.get(slot, "")
+                name = _display_name(row) if row is not None else f"slot {slot}"
+                status = (
+                    _account_status_note(row, note, kind)
+                    if row is not None
+                    else _title_note(note, kind)
+                )
+                if status.startswith("⚠ "):
+                    status = status[2:]
+                # The whole note, wrapped onto dim lines rather than cut at
+                # MAX_ERROR_CHARS (which dropped the cold-429 remedy); a note
+                # that fits is the one dim line it always was.
+                detail: list[tuple[str, str | None]] = []
+                for text in render.wrap_note(note, MAX_ERROR_CHARS):
+                    if detail:
+                        detail.append(("\n", None))
+                    detail.append((f"  {text}", "dim"))
+                callback = (
+                    None
+                    if row is None or row.is_active or not getattr(row, "switchable", True)
+                    else self._make_switch_callback(row)
+                )
+                head = f"⚠ {name} ({slot}) · Claude · {status}"
+                items.append(
+                    self._two_line_item(
+                        [(head, "warn")],
+                        detail,
+                        callback=callback,
+                        tooltip=note,
+                        plain=f"{head} · {note.strip()}" if note.strip() else head,
+                    )
+                )
+            else:
+                row = key
+                kind = "crit" if getattr(row, "attention_kind", "") == "crit" else "warn"
+                tail = " · active" if row.is_active else ""
+                detail = _codex_login.relogin_detail(row) if _codex_login is not None else ""
+                if not detail and row.usage_age_seconds is not None:
+                    detail = f"{_age_label(row.usage_age_seconds)} old"
+                items.append(
+                    self._two_line_item(
+                        [(f"⚠ {_quota_head(row)} · Codex · {row.attention_note}{tail}", kind)],
+                        [(f"  {detail}", "dim")] if detail else None,
+                        callback=self._codex_login_callback(row),
+                        tooltip=detail,
+                    )
+                )
+        items.extend(extra)
+        return items
+
+    def _claude_section(self, snapshot: UiSnapshot) -> list[Any]:
+        """``Claude · 4/5 room``: the active block, then one line per room.
+
+        One-line rows follow ``_switch_targets`` (headroom first, disabled
+        last) and skip noted slots — they live in Needs attention, and their
+        dim bars stay inside ``All Claude bars ▸``. Absent with no accounts.
+        """
+        if not snapshot.accounts:
+            return []
+        now = self._now()
+        models = tuple(snapshot.autoswitch_models or ())
+        notes = snapshot.account_notes
+        room = _claude_room(snapshot)
+        header = "Claude" + (f" · {room[0]}/{room[1]} room" if room is not None else "")
+        items: list[Any] = [render.section_header(header)]
+        active = next((row for row in snapshot.accounts if row.is_active), None)
+        if active is not None:
+            note = notes.get(active.slot, "")
+            note_kind = snapshot.account_note_kinds.get(active.slot, "")
+            width = max((len(_display_name(row)) for row in snapshot.accounts), default=8)
+            item = rumps.MenuItem(
+                "  "
+                + _account_row_label(
+                    active,
+                    name_width=min(width, 16),
+                    status=_account_status_note(active, note, note_kind),
+                    noted=bool(note),
+                    reset_style="mark",
+                    now=now,
+                ),
+                callback=None,
+            )
+            self._decorate_account_item(
+                item,
+                active,
+                label_width=_window_label_width(
+                    snapshot.accounts, self._visible_quota_rows(snapshot)
+                ),
+                note=note,
+                note_kind=note_kind,
+                reset_style="mark",
+                now=now,
+            )
+            _check(item, True)
+            items.append(item)
+        rows = [row for row in _switch_targets(snapshot.accounts) if row.slot not in notes]
+        name_width = min(max((len(_display_name(row)) for row in rows), default=8), 16)
+        for row in rows:
+            disabled = bool(getattr(row, "disabled", False))
+            binding = _binding_window(row, models)
+            tail = ""
+            if row.usage_is_stale:
+                tail += f" · {_age_label(row.usage_age_seconds)} old"
+            if disabled:
+                tail += " · disabled"
+            item = rumps.MenuItem(
+                _account_row_label(
+                    row,
+                    status=_account_status_note(row),
+                    reset_style="mark",
+                    now=now,
+                ),
+                callback=self._make_switch_callback(row),
+            )
+            render.apply_attributed(
+                item,
+                render.account_line(
+                    row.slot,
+                    _display_name(row),
+                    name_width=name_width,
+                    label=binding[0] if binding is not None else None,
+                    pct=binding[1] if binding is not None else None,
+                    reset=(
+                        _reset_mark_text(_window_reset(row, binding[0]), now)
+                        if binding is not None
+                        else ""
+                    ),
+                    tail=tail,
+                    disabled=disabled,
+                ),
+            )
+            items.append(item)
+        items.append(self._switch_items(snapshot)[2])  # Switch to best now
+        # Every bar, every window, noted slots included - one submenu away.
+        # The classic section's "Accounts" heading is dropped: the parent names it.
+        bars = [
+            item
+            for item in self._account_items(snapshot, reset_style="mark")
+            if str(getattr(item, "title", "")) != "Accounts"
+        ]
+        items.append(_submenu("All Claude bars", bars))
+        return items
+
+    def _codex_section(self, snapshot: UiSnapshot) -> list[Any]:
+        """``Codex · 2/4 room · next ↺ Thu 20:25 (gmail) · 1 reset banked``.
+
+        Active row first, then row order; alarmed rows are skipped (they are
+        in Needs attention). Each row is one line plus at most ONE fact line,
+        with a reset-credit badge where one is held. Absent with no rows.
+        """
+        rows = self._visible_quota_rows(snapshot)
+        if not rows:
+            return []
+        now = self._now()
+        header = vendor_label(rows[0].vendor)
+        if snapshot.settings.get("codex_fleet_line_enabled", True):
+            parts = _codex_fleet_parts(rows, now=now)
+            if parts is not None:
+                header = f"{header} · {parts.room}/{parts.total} room"
+                mark = render.reset_mark(parts.next_at, now)
+                if mark:
+                    header = f"{header} · next {mark} ({parts.next_alias})"
+                if parts.resets:
+                    header = f"{header} · {parts.resets}"
+        items: list[Any] = [render.section_header(header)]
+        ordered = [row for row in rows if row.is_active] + [
+            row for row in rows if not row.is_active
+        ]
+        shown = [row for row in ordered if not _quota_alarm(row)]
+        head_width = max((len(_quota_head(row)) for row in shown), default=0)
+        for row in shown:
+            window = _plan_window(row)
+            if window is None:
+                note, note_kind = _quota_note(row)
+                line1 = render.quota_line(
+                    _quota_head(row),
+                    head_width=head_width,
+                    active=bool(row.is_active),
+                    label=None,
+                    note=note,
+                    note_kind=note_kind,
+                )
+            else:
+                label, pct, expired = window
+                line1 = render.quota_line(
+                    _quota_head(row),
+                    head_width=head_width,
+                    active=bool(row.is_active),
+                    label=label,
+                    pct=pct,
+                    reset=_quota_reset_mark(row, now),
+                    expired=expired,
+                )
+            fact = _codex_fact_line(row)
+            usable = getattr(row, "reset_credits_usable", None) or 0
+            held = getattr(row, "reset_credits_available", None) or 0
+            badge = (
+                _reset_badge_text(usable, "usable")
+                if usable > 0
+                else (_reset_badge_text(held) if held > 0 else "")
+            )
+            full = _quota_row_label(row, reset_style="mark", plan_style="label", now=now)
+            item = self._two_line_item(
+                line1,
+                [(f"  {fact[0]}", fact[1])] if fact is not None else None,
+                callback=self._codex_login_callback(row),
+                badge=badge,
+                tooltip=full,
+                # The plain title is the full sentence (every figure and note)
+                # plus the badge's words: the fallback says what the block draws.
+                plain=full,
+            )
+            items.append(item)
+        items.append(
+            _submenu(
+                "All Codex bars",
+                self._quota_items(snapshot, reset_style="mark", plan_style="label"),
+            )
+        )
+        return items
+
+    def _activity_items(self, snapshot: UiSnapshot) -> list[Any]:
+        """Recent switches, ``Cost (notional, API list prices) ▸``, sessions."""
+        items: list[Any] = list(self._recent_switch_items(snapshot))
+        cost = self._cost_items(snapshot)
+        if len(cost) > 1:
+            items.append(_submenu(str(cost[0].title), cost[1:]))
+        items.extend(self._session_items(snapshot))
+        return items
+
+    def _tools_items(self, snapshot: UiSnapshot) -> list[Any]:
+        """The two one-click switches, then Switch account, Refresh, Settings, Quit."""
+        return [
+            *self._switch_items(snapshot)[:2],
+            self._switch_account_submenu(snapshot, reset_style="mark"),
+            rumps.MenuItem("Refresh now", callback=self._on_refresh_now),
+            self._settings_submenu(snapshot),
+            rumps.MenuItem("Quit", callback=self._on_quit),
+        ]
+
+    def _apply_title_attributes(self, snapshot: UiSnapshot | None = None) -> bool:
+        """Colour the status-item title run by run (spec §2.3). ``True`` if applied.
+
+        Sets ``button().setAttributedTitle_`` with the menu-bar font on every
+        run, from the same tokens the plain title is joined from — and only
+        when the join equals the title just set, so the attributed text can
+        never say something the plain title (the VoiceOver label) does not.
+        Any missing attribute or exception leaves the plain title.
+        """
+        try:
+            item = getattr(getattr(self, "_nsapp", None), "nsstatusitem", None)
+            if item is None:
+                return False
+            snapshot = snapshot or self.snapshot()
+            tokens = self.title_tokens(snapshot)
+            text = render.join_title_tokens(tokens)
+            if not text or text != self.render_title(snapshot):
+                return False
+            button = item.button() if render._responds(item, "button") else None
+            if button is None or not render._responds(button, "setAttributedTitle:"):
+                return False
+            # Recolour the plain title the button already drew (same 13 pt
+            # font and paragraph style, so the same width); rebuild only if
+            # the button has no attributed plain title to start from.
+            plain = button.attributedTitle() if render._responds(button, "attributedTitle") else None
+            string = render.title_recolored(plain, tokens)
+            if string is None:
+                string = render.title_attributed(tokens)
+            if string is None:
+                return False
+            button.setAttributedTitle_(string)
+            return True
+        except Exception:
+            return False
 
     def _alert_items(self, snapshot: UiSnapshot) -> list[rumps.MenuItem]:
         """Standing problems that need the operator, right under the header.
@@ -4986,17 +6432,35 @@ class CCUsageWidgetApp(rumps.App):
         items: list[rumps.MenuItem] = []
         names = {row.slot: _display_name(row) for row in snapshot.accounts}
         for slot in sorted(snapshot.account_notes):
-            note = snapshot.account_notes[slot][:MAX_ERROR_CHARS]
-            items.append(_info(f"⚠ {names.get(slot, f'slot {slot}')} ({slot}): {note}"))
+            note = snapshot.account_notes[slot]
+            line = f"⚠ {names.get(slot, f'slot {slot}')} ({slot}): {note}"
+            if len(note) <= MAX_ERROR_CHARS:
+                items.append(_info(line))
+                continue
+            # Wrapped, never sliced: a cut at MAX_ERROR_CHARS took the SMC-4
+            # cold-429 note's remedy (`cswap add` / `cswap remove N`) with it.
+            # Still ONE item per slot - `_needs_attention_items` counts on it.
+            first, *more = render.wrap_note(line, MAX_ERROR_CHARS)
+            rest: list[tuple[str, str | None]] = []
+            for text in more:
+                if rest:
+                    rest.append(("\n", None))
+                rest.append((f"  {text}", "dim"))
+            items.append(self._two_line_item([(first, None)], rest, tooltip=note, plain=line))
         if snapshot.alert is not None:
             kind, line = snapshot.alert
             # Upstream writes the earliest reset as an ISO-UTC instant; the
             # operator acts on a wall clock (2026-09-01: seven hours out).
             line = _localize_instants(line)[:MAX_ERROR_CHARS]
-            if kind == ALERT_EXTERNAL_SWITCH:
+            if kind in (ALERT_EXTERNAL_SWITCH, ALERT_GHOST_FLIP):
                 # Not prefixed "autoswitch:" — attributing it to the engine is
-                # the opposite of what this verdict says.
-                items.append(_info(f"⚠ {line}"))
+                # the opposite of what this verdict says. Skipped while it IS
+                # the newest journal line (the adapter writes both from one
+                # string): the Recent switches line already says it, and the
+                # same sentence twice read as two flips (UX-6).
+                newest = snapshot.recent_events[-1] if snapshot.recent_events else None
+                if newest != snapshot.alert[1]:
+                    items.append(_info(f"⚠ {line}"))
             else:
                 glyph = "⛔" if kind == ALERT_ALL_EXHAUSTED else "⚠"
                 items.append(_info(f"{glyph} autoswitch: {line}"))
@@ -5006,20 +6470,25 @@ class CCUsageWidgetApp(rumps.App):
         return items
 
     def _recent_switch_items(self, snapshot: UiSnapshot) -> list[rumps.MenuItem]:
-        """The last few switch/verdict lines, newest first.
+        """The newest switch/verdict line, then ``Recent switches ▸``.
 
-        A forensic block, not a status one: tonight the active login flipped
-        5→1 three times and every trace of it lived in a deque with no reader
-        and a log file nobody had open. Empty until something happens, so a
-        quiet machine renders exactly the pre-2026-09-01 menu.
+        A forensic block, not a status one: on 2026-09-01 the active login
+        flipped 5→1 three times and every trace of it lived in a deque with no
+        reader and a log file nobody had open. That purpose stands — who moved
+        the login, and when — but since 2026-09-25 (UX-6) the history is one
+        inline line (the newest) plus a submenu holding the last
+        :data:`RECENT_SWITCH_LINES` newest-first, placed under the account and
+        quota blocks instead of five lines above them. Empty until something
+        happens, so a quiet machine renders exactly the pre-2026-09-01 menu.
         """
         lines = tuple(snapshot.recent_events)[-RECENT_SWITCH_LINES:]
         if not lines:
             return []
-        items: list[rumps.MenuItem] = [_info("Recent switches")]
-        for line in reversed(lines):
-            items.append(_info(f"  {_localize_instants(line)[:MAX_ERROR_CHARS]}"))
-        return items
+        shown = [_localize_instants(line)[:MAX_ERROR_CHARS] for line in reversed(lines)]
+        return [
+            _info(shown[0]),
+            _submenu("Recent switches", [_info(line) for line in shown]),
+        ]
 
     def _header_item(self, snapshot: UiSnapshot) -> rumps.MenuItem:
         active = snapshot.active
@@ -5096,10 +6565,13 @@ class CCUsageWidgetApp(rumps.App):
                 # The title may have been rendered before the image existed;
                 # re-render so the ⇄ fallback drops off an icon-only item.
                 self.title = self.render_title()
+                self._apply_title_attributes()
         except Exception:
             pass
 
-    def _account_items(self, snapshot: UiSnapshot) -> list[rumps.MenuItem]:
+    def _account_items(
+        self, snapshot: UiSnapshot, *, reset_style: str = "classic"
+    ) -> list[rumps.MenuItem]:
         """The claude-swap accounts section, or ``[]`` when there is none.
 
         Empty only in the one case that is not a failure: no claude-swap
@@ -5114,6 +6586,21 @@ class CCUsageWidgetApp(rumps.App):
         if not snapshot.accounts:
             items.append(_info("  " + ("loading…" if snapshot.accounts_at == 0 else "none found")))
             return items
+        now = self._now()
+        if snapshot.settings.get("scoped_fleet_line_enabled", True):
+            # One heading per scoped window the slots report (F4), in the order
+            # they first appear: nothing hardcodes that "Fable" is the only one.
+            names: list[str] = []
+            for row in snapshot.accounts:
+                for name, _pct in row.scoped_windows:
+                    if name not in names:
+                        names.append(name)
+            for name in names:
+                heading = _scoped_fleet_heading(
+                    snapshot.accounts, name=name, now=now, notes=snapshot.account_notes
+                )
+                if heading:
+                    items.append(_info(heading))
         width = max((len(_display_name(row)) for row in snapshot.accounts), default=8)
         # One vertical edge for the whole menu: the widest window name and the
         # widest (!)-adjusted gap across EVERY block, accounts and quota alike,
@@ -5121,11 +6608,19 @@ class CCUsageWidgetApp(rumps.App):
         label_width = _window_label_width(snapshot.accounts, self._visible_quota_rows(snapshot))
         for row in snapshot.accounts:
             # Plain label first: it is what shows if attributed rendering is
-            # unavailable, and it is what VoiceOver reads.
-            label = "  " + _account_row_label(row, name_width=min(width, 16))
+            # unavailable, and it is what VoiceOver reads. A note is in its
+            # short form + age here, as on the header (UX-4); the full remedy
+            # prose is printed once, in the alert line at the top.
             note = snapshot.account_notes.get(row.slot, "")
-            if note:
-                label = f"{label}  ⚠ {note}"
+            note_kind = snapshot.account_note_kinds.get(row.slot, "")
+            label = "  " + _account_row_label(
+                row,
+                name_width=min(width, 16),
+                status=_account_status_note(row, note, note_kind),
+                noted=bool(note),
+                reset_style=reset_style,
+                now=now,
+            )
             item = rumps.MenuItem(
                 label,
                 # `switchable` gates the click, not the vendor: a read-only row
@@ -5136,7 +6631,15 @@ class CCUsageWidgetApp(rumps.App):
                     else self._make_switch_callback(row)
                 ),
             )
-            self._decorate_account_item(item, row, label_width=label_width, note=note)
+            self._decorate_account_item(
+                item,
+                row,
+                label_width=label_width,
+                note=note,
+                note_kind=note_kind,
+                reset_style=reset_style,
+                now=now,
+            )
             _check(item, row.is_active)
             items.append(item)
         return items
@@ -5158,16 +6661,15 @@ class CCUsageWidgetApp(rumps.App):
         a row renders as a header plus its note, with no bar line: a sentinel
         REPLACES a figure, it never sits beside an invented one.
         """
-        if not snapshot.settings.get("codex_tracking_enabled", True):
-            rows = tuple(row for row in snapshot.quota_rows if row.vendor == VENDOR_CLAUDE)
-        else:
-            rows = tuple(snapshot.quota_rows)
-        # The RENDERED note, not the raw field: a live row whose reading aged
-        # past CODEX_FETCH_EXPIRE_SECONDS has its bars withheld and no
-        # sentinel, and its age note is exactly what it has to say.
-        return tuple(row for row in rows if _quota_windows(row) or _quota_note(row)[0])
+        return _visible_quota_rows_of(snapshot)
 
-    def _quota_items(self, snapshot: UiSnapshot) -> list[rumps.MenuItem]:
+    def _quota_items(
+        self,
+        snapshot: UiSnapshot,
+        *,
+        reset_style: str = "classic",
+        plan_style: str = "raw",
+    ) -> list[rumps.MenuItem]:
         """The Codex (and any future read-only vendor) quota section.
 
         One item per vendor carrying a heading plus one bar line per reported
@@ -5179,26 +6681,51 @@ class CCUsageWidgetApp(rumps.App):
         if not rows:
             return []
         label_width = _window_label_width(snapshot.accounts, rows)
+        now = self._now()
         items: list[rumps.MenuItem] = []
         # The fleet line, when there is a fleet to describe (roadmap 4). It is
         # a heading, so it goes above the rows, and it is absent - not empty -
         # whenever the setting is off or no live row exists, which keeps the
         # pre-roadmap block byte-for-byte.
         if snapshot.settings.get("codex_fleet_line_enabled", True):
-            heading = _codex_fleet_heading(rows, now=time.time())
+            heading = _codex_fleet_heading(rows, now=now)
             if heading:
                 items.append(_info(heading))
         for row in rows:
             # `callback=None` is what makes AppKit render it disabled, which is
             # the requirement: a Codex quota must not look clickable, because
-            # there is nothing to switch to.
-            item = rumps.MenuItem("  " + _quota_row_label(row), callback=None)
-            self._decorate_quota_item(item, row, label_width=label_width)
+            # there is nothing to switch to. The one exception (CX-5): a dead
+            # login, whose click is `Log in again…`, never a switch.
+            callback = None
+            if _codex_login is not None and row.slot < 0 and _codex_login.needs_login(row):
+                callback = self._make_codex_login(
+                    _codex_login.account_id_for_slot(self._worker.codex_accounts, row.slot)
+                )
+            item = rumps.MenuItem(
+                "  "
+                + _quota_row_label(row, reset_style=reset_style, plan_style=plan_style, now=now),
+                callback=callback,
+            )
+            self._decorate_quota_item(
+                item,
+                row,
+                label_width=label_width,
+                reset_style=reset_style,
+                plan_style=plan_style,
+                now=now,
+            )
             items.append(item)
         return items
 
     def _decorate_quota_item(
-        self, item: rumps.MenuItem, row: AccountRow, *, label_width: int = 6
+        self,
+        item: rumps.MenuItem,
+        row: AccountRow,
+        *,
+        label_width: int = 6,
+        reset_style: str = "classic",
+        plan_style: str = "raw",
+        now: float | None = None,
     ) -> None:
         """Upgrade a quota row to the same bar block the accounts use.
 
@@ -5216,13 +6743,13 @@ class CCUsageWidgetApp(rumps.App):
             note, note_kind = _quota_note(row)
             segments = render.quota_header(
                 row.alias or vendor_label(row.vendor),
-                plan=row.plan_type or "",
+                plan=(plan_label(row.plan_type) if plan_style == "label" else row.plan_type) or "",
                 note=note,
                 active=bool(row.is_active),
                 note_kind=note_kind,
             )
             pace = dict(getattr(row, "pace_ahead", ()) or ())
-            for label, pct, note, expired in _quota_windows(row):
+            for label, pct, note, expired in _quota_windows(row, reset_style=reset_style, now=now):
                 segments.append(("\n", None))
                 segments.extend(
                     render.window_line(
@@ -5240,6 +6767,10 @@ class CCUsageWidgetApp(rumps.App):
             # returns, where the burn rate is heading. Dim and unmarked - they
             # are not verdicts, and the header's one note stays the headline.
             # Indented to the bars' own column so the block reads as one thing.
+            detail = _codex_login.relogin_detail(row) if _codex_login is not None else ""
+            if detail:  # CX-7b: `token expired Sep 20 11:13 · Log in again…`
+                segments.append(("\n", None))
+                segments.append((f"   {detail}", "dim"))
             for line in getattr(row, "info_notes", ()) or ():
                 segments.append(("\n", None))
                 segments.append((f"   {line}", "dim"))
@@ -5254,54 +6785,85 @@ class CCUsageWidgetApp(rumps.App):
         *,
         label_width: int = 5,
         note: str = "",
+        note_kind: str = "",
+        reset_style: str = "classic",
+        now: float | None = None,
     ) -> None:
         """Upgrade one account row to a multi-line bar block (`cswap watch` look).
 
         One NSMenuItem carrying a 4-line attributed title, rather than four
         items: fewer objects, and clicking anywhere in the block switches to
         that account. Falls back silently to the plain label already set.
+
+        Honesty on the bars (2026-09-25): a window in ``expired_windows`` has
+        ENDED and is drawn dim with no ``(!)`` (UX-3); a slot with a
+        derived-usage *note* draws EVERY window that way and with no pace
+        verdict, because its figures are a last-good read of unknown truth
+        (UX-4). The header then carries the note's short form and the read's
+        age (:func:`_account_status_note`) — on the active slot too.
         """
         try:
+            status = _account_status_note(row, note, note_kind)
+            # A derived state outranks staleness on the header line: the note
+            # says WHY the figures below cannot be current, and carries the
+            # age itself. The active slot never showed a bare age here.
+            age = (
+                f"{_age_label(row.usage_age_seconds)} old"
+                if row.usage_is_stale and not note and not row.is_active
+                else ""
+            )
             segments = render.account_header(
                 row.slot,
                 _display_name(row),
                 row.email,
                 row.is_active,
-                # A derived state outranks staleness on the header line: the
-                # note says WHY the figures below cannot be current.
-                age_note=(
-                    f"⚠ {note}"
-                    if note
-                    else (
-                        f"{_age_label(row.usage_age_seconds)} old" if row.usage_is_stale else ""
-                    )
-                ),
+                age_note=" · ".join(part for part in (status, age) if part),
             )
+            expired = set(getattr(row, "expired_windows", ()) or ())
             windows: list[tuple[str, float | None, str]] = [
-                ("5h", row.five_hour_pct, _reset_note(row, "five_hour")),
-                ("7d", row.seven_day_pct, _reset_note(row, "seven_day")),
+                ("5h", row.five_hour_pct, _reset_note(row, "five_hour", reset_style, now)),
+                ("7d", row.seven_day_pct, _reset_note(row, "seven_day", reset_style, now)),
             ]
             for name, pct in row.scoped_windows:
-                windows.append((name, pct, _reset_note(row, name)))
+                windows.append((name, pct, _reset_note(row, name, reset_style, now)))
             # 5 == len("  (!)"): reserve the marker's width on every row so the
             # reset notes form one column whether or not a window is exhausted.
             pace = dict(getattr(row, "pace_ahead", ()) or ())
-            for name, pct, note in windows:
+            for name, pct, reset_note in windows:
+                key = _WINDOW_KEYS.get(name, name)
+                dead = bool(note) or key in expired
                 segments.append(("\n", None))
                 segments.extend(
                     render.window_line(
                         name,
                         pct,
-                        note,
+                        reset_note,
                         label_width=label_width,
                         note_column=5,
                         # Keyed "five_hour"/"seven_day"/scoped-name; the 5h row
                         # never has a verdict, so it never gets a note.
-                        ahead=pace.get(
-                            {"5h": "five_hour", "7d": "seven_day"}.get(name, name)
-                        ),
+                        ahead=None if dead else pace.get(key),
+                        expired=dead,
                     )
                 )
+            spend = _spend_of(row)
+            if spend is not None:
+                # F2b: REAL extra-usage money, not a notional figure.
+                used, limit, currency = spend
+                pct = _spend_pct(row)
+                kind = render.severity(pct)
+                segments.append(("\n", None))
+                segments.append((f"   {'extra':<{label_width}} ", "dim"))
+                segments.append((f"{_money(used, currency)} / {_money(limit, currency)}", kind))
+                if pct is not None:
+                    segments.append((f"  {format_pct(pct)}", kind))
+                    if pct >= ATTENTION_PCT:
+                        segments.append(("  (!)", "crit"))
+                reset = _spend_reset_label(getattr(row, "spend_resets_at", None))
+                if reset and reset_style == "mark":
+                    segments.append((f"  {_reset_mark_text(reset, now)}", "dim"))
+                elif reset:
+                    segments.append((f"  resets {reset}", "dim"))
             render.apply_attributed(item, segments)
         except Exception:
             pass  # plain label stands
@@ -5339,6 +6901,7 @@ class CCUsageWidgetApp(rumps.App):
             ),
             _info(_cost_row_label(cost.last_30d.label or "Last 30d", _usd_label(cost.last_30d))),
         ]
+        items.extend(self._real_spend_items(snapshot))
         items.extend(self._model_items(cost, snapshot.settings))
         items.extend(self._unpriced_items(cost))
         items.extend(self._attribution_items(snapshot))
@@ -5350,6 +6913,36 @@ class CCUsageWidgetApp(rumps.App):
         items.extend(self._dashboard_items(snapshot))
         items.extend(self._export_items(snapshot))
         return items
+
+    def _real_spend_items(self, snapshot: UiSnapshot) -> list[rumps.MenuItem]:
+        """``Real spend (extra usage)  $480.00 / $500.00 · real, not notional``.
+
+        F2b: the one dollar figure in this section that is money actually
+        billed — claude-swap's extra-usage spend against its limit, summed
+        over the Claude slots that report one, one line per currency (never
+        converted, never a ``$`` we were not given). Absent — no line at all —
+        when no slot reports a limit, so the section is otherwise unchanged.
+        """
+        totals: dict[str, list[float]] = {}
+        order: list[str] = []
+        for row in snapshot.accounts:
+            spend = _spend_of(row)
+            if spend is None:
+                continue
+            used, limit, currency = spend
+            code = currency or ""
+            if code not in totals:
+                totals[code] = [0.0, 0.0]
+                order.append(code)
+            totals[code][0] += used
+            totals[code][1] += limit
+        return [
+            _info(
+                f"  Real spend (extra usage)  {_money(totals[code][0], code)} / "
+                f"{_money(totals[code][1], code)} · real, not notional"
+            )
+            for code in order
+        ]
 
     def _attribution_items(self, snapshot: UiSnapshot) -> list[rumps.MenuItem]:
         """``Today by project`` and ``Most expensive sessions today`` (item 6).
@@ -5368,9 +6961,13 @@ class CCUsageWidgetApp(rumps.App):
         if not snapshot.settings.get("cost_by_project_enabled", True):
             return []
         items: list[rumps.MenuItem] = []
+        sessions = self._worker.cost_session_rows
         for heading, rows in (
             ("today by project", self._worker.cost_project_rows),
-            ("today's top sessions", self._worker.cost_session_rows),
+            ("today's top sessions", sessions),
+            # F1: the worker's session rows carry the same day's runs
+            # (attribution.SessionRows); absent - byte-for-byte - without one.
+            ("today's top workflow runs", getattr(sessions, "workflow_runs", ())),
         ):
             if not rows:
                 continue
@@ -5623,7 +7220,9 @@ class CCUsageWidgetApp(rumps.App):
             items.append(_info(f"! {self._worker.dashboard_error[:MAX_ERROR_CHARS]}"))
         return items
 
-    def _switch_account_submenu(self, snapshot: UiSnapshot) -> rumps.MenuItem:
+    def _switch_account_submenu(
+        self, snapshot: UiSnapshot, *, reset_style: str = "classic"
+    ) -> rumps.MenuItem:
         """``Switch account ▸`` - every target, with what to choose by.
 
         Pseudo-accounts live in `quota_rows` and never reach here; the
@@ -5632,9 +7231,10 @@ class CCUsageWidgetApp(rumps.App):
         """
         targets = _switch_targets(snapshot.accounts)
         width = min(max((len(_display_name(row)) for row in targets), default=8), 16)
+        now = self._now()
         children: list[Any] = [
             rumps.MenuItem(
-                _switch_target_label(row, name_width=width),
+                _switch_target_label(row, name_width=width, reset_style=reset_style, now=now),
                 callback=self._make_switch_callback(row),
             )
             for row in targets
@@ -5672,7 +7272,7 @@ class CCUsageWidgetApp(rumps.App):
                 bool(settings.get(key, SETTINGS_DEFAULTS.get(key, True))),
             )
             for key, label in _TITLE_TOGGLES
-            if has_vendors or key != "title_show_codex_pct"
+            if has_vendors or key not in _VENDOR_TITLE_TOGGLES
         ]
         children: list[Any] = [
             _submenu("Title", title_children),
@@ -5754,6 +7354,23 @@ class CCUsageWidgetApp(rumps.App):
                     live_on,
                 )
             )
+            if live_on:
+                # CX-4: the only control over OAuth refresh used to be a
+                # hand-edit, and its off default let every widget token lapse.
+                refresh_on = bool(
+                    settings.get(
+                        "codex_refresh_enabled", SETTINGS_DEFAULTS["codex_refresh_enabled"]
+                    )
+                )
+                codex_children.append(
+                    _check(
+                        rumps.MenuItem(
+                            "Refresh Codex logins automatically",
+                            callback=self._make_setting_toggle("codex_refresh_enabled"),
+                        ),
+                        refresh_on,
+                    )
+                )
             fleet_on = bool(
                 settings.get(
                     "codex_fleet_line_enabled", SETTINGS_DEFAULTS["codex_fleet_line_enabled"]
@@ -5784,8 +7401,49 @@ class CCUsageWidgetApp(rumps.App):
                 )
             )
             codex_children.append(self._codex_accounts_submenu(snapshot))
+        # The Accounts block's per-model fleet line (F4) had only a hand-edit of
+        # settings.json as its off switch. Drawn only while some claude-swap
+        # slot reports a scoped window - the only case in which the line can
+        # appear - and named after that window when there is exactly one.
+        scoped_names = list(
+            dict.fromkeys(name for row in snapshot.accounts for name, _pct in row.scoped_windows)
+        )
+        if scoped_names:
+            scoped_on = bool(
+                settings.get(
+                    "scoped_fleet_line_enabled", SETTINGS_DEFAULTS["scoped_fleet_line_enabled"]
+                )
+            )
+            scoped_label = (
+                f"{scoped_names[0]} fleet line" if len(scoped_names) == 1 else "Model fleet line"
+            )
+            codex_children.insert(
+                0,
+                _check(
+                    rumps.MenuItem(
+                        self._switch_label(scoped_label, scoped_on),
+                        callback=self._make_setting_toggle("scoped_fleet_line_enabled"),
+                    ),
+                    scoped_on,
+                ),
+            )
         # Directly under `Title`, where the vendor switch has always been.
         children[1:1] = codex_children
+        # Design wave 2: the layout rollback sits right under Title - it is the
+        # other "how does the menu look" control.
+        classic_on = bool(
+            settings.get("menu_layout_classic", SETTINGS_DEFAULTS["menu_layout_classic"])
+        )
+        children.insert(
+            1,
+            _check(
+                rumps.MenuItem(
+                    _CLASSIC_LAYOUT_LABEL,
+                    callback=self._make_setting_toggle("menu_layout_classic"),
+                ),
+                classic_on,
+            ),
+        )
         audit_on = bool(
             settings.get("self_audit_enabled", SETTINGS_DEFAULTS["self_audit_enabled"])
         )
@@ -5953,6 +7611,10 @@ class CCUsageWidgetApp(rumps.App):
             )
         if not children:
             children.append(_info("No accounts adopted yet"))
+        if _codex_login is not None:  # CX-5
+            children.append(
+                rumps.MenuItem(_codex_login.ADD_ACCOUNT_LABEL, callback=self._make_codex_login(None))
+            )
         children.append(None)
         interval = int(
             snapshot.settings.get(
@@ -6079,6 +7741,15 @@ class CCUsageWidgetApp(rumps.App):
 
         def callback(_sender: Any) -> None:
             self._worker.submit(_CMD_SET_CODEX_ACCOUNT, (account_id, not enabled))
+
+        return callback
+
+    def _make_codex_login(self, account_id: str | None) -> Callable[[Any], None]:
+        """``Log in again…`` / ``Add Codex account…`` (CX-5). The file is
+        written on the worker; Terminal is opened on this thread's next tick."""
+
+        def callback(_sender: Any) -> None:
+            self._worker.submit(_CMD_CODEX_LOGIN, account_id)
 
         return callback
 

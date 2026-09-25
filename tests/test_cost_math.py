@@ -41,6 +41,8 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+os.environ.setdefault("CC_USAGE_WIDGET_NO_REVEAL", "1")  # never open Finder from a test
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cc_usage_widget.contracts import (  # noqa: E402
@@ -885,6 +887,247 @@ def test_gpt_5_5_is_priced() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 2026-09-25 (drift-2, drift-6): OpenAI's page, read that day and saved at
+# ~/.claude/plans/usage-bar-2026-09-25/evidence/drift_openai_pricing.html,
+# lists gpt-6-sol and gpt-6-luna and a separate "Cache writes" column. Before
+# this pass gpt-6-luna was in use (history 2026-09-23: 184,985 tokens) at $0,
+# and every OpenAI cache write billed at the input rate.
+# ---------------------------------------------------------------------------
+
+# model -> per-Mtok USD (input, cached input, cache writes, output), the
+# page's standard-tier short-context columns, verbatim.
+_OPENAI_PAGE_2026_09_25: dict[str, tuple[str, str, str, str]] = {
+    "gpt-6-astra": ("10.00", "1.00", "12.50", "50.00"),
+    "gpt-6-sol": ("2.00", "0.20", "2.50", "10.00"),
+    "gpt-6-luna": ("0.10", "0.01", "0.125", "0.50"),
+    "gpt-5.6-sol": ("4.00", "0.40", "5.00", "20.00"),
+    "gpt-5.6-terra": ("2.00", "0.20", "2.50", "12.00"),
+    "gpt-5.6-luna": ("0.20", "0.02", "0.25", "1.20"),
+}
+
+
+def _mtok_usd(model: str, day: dt.date, **usage: int) -> float:
+    """USD for *usage* on *model* through the module-level resolve()."""
+    from cc_usage_widget import pricing
+
+    got = pricing.resolve(model, day)
+    return got.rates.cost_picos(ModelUsage(**usage)) / 10**12
+
+
+def test_gpt_6_luna_and_gpt_6_sol_are_priced_at_the_published_rates() -> None:
+    """Both new models price at their own rows, never $0 and never at a
+    gpt-5.6 sibling's rate: 'gpt-6-sol' is not 'gpt-5.6-sol'."""
+    from cc_usage_widget import pricing
+
+    day = dt.date(2026, 9, 23)
+    luna = pricing.resolve("codex:gpt-6-luna", day)
+    assert luna.is_priced is True, luna
+    assert abs(_mtok_usd("codex:gpt-6-luna", day, input=_ONE_MTOK) - 0.10) < 1e-12
+    assert pricing.canonical_key("gpt-6-sol") == "codex:gpt-6-sol"
+    assert pricing.canonical_key("gpt-6-luna") == "codex:gpt-6-luna"
+    # The older siblings still resolve to themselves.
+    assert pricing.canonical_key("gpt-5.6-sol") == "codex:gpt-5.6-sol"
+    assert pricing.canonical_key("gpt-5.6-luna") == "codex:gpt-5.6-luna"
+    for model in ("gpt-6-sol", "gpt-6-luna"):
+        key = "codex:" + model
+        want_in, want_read, want_write, want_out = (
+            float(v) for v in _OPENAI_PAGE_2026_09_25[model]
+        )
+        assert abs(_mtok_usd(key, day, input=_ONE_MTOK) - want_in) < 1e-12, model
+        assert abs(_mtok_usd(key, day, cache_read=_ONE_MTOK) - want_read) < 1e-12, model
+        assert abs(_mtok_usd(key, day, cache_write_5m=_ONE_MTOK) - want_write) < 1e-12, model
+        assert abs(_mtok_usd(key, day, output=_ONE_MTOK) - want_out) < 1e-12, model
+        assert DEFAULT_PRICING.display_name(key) == model
+
+
+def test_openai_cache_writes_price_at_the_published_cache_write_column() -> None:
+    """drift-6: a cache write is billed at the page's 'Cache writes' column
+    (1.25x input on every model that prints one), not at the input rate. Rows
+    whose page cell is '-' (gpt-5.5, gpt-5.4) or that have no such column
+    (gpt-5.4-mini) keep the input rate - no rate is invented for them."""
+    day = dt.date(2026, 9, 25)
+    astra = _mtok_usd("codex:gpt-6-astra", day, cache_write_5m=_ONE_MTOK)
+    assert abs(astra - 12.50) < 1e-12, astra
+    # The float contract view carries the same rate (price_for() callers).
+    price = DEFAULT_PRICING.price_for("codex:gpt-6-astra", day)
+    assert price is not None and abs(price.cache_write_5m_usd_per_mtok - 12.50) < 1e-12, price
+    for model, (_, _, write, _) in _OPENAI_PAGE_2026_09_25.items():
+        got = _mtok_usd("codex:" + model, day, cache_write_5m=_ONE_MTOK)
+        assert abs(got - float(write)) < 1e-12, (model, got, write)
+    for model, input_rate in (("gpt-5.5", 5.00), ("gpt-5.4", 2.50), ("gpt-5.4-mini", 0.75)):
+        got = _mtok_usd("codex:" + model, day, cache_write_5m=_ONE_MTOK)
+        assert abs(got - input_rate) < 1e-12, (model, got)
+    # Every OpenAI row states its cache-write rate on the row itself.
+    for row in DEFAULT_PRICING.rows:
+        if row.vendor == "codex":
+            assert row.cache_write_usd_per_mtok is not None, row.model
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-23: Opus 5.5 and Fable 5.1 are this setup's main models, and both
+# priced $0 because the suffix rule (correctly) refused to fold them into
+# Opus 5 / Fable 5. Each now has its own row. Their cache READ is NOT the
+# standard 0.1x: a derived table would bill Opus 5.5 reads at $0.40 (2x) and
+# Fable 5.1 reads at $1.00 (4x), which is why each rate is checked on its own.
+# ---------------------------------------------------------------------------
+
+_ONE_MTOK = 1_000_000
+_NEW_ROW_DAY = dt.date(2026, 9, 23)
+
+# model -> per-Mtok USD for (input, output, cache_write_5m, cache_write_1h,
+# cache_read), from the published prices cited beside the rows in pricing.py.
+_NEW_ROW_RATES: dict[str, tuple[float, float, float, float, float]] = {
+    "claude-opus-5-5": (4.00, 20.00, 5.00, 8.00, 0.20),
+    "claude-fable-5-1": (10.00, 50.00, 12.50, 20.00, 0.25),
+}
+_USAGE_FIELDS = ("input", "output", "cache_write_5m", "cache_write_1h", "cache_read")
+
+
+def _check_each_rate(model: str) -> None:
+    """One Mtok in each counter, one counter at a time, so a wrong rate names
+    its own field instead of hiding inside a sum; then all five together."""
+    expected = _NEW_ROW_RATES[model]
+    for field, rate in zip(_USAGE_FIELDS, expected):
+        usage = ModelUsage(**{field: _ONE_MTOK})
+        cost = DEFAULT_PRICING.cost_usd(model, usage, _NEW_ROW_DAY)
+        assert abs(cost - rate) < 1e-12, (model, field, cost, rate)
+        # Exact integer path too: $1/Mtok == 1_000_000 pico/token.
+        picos = DEFAULT_PRICING.cost_picos(model, usage, _NEW_ROW_DAY)
+        assert picos == round(rate * 1_000_000) * _ONE_MTOK, (model, field, picos)
+    full = ModelUsage(**{f: _ONE_MTOK for f in _USAGE_FIELDS})
+    total = DEFAULT_PRICING.cost_usd(model, full, _NEW_ROW_DAY)
+    assert abs(total - sum(expected)) < 1e-9, (model, total)
+    # The float contract view must carry the same read override, or anything
+    # pricing through price_for() would silently re-derive 0.1x.
+    price = DEFAULT_PRICING.price_for(model, _NEW_ROW_DAY)
+    assert price is not None, model
+    assert abs(price.cache_read_usd_per_mtok - expected[4]) < 1e-12, price
+    assert abs(price.cache_write_5m_usd_per_mtok - expected[2]) < 1e-12, price
+    assert abs(price.cache_write_1h_usd_per_mtok - expected[3]) < 1e-12, price
+    assert abs(price.cost_usd(full) - sum(expected)) < 1e-9, price
+
+
+def test_opus_5_5_prices_each_token_kind_at_its_published_rate() -> None:
+    """$4 in, $20 out, $5 5m write, $8 1h write, $0.20 read (0.05x) = $37.20."""
+    _check_each_rate("claude-opus-5-5")
+    full = ModelUsage(**{f: _ONE_MTOK for f in _USAGE_FIELDS})
+    assert abs(DEFAULT_PRICING.cost_usd("claude-opus-5-5", full, _NEW_ROW_DAY) - 37.20) < 1e-9
+
+
+def test_fable_5_1_prices_each_token_kind_at_its_published_rate() -> None:
+    """$10 in, $50 out, $12.50 5m write, $20 1h write, $0.25 read (0.025x) = $92.75."""
+    _check_each_rate("claude-fable-5-1")
+    full = ModelUsage(**{f: _ONE_MTOK for f in _USAGE_FIELDS})
+    assert abs(DEFAULT_PRICING.cost_usd("claude-fable-5-1", full, _NEW_ROW_DAY) - 92.75) < 1e-9
+
+
+def test_opus_5_5_and_fable_5_1_spellings_resolve_to_their_own_rows() -> None:
+    """Every spelling Claude Code writes (plain, [1m], dated) lands on the
+    point release's own row, with its own menu label."""
+    cases = {
+        "claude-opus-5-5": "claude-opus-5-5",
+        "claude-opus-5-5[1m]": "claude-opus-5-5",
+        "claude-opus-5-5-20260922": "claude-opus-5-5",
+        "claude-fable-5-1": "claude-fable-5-1",
+        "claude-fable-5-1[1m]": "claude-fable-5-1",
+    }
+    for raw, want in cases.items():
+        got = DEFAULT_PRICING.canonical_model(raw)
+        assert got == want, (raw, got)
+        assert DEFAULT_PRICING.canonical_key(raw) == want, raw
+        assert DEFAULT_PRICING.is_known(raw), raw
+    assert DEFAULT_PRICING.display_name("claude-opus-5-5[1m]") == "Opus 5.5"
+    assert DEFAULT_PRICING.display_name("claude-fable-5-1") == "Fable 5.1"
+
+
+def test_a_point_release_never_borrows_its_predecessors_rate() -> None:
+    """Opus 5.5 is not Opus 5 and Fable 5.1 is not Fable 5 - and a point
+    release with no row of its own stays unknown ($0, raw name surfaced)
+    rather than borrowing the nearest neighbour's rate (SPEC 3.3 trap 5)."""
+    full = ModelUsage(**{f: _ONE_MTOK for f in _USAGE_FIELDS})
+    # Cache reads dominate this setup's token mix, and reads are where the two
+    # pairs differ most (Fable 5.1 matches Fable 5 on every other rate): 10
+    # Mtok of reads is $2.00 vs $5.00 for Opus, $2.50 vs $10.00 for Fable.
+    reads = ModelUsage(cache_read=10 * _ONE_MTOK)
+    for new, old, new_usd, old_usd in (
+        ("claude-opus-5-5", "claude-opus-5", 2.00, 5.00),
+        ("claude-fable-5-1", "claude-fable-5", 2.50, 10.00),
+    ):
+        assert DEFAULT_PRICING.canonical_model(new) == new
+        assert DEFAULT_PRICING.canonical_model(new) != old
+        got_new = DEFAULT_PRICING.cost_usd(new, reads, _NEW_ROW_DAY)
+        got_old = DEFAULT_PRICING.cost_usd(old, reads, _NEW_ROW_DAY)
+        assert abs(got_new - new_usd) < 1e-9, (new, got_new)
+        assert abs(got_old - old_usd) < 1e-9, (old, got_old)
+    # The predecessors still resolve to themselves, dated and bracketed.
+    assert DEFAULT_PRICING.canonical_model("claude-opus-5[1m]") == "claude-opus-5"
+    assert DEFAULT_PRICING.canonical_model("claude-fable-5-20260514") == "claude-fable-5"
+    for future in (
+        "claude-opus-5-7",
+        "claude-opus-5-7[1m]",
+        "claude-opus-5-5-1",
+        "claude-fable-5-2",
+        "claude-fable-5-1-1",
+    ):
+        assert DEFAULT_PRICING.canonical_model(future) == UNKNOWN_MODEL, future
+        assert DEFAULT_PRICING.cost_usd(future, full, _NEW_ROW_DAY) == 0.0, future
+        assert DEFAULT_PRICING.display_name(future) == future, future
+
+
+# Integer pico-per-token rates of every row that existed before the Opus 5.5 /
+# Fable 5.1 rows, captured from the pre-change table (HEAD ee05da2):
+# (vendor, model, from, until) -> (input, output, write_5m, write_1h, read).
+_PRE_EXISTING_RATES: dict[tuple[str, str, str | None, str | None], tuple[int, int, int, int, int]] = {
+    ("claude", "claude-fable-5", None, None): (10_000_000, 50_000_000, 12_500_000, 20_000_000, 1_000_000),
+    ("claude", "claude-mythos-5", None, None): (10_000_000, 50_000_000, 12_500_000, 20_000_000, 1_000_000),
+    ("claude", "claude-opus-5", None, None): (5_000_000, 25_000_000, 6_250_000, 10_000_000, 500_000),
+    ("claude", "claude-opus-4-8", None, None): (5_000_000, 25_000_000, 6_250_000, 10_000_000, 500_000),
+    ("claude", "claude-sonnet-5", None, "2026-08-31"): (2_000_000, 10_000_000, 2_500_000, 4_000_000, 200_000),
+    ("claude", "claude-sonnet-5", "2026-09-01", None): (3_000_000, 15_000_000, 3_750_000, 6_000_000, 300_000),
+    ("claude", "claude-sonnet-4-6", None, None): (3_000_000, 15_000_000, 3_750_000, 6_000_000, 300_000),
+    ("claude", "claude-haiku-4-5", None, None): (1_000_000, 5_000_000, 1_250_000, 2_000_000, 100_000),
+    # 2026-09-25 (drift-6): these four OpenAI rows' cache-write slots moved on
+    # purpose from the input rate to the page's "Cache writes" column; every
+    # other slot of theirs is unchanged. Nothing else in this table moved.
+    ("codex", "gpt-6-astra", None, None): (10_000_000, 50_000_000, 12_500_000, 12_500_000, 1_000_000),
+    ("codex", "gpt-5.6-sol", None, "2026-09-02"): (5_000_000, 30_000_000, 5_000_000, 5_000_000, 500_000),
+    ("codex", "gpt-5.6-sol", "2026-09-03", None): (4_000_000, 20_000_000, 5_000_000, 5_000_000, 400_000),
+    ("codex", "gpt-5.6-terra", None, None): (2_000_000, 12_000_000, 2_500_000, 2_500_000, 200_000),
+    ("codex", "gpt-5.6-luna", None, None): (200_000, 1_200_000, 250_000, 250_000, 20_000),
+    ("codex", "gpt-5.5", None, None): (5_000_000, 30_000_000, 5_000_000, 5_000_000, 500_000),
+    ("codex", "gpt-5.4", None, None): (2_500_000, 15_000_000, 2_500_000, 2_500_000, 250_000),
+    ("codex", "gpt-5.4-mini", None, None): (750_000, 4_500_000, 750_000, 750_000, 75_000),
+}
+
+
+def test_the_cache_read_override_moves_no_pre_existing_rate() -> None:
+    """Adding a per-row cache-read override must leave every older row exactly
+    as it was: same integer rates, and (for Claude) still no override, so its
+    float view still derives 0.1x / 1.25x / 2x."""
+    rows = {
+        (
+            r.vendor,
+            r.model,
+            r.effective_from.isoformat() if r.effective_from else None,
+            r.effective_until.isoformat() if r.effective_until else None,
+        ): r
+        for r in DEFAULT_PRICING.rows
+    }
+    for key, want in _PRE_EXISTING_RATES.items():
+        assert key in rows, key
+        rates = rows[key].rates
+        got = (rates.input, rates.output, rates.cache_write_5m, rates.cache_write_1h, rates.cache_read)
+        assert got == want, (key, got, want)
+        if key[0] == "claude":
+            assert rows[key].cached_input_usd_per_mtok is None, key
+            assert rows[key].cache_write_usd_per_mtok is None, key
+    # The only rows added are the two point releases and (2026-09-25) the two
+    # GPT-6 models OpenAI's page lists beside Astra.
+    added = sorted(k[1] for k in rows if k not in _PRE_EXISTING_RATES)
+    assert added == ["claude-fable-5-1", "claude-opus-5-5", "gpt-6-luna", "gpt-6-sol"], added
+
+
+# ---------------------------------------------------------------------------
 # Roadmap item 1: the per-file contribution ledger makes `merge` reversible
 #
 # The incident these encode: `DailyRollupStore.merge` was a plain addition and
@@ -1304,6 +1547,12 @@ def test_a_vanished_legacy_entry_leaves_a_legacy_tombstone() -> None:
         doomed = root / "projects" / "p" / "doomed.jsonl"
         _write(keep, [_record("k0", FABLE, {"input_tokens": 1_000}, epoch=stamp)])
         _write(doomed, [_record("d0", FABLE, {"input_tokens": 5_000}, epoch=stamp)])
+        # Pin the write day: with the real mtime (today) the final scan below
+        # kept the tombstone inside its 30-day lookback once the calendar
+        # passed its fixed clock. 09-04, not the clock's 09-05, so the test
+        # still proves the flag comes from the mtime, not the injected clock.
+        written_at = _epoch(2026, 9, 4, 10)
+        os.utime(doomed, (written_at, written_at))
         state_path = root / "scan_state.json"
         _indexer(root, now=clock).scan_once()
         _strip_ledger(state_path)

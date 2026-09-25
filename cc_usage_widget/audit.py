@@ -98,7 +98,8 @@ NOTE_TAIL_SEPARATOR: str = " — "
 The verdict is rewritten by the worker once it knows whether the plan actually
 landed, so where it starts has to be stated once rather than parsed twice. An
 em dash surrounded by spaces appears nowhere else in the line: cell
-descriptions are ``vendor day model ratio`` and caveats are parenthesised.
+descriptions are ``vendor day model ratio`` (or a signed ``+1.0M tok (+1.0%)``
+delta) and caveats are parenthesised.
 """
 
 PENDING_TAIL: str = "repair pending"
@@ -192,13 +193,25 @@ class AuditCell:
         return self.live_tokens / self.fresh_tokens
 
     def describe(self) -> str:
-        """``codex 2026-09-09 gpt-5.6-sol 12.7x`` - the worst cell, named."""
+        """``codex 2026-09-09 gpt-5.6-sol 12.7x`` - the worst cell, named.
+
+        A drift inside ``0.95 <= ratio < 1.05`` renders as a signed token delta
+        and percentage (``+1.0M tok (+1.0%)``) instead: ``.1f`` of a ratio that
+        close to one reads ``1.0x`` (or ``0.9x`` / ``1.0x`` for an under-count)
+        and hides both the size and the direction of a drift the 0.5 %
+        threshold did flag - six nightly repairs 2026-09-16..21 all said
+        ``1.0x``. The band test is integer arithmetic, so its edges are exact.
+        """
         ratio = self.ratio
-        detail = (
-            f"{ratio:.1f}x"
-            if ratio is not None
-            else f"+{format_tokens(self.drift_tokens)} tok"
-        )
+        live, fresh = self.live_tokens, self.fresh_tokens
+        if ratio is None:
+            detail = f"+{format_tokens(self.drift_tokens)} tok"
+        elif 19 * fresh <= 20 * live < 21 * fresh:
+            sign = "-" if live < fresh else "+"
+            pct = abs(live - fresh) * 100 / fresh
+            detail = f"{sign}{format_tokens(self.drift_tokens)} tok ({sign}{pct:.1f}%)"
+        else:
+            detail = f"{ratio:.1f}x"
         return f"{self.vendor} {self.day} {self.model} {detail}"
 
 

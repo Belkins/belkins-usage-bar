@@ -27,15 +27,20 @@ paints its first menu.
 
 from __future__ import annotations
 
+import atexit
+import copy
 import fcntl
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
+import threading
 import time
-from collections.abc import Mapping, Sequence
-from typing import Any
+from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
+from typing import Any, TextIO
 
 from . import accounts as accounts_mod
 from . import app as app_mod
@@ -131,47 +136,390 @@ def _log(message: str) -> None:
     sys.stderr.flush()
 
 
-def _sweep_tmp_orphans(max_age_s: float = 86_400.0) -> None:
-    """Unlink day-old ``<state>.tmp.<pid>`` orphans next to the state files.
+_TMP_ORPHAN_RE = re.compile(
+    r"^\.?[\w.-]+\.(?:json|html)(\.tmp\.\w+|\.\w+\.tmp(\.json)?|\.tmp)$"
+)
+"""Every atomic-write helper's temp name in the widget home, and nothing else.
+
+One pattern for all of them (OPS-1, 2026-09-25): the old per-file glob
+``<state>.tmp.*`` could never match ``scan_state_dedup.json.tmp.<pid>``
+(indexer.py) - seven of those, Aug 25 .. Sep 23, survived every restart
+carrying request ids at mode 644. The arms:
+
+* ``.tmp.<x>``  - ``<name>.tmp.<pid>`` (indexer, codex_indexer), the dot-
+  prefixed ``.audit_state.json.tmp.<pid>`` (audit) and ``mkstemp``'s
+  ``<name>.tmp.<random>`` (codex_accounts);
+* ``.<x>.tmp[.json]`` - ``mkstemp`` with ``prefix=".<name>."`` and
+  ``suffix=".tmp"`` (rollup, state) or ``".tmp.json"`` (notify);
+* ``.tmp`` - ``attribution.json.tmp`` and ``dashboard.html.tmp``.
+
+A real state file ends in ``.json`` / ``.html`` and cannot match: every arm
+needs a ``tmp`` component after the extension."""
+
+
+def _pid_is_alive(pid: int) -> bool:
+    """``kill(pid, 0)``: True unless the pid is certainly gone. A number
+    ``pid_t`` cannot hold raises ``OverflowError`` in ``os.kill``; no process
+    owns it, so it answers False."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by someone else
+    except (OSError, OverflowError, ValueError):
+        return False
+    return True
+
+
+def _sweep_tmp_orphans(
+    max_age_s: float = 86_400.0,
+    home: Path = SCAN_STATE_PATH.parent,
+    reprieve_max_age_s: float | None = None,
+) -> None:
+    """Unlink day-old atomic-write temp orphans in the widget *home*.
 
     Safe under the single-instance lock: no live writer can own a tmp file
-    that old, and every writer creates a fresh ``mkstemp`` name.
+    that old, and every writer creates a fresh name. Belt and braces for the
+    ``<name>.tmp.<pid>`` shape: a suffix naming a pid that is still alive is
+    left alone - but only while the file is younger than
+    *reprieve_max_age_s* (default seven times *max_age_s*, a week). macOS
+    reuses pids, and an unrelated long-lived agent that inherits the number
+    would otherwise pin the orphan forever (R2-SEC-3: a 23-day-old
+    ``scan_state_dedup.json.tmp.1068`` was held by TextInputMenuAgent).
+    Past that age, age alone decides. Top level only:
+    ``codex-accounts/<id>/`` holds credentials and is not ours to sweep.
     """
+    if reprieve_max_age_s is None:
+        reprieve_max_age_s = 7 * max_age_s
     try:
         now = time.time()
-        for state_path in (SCAN_STATE_PATH, CODEX_SCAN_STATE_PATH, ROLLUPS_PATH):
-            for orphan in state_path.parent.glob(f"{state_path.name}.tmp.*"):
-                try:
-                    if now - orphan.stat().st_mtime > max_age_s:
-                        orphan.unlink()
-                        _log(f"swept atomic-write orphan {orphan.name}")
-                except OSError:
+        for orphan in Path(home).iterdir():
+            match = _TMP_ORPHAN_RE.match(orphan.name)
+            if match is None:
+                continue
+            try:
+                if not orphan.is_file() or orphan.is_symlink():
                     continue
+                age = now - orphan.stat().st_mtime
+                if age <= max_age_s:
+                    continue
+                suffix = (match.group(1) or "").rpartition(".")[2]
+                if (
+                    age < reprieve_max_age_s
+                    and match.group(1).startswith(".tmp.")
+                    and suffix.isascii()
+                    and suffix.isdigit()
+                    and _pid_is_alive(int(suffix))
+                ):
+                    continue
+                orphan.unlink()
+                _log(f"swept atomic-write orphan {orphan.name}")
+            except (OSError, ValueError, OverflowError):
+                continue
     except Exception as exc:  # pragma: no cover - housekeeping must not kill startup
         _log(f"tmp-orphan sweep failed: {exc}")
 
 
-def _bound_widget_log(max_bytes: int = 5_000_000) -> None:
+_MALLOC_NOISE = b"MallocStackLogging: can't turn off"
+"""A line every child ``python`` prints at exit on this macOS, carrying no
+information: 25,560 of them were 68% of widget.log on 2026-09-25."""
+
+
+def _bound_widget_log(
+    max_bytes: int = 5_000_000, log_path: Path | str | None = None
+) -> None:
     """Truncate the launchd-appended log once it passes *max_bytes*.
 
     launchd appends to ``logs/widget.log`` forever and knows no rotation;
-    keep the tail half so recent forensics survive the cut.
+    keep the tail half so recent forensics survive the cut, minus the
+    ``MallocStackLogging`` noise lines. Runs at launch and once per local day
+    from the worker (OPS-7). Written IN PLACE, never renamed: launchd holds an
+    ``O_APPEND`` fd on this inode, so a rename would leave it writing into the
+    unlinked old file. *log_path* defaults to the installed widget's log.
     """
     try:
-        log_path = SCAN_STATE_PATH.parent / "logs" / "widget.log"
-        size = log_path.stat().st_size
+        path = (
+            Path(log_path)
+            if log_path is not None
+            else SCAN_STATE_PATH.parent / "logs" / "widget.log"
+        )
+        size = path.stat().st_size
         if size <= max_bytes:
             return
-        data = log_path.read_bytes()[-max_bytes // 2 :]
+        data = path.read_bytes()[-max_bytes // 2 :]
         nl = data.find(b"\n")
         if nl >= 0:
             data = data[nl + 1 :]
-        log_path.write_bytes(data)
+        data = b"".join(
+            line for line in data.splitlines(keepends=True) if _MALLOC_NOISE not in line
+        )
+        path.write_bytes(data)
         _log(f"widget.log was {size} bytes — truncated to the recent tail")
     except FileNotFoundError:
         pass
     except Exception as exc:  # pragma: no cover - housekeeping must not kill startup
         _log(f"log bound failed: {exc}")
+
+
+_RETRY_AFTER_RE = re.compile(r"(retry[-_ ]after\D{0,3})\d+", re.IGNORECASE)
+
+_COLLAPSED_SUMMARY = "_cc_usage_widget_repeat_summary"
+"""Marks a summary record the collapser itself emitted, so it passes its own
+filter untouched on the way back through the handler."""
+
+
+def _template(record: logging.LogRecord, message: str) -> logging.LogRecord:
+    """What a later summary line is built from: the formatted message, with
+    no args, traceback or stack - an hour-long window must not keep a
+    traceback's frames alive, and a count line does not repeat one."""
+    out = copy.copy(record)
+    out.msg, out.args = message, None
+    out.exc_info = out.exc_text = out.stack_info = None
+    return out
+
+
+def _daemon_timer(delay: float, callback: Callable[[], None]) -> None:
+    timer = threading.Timer(max(0.0, delay), callback)
+    timer.daemon = True
+    timer.start()
+
+
+class _RepeatCollapser(logging.Filter):
+    """Collapse a WARNING/ERROR that repeats verbatim into one line + a count.
+
+    OPS-5 (2026-09-25): 645 ``Usage fetch failed for account 6: http-403`` and
+    153 ``http-429, retry-after 3600s`` lines were one incident, and they
+    buried the switches, keychain timeouts and expiries around them. Keyed on
+    ``(logger name, level, message)`` with retry-after digits normalised: the
+    first record passes; repeats within *window_s* of the last emitted one are
+    counted and dropped; the first repeat after the window is emitted with
+    ``" (repeated N times since HH:MM)"`` and opens a new window. A different
+    key is its own first. INFO and below always pass.
+
+    A burst that STOPS inside its window still reports its count (R2-SEC-2:
+    six 403s in fifty minutes used to leave one line and no count): once
+    :meth:`install` has given it the handler, the same summary line is
+    emitted when the window closes (a daemon timer), on the next record of
+    any key that finds the window already closed, and at :meth:`flush`
+    (process exit, SIGTERM) for a window still open.
+
+    Attached to the ``basicConfig`` handler only (a handler filter that
+    returns a copy, Python 3.12+), so other handlers - claude-swap's own file
+    handler - still see every record unchanged; the widget's own ``_log``
+    writes stderr directly and never reaches it.
+    """
+
+    def __init__(
+        self,
+        window_s: float = 3600.0,
+        clock: Callable[[], float] = time.time,
+        schedule: Callable[[float, Callable[[], None]], None] | None = None,
+    ) -> None:
+        super().__init__()
+        self._window_s = float(window_s)
+        self._clock = clock
+        self._schedule = _daemon_timer if schedule is None else schedule
+        # key -> [emitted_at, repeats, a stripped copy of the emitted record]
+        self._seen: dict[tuple[str, int, str], list[Any]] = {}
+        self._lock = threading.Lock()
+        self._sink: Callable[[logging.LogRecord], Any] | None = None
+        self._timer_armed = False
+
+    def install(self, handler: logging.Handler) -> None:
+        """Filter *handler*'s records, and emit burst summaries through it."""
+        handler.addFilter(self)
+        self._sink = handler.handle
+
+    def filter(self, record: logging.LogRecord) -> bool | logging.LogRecord:
+        if getattr(record, _COLLAPSED_SUMMARY, False):
+            return True
+        key = None
+        message = ""
+        if record.levelno >= logging.WARNING:
+            try:
+                message = record.getMessage()
+                key = (record.name, record.levelno, _RETRY_AFTER_RE.sub(r"\1#", message))
+            except Exception:
+                key = None
+        now = self._clock()
+        self._emit(self._take(now, expired_only=True, skip=key))
+        if key is None:
+            return True
+        arm = False
+        with self._lock:
+            entry = self._seen.get(key)
+            if entry is None:
+                overflow = self._prune(now) if len(self._seen) >= 512 else []
+                self._seen[key] = [now, 0, _template(record, message)]
+                result: bool | logging.LogRecord = True
+            else:
+                overflow = []
+                emitted_at, repeats, _kept = entry
+                if now - emitted_at < self._window_s:
+                    entry[1] = repeats + 1
+                    arm = not self._timer_armed and self._sink is not None
+                    self._timer_armed = self._timer_armed or arm
+                    result = False
+                else:
+                    self._seen[key] = [now, 0, _template(record, message)]
+                    result = (
+                        self._summary(record, message, repeats, emitted_at, now)
+                        if repeats
+                        else True
+                    )
+        self._emit(overflow)
+        if arm:
+            self._arm(now)
+        return result
+
+    def flush(self) -> None:
+        """Emit every pending count now, open window or not (exit paths)."""
+        self._emit(self._take(self._clock(), expired_only=False, skip=None))
+
+    # -- internals ---------------------------------------------------------
+
+    def _summary(
+        self,
+        template: logging.LogRecord,
+        message: str,
+        repeats: int,
+        emitted_at: float,
+        now: float,
+    ) -> logging.LogRecord:
+        since = time.strftime("%H:%M", time.localtime(emitted_at))
+        out = copy.copy(template)
+        out.msg = f"{message} (repeated {int(repeats)} times since {since})"
+        out.args = None
+        out.created = now
+        out.msecs = (now - int(now)) * 1000.0
+        return out
+
+    def _take(
+        self, now: float, *, expired_only: bool, skip: tuple[str, int, str] | None
+    ) -> list[logging.LogRecord]:
+        """Remove and return summaries for pending counts (the lock inside)."""
+        out: list[logging.LogRecord] = []
+        with self._lock:
+            for k, (emitted_at, repeats, template) in list(self._seen.items()):
+                if k == skip or not repeats:
+                    continue
+                if expired_only and now - emitted_at < self._window_s:
+                    continue
+                del self._seen[k]
+                try:
+                    message = template.getMessage()
+                except Exception:  # pragma: no cover - it formatted once already
+                    continue
+                summary = self._summary(template, message, repeats, emitted_at, now)
+                setattr(summary, _COLLAPSED_SUMMARY, True)
+                out.append(summary)
+        return out
+
+    def _emit(self, summaries: list[logging.LogRecord]) -> None:
+        sink = self._sink
+        if sink is None:
+            return
+        for summary in summaries:
+            try:
+                sink(summary)
+            except Exception:  # pragma: no cover - logging must not raise
+                pass
+
+    def _arm(self, now: float) -> None:
+        """One timer at a time, due when the earliest pending window closes."""
+        with self._lock:
+            pending = [at for at, repeats, _t in self._seen.values() if repeats]
+        if not pending:
+            with self._lock:
+                self._timer_armed = False
+            return
+        delay = min(pending) + self._window_s - now
+        try:
+            self._schedule(max(0.0, delay), self._on_timer)
+        except Exception:  # pragma: no cover - no timer: next record / flush
+            with self._lock:
+                self._timer_armed = False
+
+    def _on_timer(self) -> None:
+        now = self._clock()
+        self._emit(self._take(now, expired_only=True, skip=None))
+        with self._lock:
+            rearm = any(repeats for _at, repeats, _t in self._seen.values())
+            self._timer_armed = rearm
+        if rearm:
+            self._arm(now)
+
+    def _prune(self, now: float) -> list[logging.LogRecord]:
+        """Caller holds the lock. Drops closed windows (their counts were
+        taken on the way in); at the cap, clears the rest and returns their
+        pending counts as summaries rather than losing them."""
+        stale = [k for k, (at, _n, _t) in self._seen.items() if now - at >= self._window_s]
+        for k in stale:
+            del self._seen[k]
+        out: list[logging.LogRecord] = []
+        if len(self._seen) >= 512:
+            for emitted_at, repeats, template in self._seen.values():
+                if repeats:
+                    try:
+                        summary = self._summary(
+                            template, template.getMessage(), repeats, emitted_at, now
+                        )
+                    except Exception:  # pragma: no cover
+                        continue
+                    setattr(summary, _COLLAPSED_SUMMARY, True)
+                    out.append(summary)
+            self._seen.clear()
+        return out
+
+
+_COLLAPSER: _RepeatCollapser | None = None
+"""The collapser :func:`_configure_logging` installed, for the exit flush."""
+
+
+def _flush_repeat_counts() -> None:
+    collapser = _COLLAPSER
+    if collapser is not None:
+        try:
+            collapser.flush()
+        except Exception:  # pragma: no cover - never block an exit
+            pass
+
+
+def _configure_logging(stream: TextIO | None = None) -> logging.Handler | None:
+    """``basicConfig`` once, with the repeat collapser on its handler.
+
+    Returns the handler it created, or None when the root logger already had
+    one (a host that configured logging keeps its own).
+    """
+    root = logging.getLogger()
+    if root.handlers:
+        return None
+    logging.basicConfig(
+        level=logging.INFO,
+        stream=sys.stderr if stream is None else stream,
+        format="[%(asctime)s] %(name)s %(levelname)s: %(message)s",
+        # Full date: widget.log is append-forever across restarts, and
+        # time-only stamps made multi-day incident forensics guesswork.
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    global _COLLAPSER
+    handler = root.handlers[0]
+    collapser = _RepeatCollapser()
+    collapser.install(handler)
+    _COLLAPSER = collapser
+    # A normal interpreter exit; the SIGTERM path flushes explicitly.
+    atexit.register(_flush_repeat_counts)
+    # The menu's Quit ends in NSApp terminate, which exits without atexit;
+    # rumps emits before_quit from applicationWillTerminate_ on that path.
+    try:
+        import rumps.events
+
+        if _flush_repeat_counts not in rumps.events.before_quit.callbacks:
+            rumps.events.before_quit.register(_flush_repeat_counts)
+    except Exception:  # pragma: no cover - no rumps: no menu Quit to cover
+        pass
+    return handler
 
 
 # ---------------------------------------------------------------------------
@@ -546,6 +894,9 @@ def _install_signal_handlers(app: CCUsageWidgetApp) -> None:
 
     def handler(signum: int, _frame: Any) -> None:
         _log(f"signal {signal.Signals(signum).name}: shutting down")
+        # AppKit's terminate ends the process with C exit(), past atexit: the
+        # collapser's pending repeat counts are written here (R2-SEC-2).
+        _flush_repeat_counts()
         try:
             app.shutdown()
         except Exception as exc:  # pragma: no cover - defensive
@@ -689,15 +1040,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # The adapter's diagnostics (engine started/stopped, switches, degradations)
     # go through `logging`; without a handler the default root level discards
     # every INFO line, so a widget that silently stopped switching left no trace.
-    if not logging.getLogger().handlers:
-        logging.basicConfig(
-            level=logging.INFO,
-            stream=sys.stderr,
-            format="[%(asctime)s] %(name)s %(levelname)s: %(message)s",
-            # Full date: widget.log is append-forever across restarts, and
-            # time-only stamps made multi-day incident forensics guesswork.
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
+    _configure_logging()
 
     if not dry_run:
         acquired, detail = acquire_single_instance_lock()

@@ -932,6 +932,448 @@ def test_a_vanished_transcript_keeps_its_scope_on_the_tombstone() -> None:
         assert totals == {"alpha": 3_000}, (totals, day_total)
 
 
+# ---------------------------------------------------------------------------
+# 5. F1 (2026-09-25): workflow swarm agents fold into their parent session and
+#    get a per-run cost view. Every path, label and phase below is SYNTHETIC.
+# ---------------------------------------------------------------------------
+
+WF_SESSION = "9280af20-7e84"
+WF_RUN = "wf_abc-123"
+
+
+def _wf_dir(project: Path) -> Path:
+    return project / WF_SESSION / "subagents" / "workflows" / WF_RUN
+
+
+def test_a_workflow_agent_folds_into_its_parent_session_and_names_its_run() -> None:
+    """``subagents/workflows/wf_<id>/agent-<id>.jsonl`` is its parent session's.
+
+    Before F1 only ``parts[-2] == "subagents"`` folded, so every workflow agent
+    became a session row of its own called ``agent-<id>`` - 14 of them in
+    today's cache the day this was found - and "today's top sessions" ranked
+    anonymous agents instead of the session that ran the swarm.
+    """
+    scope = claude_scope(
+        f"/x/projects/-Users-v-proj/{WF_SESSION}/subagents/workflows/{WF_RUN}/agent-a1.jsonl"
+    )
+    assert scope.session == WF_SESSION, scope
+    assert scope.workflow == WF_RUN, scope
+    assert scope.agent == "a1", scope
+    assert scope.project == "-Users-v-proj", scope
+    assert scope.workflow_key.split("\x1f") == [
+        VENDOR_CLAUDE, "-Users-v-proj", WF_SESSION, WF_RUN, "a1"
+    ], scope.workflow_key
+
+    # The plain subagent layout folds exactly as before, and names no run.
+    plain = claude_scope(f"/x/projects/-Users-v-proj/{WF_SESSION}/subagents/agent-3.jsonl")
+    assert (plain.session, plain.workflow, plain.agent) == (WF_SESSION, "", ""), plain
+    assert plain.workflow_key == "", plain
+    # An ANCESTOR called "subagents" is not the layout: nothing folds.
+    ancestor = claude_scope("/Users/v/subagents/projects/-Users-v-proj/sess-1.jsonl")
+    assert (ancestor.session, ancestor.workflow) == ("sess-1", ""), ancestor
+    # Nor is an unknown shape below it.
+    odd = claude_scope(f"/x/projects/p/{WF_SESSION}/subagents/other/deep/agent-9.jsonl")
+    assert odd.session == "agent-9" and odd.workflow == "", odd
+
+
+def _swarm_corpus(root: Path, now: float) -> Path:
+    """A parent session plus two agents of one workflow run, and its journal."""
+    project = root / "projects" / "-Users-v-alpha"
+    _write(
+        project / f"{WF_SESSION}.jsonl",
+        [_claude_record("p1", now, cwd="/Users/v/alpha", tokens=1_000)],
+    )
+    run = _wf_dir(project)
+    _write(run / "agent-a1.jsonl", [_claude_record("w1", now, cwd="/Users/v/alpha", tokens=2_000)])
+    _write(run / "agent-a2.jsonl", [_claude_record("w2", now, cwd="/Users/v/alpha", tokens=4_000)])
+    _write(
+        run / "journal.jsonl",
+        [
+            {"type": "launched"},
+            {
+                "type": "started", "key": "k1", "agentId": "a1",
+                "label": "review:tests\nSYNTHETIC", "phase": "Review",
+            },
+            {
+                "type": "started", "key": "k2", "agentId": "a2",
+                "label": "SYNTHETIC_" + "x" * 200, "phase": "Build",
+            },
+            {"type": "result", "key": "k1", "agentId": "a1", "result": {"ok": True}},
+        ],
+    )
+    return project
+
+
+def test_a_workflow_run_is_one_row_whose_tokens_are_its_agents_sum() -> None:
+    """End to end from files: the parent session holds the whole swarm, and the
+    run's own row holds exactly its two agents."""
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        now = time.time()
+        today = local_day_key(now)
+        _swarm_corpus(root, now)
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        attribution = AttributionStore(path=attribution_path_for(store.path))
+        _drain_attributed(_claude_indexer(root), store, attribution)
+
+        # 1,000 -> 1,500, 2,000 -> 3,000, 4,000 -> 6,000 (input + output/2).
+        assert _session_totals(attribution, today) == {WF_SESSION: 10_500}
+        assert _project_totals(attribution, today) == {"alpha": 10_500}
+        runs = attribution.top_workflows(today, DEFAULT_PRICING)
+        assert len(runs) == 1, runs
+        run = runs[0]
+        assert run.workflow == WF_RUN and run.session == WF_SESSION, run
+        assert run.total_tokens == 3_000 + 6_000, run
+        assert run.agents == 2, run
+        assert run.label == "wf_abc-123 · alpha", run.label
+        assert [m.name for m in run.models] == ["Fable 5"], run.models
+        assert run.models[0].total_tokens == run.total_tokens, run.models
+        assert run.usd > 0, run
+        # The menu reads the runs off the session rows the worker publishes.
+        sessions = attribution.top_sessions(today, DEFAULT_PRICING)
+        assert sessions.workflow_runs == runs, sessions.workflow_runs
+        assert sessions == tuple(sessions), "still a plain tuple for every other reader"
+
+
+def test_the_journal_join_splits_a_run_per_phase_and_clamps_what_it_shows() -> None:
+    """Phase and label come from the run's journal, read-only; free text is
+    cleaned and clamped; an agent the journal does not name is said to be so."""
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        now = time.time()
+        project = _swarm_corpus(root, now)
+        # A third agent the journal never started: counted, labelled honestly.
+        _write(
+            _wf_dir(project) / "agent-a3.jsonl",
+            [_claude_record("w3", now, cwd="/Users/v/alpha", tokens=100)],
+        )
+        journal = _wf_dir(project) / "journal.jsonl"
+        before = journal.read_bytes()
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        attribution = AttributionStore(path=attribution_path_for(store.path))
+        _drain_attributed(_claude_indexer(root), store, attribution)
+
+        (run,) = attribution.workflow_runs(DEFAULT_PRICING, projects_dir=root / "projects")
+        phases = {part.name: part.total_tokens for part in run.phases}
+        assert phases == {"Build": 6_000, "Review": 3_000, "(no phase)": 150}, phases
+        assert sum(phases.values()) == run.total_tokens, (phases, run)
+        names = [part.name for part in run.agent_rows]
+        assert "review:tests SYNTHETIC" in names, names
+        assert "agent-a3" in names, names
+        long = [n for n in names if n.startswith("SYNTHETIC_")]
+        assert long and len(long[0]) <= 40 and long[0].endswith("…"), long
+        assert all("\n" not in n for n in names), names
+        assert journal.read_bytes() == before, "the journal is read-only"
+        # Without a projects directory there is no join, and no file is read.
+        (bare,) = attribution.workflow_runs(DEFAULT_PRICING)
+        assert bare.phases == () and bare.total_tokens == run.total_tokens, bare
+        # The cache never holds a label or phase.
+        attribution.save(force=True)
+        text = attribution.path.read_text(encoding="utf-8")
+        assert "SYNTHETIC" not in text and "Review" not in text, text[:200]
+
+
+def test_no_workflow_run_means_no_workflow_rows() -> None:
+    """The menu block must be byte-for-byte absent without a swarm."""
+    store = AttributionStore(path=None)
+    store.merge([(_scope("alpha", "s-1"), _rollup("2026-09-10", 100))])
+    sessions = store.top_sessions("2026-09-10", DEFAULT_PRICING)
+    assert sessions.workflow_runs == (), sessions.workflow_runs
+    assert store.top_workflows("2026-09-10") == ()
+    assert AttributionStore(path=None).top_sessions("2026-09-10") == ()
+
+
+OPUS = "claude-opus-5-5"
+
+
+def _v1_upgrade_day_fixture(root: Path) -> tuple[Path, Path, dict[str, Any]]:
+    """A version-1 ``attribution.json`` in the SHAPE of the live one measured
+    on 2026-09-25 (R2-ATTR): 81 session cells on 09-24, 9 of them workflow
+    agents; 170 on 09-25, 150 of them workflow agents (three runs of 25 agents
+    on two models). Plus the transcript tree those agents' names live in, one
+    agent's transcript deliberately missing. Every number is synthetic.
+    """
+    sep = "\x1f"
+    projects_dir = root / "projects"
+    project_dir = projects_dir / "-Users-v-alpha"
+    sessions: dict[str, dict[str, list[int]]] = {"2026-09-24": {}, "2026-09-25": {}}
+    agents: list[tuple[str, str, str, str]] = []  # (day, parent, wf, agent id)
+    for index in range(3):
+        for n in range(25):
+            agents.append(("2026-09-25", WF_SESSION, f"wf_run{index}-000", f"a{index}{n:015x}"))
+    for n in range(9):
+        agents.append(("2026-09-24", "7f6022f6-50df", "wf_early-000", f"b{n:016x}"))
+    missing = agents[0][3]
+    for day, parent, workflow, agent in agents:
+        models = (FABLE, OPUS) if day == "2026-09-25" else (FABLE,)
+        for m, model in enumerate(models):
+            sessions[day][f"claude{sep}alpha{sep}agent-{agent}{sep}{model}"] = [
+                1_000 + 10 * m, 200, 0, 0, 0
+            ]
+        if agent != missing:
+            _write(project_dir / parent / "subagents" / "workflows" / workflow / f"agent-{agent}.jsonl", [])
+    for n in range(10):
+        for model in (FABLE, OPUS):
+            session = WF_SESSION if n == 0 else f"s25-{n:04d}"
+            sessions["2026-09-25"][f"claude{sep}alpha{sep}{session}{sep}{model}"] = [500, 50, 0, 0, 0]
+    for n in range(36):
+        for model in (FABLE, OPUS):
+            session = "7f6022f6-50df" if n == 0 else f"s24-{n:04d}"
+            sessions["2026-09-24"][f"claude{sep}alpha{sep}{session}{sep}{model}"] = [300, 30, 0, 0, 0]
+    sessions["2026-09-25"][f"codex{sep}beta{sep}agent-like-thread{sep}codex:{SOL}"] = [700, 0, 0, 0, 0]
+    assert [len(sessions[d]) for d in sorted(sessions)] == [81, 171]  # +1: the codex control
+    projects: dict[str, dict[str, list[int]]] = {}
+    for day, rows in sessions.items():
+        for key, counters in rows.items():
+            vendor, project, _session, model = key.split(sep)
+            cell = projects.setdefault(day, {}).setdefault(f"{vendor}{sep}{project}{sep}{model}", [0] * 5)
+            for i, value in enumerate(counters):
+                cell[i] += value
+    path = root / "attribution.json"
+    path.write_text(
+        json.dumps({"version": 1, "projects": projects, "sessions": sessions}), encoding="utf-8"
+    )
+    return path, projects_dir, {"agents": agents, "missing": missing, "sessions": sessions}
+
+
+def _session_rows_total(store: AttributionStore, day: str) -> int:
+    return sum(row.total_tokens for row in store.top_sessions(day, limit=10_000))
+
+
+def _project_rows_total(store: AttributionStore, day: str) -> int:
+    return sum(row.total_tokens for row in store.top_projects(day, limit=10_000))
+
+
+def test_a_version_1_cache_folds_its_agent_rows_into_their_parent_sessions() -> None:
+    """R2-ATTR. The version bump used to DROP every ``agent-<id>`` session row
+    of a v1 file - 150 of 170 cells on the upgrade day - so the per-session
+    and per-run blocks under-counted today's swarms for two days. Each row is
+    now re-keyed onto the parent session and run its transcript's NAME gives
+    (the exact scope a v2 read of that file produces); a row whose transcript
+    is gone is kept and labelled partial; nothing is dropped, so the session
+    rows still sum to the project rows on the upgrade day."""
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        path, projects_dir, fx = _v1_upgrade_day_fixture(root)
+        sep = "\x1f"
+        logs: list[str] = []
+        store = AttributionStore(path=path, logger=logs.append, projects_dir=projects_dir)
+        store.load()
+        for day in ("2026-09-24", "2026-09-25"):
+            assert _session_rows_total(store, day) == _project_rows_total(store, day), day
+
+        def v1_tokens(agent: str, day: str) -> int:
+            return sum(
+                sum(counters)
+                for key, counters in fx["sessions"][day].items()
+                if key.split(sep)[2] == f"agent-{agent}"
+            )
+
+        folded = [a for a in fx["agents"] if a[3] != fx["missing"]]
+        today = _session_totals(store, "2026-09-25")
+        own = 2 * 550
+        agents_of_parent = sum(v1_tokens(a[3], a[0]) for a in folded if a[0] == "2026-09-25")
+        assert today[WF_SESSION] == own + agents_of_parent, today[WF_SESSION]
+        runs = {run.workflow: run for run in store.top_workflows("2026-09-25", limit=99)}
+        assert sorted(runs) == ["wf_run0-000", "wf_run1-000", "wf_run2-000"], sorted(runs)
+        assert runs["wf_run1-000"].agents == 25 and runs["wf_run0-000"].agents == 24
+        for workflow, run in runs.items():
+            expected = sum(v1_tokens(a[3], a[0]) for a in folded if a[2] == workflow)
+            assert run.total_tokens == expected, (workflow, run.total_tokens, expected)
+        (early,) = store.top_workflows("2026-09-24", limit=99)
+        assert early.session == "7f6022f6-50df" and early.agents == 9, early
+
+        # The one agent whose transcript is gone: kept, counted, and said.
+        rows = {row.session: row for row in store.top_sessions("2026-09-25", limit=10_000)}
+        kept = rows[f"agent-{fx['missing']}"]
+        assert kept.total_tokens == v1_tokens(fx["missing"], "2026-09-25"), kept
+        assert kept.label.startswith("partial: agent a00000 · ") and "alpha" in kept.label, kept.label
+        assert rows["agent-like-thread"].vendor == VENDOR_CODEX, "codex rows are not agents"
+        assert not rows["agent-like-thread"].label.startswith("partial"), rows["agent-like-thread"].label
+        assert sum(1 for s in rows if s.startswith("agent-")) == 2, sorted(rows)[:5]
+        assert any("folded 157" in line and "kept 2" in line for line in logs), logs
+
+        # Persisted: a reload with no projects directory at all reads the same.
+        store.save()
+        written = json.loads(path.read_text(encoding="utf-8"))
+        assert written["version"] == 2 and len(written["aliases"]) == len(folded), len(written["aliases"])
+        reloaded = AttributionStore(path=path, projects_dir=None)
+        reloaded.load()
+        assert _session_totals(reloaded, "2026-09-25") == today
+
+        # A retraction still owed under the v1 scope follows the alias to the
+        # parent and the run, instead of clamping on the vanished row.
+        day, parent, workflow, agent = folded[30]
+        cell = fx["sessions"][day][f"claude{sep}alpha{sep}agent-{agent}{sep}{FABLE}"]
+        legacy = Attribution(vendor=VENDOR_CLAUDE, project="alpha", session=f"agent-{agent}")
+        before_run = {r.workflow: r.total_tokens for r in reloaded.top_workflows(day, limit=99)}
+        clamped = reloaded.retract(
+            [(legacy, DayRollup(day=day, models={FABLE: ModelUsage.from_counters(tuple(cell))}))]
+        )
+        assert clamped == 0
+        assert _session_totals(reloaded, day)[parent] == today[parent] - sum(cell)
+        after_run = {r.workflow: r.total_tokens for r in reloaded.top_workflows(day, limit=99)}
+        assert after_run[workflow] == before_run[workflow] - sum(cell), (before_run, after_run)
+        assert _session_rows_total(reloaded, day) == _project_rows_total(reloaded, day)
+
+        # The alias is bounded like the session rows it redirects into.
+        reloaded.prune(today="2026-09-30")
+        reloaded.save(force=True)
+        assert json.loads(path.read_text(encoding="utf-8"))["aliases"] == {}
+
+
+def test_a_version_1_scope_retracts_where_its_tokens_went() -> None:
+    """The ledger/tombstone half of the migration.
+
+    A workflow agent indexed by a version-1 build persisted the scope
+    ``claude|alpha|agent-a1``. Re-read after the upgrade (a new inode), its
+    old contribution must come out of the project it went into - and NOT out
+    of the parent session, which never held it: retracting 3,000 from a
+    parent holding its own 1,500 would clamp the parent to zero. Its new
+    contribution lands on the parent session and on the run.
+    """
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        now = time.time()
+        today = local_day_key(now)
+        project = root / "projects" / "-Users-v-alpha"
+        _write(
+            project / f"{WF_SESSION}.jsonl",
+            [_claude_record("p1", now, cwd="/Users/v/alpha", tokens=1_000)],
+        )
+        agent = _wf_dir(project) / "agent-a1.jsonl"
+        _write(agent, [_claude_record("w1", now, cwd="/Users/v/alpha", tokens=2_000)])
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        cache = attribution_path_for(store.path)
+        _drain_attributed(_claude_indexer(root), store, AttributionStore(path=cache))
+
+        # Rewrite what a version-1 build would have left on disk: the agent's
+        # persisted scope names its own stem, and the cache is version 1 with
+        # that anonymous session row.
+        sep = "\x1f"
+        state_path = root / "scan_state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state[str(agent)]["sc"] = f"claude{sep}alpha{sep}agent-a1"
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        cache.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "projects": {today: {f"claude{sep}alpha{sep}{FABLE}": [3_000, 1_500, 0, 0, 0]}},
+                    "sessions": {
+                        today: {
+                            f"claude{sep}alpha{sep}{WF_SESSION}{sep}{FABLE}": [1_000, 500, 0, 0, 0],
+                            f"claude{sep}alpha{sep}agent-a1{sep}{FABLE}": [2_000, 1_000, 0, 0, 0],
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        # Upgrade + restart, then the agent's transcript is replaced.
+        restarted = _claude_indexer(root)
+        reloaded = AttributionStore(path=cache, projects_dir=root / "projects")
+        reloaded.load()
+        # The upgrade folded the agent's row into its parent and run (R2-ATTR).
+        assert _session_totals(reloaded, today) == {WF_SESSION: 4_500}
+        assert reloaded.top_workflows(today)[0].total_tokens == 3_000
+        replacement = agent.with_suffix(".new")
+        _write(replacement, [_claude_record("w9", now, cwd="/Users/v/alpha", tokens=4_000)])
+        os.replace(replacement, agent)
+        _drain_attributed(restarted, store, reloaded)
+
+        day_total = store.today(today).total.total_tokens
+        assert day_total == 1_500 + 6_000, store.today(today)
+        assert _project_totals(reloaded, today) == {"alpha": day_total}
+        assert _session_totals(reloaded, today) == {WF_SESSION: day_total}, (
+            "the retraction clamped the parent's own tokens away"
+        )
+        (run,) = reloaded.top_workflows(today)
+        assert run.total_tokens == 6_000, run
+
+        # From now on the file's persisted scope is the parent's.
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        assert state[str(agent)]["sc"].split(sep)[2] == WF_SESSION, state[str(agent)]
+
+
+def test_a_workflow_agent_retraction_after_a_restart_leaves_its_run_exact() -> None:
+    """A version-2 restart: the scope names the parent session, and the run's
+    workflow and agent are re-derived from the path - so the retraction
+    comes back out of the run row it went into."""
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        now = time.time()
+        today = local_day_key(now)
+        project = _swarm_corpus(root, now)
+        store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
+        cache = attribution_path_for(store.path)
+        first = AttributionStore(path=cache)
+        _drain_attributed(_claude_indexer(root), store, first)
+        first.save(force=True)
+
+        restarted = _claude_indexer(root)
+        reloaded = AttributionStore(path=cache)
+        reloaded.load()
+        agent = _wf_dir(project) / "agent-a2.jsonl"
+        replacement = agent.with_suffix(".new")
+        _write(replacement, [_claude_record("w8", now, cwd="/Users/v/alpha", tokens=1_000)])
+        os.replace(replacement, agent)
+        _drain_attributed(restarted, store, reloaded)
+
+        (run,) = reloaded.top_workflows(today)
+        assert run.total_tokens == 3_000 + 1_500, run
+        assert _session_totals(reloaded, today) == {WF_SESSION: 1_500 + 3_000 + 1_500}
+
+
+def _draw_attribution(sessions: Any, *, enabled: bool = True) -> list[str]:
+    """``_attribution_items`` against a stand-in worker - no app, no widget home."""
+    import types
+
+    from cc_usage_widget import app as app_mod
+    from cc_usage_widget.app import UiSnapshot
+    from cc_usage_widget.contracts import SETTINGS_DEFAULTS, normalize_settings
+
+    project = attr_mod.AttributionRow(
+        vendor=VENDOR_CLAUDE, project="alpha", session="",
+        usage=ModelUsage(input=9_000), usd=1.25, unpriced_tokens=0,
+    )
+    owner = types.SimpleNamespace(
+        _worker=types.SimpleNamespace(cost_project_rows=(project,), cost_session_rows=sessions)
+    )
+    settings = normalize_settings({**SETTINGS_DEFAULTS, "cost_by_project_enabled": enabled})
+    items = app_mod.CCUsageWidgetApp._attribution_items(owner, UiSnapshot(settings=settings))
+    return [str(item.title) for item in items]
+
+
+def test_the_menu_lists_todays_top_workflow_runs_only_when_there_are_any() -> None:
+    """The third block rides on the session rows the worker already publishes,
+    and without a run the section is the one drawn before F1, line for line."""
+    session = attr_mod.AttributionRow(
+        vendor=VENDOR_CLAUDE, project="alpha", session=WF_SESSION,
+        usage=ModelUsage(input=9_000), usd=1.25, unpriced_tokens=0,
+    )
+    before_f1 = _draw_attribution((session,))
+    empty = attr_mod.SessionRows((session,))
+    assert _draw_attribution(empty) == before_f1, "no run must mean no new line"
+
+    with_run = attr_mod.SessionRows((session,))
+    with_run.workflow_runs = (
+        attr_mod.WorkflowRun(
+            vendor=VENDOR_CLAUDE, project="alpha", session=WF_SESSION, workflow=WF_RUN,
+            usage=ModelUsage(input=6_000_000), usd=0.75, unpriced_tokens=0, agents=2,
+        ),
+    )
+    drawn = _draw_attribution(with_run)
+    assert drawn[: len(before_f1)] == before_f1, drawn
+    heading = drawn[len(before_f1)]
+    assert "── today's top workflow runs" in heading and "$0.75" in heading, drawn
+    assert "wf_abc-123 · alpha" in drawn[-1] and "6.0M tok" in drawn[-1], drawn
+    assert len(drawn) == len(before_f1) + 2, drawn
+    # The feature's off switch covers the new block too.
+    assert _draw_attribution(with_run, enabled=False) == [], "off must mean off"
+
+
 def _tests() -> list[tuple[str, object]]:
     items = [
         (name, value)
