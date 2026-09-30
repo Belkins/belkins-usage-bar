@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-09-30 — A shorter title that leads with the wall that binds
+
+The title read `backup-account 37% C86% ⚠ 7d96% 0/4` (290 pt): the 5-hour 37%
+that does not bind was bright, the 7-day 96% that does sat dimmed at the end,
+and `0/4` — nowhere to switch — was the faintest thing in the bar. It now reads
+`backup-a… 7d96% C86% ⚠ 0/4` (230 pt):
+
+- At the switch threshold a non-5h binding window replaces the 5-hour figure,
+  labelled (`7d`, `F`) with the figure in its severity colour; the fleet suffix
+  no longer repeats it. Below the threshold the title is unchanged.
+- The room count is orange when it is `0/N`, dimmed otherwise.
+- Aliases longer than ten characters are cut to eight and `…` in the title
+  only.
+
 ## 2026-09-30 — The menu-bar title falls back to compact when the bar is full
 
 After a reboot the widget could be running and absent: the full title grows

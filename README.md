@@ -162,9 +162,13 @@ Accounts block shows more than the bars:
   healthy slot no longer badges the title. The newest switch is shown inline,
   and the rest are under a **Recent switches** submenu.
 * **The title follows the window auto-switch actually decides on.** If that is
-  the Fable window rather than the 5-hour one, the fleet suffix leads with it
-  (`F90%`, `7d92%`), so you can see which wall is closing. A window whose reset
-  has passed never binds the title and never costs the fleet a room.
+  the Fable or 7-day window rather than the 5-hour one and it is at the
+  switch threshold, it takes the 5-hour figure's place, labelled and in its own
+  colour (`backup-a… 7d96% C86% ⚠ 0/4`), so you can see which wall is closing.
+  The room count (`0/4`) turns orange when no other account has room. A window
+  whose reset has passed never binds the title and never costs the fleet a room.
+* **Long aliases are shortened in the title** to eight characters and `…`
+  (`backup-account` → `backup-a…`); the menu shows the full name.
 
 ## Optional: a live row for each of your Codex accounts
 

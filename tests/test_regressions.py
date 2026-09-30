@@ -6859,6 +6859,38 @@ def test_title_fleet_binds_on_the_same_window_as_the_engine() -> None:
         app._worker.stop(timeout=2.0)
 
 
+def test_at_the_weekly_wall_the_title_leads_with_it_not_the_5h_figure() -> None:
+    """2026-09-30 screenshot: ``backup-account 37% C86% ⚠ 7d96% 0/4`` — the
+    5-hour 37% that does not bind was bright, the 7-day 96% that does sat dim
+    at the far end, and "0/4" (nowhere to switch) was the faintest thing in
+    the bar. At the wall the binding window replaces the 5h figure in its own
+    colour, the count is not dimmed when it is zero, and a long alias is cut
+    so the bar has room. Below the wall the title is byte-identical."""
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        me = _ux_row(5, "backup-account", five=37.0, seven=96.0, active=True,
+                     seven_reset="Oct 2 10:00")
+        full = _ux_row(2, "podol", five=3.0, seven=99.0, seven_reset="Oct 3 09:00")
+        snap = UiSnapshot(settings=_fleet_settings(), accounts=(me, full), active=me,
+                          autoswitch_threshold=85.0)
+        assert app.render_title(snap) == "backup-a… 7d96% 0/2", app.render_title(snap)
+        tokens = app.title_tokens(snap)
+        assert [("7d", None), ("96%", "crit")] in tokens, tokens
+        assert tokens[-1] == [("0/2", "warn")], tokens
+
+        roomy = replace(snap, accounts=(me, replace(full, seven_day_pct=10.0)))
+        assert app.title_tokens(roomy)[-1] == [("1/2", "dim")], app.title_tokens(roomy)
+
+        calm = replace(me, seven_day_pct=60.0)
+        quiet = replace(snap, accounts=(calm, full), active=calm)
+        assert app.render_title(quiet) == "backup-a… 37%", app.render_title(quiet)
+        short = replace(calm, alias="work1")
+        assert app.render_title(replace(quiet, accounts=(short, full), active=short)) == "work1 37%"
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
 def test_binding_window_mirrors_claude_swap_relevant_windows() -> None:
     """``_binding_window`` is upstream's ``relevant_windows`` + max, not a
     reinvention: 5h and 7d always; scoped windows only when named

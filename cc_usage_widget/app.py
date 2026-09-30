@@ -861,6 +861,25 @@ def _title_pct(pct: float | None) -> str:
     return f"{format_pct(pct)}{_attention(pct).strip()}"
 
 
+_TITLE_ALIAS_MAX = 10
+"""Longest alias the menu-bar title prints whole; longer ones keep 8 characters
+and an ellipsis (``backup-account`` -> ``backup-a…``, 2026-09-30: the alias was
+the widest part of a 290 pt title). The menu always shows the full name."""
+
+
+def _title_alias(name: str) -> str:
+    return name if len(name) <= _TITLE_ALIAS_MAX else f"{name[:8]}…"
+
+
+def _binding_token(row: AccountRow, binding: tuple[str, float]) -> tuple[str, str]:
+    """``("7d", "96%")`` — a non-5h binding window's label and figure.
+
+    One spelling for the title's figure and the fleet suffix's lead, so the
+    suffix's "already in the title" check compares like with like."""
+    label = "7d" if binding[0] == "7d" else row.scoped_abbrev(binding[0])
+    return label, _title_pct(binding[1])
+
+
 COMPACT_ATTENTION = "⚠"
 """What a compact-title figure becomes when a note has replaced it.
 
@@ -5391,14 +5410,30 @@ class CCUsageWidgetApp(rumps.App):
         notes = snapshot.account_notes
         if active is not None:
             if settings.get("title_show_alias", True):
-                parts.append([(_display_name(active), None)])
+                parts.append([(_title_alias(_display_name(active)), None)])
             note = notes.get(active.slot)
+            binding = _binding_window(active, tuple(snapshot.autoswitch_models or ()))
+            walled = (
+                binding
+                if binding is not None
+                and binding[0] != "5h"
+                and binding[1] >= self._title_threshold(snapshot)
+                else None
+            )
             if note:
                 # A derived state replaces the figures (contract on
                 # UiSnapshot.account_notes): "vlad ⚠ relogin", never "vlad 0%".
                 parts.append(
                     [(_title_note(note, snapshot.account_note_kinds.get(active.slot, "")), "warn")]
                 )
+            elif walled is not None:
+                # 2026-09-30: "37% … 7d96% 0/4" lit the 5-hour figure that does
+                # not bind and dimmed the wall that does. At the wall the
+                # binding window REPLACES the 5-hour figure, labelled and in
+                # its own colour; _title_fleet then finds it in `base` and
+                # leads with the count alone.
+                label, pct_text = _binding_token(active, walled)
+                parts.append([(label, None), (pct_text, render.severity(walled[1]))])
             else:
                 if settings.get("title_show_five_hour_pct", True) and active.five_hour_pct is not None:
                     parts.append(
@@ -5475,7 +5510,10 @@ class CCUsageWidgetApp(rumps.App):
         if parts and settings.get("title_show_fleet", True):
             fleet = self._title_fleet(snapshot, base=render.join_title_tokens(parts))
             if fleet:
-                parts.append([(fleet, "dim")])
+                # "0/N" is the one suffix that changes what the operator does
+                # next (nowhere to switch), so it is not dimmed like the rest.
+                room = _claude_room(snapshot)
+                parts.append([(fleet, "warn" if room is not None and room[0] == 0 else "dim")])
         return parts
 
     def _compact_title(self, snapshot: UiSnapshot) -> str:
@@ -5706,8 +5744,7 @@ class CCUsageWidgetApp(rumps.App):
         # The binding window, labelled, when it is not the 5-hour one.
         lead = ""
         if at_limit and binding is not None and binding[0] != "5h" and active is not None:
-            abbrev = "7d" if binding[0] == "7d" else active.scoped_abbrev(binding[0])
-            token = f"{abbrev}{_title_pct(binding[1])}"
+            token = "".join(_binding_token(active, binding))
             if token not in base.split():
                 lead = token
 
