@@ -90,7 +90,7 @@ from .contracts import (
     vendor_label,
     vendor_of_key,
 )
-from .render import coarse_duration, fleet_reset_label
+from .render import coarse_duration, fleet_reset_label, plan_label
 
 __all__ = [
     "Cell",
@@ -976,7 +976,9 @@ def _quota_section(rows: Sequence[AccountRow]) -> str:
         extra = "".join(f'<li>{_esc(line)}</li>' for line in row.info_notes)
         extra = f'<ul class="info">{extra}</ul>' if extra else ""
         title = row.alias or row.vendor_label
-        plan = f' <span class="plan">{_esc(row.plan_type)}</span>' if row.plan_type else ""
+        # The display name (`Max 20x`, `Business`), not the raw slug: Claude
+        # rows carry `claude_max_20x` since 2026-09-30.
+        plan = f' <span class="plan">{_esc(plan_label(row.plan_type))}</span>' if row.plan_type else ""
         blocks.append(
             f'<div class="account"><h3>{_esc(title)}'
             f'<span class="vendor">{_esc(row.vendor_label)}</span>{plan}</h3>'

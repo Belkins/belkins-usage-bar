@@ -61,7 +61,9 @@ an in-flight guard instead of queueing behind each other.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
+import io
 import json
 import logging
 import math
@@ -81,6 +83,7 @@ from .contracts import (
     ALERT_EXTERNAL_SWITCH,
     ALERT_GHOST_FLIP,
     ALERT_NO_TARGET,
+    ALERT_UNMANAGED_LOGIN,
     FETCH_FAILING_MIN_FAILURES,
     GHOST_FLIP_FIGHT_COUNT,
     GHOST_FLIP_WINDOW_SECONDS,
@@ -176,10 +179,11 @@ _TIMESTAMP_TAIL_RE: Final[re.Pattern[str]] = re.compile(
 )
 """Matches an ISO instant and keeps only its date - see :func:`_episode_key`."""
 
-_TESTED_CLAUDE_SWAP_PREFIX: Final[str] = "0.25."
+_TESTED_CLAUDE_SWAP_PREFIX: Final[str] = "0.26."
 """claude-swap versions this adapter's private-symbol reach-ins were verified
-against. A mismatch WARNS (never refuses): the failure policy already degrades
-gracefully, this just makes the degradation datable."""
+against (tests/test_ops.py contract; 0.26.0 on 2026-09-30, with a live switch
+round trip). A mismatch WARNS (never refuses): the failure policy already
+degrades gracefully, this just makes the degradation datable."""
 
 FETCH_FAILING_KIND: Final[str] = "fetch-failing"
 """Sentinel kind (:meth:`SwapAccountSource.sentinel_kinds`) for a slot whose
@@ -493,6 +497,33 @@ def _alias_from_email(email: str, slot: int) -> str:
     return local or f"account-{slot}"
 
 
+_MAX_MULTIPLIER_RE: Final = re.compile(r"_(\d+x)$")
+_ANSI_RE: Final = re.compile(r"\x1b\[[0-9;]*m")
+"""claude-swap colours its terminal output; the log line keeps only the words."""
+
+
+def claude_plan_type(oauth_account: Any) -> str | None:
+    """The plan a stored Claude login names, or ``None`` when it does not say.
+
+    ``organizationType`` verbatim (``claude_max``, ``claude_team``), except
+    that a Max plan gets the multiplier its ``organizationRateLimitTier``
+    carries (``default_claude_max_20x`` -> ``claude_max_20x``): that suffix is
+    the only field that tells a 5x from a 20x plan.
+    """
+    if not isinstance(oauth_account, Mapping):
+        return None
+    org_type = oauth_account.get("organizationType")
+    if not isinstance(org_type, str) or not org_type.strip():
+        return None
+    org_type = org_type.strip()
+    tier = oauth_account.get("organizationRateLimitTier")
+    if org_type == "claude_max" and isinstance(tier, str):
+        match = _MAX_MULTIPLIER_RE.search(tier)
+        if match:
+            return f"{org_type}_{match.group(1)}"
+    return org_type
+
+
 # ---------------------------------------------------------------------------
 # The claude_swap backend, imported lazily and defensively
 # ---------------------------------------------------------------------------
@@ -694,6 +725,13 @@ class SwapAccountSource:
         self._fetch_failing_seen: dict[int, tuple[int, Any]] = {}
         self._switchable: frozenset[int] = frozenset()
         self._alias_by_slot: dict[int, str] = {}
+        # Stored-login plan per config backup, keyed by path and re-read only
+        # when the file's (mtime_ns, size) moves: the file is ~190 KB and a
+        # switch rewrites it, the plan inside almost never changes.
+        self._plan_cache: dict[Path, tuple[tuple[int, int], str | None]] = {}
+        # (email, organisation) of a signed-in login no slot holds, from the
+        # last pass; None while the live login is a slot's (or there is none).
+        self._unmanaged_login: tuple[str, str] | None = None
 
         self._engine: Any | None = None
         self._engine_policy_mtime: float | None = None
@@ -830,7 +868,14 @@ class SwapAccountSource:
         finally:
             self._take_lock.release()
 
+        # No active slot: either nobody is signed in, or somebody is and no
+        # slot holds that login - the case that pauses the engine and that a
+        # switch would park in `cswap unclaimed` (ALERT_UNMANAGED_LOGIN).
+        active_now = getattr(snapshot, "active_number", None)
+        unmanaged = None if active_now else self._live_unmanaged_login(backend)
+
         with self._lock:
+            self._unmanaged_login = unmanaged
             previous = self._last_active_number
             # Consumed once, whether or not the active actually moved: an
             # expectation that outlives the pass it was made for would swallow
@@ -845,6 +890,84 @@ class SwapAccountSource:
             since, self._last_pass_wall = self._last_pass_wall, self._wall()
         if not self._note_reverted_switch(expected, current, since=since):
             self._note_external_switch(previous, current, expected, since=since)
+
+    def _live_unmanaged_login(self, backend: _Backend) -> tuple[str, str] | None:
+        """``(email, organisation)`` of the signed-in login, read when no slot is active.
+
+        ``has_live_login`` is claude-swap's own test (``~/.claude.json`` names
+        an identity); the organisation is read from the same file for the menu
+        line only, and a personal plan's default ``"<email>'s Organization"``
+        is dropped as noise. Anything unreadable is "no unmanaged login".
+        """
+        switcher = getattr(backend, "switcher", None)
+        has_live = getattr(switcher, "has_live_login", None)
+        try:
+            if not callable(has_live) or not has_live():
+                return None
+            config_path = getattr(switcher, "_get_claude_config_path", None)
+            path = Path(config_path()) if callable(config_path) else Path.home() / ".claude.json"
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            self._log.debug("accounts: live login unreadable: %r", exc)
+            return None
+        oauth = data.get("oauthAccount") if isinstance(data, Mapping) else None
+        if not isinstance(oauth, Mapping):
+            return None
+        email = str(oauth.get("emailAddress") or "").strip()
+        if not email:
+            return None
+        org = str(oauth.get("organizationName") or "").strip()
+        if org.endswith("'s Organization"):
+            org = ""
+        return email, org
+
+    def unmanaged_login(self) -> str | None:
+        """``pat@example.com (Acme)`` while a signed-in login is in no slot, else ``None``."""
+        with self._lock:
+            login = self._unmanaged_login
+        if login is None:
+            return None
+        email, org = login
+        return f"{email} ({org})" if org else email
+
+    def _unmanaged_alert(self) -> tuple[str, str] | None:
+        """:data:`ALERT_UNMANAGED_LOGIN` with the login named, or ``None``."""
+        who = self.unmanaged_login()
+        if who is None:
+            return None
+        # Fits the menu's 140-character alert line with a 30-character login.
+        return (
+            ALERT_UNMANAGED_LOGIN,
+            f"{who} isn't in the pool: auto-switch is paused and switching away "
+            "parks it. Add it (menu below) or run cswap add",
+        )
+
+    def add_live_login(self) -> bool:
+        """Put the signed-in login into the pool - ``cswap add``. True on success.
+
+        claude-swap's own add path does the checking: it refuses a credential
+        that is not the account ``~/.claude.json`` names, and an identity that
+        is already in the pool is refreshed in place (which is also how a
+        ``re-login needed`` slot is cured) rather than duplicated. It prints for
+        a terminal; that text goes to the log instead.
+        """
+        backend = self._backend_or_none()
+        if backend is None:
+            return False
+        printed = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(printed):
+                backend.switcher.add_account(slot=None, assume_yes=True)
+        except Exception as exc:
+            self._record_error("adding the signed-in login to the pool failed", exc)
+            return False
+        said = _ANSI_RE.sub("", printed.getvalue()).strip() or "signed-in login added"
+        LOGGER.info("accounts: add signed-in login -> %s", said)
+        with self._lock:
+            self._event_log.append(f"{_stamp()} {said}")
+            self._unmanaged_login = None
+        self.refresh(force=True)
+        return True
 
     def _note_reverted_switch(
         self, expected: str | None, current: str | None, *, since: float | None = None
@@ -1268,7 +1391,46 @@ class SwapAccountSource:
             spend_pct=spend[2] if spend is not None else None,
             spend_currency=spend[3] if spend is not None else None,
             spend_resets_at=spend_resets_at,
+            plan_type=self._stored_plan(slot, email, backend),
+            org_name=str(getattr(account, "org_name", "") or "").strip(),
         )
+
+    def _stored_plan(self, slot: int, email: str, backend: _Backend | None) -> str | None:
+        """:func:`claude_plan_type` of the login stored for *slot*, or ``None``.
+
+        Read from claude-swap's per-slot config backup - the ``~/.claude.json``
+        it captured at ``cswap add`` / switch time - because neither the usage
+        endpoint nor the snapshot carries the plan. The file name is upstream's
+        (``switcher.configs_dir``, ``.claude-config-<slot>-<email>.json``); a
+        missing or unreadable file means "no plan shown", never an error.
+        """
+        if backend is None or not email:
+            return None
+        configs = getattr(getattr(backend, "switcher", None), "configs_dir", None)
+        if configs is None:
+            base = getattr(backend, "backup_dir", None)
+            if base is None:
+                return None
+            configs = Path(base) / "configs"
+        path = Path(configs) / f".claude-config-{slot}-{email}.json"
+        try:
+            st = path.stat()
+        except OSError:
+            return None
+        key = (st.st_mtime_ns, st.st_size)
+        with self._lock:
+            cached = self._plan_cache.get(path)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            plan = None
+        else:
+            plan = claude_plan_type(data.get("oauthAccount") if isinstance(data, Mapping) else None)
+        with self._lock:
+            self._plan_cache[path] = (key, plan)
+        return plan
 
     def _reset_clock(
         self, window: Any, backend: _Backend | None
@@ -1455,12 +1617,16 @@ class SwapAccountSource:
         with self._lock:
             alert = self._alert
             external = self._external_alert
+        # A login no slot holds is the widget's own observation as well, and
+        # it outranks an external switch: that switch is what put it there,
+        # and until it is added any click on another account parks it.
+        unmanaged = self._unmanaged_alert()
         if not self.autoswitch_enabled():
             # An external switch is the widget's OWN observation, not an engine
             # verdict, so it survives the toggle - and autoswitch is OFF by
             # default, which is precisely when a rival actor owns the login.
             # Every other verdict belongs to the engine and dies with it.
-            return external or self._standing_login_fight()
+            return unmanaged or external or self._standing_login_fight()
         # Precedence is deliberate: a live verdict outranks the state file.
         # An engine that will not start is the most urgent of all — nothing is
         # switching for ANY account — so it legitimately hides a per-account
@@ -1469,6 +1635,7 @@ class SwapAccountSource:
         # the engine's repair switch that retracts `external` (swap-3).
         return (
             alert
+            or unmanaged
             or external
             or self._standing_login_fight()
             or self._persisted_quarantine_alert()
@@ -1712,6 +1879,7 @@ class SwapAccountSource:
         # manual switch landed on a token-dead account and left no log line
         # at all, which cost real diagnosis time.
         target_slot = self._resolve_slot_for_logging(identifier)
+        label = self._switch_label(identifier)
         sentinel = None
         if target_slot is not None:
             with self._lock:
@@ -1721,11 +1889,11 @@ class SwapAccountSource:
                 "manual switch -> %s requested although the target reports "
                 "%r — the engine would not have chosen it; proceeding "
                 "(operator override)",
-                identifier,
+                label,
                 sentinel,
             )
         else:
-            LOGGER.info("manual switch -> %s requested", identifier)
+            LOGGER.info("manual switch -> %s requested", label)
 
         ok = self._attempt_switch(backend, identifier)
         if not ok:
@@ -1733,7 +1901,7 @@ class SwapAccountSource:
             if fallback is not None and fallback != identifier:
                 ok = self._attempt_switch(backend, fallback)
         if ok:
-            LOGGER.info("manual switch -> %s succeeded", identifier)
+            LOGGER.info("manual switch -> %s succeeded", label)
             with self._lock:
                 # Claim the change the refresh below is about to see, so our
                 # own click is never reported as an external switch. The slot
@@ -1741,7 +1909,7 @@ class SwapAccountSource:
                 self._expect_active = (
                     str(target_slot) if target_slot is not None else _ANY_SLOT
                 )
-                self._event_log.append(f"{_stamp()} manual \u2192 {identifier}")
+                self._event_log.append(f"{_stamp()} manual \u2192 {label}")
                 # Taking the wheel back retracts "another actor is driving".
                 self._external_alert = None
             # Reflect the new active row now rather than up to a tick later.
@@ -1791,15 +1959,29 @@ class SwapAccountSource:
         )
         return False
 
+    def _switch_label(self, identifier: str) -> str:
+        """``6 (team)`` for a slot number whose alias is known, else *identifier*.
+
+        The menu switches by slot number; the log and Recent switches keep the
+        name a person reads."""
+        if identifier.isdigit():
+            with self._lock:
+                alias = self._alias_by_slot.get(int(identifier))
+            if alias and alias != identifier:
+                return f"{identifier} ({alias})"
+        return identifier
+
     def _slot_identifier_for(self, identifier: str) -> str | None:
-        """``str(slot)`` for a cached alias, or ``None`` when it is not ours."""
+        """``str(slot)`` for a cached alias, or ``None`` when it is not ours.
+
+        ``None`` too when the name fits more than one slot - two slots of one
+        login share the email-derived fallback alias - rather than the first:
+        a guessed slot is a switch to the wrong account."""
         with self._lock:
             aliases = dict(self._alias_by_slot)
         wanted = identifier.strip().lower()
-        for slot, alias in aliases.items():
-            if alias.strip().lower() == wanted:
-                return str(slot)
-        return None
+        matches = [slot for slot, alias in aliases.items() if alias.strip().lower() == wanted]
+        return str(matches[0]) if len(matches) == 1 else None
 
     def switch_best(self) -> bool:
         """Switch to the switchable account with the most remaining quota.

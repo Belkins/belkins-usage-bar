@@ -906,16 +906,29 @@ CLAUDE_SWAP_CONTRACT: tuple[tuple[str, str], ...] = (
     # methods called on the switcher
     ("claude_swap.switcher", "ClaudeAccountSwitcher.switch_to"),
     ("claude_swap.switcher", "ClaudeAccountSwitcher._account_is_switchable"),  # PRIVATE
+    # the signed-in login no slot holds (2026-09-30)
+    ("claude_swap.switcher", "ClaudeAccountSwitcher.has_live_login"),
+    ("claude_swap.switcher", "ClaudeAccountSwitcher.add_account"),
+    ("claude_swap.switcher", "ClaudeAccountSwitcher._get_claude_config_path"),  # PRIVATE
 )
-"""18 (module, name) pairs, verified against claude-swap 0.25.0 and 0.26.0
-(evidence/drift_symbol_check.py). A future release that drops or renames one
-degrades the accounts adapter silently; this goes red instead."""
+"""21 (module, name) pairs; the first 18 verified against claude-swap 0.25.0
+and 0.26.0 (evidence/drift_symbol_check.py), the last three against 0.26.0. A
+future release that drops or renames one degrades the accounts adapter
+silently; this goes red instead."""
 
 PINNED_SIGNATURES: dict[tuple[str, str], list[str]] = {
     ("claude_swap.menubar", "_rolled_weekly_window"): ["window", "now"],
     ("claude_swap.switcher", "ClaudeAccountSwitcher._account_is_switchable"): [
         "self",
         "account_num",
+    ],
+    # Called by keyword (slot=None, assume_yes=True): a rename is a TypeError
+    # the menu would only show as "adding … failed".
+    ("claude_swap.switcher", "ClaudeAccountSwitcher.add_account"): [
+        "self",
+        "slot",
+        "assume_yes",
+        "alias",
     ],
 }
 
@@ -933,7 +946,7 @@ def test_claude_swap_contract() -> None:
     """Proved once by renaming ``compute_pace`` to ``compute_pacex`` in the
     table: AttributeError ... red. Needs the claude-swap venv; without the
     package (CI) it is a counted skip, never a pass (R2-CI-1)."""
-    assert len(CLAUDE_SWAP_CONTRACT) == 18
+    assert len(CLAUDE_SWAP_CONTRACT) == 21
     _require_claude_swap()
     missing = []
     for module, dotted in CLAUDE_SWAP_CONTRACT:

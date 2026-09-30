@@ -323,6 +323,18 @@ def test_attention_extras_are_drawn_verbatim_and_counted() -> None:
     assert "cards-attn-extra-0" in only, "the extras alone still open the attention card"
 
 
+def test_a_long_attention_line_wraps_so_its_remedy_stays() -> None:
+    """The long verdicts carry their remedy at the END (an unmanaged login's
+    `cswap add`); cut to one line, the card showed "...isn't in the pool: au…".
+    They wrap, whole words, to at most three lines, every word kept."""
+    _need_appkit()
+    line = ("⚠ pat@example.com (Acme) isn't in the pool: auto-switch is paused and "
+            "switching away parks it. Add it (menu below) or run cswap add")
+    drawn = _drawn(_by_key(_build(actions=_Recorder().actions(extras=(line,))))["cards-attn-extra-0"])
+    assert 2 <= len(drawn) <= 3 and drawn[-1].endswith("cswap add"), drawn
+    assert " ".join(drawn) == line, drawn
+
+
 # ---------------------------------------------------------------------------
 # pixels
 # ---------------------------------------------------------------------------
@@ -544,6 +556,107 @@ def test_window_rows_and_account_rows_share_columns() -> None:
             img.unlockFocus()
     assert len(bars) >= 4 and len(set(bars)) == 1, bars
     assert len(rights["pct"]) == 1 and len(rights["reset"]) == 1, rights
+
+
+# ---------------------------------------------------------------------------
+# one login, several subscriptions; every reset time on a row (2026-09-30)
+# ---------------------------------------------------------------------------
+
+
+def _two_subscriptions() -> UiSnapshot:
+    """``pat@example.com`` twice - a personal Max org (active) and a company
+    Team org, its email in other case - plus ``solo`` on a login of its own."""
+    home = replace(_claude(1, "home", active=True, five_hour_pct=20.0, seven_day_pct=40.0,
+                           five_hour_resets_at="14:50", seven_day_resets_at="Sep 26 13:59",
+                           usage_age_seconds=30.0, plan_type="claude_max_20x",
+                           org_name="pat@example.com's Organization"), email="pat@example.com")
+    office = replace(_claude(6, "office", five_hour_pct=5.0, seven_day_pct=10.0, usage_age_seconds=30.0,
+                             seven_day_resets_at="Oct 2 10:49", plan_type="claude_team", org_name="Acme"),
+                     email="Pat@Example.com")
+    solo = _claude(2, "solo", five_hour_pct=5.0, seven_day_pct=51.0, seven_day_resets_at="14:00",
+                   usage_age_seconds=30.0, plan_type="claude_max_20x")
+    return replace(_snapshot(), accounts=(home, solo, office), active=home,
+                   account_notes={}, account_note_kinds={})
+
+
+def test_one_login_with_two_subscriptions_says_which_is_which() -> None:
+    """One email can hold a personal Max org AND the company Team org - two
+    claude-swap slots. The menu has to show that: the active hero names its
+    plan and which subscription it is, a row names its plan and, in its
+    caption, the kind and the login it shares (the same ``pat@`` on both), and
+    the tooltip spells the pairing out. A login with one slot is unchanged
+    apart from its plan: no kind, no email."""
+    _need_appkit()
+    blocks = _by_key(_build(_two_subscriptions()))
+    hero = _drawn(blocks["cards-claude-active"])
+    assert "Max 20x · personal" in hero, hero
+    office = _drawn(blocks["cards-claude-6"])
+    assert "Team" in office and "corporate · Pat@" in office, office
+    tip = blocks["cards-claude-6"].tooltip
+    assert "same login as home" in tip and "Acme" in tip, tip
+    solo = _drawn(blocks["cards-claude-2"])
+    assert "Max 20x" in solo, solo
+    assert not any("personal" in s or "corporate" in s or "@" in s for s in solo), solo
+
+
+def test_a_long_name_gives_way_to_the_plan_in_the_hero() -> None:
+    """The plan after the hero's name is what tells two subscriptions of one
+    login apart, so a long alias must be the one that is cut. ``_drawn``
+    records strings before they are fitted; this records what is DRAWN."""
+    _need_appkit()
+    from AppKit import NSImage
+
+    snap = _two_subscriptions()
+    home = replace(snap.accounts[0], alias="a-really-quite-long-account-alias")
+    snap = replace(snap, accounts=(home,) + snap.accounts[1:], active=home)
+    block = _by_key(_build(snap))["cards-claude-active"]
+    shown: list[str] = []
+
+    class Fitted(card_base.Pen):
+        def text(self, s: str, x: float, y: float, size: float, weight: Any = "regular",
+                 *a: Any, **k: Any) -> float:
+            shown.append(self.fit(s, size, weight, k.get("maxw"), mono=k.get("mono", False),
+                                  code=k.get("code", False), rounded=k.get("rounded", False)))
+            return super().text(s, x, y, size, weight, *a, **k)
+
+    img = NSImage.alloc().initWithSize_((card_base.W, max(1.0, block.height)))
+    img.lockFocus()
+    try:
+        block.paint(Fitted(False), card_base.W, block.height)
+    finally:
+        img.unlockFocus()
+    assert "Max 20x · personal" in shown, shown
+    assert any(s.startswith("a-really") and s.endswith("…") for s in shown), shown
+
+
+def test_a_row_lists_every_reset_time_not_only_its_binding_one() -> None:
+    """A row's bar shows the window that binds it, with that window's reset.
+    Its caption lists every OTHER reset time, so when each window comes back
+    reads off the menu itself. A window resetting at the minute already shown
+    (a weekly Fable beside the weekly 7d) is not repeated, an idle 5-hour
+    window has no reset to list, and an ENDED window's reset is past."""
+    _need_appkit()
+    snap = _snapshot()
+    capped = _claude(2, "spare", five_hour_pct=31.0, five_hour_resets_at="14:50",
+                     seven_day_pct=100.0, seven_day_resets_at="Sep 26 13:59",
+                     scoped_windows=(("Fable", 45.0), ("Opal", 12.0)),
+                     scoped_resets_at=(("Fable", "Sep 26 13:59"), ("Opal", "Oct 2 10:49")),
+                     usage_age_seconds=30.0)
+    idle = _claude(4, "idle", five_hour_pct=0.0, seven_day_pct=0.0, seven_day_resets_at="Oct 2 10:49",
+                   usage_age_seconds=30.0)
+    ended = replace(capped, slot=5, alias="ended", expired_windows=("five_hour",))
+    snap = replace(snap, accounts=(snap.accounts[0], capped, snap.accounts[2], idle, ended))
+    blocks = _by_key(_build(snap))
+    mark = app_mod._reset_mark_text
+    spare = _drawn(blocks["cards-claude-2"])
+    assert mark("Sep 26 13:59", NOW) in spare, spare  # the binding 7d reset, beside the bar
+    assert f"5h 31% {mark('14:50', NOW)}" in spare, spare
+    assert f"Opal 12% {mark('Oct 2 10:49', NOW)}" in spare, spare
+    assert not any(s.startswith("Fable") for s in spare), spare
+    idle_drawn = _drawn(blocks["cards-claude-4"])
+    assert f"7d 0% {mark('Oct 2 10:49', NOW)}" in idle_drawn, idle_drawn
+    assert not any(s.startswith("5h 0%") for s in idle_drawn), idle_drawn
+    assert not any(s.startswith("5h ") for s in _drawn(blocks["cards-claude-5"]))
 
 
 def _tests() -> list[tuple[str, Any]]:

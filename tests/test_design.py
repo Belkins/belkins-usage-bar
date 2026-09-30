@@ -296,9 +296,18 @@ def test_reset_mark_text_reads_claude_swap_strings_back() -> None:
 
 
 def test_plan_label_maps_only_observed_plans() -> None:
-    """UX-9: two observed plans get display names; anything else verbatim."""
+    """UX-9: observed opaque plans get display names and anything else is
+    printed verbatim, never guessed. Claude's own ``claude_<plan>[_<N>x]``
+    slugs name their plan, so they are spelled by rule (2026-09-30): a Pro or
+    5x login must not show up as ``claude_max_5x`` beside its name."""
     assert app_mod.plan_label("pro") == "Pro"
     assert app_mod.plan_label("self_serve_business_prolite") == "Business"
+    assert app_mod.plan_label("claude_max_20x") == "Max 20x"
+    assert app_mod.plan_label("claude_team") == "Team"
+    assert app_mod.plan_label("claude_max_5x") == "Max 5x"
+    assert app_mod.plan_label("claude_pro") == "Pro" and app_mod.plan_label("claude_max") == "Max"
+    assert app_mod.plan_label("claude_team_premium") == "Team Premium"
+    assert app_mod.plan_label("claude_") == "claude_" and app_mod.plan_label("claude_X9") == "claude_X9"
     assert app_mod.plan_label("team_x") == "team_x"
     assert app_mod.plan_label("") == "" and app_mod.plan_label(None) == ""
 

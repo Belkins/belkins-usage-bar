@@ -81,6 +81,7 @@ from .contracts import (
     ALERT_EXTERNAL_SWITCH,
     ALERT_GHOST_FLIP,
     ALERT_NO_TARGET,
+    ALERT_UNMANAGED_LOGIN,
     ATTENTION_PCT,
     CODEX_SCAN_STATE_PATH,
     CODEX_ACCOUNTS_REGISTRY_PATH,
@@ -328,6 +329,7 @@ _CMD_SET_AUTOSWITCH = "set_autoswitch"
 _CMD_SET_SETTING = "set_setting"
 _CMD_SWITCH_TO = "switch_to"
 _CMD_SWITCH_BEST = "switch_best"  # switch-ux
+_CMD_ADD_LOGIN = "add_login"  # ALERT_UNMANAGED_LOGIN: `cswap add` the signed-in login
 _CMD_REBUILD_INDEX = "rebuild_index"
 _CMD_WIRE_SOURCES = "wire_sources"
 _CMD_MAP_DIR = "map_dir"  # W3
@@ -608,6 +610,18 @@ def _alert_of(source: Any) -> tuple[str, str] | None:
     return None
 
 
+def _unmanaged_login_of(source: Any) -> str | None:
+    """The adapter's signed-in-but-not-pooled login label, if any."""
+    getter = getattr(source, "unmanaged_login", None)
+    if not callable(getter):
+        return None
+    try:
+        login = getter()
+    except Exception:
+        return None
+    return str(login) if login else None
+
+
 def _autoswitch_threshold_of(source: Any) -> float | None:  # W4
     """The adapter's CACHED ``autoswitch.threshold``, or ``None``.
 
@@ -687,6 +701,8 @@ def _title_alert(kind: str) -> str:
         return "⚠ ghost"
     if kind == ALERT_NO_TARGET:
         return "⚠ no target"
+    if kind == ALERT_UNMANAGED_LOGIN:
+        return "⚠ not in pool"
     return "⚠ autoswitch"
 
 
@@ -774,6 +790,10 @@ class UiSnapshot:
     """
     alert: tuple[str, str] | None = None
     """The autoswitch engine's standing verdict as ``(kind, human line)``."""
+    unmanaged_login: str | None = None
+    """``pat@example.com (Acme)`` while Claude Code is signed in to an account
+    no claude-swap slot holds, else ``None``. Drives the one-click ``Add … to
+    the pool`` item; the matching alert is :data:`ALERT_UNMANAGED_LOGIN`."""
     recent_events: tuple[str, ...] = ()  # forensics (W1)
     """Recent switch/verdict lines from the adapter, oldest first.
 
@@ -1055,6 +1075,94 @@ def _window_reset(row: AccountRow, label: str) -> str | None:
     if label == "7d":
         return row.seven_day_resets_at
     return next((r for name, r in row.scoped_resets_at if name == label), None)
+
+
+def _window_reset_marks(row: AccountRow, now: float, *, skip: str | None = None) -> list[str]:
+    """The row's OTHER reset times, ``5h 31% ↺ 18:29``: 5h, 7d, then scoped.
+
+    *skip* is the window a row already draws beside its bar, with its reset.
+    A window resetting at that same minute (a weekly Fable window beside a
+    weekly 7d one) adds no new time, one with no reset (an idle 5-hour window)
+    has none to add, and an ENDED one's reset is already past (swap-1): all
+    three are left out, so each distinct reset time is listed once.
+    """
+    dead = set(row.expired_windows or ())
+    resets = dict(row.scoped_resets_at)
+    windows = [
+        ("5h", "five_hour", row.five_hour_pct, row.five_hour_resets_at),
+        ("7d", "seven_day", row.seven_day_pct, row.seven_day_resets_at),
+        *((name, name, pct, resets.get(name)) for name, pct in row.scoped_windows),
+    ]
+    shown = _reset_mark_text(_window_reset(row, skip), now) if skip else ""
+    marks: list[str] = []
+    for label, key, pct, raw in windows:
+        if label == skip or pct is None or key in dead:
+            continue
+        mark = _reset_mark_text(raw, now)
+        if mark and mark != shown:
+            marks.append(f"{label} {format_pct(pct)} {mark}")
+    return marks
+
+
+_PERSONAL_PLANS: Final = ("claude_max", "claude_pro")
+_CORPORATE_PLANS: Final = ("claude_team", "claude_enterprise")
+
+
+def _login_siblings(accounts: Sequence[AccountRow], row: AccountRow) -> tuple[AccountRow, ...]:
+    """The OTHER Claude slots signed in with *row*'s email, in list order.
+
+    One login can hold several subscriptions - a personal Max org and a company
+    Team org under the same address - and claude-swap keeps one slot per
+    (email, organisation). Emails compare case-insensitively.
+    """
+    email = (row.email or "").strip().lower()
+    if row.vendor != VENDOR_CLAUDE or not email:
+        return ()
+    return tuple(
+        other
+        for other in accounts
+        if other.slot != row.slot
+        and other.vendor == VENDOR_CLAUDE
+        and (other.email or "").strip().lower() == email
+    )
+
+
+def _subscription_kind(row: AccountRow) -> str:
+    """``personal`` or ``corporate``, from a Claude row's plan; else ``""``."""
+    plan = row.plan_type or ""
+    if plan.startswith(_CORPORATE_PLANS):
+        return "corporate"
+    if plan.startswith(_PERSONAL_PLANS):
+        return "personal"
+    return ""
+
+
+def _claude_plan_text(accounts: Sequence[AccountRow], row: AccountRow) -> str:
+    """The plan beside a Claude name, ``Max 20x``; ``Max 20x · personal`` when
+    the same login holds another slot, so its subscriptions read apart."""
+    kind = _subscription_kind(row) if _login_siblings(accounts, row) else ""
+    return " · ".join(part for part in (plan_label(row.plan_type), kind) if part)
+
+
+def _same_login_note(accounts: Sequence[AccountRow], row: AccountRow) -> str:
+    """``same login as team`` when *row*'s email holds another slot, else ``""``."""
+    siblings = _login_siblings(accounts, row)
+    if not siblings:
+        return ""
+    return "same login as " + ", ".join(_display_name(other) for other in siblings)
+
+
+def _subscription_caption(accounts: Sequence[AccountRow], row: AccountRow) -> str:
+    """``corporate · pat@`` for a slot whose login holds another one: which
+    subscription this is, and whose - the same ``name@`` on two rows is what
+    reads as one account. Falls back to :func:`_same_login_note` when the plan
+    does not say which kind; ``""`` for a login with a single slot."""
+    if not _login_siblings(accounts, row):
+        return ""
+    kind = _subscription_kind(row)
+    if not kind:
+        return _same_login_note(accounts, row)
+    return f"{kind} · {_email_local(row.email, 16)}@"
 
 
 def _account_status_note(row: AccountRow, note: str = "", note_kind: str = "") -> str:
@@ -3455,6 +3563,7 @@ class BackgroundWorker:
                         account_notes=_account_notes_of(accounts),
                         account_note_kinds=_account_note_kinds_of(accounts),
                         alert=_alert_of(accounts),
+                        unmanaged_login=_unmanaged_login_of(accounts),
                         # The switch this tick made is the newest line of the
                         # journal; publishing rows without it would show a new
                         # active account above a "Recent switches" block that
@@ -3473,11 +3582,17 @@ class BackgroundWorker:
             # the alert exists to end.
             alert = _alert_of(accounts)
             events = _recent_events_of(accounts)
-            if alert != self._snapshot.alert or events != self._snapshot.recent_events:
+            unmanaged = _unmanaged_login_of(accounts)
+            if (
+                alert != self._snapshot.alert
+                or events != self._snapshot.recent_events
+                or unmanaged != self._snapshot.unmanaged_login
+            ):
                 self._publish(
                     replace(
                         self._snapshot,
                         alert=alert,
+                        unmanaged_login=unmanaged,
                         recent_events=events,
                         switch_note=_switch_note_of(accounts),
                     )
@@ -3610,6 +3725,9 @@ class BackgroundWorker:
                 return True, False
             if name == _CMD_SWITCH_BEST:
                 self._switch_best()
+                return True, False
+            if name == _CMD_ADD_LOGIN:
+                self._add_live_login()
                 return True, False
             if name == _CMD_REBUILD_INDEX:
                 self._rebuild_index(str(payload) if payload else None)
@@ -3754,6 +3872,30 @@ class BackgroundWorker:
                     after[:MAX_ERROR_CHARS]
                     if after and after != before
                     else "switch to the best account was refused"
+                )
+        except Exception as exc:
+            error = _describe(exc)
+        self._run_accounts_job(force=True, error_override=error)
+
+    def _add_live_login(self) -> None:
+        """``Add to pool: …``: claude-swap's ``cswap add`` for the live login.
+
+        The refusal reason is the value here too (a credential that does not
+        belong to the named account, a login that changed underneath), so it
+        is read back from the source and shown, as :meth:`_switch_best` does.
+        """
+        add = getattr(self._accounts, "add_live_login", None)
+        if not callable(add):
+            return
+        before = getattr(self._accounts, "last_error", None)
+        error: str | None = None
+        try:
+            if not add():
+                after = getattr(self._accounts, "last_error", None)
+                error = (
+                    after[:MAX_ERROR_CHARS]
+                    if after and after != before
+                    else "adding the signed-in login to the pool was refused"
                 )
         except Exception as exc:
             error = _describe(exc)
@@ -4033,6 +4175,7 @@ class BackgroundWorker:
                     account_notes=_account_notes_of(self._accounts),
                     account_note_kinds=_account_note_kinds_of(self._accounts),
                     alert=_alert_of(self._accounts),
+                    unmanaged_login=_unmanaged_login_of(self._accounts),
                     recent_events=_recent_events_of(self._accounts),
                     switch_note=_switch_note_of(self._accounts),
                     autoswitch_threshold=_autoswitch_threshold_of(self._accounts),
@@ -6091,9 +6234,11 @@ class CCUsageWidgetApp(rumps.App):
         by_slot = {row.slot: row for row in snapshot.accounts}
 
         def switch_to(slot: int) -> None:
+            # The slot NUMBER, never the alias: a row's alias falls back to its
+            # email's local part, so two slots of one login (a personal and a
+            # Team org) submit the same name and the click lands on the first.
             row = by_slot.get(slot)
-            target = (row.alias or str(row.slot)) if row is not None else str(slot)
-            self._worker.submit(_CMD_SWITCH_TO, target)
+            self._worker.submit(_CMD_SWITCH_TO, str(row.slot if row is not None else slot))
 
         def codex_login_for(row: AccountRow) -> Callable[[], None] | None:
             callback = self._codex_login_callback(row)
@@ -6173,6 +6318,8 @@ class CCUsageWidgetApp(rumps.App):
             )
         elif kind == "switch":
             return self._switch_account_submenu(snapshot, reset_style="mark")
+        elif kind == "add_login":
+            return self._add_login_item(snapshot)
         elif kind == "all":
             return _submenu(title, self._all_windows_items(snapshot))
         elif kind == "refresh":
@@ -6246,6 +6393,9 @@ class CCUsageWidgetApp(rumps.App):
             items.extend(problems)
         items.append(None)
         items.append(self._switch_account_submenu(snapshot))
+        add_login = self._add_login_item(snapshot)
+        if add_login is not None:
+            items.append(add_login)
         items.append(rumps.MenuItem("Refresh now", callback=self._on_refresh_now))
         items.append(self._settings_submenu(snapshot))
         items.append(rumps.MenuItem("Quit", callback=self._on_quit))
@@ -6756,10 +6906,13 @@ class CCUsageWidgetApp(rumps.App):
         return items
 
     def _tools_items(self, snapshot: UiSnapshot) -> list[Any]:
-        """The two one-click switches, then Switch account, Refresh, Settings, Quit."""
+        """The two one-click switches, then Switch account (and ``Add … to the
+        pool`` while a signed-in login is in no slot), Refresh, Settings, Quit."""
+        add_login = self._add_login_item(snapshot)
         return [
             *self._switch_items(snapshot)[:2],
             self._switch_account_submenu(snapshot, reset_style="mark"),
+            *([add_login] if add_login is not None else []),
             rumps.MenuItem("Refresh now", callback=self._on_refresh_now),
             self._settings_submenu(snapshot),
             rumps.MenuItem("Quit", callback=self._on_quit),
@@ -6832,9 +6985,10 @@ class CCUsageWidgetApp(rumps.App):
             # Upstream writes the earliest reset as an ISO-UTC instant; the
             # operator acts on a wall clock (2026-09-01: seven hours out).
             line = _localize_instants(line)[:MAX_ERROR_CHARS]
-            if kind in (ALERT_EXTERNAL_SWITCH, ALERT_GHOST_FLIP):
+            if kind in (ALERT_EXTERNAL_SWITCH, ALERT_GHOST_FLIP, ALERT_UNMANAGED_LOGIN):
                 # Not prefixed "autoswitch:" — attributing it to the engine is
-                # the opposite of what this verdict says. Skipped while it IS
+                # the opposite of what this verdict says (an unmanaged login is
+                # the widget's own reading too). Skipped while it IS
                 # the newest journal line (the adapter writes both from one
                 # string): the Recent switches line already says it, and the
                 # same sentence twice read as two flips (UX-6). A layout with
@@ -8164,7 +8318,9 @@ class CCUsageWidgetApp(rumps.App):
         return callback
 
     def _make_switch_callback(self, row: AccountRow) -> Callable[[Any], None]:
-        target = row.alias or str(row.slot)
+        # The slot number, not the alias (see `_theme_actions`): claude-swap
+        # resolves digits first, an alias only if it was registered.
+        target = str(row.slot)
 
         def callback(_sender: Any) -> None:
             self._worker.submit(_CMD_SWITCH_TO, target)
@@ -8174,6 +8330,24 @@ class CCUsageWidgetApp(rumps.App):
     def _on_switch_best(self, _sender: Any) -> None:
         """Hand the pick to claude-swap on the worker. Main thread does no I/O."""
         self._worker.submit(_CMD_SWITCH_BEST, None)
+
+    def _on_add_login(self, _sender: Any) -> None:
+        """``Add to pool: …`` - the add runs on the worker, like a switch."""
+        self._worker.submit(_CMD_ADD_LOGIN, None)
+
+    def _add_login_item(self, snapshot: UiSnapshot) -> rumps.MenuItem | None:
+        """``Add to pool: pat@example.com (Acme)``, only while such a login is live."""
+        who = snapshot.unmanaged_login
+        if not who:
+            return None
+        text = f"Add to pool: {who}"
+        title = _card_base.fit_menu_title(text) if _card_base is not None else text
+        item = rumps.MenuItem(title, callback=self._on_add_login)
+        item._menuitem.setToolTip_(
+            f"{text} — Claude Code is signed in to it but no claude-swap slot holds it, so "
+            "auto-switch is paused and a switch would park it. Runs `cswap add`."
+        )
+        return item
 
     def _on_refresh_now(self, _sender: Any) -> None:
         self._worker.submit(_CMD_REFRESH, None)

@@ -430,7 +430,9 @@ def test_theme_actions_enqueue_and_never_act_on_the_ui_thread() -> None:
         actions.switch_to(2)
         actions.switch_best()
         actions.refresh()
-        assert h.sent == [("switch_to", "spare"), ("switch_best", None), ("refresh", None)], h.sent
+        # The slot number, not the alias: an alias falls back to the email's
+        # local part, which two slots of one login share (2026-09-30 review).
+        assert h.sent == [("switch_to", "2"), ("switch_best", None), ("refresh", None)], h.sent
         assert actions.codex_login_for(snap.quota_rows[1]) is None, "a live Codex row is not a login row"
         assert actions.codex_login(snap.quota_rows[1]) is False
         assert actions.open_url("file:///etc/hosts") is False, "only http(s)"

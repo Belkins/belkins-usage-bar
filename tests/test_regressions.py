@@ -92,6 +92,7 @@ from cc_usage_widget.contracts import (  # noqa: E402
     ALERT_EXTERNAL_SWITCH,
     ALERT_KINDS,
     ALERT_NO_TARGET,
+    ALERT_UNMANAGED_LOGIN,
     SETTINGS_DEFAULTS,
     VENDOR_CLAUDE,
     VENDOR_CODEX,
@@ -3061,6 +3062,136 @@ def test_switch_best_is_one_click_and_dims_with_nowhere_to_go() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 2026-09-30: a signed-in login that no slot holds
+# ---------------------------------------------------------------------------
+
+
+def test_a_signed_in_login_no_slot_holds_is_named_and_can_be_added() -> None:
+    """2026-09-30: a `/login` into a new Team seat left claude-swap with no
+    active slot. The engine then refuses to act - a quiet no-switch that also
+    clears any verdict - so auto-switch sat paused with nothing on screen, and
+    the next click parked the login in `cswap unclaimed`, twice. The widget
+    must name the login as a standing alert (auto-switch on or off: a click
+    parks it either way), offer the add, and drop both once the add lands.
+    Nobody signed in at all is not this alert: there is nothing to add."""
+    with tempfile.TemporaryDirectory() as tmp:
+        config = Path(tmp) / ".claude.json"
+        config.write_text(json.dumps({"oauthAccount": {
+            "emailAddress": "pat@example.com", "organizationName": "Acme"}}), encoding="utf-8")
+        source, backend = _forensics_source("1")
+        live = {"on": True}
+        added: list[dict[str, Any]] = []
+
+        def add_account(**kwargs: Any) -> None:
+            added.append(kwargs)
+            print("\x1b[32mAdded\x1b[0m Account 6: pat@example.com [Acme]")  # upstream prints for a tty
+            backend.snapshot.active_number = "6"
+
+        backend.switcher.has_live_login = lambda: live["on"]
+        backend.switcher._get_claude_config_path = lambda: config
+        backend.switcher.add_account = add_account
+
+        backend.snapshot.active_number = None  # the /login: an identity no slot holds
+        source.refresh(force=True)
+        assert source.unmanaged_login() == "pat@example.com (Acme)"
+        alert = source.current_alert()
+        assert alert is not None and alert[0] == ALERT_UNMANAGED_LOGIN, alert
+        assert "pat@example.com (Acme)" in alert[1] and "cswap add" in alert[1], alert
+        # The menu caps the line at MAX_ERROR_CHARS: with a 30-character login
+        # (email + organisation) the remedy at its end must still be there.
+        assert len(alert[1]) - len("pat@example.com (Acme)") + 30 <= app_mod.MAX_ERROR_CHARS, alert[1]
+        source.autoswitch_enabled = lambda: False
+        assert (source.current_alert() or ("",))[0] == ALERT_UNMANAGED_LOGIN
+        assert app_mod._title_alert(ALERT_UNMANAGED_LOGIN) == "⚠ not in pool"
+
+        assert source.add_live_login() is True
+        assert added == [{"slot": None, "assume_yes": True}], added
+        assert source.unmanaged_login() is None and source.current_alert() is None
+        assert any(e.endswith("Added Account 6: pat@example.com [Acme]") for e in source.recent_events()), (
+            source.recent_events())
+
+        live["on"] = False  # signed out entirely: no identity, nothing to add
+        backend.snapshot.active_number = None
+        source.refresh(force=True)
+        assert source.unmanaged_login() is None and source.current_alert() is None
+
+        def refuse(**_kwargs: Any) -> None:
+            raise RuntimeError("credential does not belong to pat@example.com")
+
+        live["on"] = True
+        backend.switcher.add_account = refuse
+        source.refresh(force=True)
+        assert source.add_live_login() is False
+        assert "does not belong" in (source.last_error or ""), source.last_error
+        assert source.unmanaged_login() == "pat@example.com (Acme)", "a refused add keeps the offer"
+
+
+def test_a_click_on_one_of_two_slots_of_one_login_switches_to_that_slot() -> None:
+    """One email, two orgs, neither slot aliased: both rows fall back to the
+    same display name ("pat"). The menu used to submit that name; claude-swap
+    refused it and the widget's fallback picked the FIRST slot so named, so a
+    click on the Team slot activated the personal one. The click must carry the
+    slot number, and a name that fits two slots must never resolve to one."""
+    source, backend = _forensics_source("1")
+    source._alias_by_slot = {1: "pat", 6: "pat", 2: "main"}
+    assert source._slot_identifier_for("pat") is None, "ambiguous: no guess"
+    assert source._slot_identifier_for("main") == "2"
+    assert source.switch_to("6") is True
+    assert backend.switcher.calls == ["6"], backend.switcher.calls
+    assert any(line.endswith("manual → 6 (pat)") for line in source.recent_events()), source.recent_events()
+
+    from cc_usage_widget.contracts import AccountRow
+
+    settings = dict(SETTINGS_DEFAULTS)
+    personal = AccountRow(slot=1, alias="pat", email="pat@example.com", is_active=True)
+    team = AccountRow(slot=6, alias="pat", email="pat@example.com", is_active=False)
+    sent: list[tuple[str, Any]] = []
+    fake = type("_App", (), {
+        "_worker": type("_W", (), {"submit": lambda _s, *a: sent.append(a)})(),
+        "_alert_items": lambda _s, _snap, **_k: [],
+    })()
+    app_mod.CCUsageWidgetApp._make_switch_callback(fake, team)(None)
+    app_mod.CCUsageWidgetApp._theme_actions(fake, UiSnapshot(settings=settings, accounts=(personal, team))).switch_to(6)
+    assert sent == [(app_mod._CMD_SWITCH_TO, "6"), (app_mod._CMD_SWITCH_TO, "6")], sent
+
+
+def test_add_to_pool_is_offered_only_while_a_login_is_unmanaged() -> None:
+    """The one-click add lives in the common tail every card theme draws, next
+    to Switch account, and only while there is such a login; the worker runs
+    it off the main thread and shows the refusal reason, as switch-best does."""
+    from cc_usage_widget import themes
+
+    settings = dict(SETTINGS_DEFAULTS)
+    plain = UiSnapshot(settings=settings)
+    assert all(row is None or row["id"] != "add_login" for row in themes.tail_rows(plain))
+    ids = [row and row["id"] for row in themes.tail_rows(replace(plain, unmanaged_login="pat@example.com (Acme)"))]
+    assert ids[ids.index("switch") + 1] == "add_login", ids
+    row = next(r for r in themes.tail_rows(replace(plain, unmanaged_login="pat@example.com (Acme)"))
+               if r and r["id"] == "add_login")
+    assert row["tooltip"] == "Add to pool: pat@example.com (Acme)", row
+
+    class _Adder:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.last_error: str | None = None
+
+        def add_live_login(self) -> bool:
+            self.calls += 1
+            self.last_error = "adding the signed-in login to the pool failed: credential drifted"
+            return False
+
+        def rows(self, **_kw: Any) -> tuple[Any, ...]:
+            return ()
+
+    published: list[UiSnapshot] = []
+    adder = _Adder()
+    worker = BackgroundWorker(publish=published.append, snapshot=UiSnapshot(settings=settings), accounts=adder)
+    worker._handle_command((app_mod._CMD_ADD_LOGIN, None))
+    assert adder.calls == 1
+    assert "credential drifted" in (published[-1].accounts_error or ""), published[-1].accounts_error
+
+
+# ---------------------------------------------------------------------------
 # 2026-09-01: a second actor that can switch must not stay invisible
 # ---------------------------------------------------------------------------
 
@@ -3796,6 +3927,47 @@ def test_disabled_flag_is_carried_from_claude_swap_into_the_row() -> None:
         switchable=True, usage=None,
     )
     assert source._build_row(plain, "1", time.time(), None).disabled is False
+
+
+def test_claude_rows_carry_the_stored_plan_and_org_name() -> None:
+    """One email can hold a personal Max org and a company Team org - two
+    slots. Nothing in the usage feed says which is which: the plan comes from
+    the login claude-swap stored for each slot (its config backup) and the org
+    name from the snapshot. The backup is re-read when it changes (a re-login
+    can change the plan), and a slot with no backup shows no plan rather than a
+    guessed one."""
+    import types
+
+    from cc_usage_widget.accounts import claude_plan_type
+
+    def write(path: Path, oauth: dict[str, Any]) -> None:
+        path.write_text(json.dumps({"oauthAccount": oauth, "projects": {"/x": {}}}), encoding="utf-8")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        configs = Path(tmp) / "configs"
+        configs.mkdir()
+        write(configs / ".claude-config-1-pat@example.com.json",
+              {"organizationType": "claude_max", "organizationRateLimitTier": "default_claude_max_20x"})
+        team = configs / ".claude-config-6-pat@example.com.json"
+        write(team, {"organizationType": "claude_team", "organizationRateLimitTier": "default_raven",
+                     "seatTier": "team_standard"})
+        source = SwapAccountSource(settings={})
+        backend = types.SimpleNamespace(backup_dir=Path(tmp), roll_weekly=lambda w, _now: w,
+                                        fresh_reset_strings=lambda _w: None, sentinel_notes={})
+
+        def row(num: int, org: str) -> Any:
+            account = types.SimpleNamespace(number=str(num), email="pat@example.com", alias="", org_name=org,
+                                            is_active=False, switchable=True, usage=None)
+            return source._build_row(account, "1", time.time(), backend)
+
+        personal, corporate, missing = row(1, "pat@example.com's Organization"), row(6, "Acme"), row(7, "Other")
+        assert (personal.plan_type, corporate.plan_type, missing.plan_type) == (
+            "claude_max_20x", "claude_team", None)
+        assert (personal.org_name, corporate.org_name) == ("pat@example.com's Organization", "Acme")
+        write(team, {"organizationType": "claude_enterprise"})
+        assert row(6, "Acme").plan_type == "claude_enterprise", "a changed backup must not serve the cached plan"
+    assert claude_plan_type({"organizationType": "claude_max"}) == "claude_max"  # no tier: no multiplier
+    assert claude_plan_type({"organizationType": ""}) is None and claude_plan_type(None) is None
 
 
 # ---------------------------------------------------------------------------

@@ -150,7 +150,19 @@ def build(snapshot: Any, now: float, actions: ThemeActions) -> list[Block]:
             tags.append(("disabled", "state", None))
         if row.usage_is_stale:
             tags.append((A._age_label(row.usage_age_seconds), "state", "clock"))
+        # One login, several subscriptions: which one this row is. A state tag,
+        # so it survives a tight row; the plan is decoration, as on Codex rows.
+        kind = A._subscription_kind(row) if A._login_siblings(snap.accounts, row) else ""
+        if kind:
+            tags.append((kind, "state", None))
+        plan = A.plan_label(row.plan_type)
+        if plan:
+            tags.append((plan, "plan", None))
         return tags
+
+    def plan_tip(row: Any) -> str:
+        return " · ".join(x for x in (A._claude_plan_text(snap.accounts, row), row.org_name,
+                                      A._same_login_note(snap.accounts, row)) if x)
 
     def tags_codex(row: Any) -> list[tuple[str, str, str | None]]:
         tags: list[tuple[str, str, str | None]] = []
@@ -327,6 +339,8 @@ def build(snapshot: Any, now: float, actions: ThemeActions) -> list[Block]:
             caption(pen, cap, X0, base + HEAD_CAP, R - X0)
 
         ax = "Claude, active " + (A._display_name(active) if active else "none")
+        if active is not None and plan_tip(active):
+            ax += f" ({plan_tip(active)})"
         if active is not None:
             note = notes.get(active.slot)
             if note:
@@ -500,6 +514,8 @@ def build(snapshot: Any, now: float, actions: ThemeActions) -> list[Block]:
 
             ax = f"Claude {A._display_name(row)} slot {row.slot}. " + ", ".join(
                 f"{l} {fmt_pct(p)}{' ended' if e else ''} {m}".strip() for l, p, m, e in claude_windows(row))
+            if plan_tip(row):
+                ax += f". {plan_tip(row)}"
             if row.usage_is_stale:
                 ax += f". usage {A._age_label(row.usage_age_seconds)} old"
             if row.disabled:

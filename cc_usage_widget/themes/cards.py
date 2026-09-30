@@ -409,10 +409,14 @@ def _claude_bars(A: Any, row: Any, now: float) -> list[tuple[str, float, str, bo
     return out
 
 
-def _claude_tip(A: Any, row: Any, now: float, note: str = "") -> str:
+def _claude_tip(A: Any, row: Any, now: float, note: str = "", accounts: tuple = ()) -> str:
     from ..contracts import format_pct
 
     parts = [f"{A._display_name(row)} · slot {row.slot} · {row.email}"]
+    plan = " · ".join(x for x in (A._claude_plan_text(accounts, row), row.org_name,
+                                  A._same_login_note(accounts, row)) if x)
+    if plan:
+        parts.append(plan)
     if note:
         parts.append(note)
     else:
@@ -443,6 +447,7 @@ def _claude_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) -
         right += [h for h in (A._scoped_fleet_heading(snap.accounts, name=n, now=now, notes=notes)
                               for n in scoped) if h]
     hero = None
+    accounts = tuple(snap.accounts)
     if active is not None:
         note = notes.get(active.slot, "")
         binding = None if note else A._binding_window(active, models)
@@ -456,13 +461,14 @@ def _claude_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) -
             captions.append((f"extra usage {A._money(used, cur)} of {A._money(limit, cur)}",
                              R.severity(sp) if sp else "dim"))
         hero = {
-            "name": A._display_name(active), "slot": active.slot, "plan": "", "sub": active.email,
+            "name": A._display_name(active), "slot": active.slot,
+            "plan": A._claude_plan_text(accounts, active), "sub": active.email,
             "big": (format_pct(binding[1]), binding[0], R.severity(binding[1])) if binding else None,
             "status": (A._account_status_note(active, note, snap.account_note_kinds.get(active.slot, "")), "warn")
             if note else None,
             "bars": [] if note else _claude_bars(A, active, now),
             "captions": captions,
-            "tip": _claude_tip(A, active, now, note),
+            "tip": _claude_tip(A, active, now, note, accounts),
             "action": None,
         }
     targets = [r for r in A._switch_targets(snap.accounts) if r.slot not in notes]
@@ -473,17 +479,25 @@ def _claude_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) -
         caps = []
         if r is nxt:
             caps.append(("next", "tag"))
+        # One login, several subscriptions: which one this is, and whose. The
+        # hero carries the kind in its name line instead (room there).
+        sub = A._subscription_caption(accounts, r)
+        if sub:
+            caps.append((sub, "dim"))
+        # Every other reset time, not only the binding one beside the bar.
+        caps += [(mark, "dim") for mark in A._window_reset_marks(r, now, skip=binding[0] if binding else None)]
         if r.disabled:
             caps.append(("disabled · not in rotation", "dim"))
         if r.usage_is_stale:
             caps.append((f"{A._age_label(r.usage_age_seconds)} old", "dim"))
         rows.append({
-            "key": f"cards-claude-{r.slot}", "slot": str(r.slot), "name": A._display_name(r), "plan": "",
+            "key": f"cards-claude-{r.slot}", "slot": str(r.slot), "name": A._display_name(r),
+            "plan": A.plan_label(r.plan_type),
             "label": binding[0] if binding else "",
             "pct": binding[1] if binding else None,
             "sev": R.severity(binding[1]) if binding else "dim",
             "reset": A._reset_mark_text(A._window_reset(r, binding[0]), now) if binding else "",
-            "withheld": None, "captions": caps, "tip": _claude_tip(A, r, now),
+            "withheld": None, "captions": caps, "tip": _claude_tip(A, r, now, accounts=accounts),
             "action": (lambda slot=r.slot: actions.switch_to(slot)),
         })
     return {"title": "Claude", "icon": "sparkle", "right": " · ".join(right), "right_parts": right,
@@ -630,10 +644,37 @@ def _attn_item(it: dict[str, Any]) -> Callable[[Any, float], float]:
     return draw
 
 
+EXTRA_LINES = 3
+EXTRA_STEP = 17.0  # 13 pt text, the pitch of the attention item's two lines
+
+
+def _word_lines(pen: Any, s: str, fk: str, maxw: float, most: int) -> list[str]:
+    """*s* greedily word-wrapped to *maxw*, at most *most* lines; the last line
+    keeps the rest (``text`` then cuts it with an ellipsis)."""
+    if most <= 1:
+        return [s]
+    words, lines, cur = s.split(), [], ""
+    for i, word in enumerate(words):
+        trial = f"{cur} {word}" if cur else word
+        if cur and text_w(pen, trial, fk) > maxw:
+            lines.append(cur)
+            if len(lines) == most - 1:
+                return lines + [" ".join(words[i:])]
+            cur = word
+        else:
+            cur = trial
+    return lines + [cur] if cur else lines
+
+
 def _attn_extra(line: str) -> Callable[[Any, float], float]:
+    # Wrapped, not cut to one line: the remedy sits at the END of the long
+    # verdicts (an unmanaged login's `cswap add`, a login fight's `cswap map`).
     def draw(pen: Any, y0: float) -> float:
         b = y0 + 17
-        text(pen, line.split("\n")[0], "primary", "label", X0, b, maxw=W_INNER)
+        for i, part in enumerate(_word_lines(pen, line.split("\n")[0], "primary", W_INNER, EXTRA_LINES)):
+            if i:
+                b += EXTRA_STEP
+            text(pen, part, "primary", "label", X0, b, maxw=W_INNER)
         return b + ROW_END
     return draw
 
@@ -692,9 +733,14 @@ def _hero(hero: dict[str, Any]) -> Callable[[Any, float], float]:
             bw = text(pen, pct, "hero_big", "secondary" if sev == "dim" else "label", X1, b1 + 14, right=True)
         name_max = X1 - bw - 12 - X0 - 12
         symbol(pen, "circle.fill", X0, b1 - 5, 7, "accent")
-        nw = text(pen, hero["name"], "hero_name", "label", X0 + 12, b1, maxw=name_max)
-        if hero.get("plan"):
-            text(pen, hero["plan"], "secondary_med", "secondary", X0 + 12 + nw + 6, b1, maxw=name_max - nw - 6)
+        # The name gives way to the plan (down to 45 % of the line): the plan
+        # is what tells two subscriptions of one login apart.
+        plan = hero.get("plan") or ""
+        pw = text_w(pen, plan, "secondary_med") + 6 if plan else 0.0
+        nw = text(pen, hero["name"], "hero_name", "label", X0 + 12, b1,
+                  maxw=max(name_max - pw, name_max * 0.45))
+        if plan:
+            text(pen, plan, "secondary_med", "secondary", X0 + 12 + nw + 6, b1, maxw=name_max - nw - 6)
         sub = hero["sub"]
         sub = f"Active · slot {hero['slot']} · {sub}" if hero.get("slot") is not None else f"Active · {sub}"
         text(pen, sub, "secondary", "secondary", X0 + 12, b2, maxw=name_max)

@@ -28,6 +28,7 @@ caller falls back to the plain-text labels it already had.
 from __future__ import annotations
 
 import datetime as dt
+import re
 import textwrap
 from typing import Any, Iterable, Sequence
 
@@ -307,18 +308,32 @@ def reset_mark(reset_at: float | None, now: float) -> str:
 PLAN_LABELS: dict[str, str] = {
     "pro": "Pro",
     "self_serve_business_prolite": "Business",
+    "claude_max_20x": "Max 20x",
+    "claude_team": "Team",
 }
-"""Display names for the plan strings the Codex endpoint has actually been
-seen to send (UX-9). Only OBSERVED values are mapped; any other plan string is
-printed verbatim, because renaming a plan we have never seen would be a guess."""
+"""Display names for the plan strings the Codex endpoint and claude-swap's
+stored Claude logins have actually been seen to carry (UX-9; the Claude pair
+2026-09-30). Only OBSERVED values are mapped: an opaque slug such as
+``self_serve_business_prolite`` renamed from a guess would be wrong. Claude's
+own ``claude_<plan>[_<N>x]`` slugs are the exception - they name the plan, so
+:func:`plan_label` spells them by rule. Anything else is printed verbatim."""
+
+_CLAUDE_PLAN_RE = re.compile(r"^claude_([a-z]+(?:_[a-z]+)*)(?:_(\d+x))?$")
 
 
 def plan_label(raw: str | None) -> str:
-    """``"pro"`` -> ``"Pro"``, ``"self_serve_business_prolite"`` -> ``"Business"``;
-    anything else verbatim; ``None``/empty -> ``""``."""
+    """``"pro"`` -> ``"Pro"``, ``"self_serve_business_prolite"`` -> ``"Business"``,
+    ``"claude_max_5x"`` -> ``"Max 5x"``, ``"claude_team_premium"`` -> ``"Team
+    Premium"``; anything else verbatim; ``None``/empty -> ``""``."""
     if not raw:
         return ""
-    return PLAN_LABELS.get(raw, raw)
+    if raw in PLAN_LABELS:
+        return PLAN_LABELS[raw]
+    match = _CLAUDE_PLAN_RE.match(raw)
+    if match:
+        words = " ".join(word.capitalize() for word in match.group(1).split("_"))
+        return f"{words} {match.group(2)}" if match.group(2) else words
+    return raw
 
 
 # --------------------------------------------------------------------------

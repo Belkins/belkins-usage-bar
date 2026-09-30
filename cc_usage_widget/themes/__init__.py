@@ -150,6 +150,13 @@ def tail_rows(snapshot: Any, *, problems: Sequence[str] = ()) -> list[dict[str, 
     rows.append({"id": "cost_tracking", "title": "Cost tracking", "check": cost_on,
                  "detail": "on" if cost_on else "off"})
     rows.append({"id": "switch", "title": "Switch account", "submenu": True})
+    # A signed-in login no slot holds pauses auto-switch and is parked by any
+    # switch; one click puts it in the pool (`cswap add`) while it is live.
+    unmanaged = getattr(snapshot, "unmanaged_login", None)
+    if unmanaged:
+        # Verb first: a long login is cut at its tail, never "…to the p…".
+        text = f"Add to pool: {unmanaged}"
+        rows.append({"id": "add_login", "title": fit_menu_title(text), "tooltip": text})
     # The engine's one-click pick (claude-swap strategy=best), not a theme's
     # own "Switch to <X>" ranking; dim when there is nowhere to go.
     rows.append({"id": "best", "title": "Switch to best now"})

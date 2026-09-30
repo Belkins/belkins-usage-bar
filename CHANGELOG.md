@@ -1,5 +1,57 @@
 # Changelog
 
+## 2026-09-30 — Switching: a new login is never lost, a click lands on its slot
+
+A `/login` into an account the pool did not hold (a new Team seat) left
+claude-swap with no active slot. Its engine then refuses to act, and it says
+so in a quiet tick that also cleared any standing alert: auto-switch sat
+paused with nothing on screen, and the next click on another account parked
+the login in `cswap unclaimed`, from which nothing restores it. It happened
+twice in one afternoon.
+
+- **Not in the pool:** while Claude Code is signed in to such a login, a
+  standing alert names it (`pat@example.com (Acme) isn't in the pool: auto-switch
+  is paused …`, title `⚠ not in pool`, shown with auto-switch on or off), and
+  the menu offers **Add to pool: …** under Switch account. It runs
+  claude-swap's own `cswap add` on the worker thread, with upstream's checks: a
+  credential that is not the named account is refused, and the refusal reason
+  is shown.
+- **Clicks switch by slot number.** A row's alias falls back to its email's
+  local part, so two slots of one login submitted the same name; claude-swap
+  refused it and the fallback picked the first slot so named, and the click
+  landed on the other subscription. The menu now submits the slot, a name that
+  fits two slots never resolves to one, and the log reads `manual → 6 (team)`.
+- Claude's own plan slugs are spelled by rule (`claude_max_5x` → Max 5x,
+  `claude_pro` → Pro), and the HTML dashboard shows the display name instead of
+  the raw slug. The active card's name gives way to its plan, so a long alias
+  no longer cuts `personal` / `corporate`.
+
+## 2026-09-30 — One login, two subscriptions; every reset time on a row
+
+One email can hold a personal Max org and a company Team org, and claude-swap
+keeps each as its own slot. The menu showed them as two unrelated accounts, and
+an account row showed one reset — the binding window's — so when the others
+came back was only in **All windows & resets ▸**.
+
+- In the Cards, Apple and Dense menus every Claude slot names its plan beside
+  the name (`Max 20x`, `Team`; the Glance and Classic text menus do not), read
+  from the login claude-swap stored for it (the slot's config backup:
+  `organizationType`, plus the Max multiplier from `organizationRateLimitTier`).
+  A slot with no readable backup shows no plan rather than a guessed one.
+- A login that holds more than one slot says which subscription each is:
+  `Max 20x · personal` on the active account, `corporate · pat@` in a row's
+  caption (the same `name@` on both rows is the pairing), and the tooltip reads
+  `same login as …` with the organisation. Apple and Dense show the plan and
+  kind too.
+- **Cards:** a row's caption lists every OTHER reset time, `5h 31% ↺ 18:29`. A
+  window resetting at the minute already shown beside the bar (weekly Fable
+  with weekly 7d) is not repeated, an idle 5-hour window has none, and an ended
+  window's reset is past. The times join a row's existing caption line where
+  one exists (on the 2026-09-30 live state the Cards menu kept its 1019 pt); a
+  row that had no caption gains one line.
+- Claude has no banked reset credits: its usage endpoint reports extra-usage
+  credits only, so `↺ … reset credit` stays a Codex fact.
+
 ## 2026-09-30 — A shorter title that leads with the wall that binds
 
 The title read `backup-account 37% C86% ⚠ 7d96% 0/4` (290 pt): the 5-hour 37%

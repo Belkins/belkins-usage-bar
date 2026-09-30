@@ -148,6 +148,24 @@ def _window_tips(A: Any, row: Any, now: float) -> list[str]:
     return out
 
 
+def _name_and_plan(p: Pen, name: str, plan: str, x: float, maxw: float, *, base: float = 19,
+                   size: float = 15, weight: str = "semibold", plan_weight: str = "medium") -> None:
+    """Name, then its plan in secondary ink, as the Codex hero draws one; the
+    name gives way (down to 45 % of the line), so neither disappears."""
+    pw = (p.width(plan, 11, plan_weight) + 6) if plan else 0.0
+    nw = p.text(name, x, base, size, weight, "label", maxw=max(maxw - pw, maxw * 0.45))
+    if plan:
+        p.text(plan, x + nw + 6, base, 11, plan_weight, "secondary", maxw=maxw - nw - 6)
+
+
+def _plan_tip(A: Any, accounts: Any, row: Any) -> list[str]:
+    """The tooltip line naming a Claude slot's plan, organisation and any slot
+    sharing its login (``Max 20x · personal · … · same login as team``)."""
+    line = " · ".join(x for x in (A._claude_plan_text(accounts, row), row.org_name,
+                                  A._same_login_note(accounts, row)) if x)
+    return [line] if line else []
+
+
 def _other_windows(A: Any, row: Any, binding: Any) -> list[str]:
     from ..contracts import format_pct
 
@@ -184,8 +202,9 @@ def _hero_claude(A: Any, R: Any, snap: Any, now: float, models: tuple, actions: 
     kind = snap.account_note_kinds.get(a.slot, "")
     binding = None if note else A._binding_window(a, models)
     name = A._display_name(a)
+    plan = A._claude_plan_text(snap.accounts, a)
     others = [] if note else _other_windows(A, a, binding)
-    tip = [f"{name} ({a.email}) · slot {a.slot}"]
+    tip = [f"{name} ({a.email}) · slot {a.slot}"] + _plan_tip(A, snap.accounts, a)
     if not note:
         tip += _window_tips(A, a, now)
     else:
@@ -202,7 +221,7 @@ def _hero_claude(A: Any, R: Any, snap: Any, now: float, models: tuple, actions: 
         p.text(str(a.slot), LEAD + HERO_ICON / 2, 26, 14, "semibold", "white", mono=True, center=True)
         if note:
             head, _act, _age = _claude_state(A, a, note, kind)
-            p.text(name, nx, 19, 15, "semibold", "label", maxw=RIGHT - nx)
+            _name_and_plan(p, name, plan, nx, RIGHT - nx)
             p.text(a.email, nx, 35, 11, "regular", "secondary", maxw=RIGHT - nx)
             p.symbol("exclamationmark.triangle.fill", LEAD, 49, 11, "warn", box=14)
             p.text(f"{head} — figures withheld", LEAD + 18, 60, 11, "medium", "label",
@@ -210,7 +229,7 @@ def _hero_claude(A: Any, R: Any, snap: Any, now: float, models: tuple, actions: 
             return
         big = format_pct(binding[1]) if binding else "—"
         bw = p.text(big, RIGHT, 31, 26, "semibold", "label", mono=True, rounded=True, right=True)
-        p.text(name, nx, 19, 15, "semibold", "label", maxw=RIGHT - bw - 10 - nx)
+        _name_and_plan(p, name, plan, nx, RIGHT - bw - 10 - nx)
         p.text(a.email, nx, 35, 11, "regular", "secondary", maxw=RIGHT - bw - 10 - nx)
         s = R.severity(binding[1]) if binding else "ok"
         p.bar(LEAD, 49, RIGHT - LEAD, 6, binding[1] if binding else None, "ok" if s == "ok" else s)
@@ -422,10 +441,12 @@ def _attention(A: Any, snap: Any, actions: ThemeActions) -> list[Block]:
 # --------------------------------------------------------------- list rows --
 
 
-def _claude_row(A: Any, R: Any, r: Any, now: float, models: tuple, actions: ThemeActions) -> Block:
+def _claude_row(A: Any, R: Any, r: Any, now: float, models: tuple, actions: ThemeActions,
+                accounts: Any = ()) -> Block:
     from ..contracts import format_pct
 
     binding = A._binding_window(r, models)
+    plan = A._claude_plan_text(accounts, r)
     caption = []
     if getattr(r, "disabled", False):
         caption.append("Disabled")
@@ -443,7 +464,7 @@ def _claude_row(A: Any, R: Any, r: Any, now: float, models: tuple, actions: Them
     caption_text = _cap(" · ".join(caption))
     sub = " · ".join(([caption_text] if caption_text else []) + others)
     name = A._display_name(r)
-    tip = [f"{name} ({r.email}) · slot {r.slot}"] + _window_tips(A, r, now)
+    tip = [f"{name} ({r.email}) · slot {r.slot}"] + _plan_tip(A, accounts, r) + _window_tips(A, r, now)
     pct = binding[1] if binding else None
     slot_txt = str(r.slot)
 
@@ -455,7 +476,8 @@ def _claude_row(A: Any, R: Any, r: Any, now: float, models: tuple, actions: Them
         fig = format_pct(pct) if pct is not None else "—"
         pw = p.width(fig, 13, "semibold", mono=True, rounded=True)
         lw = (p.width(binding[0], 11) + 4) if binding else 0.0
-        p.text(name, nx, 18, 13, "regular", "label", maxw=RIGHT - pw - lw - 8 - nx)
+        _name_and_plan(p, name, plan, nx, RIGHT - pw - lw - 8 - nx, base=18, size=13, weight="regular",
+                       plan_weight="regular")
         p.text(sub, nx, 34, 11, "regular", "secondary", maxw=gx - nx - 8)
         p.text(fig, RIGHT, 18, 13, "semibold", "label", mono=True, rounded=True, right=True)
         if binding:
@@ -555,7 +577,7 @@ def build(snapshot: Any, now: float, actions: ThemeActions) -> list[Block]:
     claude_rows = [r for r in snap.accounts if not r.is_active and r.slot not in snap.account_notes]
     if claude_rows:
         sections.append([_section("Claude accounts", key="claude-accounts")]
-                        + [_claude_row(A, R, r, now, models, actions) for r in claude_rows])
+                        + [_claude_row(A, R, r, now, models, actions, snap.accounts) for r in claude_rows])
     # An alarmed login is listed once, in Needs attention (with its Log in
     # again action), not a second time here - as glance and dense do.
     codex_rows = [r for r in live if not r.is_active and not A._quota_alarm(r)]

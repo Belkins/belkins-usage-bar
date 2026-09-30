@@ -455,6 +455,15 @@ a ``Switched from account`` line). Distinct from :data:`ALERT_EXTERNAL_SWITCH`
 because the remedy differs: a rival ``cswap`` actor is stopped by stopping it,
 a config-only rewrite by restarting or isolating the sessions that do it."""
 
+ALERT_UNMANAGED_LOGIN: Final[str] = "unmanaged-login"
+"""OURS - Claude Code is signed in to an account no claude-swap slot holds (a
+fresh ``/login`` into a new account or organisation). The engine then refuses
+to act - its ``unmanaged-active-account`` no-switch is a quiet tick that also
+clears any standing verdict - so auto-switch is paused with nothing on screen,
+and any switch, a menu click included, parks that login in ``cswap unclaimed``,
+from which nothing restores it (2026-09-30: a new Team seat lost twice that
+way). The remedy is ``cswap add`` while the login is live."""
+
 ALERT_KINDS: Final[tuple[str, ...]] = (
     ALERT_ALL_EXHAUSTED,
     ALERT_ACCOUNT_QUARANTINED,
@@ -462,6 +471,7 @@ ALERT_KINDS: Final[tuple[str, ...]] = (
     ALERT_EXTERNAL_SWITCH,
     ALERT_NO_TARGET,
     ALERT_GHOST_FLIP,
+    ALERT_UNMANAGED_LOGIN,
 )
 """Every autoswitch verdict the menu bar renders as a standing alert.
 
@@ -2286,7 +2296,18 @@ class AccountRow:
     fleet-headroom counts must leave it out."""
     plan_type: str | None = None
     """Vendor-reported plan, e.g. Codex's ``"pro"`` (SPEC-CODEX 1). Passed
-    through verbatim; ``None`` when the source does not report one."""
+    through verbatim; ``None`` when the source does not report one.
+
+    Claude rows: the slot's stored login (claude-swap's config backup,
+    ``oauthAccount.organizationType``), with the Max multiplier from
+    ``organizationRateLimitTier`` appended - ``claude_max`` +
+    ``default_claude_max_20x`` -> ``claude_max_20x``, ``claude_team`` as is."""
+    org_name: str = ""
+    """claude-swap's organisation name for a Claude slot (``AccountSnapshot.
+    org_name``): a Team org's own name (``"Acme"``), or the
+    ``"<email>'s Organization"`` a personal plan gets. One email can hold
+    several slots, one per organisation; this is what tells them apart. Empty on
+    Codex rows and when upstream stored none."""
     stale_after_seconds: float = STALE_USAGE_SECONDS
     """Age past which :attr:`usage_is_stale` turns on for THIS row.
 
