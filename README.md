@@ -417,6 +417,13 @@ inert while it is on, and a standing problem still replaces the figure it
 invalidates (`V·C ⚠/100`) rather than showing a percentage the account can no
 longer support.
 
+The widget also switches to the compact title **by itself** when the full one is
+not drawn: every 30 seconds it asks the window server whether its item is
+onscreen, and two hidden readings while the menu bar is visible (never in a
+fullscreen app) turn compact on for the rest of that run. The setting is not
+written — Title ▸ Compact reads `— on for now: menu bar full` — so the next
+start tries the full title again.
+
 ## Run Codex on the best account
 
 With several logins tracked, the widget can tell you which one to start the
@@ -679,6 +686,11 @@ macOS assigns menu bar slots by a stored per-app position. On a **full menu bar*
 (very likely on a notched MacBook), an item with no stored position silently
 loses arbitration and is never drawn — no error anywhere. The widget seeds its own
 position to avoid this, but if the bar is genuinely full something has to give.
+
+The full title grows with live alerts, so an item that fitted yesterday can
+lose its slot after a reboot. The widget notices and falls back to the compact
+title on its own within about a minute (`title: status item hidden by a full
+menu bar` in `logs/widget.log`); if even that does not fit:
 
 Fixes, in order:
 1. Quit a menu bar app you don't need and restart the widget.

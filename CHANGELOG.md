@@ -1,5 +1,21 @@
 # Changelog
 
+## 2026-09-30 — The menu-bar title falls back to compact when the bar is full
+
+After a reboot the widget could be running and absent: the full title grows
+with live alerts (288 pt with an expired login, a capped account, a banked
+reset and an unpriced-model alert, against 165 pt on 2026-09-25), and a full,
+notched menu bar silently drops an item that does not fit.
+
+- Every 30 s the repaint tick asks the window server whether the status item is
+  drawn (new `menubar.py`, CoreGraphics through `objc` — no new dependency).
+  Two hidden readings while the bar itself is visible switch this run to the
+  compact title (`V·C 100/100`, ~105 pt) and log it once. A fullscreen app or
+  an auto-hidden bar gives no verdict and never triggers it.
+- `title_compact` is not written; **Settings ▸ Title ▸ Compact** reads
+  `— on for now: menu bar full` while the fallback is active, and the next
+  start tries the full title again.
+
 ## 2026-09-25 — Native card themes: Cards (default), Apple, Dense
 
 The dropdown is now drawn by native views instead of text lines. **Settings ▸

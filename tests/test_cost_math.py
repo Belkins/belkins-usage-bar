@@ -56,6 +56,7 @@ from cc_usage_widget.contracts import (  # noqa: E402
 )
 from cc_usage_widget.indexer import Indexer  # noqa: E402
 from cc_usage_widget.pricing import DEFAULT_PRICING  # noqa: E402
+from cc_usage_widget import rollup as rollup_mod  # noqa: E402
 from cc_usage_widget.rollup import DailyRollupStore  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -713,10 +714,17 @@ def test_end_to_end_hand_computed_total() -> None:
 
         indexer = _indexer(root, now=clock)
         store = DailyRollupStore(path=root / "rollups.json", keep_days=30)
-        store.load()
-        result = indexer.scan_once()
-        store.merge(result.deltas)
-        store.save()
+        # The store prunes by the REAL clock when it merges; from 2026-09-30 on
+        # that dropped the 08-31 day and last 7d read $29.90. Pin it to *clock*.
+        real_time = rollup_mod.time
+        rollup_mod.time = type("_PinnedTime", (), {"time": staticmethod(lambda: clock)})
+        try:
+            store.load()
+            result = indexer.scan_once()
+            store.merge(result.deltas)
+            store.save()
+        finally:
+            rollup_mod.time = real_time
 
         assert result.errors == (), result.errors
         assert result.files_read == 2, result.files_read

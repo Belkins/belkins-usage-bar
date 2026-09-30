@@ -370,6 +370,42 @@ def test_title_variants_and_widths_in_characters() -> None:
         _close(app)
 
 
+def test_status_item_verdict_waits_for_a_visible_bar() -> None:
+    """2026-09-30: after a reboot the 288 pt full title lost the space right of
+    the notch and the widget was simply not there. A hidden verdict must come
+    only from a VISIBLE bar: in a fullscreen app every item reads offscreen,
+    and treating that as "hidden" would compact the title for nothing."""
+    from cc_usage_widget import menubar
+
+    me, bar = 42, [(630, True), (630, True), (907, True)]
+    assert menubar.item_hidden([(me, False)] + bar, me) is True
+    assert menubar.item_hidden([(me, True)] + bar, me) is False
+    fullscreen = [(me, False), (630, False), (630, False), (907, False)]
+    assert menubar.item_hidden(fullscreen, me) is None
+    assert menubar.item_hidden(bar, me) is None  # no item yet (startup)
+
+
+def test_hidden_title_falls_back_to_compact_for_the_run() -> None:
+    """Two hidden readings switch the bar to the compact title (which fits)
+    without writing the setting, so the next start retries the full title. A
+    single hidden reading followed by a drawn one is a relayout, not a full
+    bar; no verdict (bar hidden) must neither fire nor break the streak."""
+    app = _new_app()
+    try:
+        app._snapshot = real_snapshot()
+        full = app.render_title()
+        readings = iter([True, False, True, None, True])
+        fired = [app._check_title_fits(lambda: next(readings)) for _ in range(5)]
+        assert fired == [False, False, False, False, True], fired
+        assert app.render_title() == "M·C 44/⚠" != full
+        assert app.snapshot().settings["title_compact"] is False  # never stored
+        title = [_title(i) for i in app.menu["Settings"]["Title"].values() if i is not None]
+        assert title[0].endswith("menu bar full"), title
+        assert app._check_title_fits(lambda: True) is False  # fires once per run
+    finally:
+        _close(app)
+
+
 def test_title_token_kinds() -> None:
     """Spec §2.3: alarm glyphs warn (crit when the row is crit), ↺now good,
     fleet dim, a healthy 44% uncoloured, 100% crit."""

@@ -74,7 +74,7 @@ from typing import Any, Callable, Final, Iterable, Iterator, NamedTuple, Sequenc
 
 import rumps
 
-from . import fleet, notify as notify_mod, render, statebackup
+from . import fleet, menubar, notify as notify_mod, render, statebackup
 from .contracts import (
     ALERT_ACCOUNT_QUARANTINED,
     ALERT_ALL_EXHAUSTED,
@@ -171,6 +171,11 @@ stable across releases."""
 SYNC_INTERVAL_SECONDS = 1.0
 """Main-thread repaint tick. Does a lock-guarded flag read and returns; the
 menu is only rebuilt when the worker published something new."""
+
+TITLE_FIT_CHECK_SECONDS = 30.0
+"""How often the repaint tick asks the window server whether the status item
+is drawn (:mod:`menubar`). Two hidden readings in a row switch the title to
+compact for the rest of the run (:meth:`CCUsageWidgetApp._check_title_fits`)."""
 
 INDEX_CHUNK_SECONDS = 0.75
 """``scan_once`` deadline while the first index is still incomplete. Short
@@ -269,6 +274,12 @@ _COMPACT_TITLE_LABEL = "Compact (V\u00b7C 100/100)"
 
 Names the shape rather than the word "compact": the setting changes what the
 menu bar says, and one look at the example answers what it will look like."""
+
+_AUTO_COMPACT_SUFFIX = " — on for now: menu bar full"
+"""Appended while :meth:`CCUsageWidgetApp._check_title_fits` has switched the
+title to compact without the setting: the unticked item would otherwise
+contradict the bar. Ticking it stores the setting; the next start retries the
+full title only while it stays unticked."""
 
 _RESTORE_BACKUP_LABEL = "Restore last backup\u2026"
 """The undo for ``Rebuild cost index`` (roadmap item 17). Ellipsis because it
@@ -5070,6 +5081,9 @@ class CCUsageWidgetApp(rumps.App):
         self._worker_restarts = 0
         self._worker_alive_since = 0.0
         self._running = False
+        self._auto_compact = False
+        self._title_hidden_streak = 0
+        self._title_fit_checked_at = 0.0
         self.rebuild_menu()
 
     # -- lifecycle ---------------------------------------------------------
@@ -5203,8 +5217,41 @@ class CCUsageWidgetApp(rumps.App):
                 snapshot = self._snapshot
             if dirty:
                 self.rebuild_menu(snapshot)
+            self._check_title_fits()
         except Exception as exc:  # pragma: no cover - defensive
             _log(f"repaint failed: {_describe(exc)}")
+
+    def _check_title_fits(self, hidden: Callable[[], bool | None] | None = None) -> bool:
+        """Fall back to the compact title when the full one is not drawn.
+
+        A full, notched menu bar drops a status item that does not fit, and
+        the full title grows with live alerts — after a reboot on 2026-09-30
+        it measured 288 pt and the widget was simply not there. Two hidden
+        readings :data:`TITLE_FIT_CHECK_SECONDS` apart (one could be the item
+        still settling after a relayout) switch this run to the compact title;
+        the stored ``title_compact`` is never written, so the next start tries
+        the full title again. No verdict (bar hidden, no item yet) resets
+        nothing and counts nothing. *hidden* is the test seam. Returns whether
+        the fallback fired on this call.
+        """
+        if self._auto_compact or self.snapshot().settings.get("title_compact", False):
+            return False
+        now = time.monotonic()
+        if hidden is None:
+            if now - self._title_fit_checked_at < TITLE_FIT_CHECK_SECONDS:
+                return False
+            hidden = menubar.own_item_hidden
+        self._title_fit_checked_at = now
+        verdict = hidden()
+        if verdict is None:
+            return False
+        self._title_hidden_streak = self._title_hidden_streak + 1 if verdict else 0
+        if self._title_hidden_streak < 2:
+            return False
+        self._auto_compact = True
+        _log("title: status item hidden by a full menu bar; showing the compact title until restart")
+        self.rebuild_menu()
+        return True
 
     def _desktop_handoff(self, action: str, path: Any) -> bool:
         """Perform ONE hand-off to the desktop. **AppKit thread.**
@@ -5334,7 +5381,7 @@ class CCUsageWidgetApp(rumps.App):
         """
         snapshot = snapshot or self.snapshot()
         settings = snapshot.settings
-        if settings.get("title_compact", False):
+        if settings.get("title_compact", False) or getattr(self, "_auto_compact", False):
             return self._compact_tokens(snapshot)
         merge = bool(settings.get("title_merge_alerts", False))
         parts: list[list[tuple[str, str | None]]] = []
@@ -7558,7 +7605,9 @@ class CCUsageWidgetApp(rumps.App):
             # is inert (roadmap item 16).
             _check(
                 rumps.MenuItem(
-                    _COMPACT_TITLE_LABEL, callback=self._make_setting_toggle("title_compact")
+                    _COMPACT_TITLE_LABEL
+                    + (_AUTO_COMPACT_SUFFIX if self._auto_compact and not compact_on else ""),
+                    callback=self._make_setting_toggle("title_compact"),
                 ),
                 compact_on,
             ),

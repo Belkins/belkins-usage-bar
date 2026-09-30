@@ -2995,7 +2995,10 @@ Notification keys (roadmap item 7, ``notify.py``):
     vendor initial and the active account's weekly percentage), and every
     ``title_show_*`` toggle above is ignored because none of those components
     is rendered. Off = the SPEC 4.1 title, byte for byte. The budget is
-    ``render.COMPACT_TITLE_MAX``.
+    ``render.COMPACT_TITLE_MAX``. Off is not a promise the full title is
+    drawn: when the window server reports the item hidden on a visible bar,
+    the app shows the compact title for the rest of the run without writing
+    this key (``CCUsageWidgetApp._check_title_fits``).
 
 ``title_show_fleet``
     Defaults ``True``, and unlike the other title components it costs nothing
