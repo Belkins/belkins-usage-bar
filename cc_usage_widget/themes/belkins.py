@@ -1,19 +1,22 @@
 """The ``belkins`` menu theme — Belkins AI Companion, XP Bar & Party Stamina Cards.
 
 Custom flagship theme for Belkins Usage Bar (`bswap` / `belkins`), inspired by
-PokeTokenBar. Replaces all ``cswap`` references with ``bswap`` and adds:
+PokeTokenBar. Replaces all ``cswap`` references with ``bswap`` and organizes the
+dropdown into 5 clean, in-place tabs (`⚡ Party`, `Claude`, `Codex`, `🐾 Dex`,
+`🛒 Mart`):
 
 1. **Belkins Companion Hero Card**: Live 14x14 pixel-art evolving AI companion
    (Sparkbit -> Outreachik -> Pipelinex -> Belkinosaur -> Belkins Prime),
-   segmented XP progress bar, real-time mood badge, and Trophy Dex strip.
+   segmented XP progress bar, real-time mood badge, and SparkCoins wallet.
    Clicking the card opens the Belkins HTML Dashboard & Dex.
-2. **Needs Attention Card**: High-signal alert rows with ``bswap`` remedy chips
-   and one-click Codex relogin actions.
-3. **Claude Fleet & Party Stamina Card**: Active account HP/Stamina segmented
-   bars (5h / 7d / scoped) plus compact clickable Party Stamina rows for every
-   standby account in the pool (one click switches via ``bswap``).
-4. **Codex Fleet & Party Card**: Active Codex hero + standby party accounts with
-   reset-credit badges and one-click relogin.
+2. **⚡ Party Tab (Default)**: Clean command center showing active Claude and
+   Codex champions first, plus a smart grouped Needs-Attention summary card
+   that collapses multiple re-login slots into a single compact alert row.
+3. **Claude & Codex Tabs**: Dedicated fleet cards with spacious Party Stamina
+   rows for one-click account switching via ``bswap``.
+4. **🐾 Dex Tab**: 5-Stage Evolution Pokedex + 2x4 Trophy Badge Bento Grid.
+5. **🛒 Mart Tab**: Interactive Belkins Poké Mart for buying & equipping pixel
+   cosmetics and habitat pads with SparkCoins (`🪙`).
 """
 
 from __future__ import annotations
@@ -54,6 +57,30 @@ def set_active_tab(tab_id: str) -> None:
     if any(t[0] == tab_id for t in TABS):
         _ACTIVE_TAB = tab_id
 
+
+def _fmt_num(n: int) -> str:
+    """Compact human-readable number for XP and SparkCoins in tight pills."""
+    val = int(n)
+    if abs(val) >= 1_000_000:
+        m = val / 1_000_000.0
+        return f"{m:.1f}M" if abs(m) >= 10.0 else f"{m:.2f}M".rstrip("0").rstrip(".") + ("M" if "." not in f"{m:.2f}".rstrip("0").rstrip(".") else "")
+    if abs(val) >= 10_000:
+        k = val / 1_000.0
+        return f"{k:.0f}K" if abs(k) >= 100.0 else f"{k:.1f}K"
+    return f"{val:,}"
+
+
+def _fmt_compact_coins(n: int) -> str:
+    val = int(n)
+    if val >= 1_000_000:
+        m = val / 1_000_000.0
+        return f"{m:.1f}M" if m >= 10.0 else f"{m:.2f}M"
+    if val >= 10_000:
+        k = val / 1_000.0
+        return f"{k:.0f}K" if k >= 100.0 else f"{k:.1f}K"
+    return f"{val:,}"
+
+
 # ---------------------------------------------------------------- layout ---
 CARD_X = 10.0
 PAD = 14.0
@@ -71,16 +98,16 @@ COL_PCT_W = 40.0
 COL_BAR_W = 62.0
 COL_BAR_X = COL_PCT_R - COL_PCT_W - 6 - COL_BAR_W
 COL_LABEL_R = COL_BAR_X - 6
-CAP_STEP = 14.0
+CAP_STEP = 15.0
 HEAD_BASE = 22.0
 HEAD_AFTER = 12.0
 WIN_LABEL_W = 50.0
-WIN_STEP = 21.0
-ROW_BASE = 17.0
+WIN_STEP = 22.0
+ROW_BASE = 19.0
 ROW_CAP = 15.0
-ROW_END = 10.0
-INK = 3.0
-PART_END = 8.0
+ROW_END = 11.0
+INK = 4.0
+PART_END = 9.0
 ACCENT_W = 3.5
 ROW_HL = {"hl_inset": CARD_X + 4, "hl_vinset": 1.0, "hl_radius": 6.0}
 
@@ -105,9 +132,9 @@ F: dict[str, tuple[float, str, bool, bool, bool]] = {
 
 _WHITE = (255, 255, 255)
 _ROLES: tuple[tuple[str, tuple, tuple, Any], ...] = (
-    ("belkins_card", (255, 255, 255, 0.90), (24, 25, 32, 0.90), None),
-    ("belkins_card_edge", (0, 0, 0, 0.07), (255, 255, 255, 0.10), None),
-    ("belkins_hero_card", (255, 248, 244, 0.94), (32, 24, 28, 0.92), None),
+    ("belkins_card", (255, 255, 255, 0.94), (24, 25, 32, 0.92), None),
+    ("belkins_card_edge", (0, 0, 0, 0.08), (255, 255, 255, 0.10), None),
+    ("belkins_hero_card", (255, 249, 245, 0.96), (32, 24, 28, 0.94), None),
     ("belkins_hero_edge", (235, 88, 42, 0.28), (255, 108, 58, 0.36), None),
     ("belkins_flame_rule", (242, 82, 34), (255, 102, 51), _WHITE),
     ("belkins_claude_rule", (217, 119, 87), (232, 136, 104), _WHITE),
@@ -120,10 +147,13 @@ _ROLES: tuple[tuple[str, tuple, tuple, Any], ...] = (
     ("belkins_emerald_pad", (14, 38, 30, 0.96), (10, 28, 22, 0.98), None),
     ("belkins_emerald_edge", (40, 199, 138, 0.65), (52, 211, 153, 0.75), None),
     ("belkins_gold_rule", (217, 155, 12), (250, 204, 21), _WHITE),
-    ("belkins_gold_text", (176, 118, 0), (250, 204, 21), _WHITE),
+    ("belkins_gold_text", (170, 112, 0), (250, 204, 21), _WHITE),
     ("belkins_gold_pill", (250, 190, 25, 0.18), (250, 204, 21, 0.22), (255, 255, 255, 0.22)),
     ("belkins_tab_bar", (0, 0, 0, 0.05), (255, 255, 255, 0.06), None),
-    ("belkins_tab_active", (242, 82, 34, 0.18), (255, 102, 51, 0.28), None),
+    ("belkins_tab_active", (242, 82, 34, 0.16), (255, 102, 51, 0.28), None),
+    ("belkins_tab_active_fill", (242, 82, 34), (245, 92, 42), _WHITE),
+    ("belkins_tab_active_text", (255, 255, 255), (255, 255, 255), _WHITE),
+    ("belkins_tab_inactive_text", (55, 58, 66, 0.90), (225, 228, 236, 0.86), _WHITE),
     ("belkins_tab_edge", (242, 82, 34, 0.45), (255, 112, 56, 0.55), None),
     ("belkins_xp_fill", (242, 82, 34), (255, 112, 56), _WHITE),
     ("belkins_xp_track", (0, 0, 0, 0.10), (255, 255, 255, 0.14), (255, 255, 255, 0.28)),
@@ -131,9 +161,11 @@ _ROLES: tuple[tuple[str, tuple, tuple, Any], ...] = (
     ("belkins_flame_pill", (242, 82, 34, 0.14), (255, 108, 58, 0.20), (255, 255, 255, 0.22)),
     ("belkins_good_pill", (40, 167, 69, 0.14), (48, 209, 88, 0.20), (255, 255, 255, 0.22)),
     ("belkins_warn_pill", (255, 149, 0, 0.15), (255, 159, 10, 0.22), (255, 255, 255, 0.22)),
-    ("belkins_badge_on", (250, 190, 25, 0.22), (250, 204, 21, 0.22), (255, 255, 255, 0.22)),
-    ("belkins_badge_off", (0, 0, 0, 0.045), (255, 255, 255, 0.05), (255, 255, 255, 0.12)),
-    ("belkins_hair", (0, 0, 0, 0.08), (255, 255, 255, 0.09), None),
+    ("belkins_badge_on", (250, 190, 25, 0.16), (250, 204, 21, 0.18), (255, 255, 255, 0.22)),
+    ("belkins_badge_on_edge", (217, 155, 12, 0.35), (250, 204, 21, 0.38), None),
+    ("belkins_badge_off", (0, 0, 0, 0.04), (255, 255, 255, 0.05), (255, 255, 255, 0.12)),
+    ("belkins_badge_off_edge", (0, 0, 0, 0.07), (255, 255, 255, 0.08), None),
+    ("belkins_hair", (0, 0, 0, 0.07), (255, 255, 255, 0.08), None),
     ("belkins_track", (0, 0, 0, 0.10), (255, 255, 255, 0.14), (255, 255, 255, 0.30)),
     ("belkins_warn_fill", (255, 149, 0), (255, 159, 10), _WHITE),
     ("belkins_crit_fill", (255, 59, 48), (255, 69, 58), _WHITE),
@@ -547,6 +579,7 @@ class _Card:
 
 
 def _companion_card(snapshot: Any, companion: CompanionState, actions: ThemeActions) -> _Card:
+    """Clean, breathable 3-row Companion Header with 48x48 sprite, XP bar, Mood & SparkCoins."""
     card = _Card("belkins_hero_card", "belkins_hero_edge", rule="belkins_flame_rule")
     open_dash = getattr(actions, "open_dashboard", None)
     dash_enabled = bool(snapshot.settings.get("dashboard_enabled", True))
@@ -559,8 +592,8 @@ def _companion_card(snapshot: Any, companion: CompanionState, actions: ThemeActi
         mood_k = "overdrive" if "context_berry" in eq_live else companion.mood_key
         mood_lbl = "🍒 Berry Overdrive" if "context_berry" in eq_live else companion.mood_label
 
-        pad_top = y0 + 10.0
-        sprite_sz = 46.0
+        pad_top = y0 + 11.0
+        sprite_sz = 48.0
         draw_pixel_companion(
             pen,
             companion.stage,
@@ -570,10 +603,10 @@ def _companion_card(snapshot: Any, companion: CompanionState, actions: ThemeActi
             mood_key=mood_k,
             equipped=eq_live,
         )
-        rx = X0 + sprite_sz + 10.0
+        rx = X0 + sprite_sz + 11.0
         rw = X1 - rx
 
-        # Line 1: Companion Stage Name + Level + Mood Pill
+        # Row 1: Companion Stage Name + Level Badge on left · Mood Pill on right
         b1 = pad_top + 13.0
         mood_role = (
             "warn_text"
@@ -595,9 +628,9 @@ def _companion_card(snapshot: Any, companion: CompanionState, actions: ThemeActi
             bg=mood_bg,
             weight="semibold",
         )
-        name_s = f"⚡ {companion.stage.name}"
-        nw = text(pen, name_s, "hero_name", "label", rx, b1, maxw=rw - mw - 6)
-        lvl_s = f"Lv.{companion.level} · {companion.stage.title}"
+        name_s = companion.stage.name
+        nw = text(pen, name_s, "hero_name", "label", rx, b1, maxw=rw - mw - 42.0)
+        lvl_s = f"Lv.{companion.level}"
         text(
             pen,
             lvl_s,
@@ -605,62 +638,48 @@ def _companion_card(snapshot: Any, companion: CompanionState, actions: ThemeActi
             "belkins_flame_text",
             rx + nw + 6.0,
             b1,
-            maxw=max(0.0, rw - mw - nw - 12.0),
+            maxw=max(0.0, rw - mw - nw - 8.0),
         )
 
-        # Line 2: Segmented XP Progress Bar
-        bar_mid = pad_top + 25.0
+        # Row 2: Segmented XP Progress Bar on left · Compact SparkCoins Pill on right
+        b2 = pad_top + 29.0
+        coin_s = f"🪙 {_fmt_compact_coins(coins_live)}"
+        cw = _pill_w(pen, coin_s)
+        pen.pill(
+            coin_s,
+            X1 - cw,
+            b2 - 0.5,
+            F["tag"][0],
+            role="belkins_gold_text",
+            bg="belkins_gold_pill",
+            weight="semibold",
+        )
+        bar_w = max(60.0, rw - cw - 8.0)
         segmented_bar(
             pen,
             rx,
-            bar_mid,
-            rw,
+            b2 - 3.5,
+            bar_w,
             companion.xp_fraction * 100.0,
             "ok",
             h=6.0,
-            cells=12,
+            cells=10,
             fill_override="belkins_xp_fill",
         )
 
-        # Line 3: XP stats & next evolution
-        b3 = pad_top + 41.0
-        if companion.next_stage is not None:
-            evo_s = f"Next: {companion.next_stage.name} (Lv.{companion.next_stage.min_level})"
+        # Row 3: Clean Daily Summary / Evolution Title + Trophy Count (zero truncation)
+        b3 = pad_top + 45.0
+        trophies_s = f"🏆 {companion.unlocked_badges_count}/{len(companion.badges)}"
+        if companion.tokens_today > 0:
+            left_s = f"Today: {format_tokens(companion.tokens_today)} tok ({format_usd(companion.usd_today)})"
+        elif companion.next_stage is not None:
+            left_s = f"{companion.stage.title} · Next: Lv.{companion.next_stage.min_level}"
         else:
-            evo_s = "MAX EVOLUTION · SOVEREIGN"
-        xp_s = f"{companion.xp_total:,} XP (+{companion.xp_today:,}/d) · {evo_s}"
-        text(pen, xp_s, "caption", "secondary", rx, b3, maxw=rw)
+            left_s = f"{companion.stage.title} · {_fmt_num(companion.xp_total)} XP"
+        tw_right = text(pen, trophies_s, "caption_med", "belkins_gold_text", X1, b3, right=True)
+        text(pen, left_s, "caption", "secondary", rx, b3, maxw=rw - tw_right - 8.0)
 
-        # Line 4: Trophy Badges Strip + SparkCoins Wallet
-        rule_y = pad_top + sprite_sz + 6.0
-        hairline(pen, X0, X1, rule_y)
-        b4 = rule_y + 15.0
-        bx = X0
-        for badge in companion.badges:
-            bw = 17.5
-            if not isinstance(pen, _Measure):
-                pen.rrect(
-                    bx,
-                    b4 - 11.5,
-                    bw,
-                    15.0,
-                    4.0,
-                    "belkins_badge_on" if badge.unlocked else "belkins_badge_off",
-                )
-            text(
-                pen,
-                badge.icon,
-                "caption_med",
-                "label" if badge.unlocked else "secondary",
-                bx + bw / 2.0,
-                b4,
-                center=True,
-            )
-            bx += bw + 2.5
-
-        right_s = f"🪙 {coins_live:,} · Dex ▸"
-        text(pen, right_s, "caption_med", "belkins_gold_text", X1, b4, right=True, maxw=X1 - bx - 4.0)
-        return b4 + 8.0
+        return pad_top + sprite_sz + 11.0
 
     tip_lines = [
         f"Belkins Companion: {companion.stage.name} (Lv.{companion.level} · {companion.stage.title})",
@@ -896,10 +915,6 @@ def _claude_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) -
         sub = A._subscription_caption(accounts, r)
         if sub:
             caps.append((sub, "dim"))
-        caps += [
-            (mark, "dim")
-            for mark in A._window_reset_marks(r, now, skip=binding[0] if binding else None)
-        ]
         if r.disabled:
             caps.append(("disabled · bswap enable", "dim"))
         if r.usage_is_stale:
@@ -932,7 +947,7 @@ def _claude_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) -
     }
 
 
-def _codex_caps(A: Any, row: Any) -> list[tuple[str, str]]:
+def _codex_caps(A: Any, row: Any, *, compact: bool = False) -> list[tuple[str, str]]:
     caps = []
     if row.attention_note and row.attention_kind == "crit":
         caps.append((row.attention_note, "crit"))
@@ -941,7 +956,7 @@ def _codex_caps(A: Any, row: Any) -> list[tuple[str, str]]:
             caps.append((line, "good"))
         elif line.startswith(A._PACE_NOTE_PREFIX):
             caps.append((line, "warn"))
-        else:
+        elif not compact:
             caps.append((line, "dim"))
     if row.usage_is_stale:
         caps.append((f"{A._age_label(row.usage_age_seconds)} old", "dim"))
@@ -990,9 +1005,11 @@ def _codex_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) ->
         alarm = A._quota_alarm(active)
         known = bool(win) and win[1] is not None and not alarm
         act = actions.codex_login_for(active)
-        caps = _codex_caps(A, active)
+        caps = _codex_caps(A, active, compact=False)
+        caps_compact = _codex_caps(A, active, compact=True)
         if act is not None:
             caps.append(("Log in again…", "accent"))
+            caps_compact.append(("Log in again…", "accent"))
         hero = {
             "name": A._quota_alias(active),
             "plan": A.plan_label(active.plan_type),
@@ -1004,6 +1021,7 @@ def _codex_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) ->
             "status": (active.attention_note, "warn") if alarm else None,
             "bars": [(win[0], win[1], A._quota_reset_mark(active, now), win[2])] if known else [],
             "captions": caps,
+            "captions_compact": caps_compact,
             "tip": _codex_tip(A, active, now),
             "action": act,
         }
@@ -1013,7 +1031,7 @@ def _codex_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) ->
             continue
         win = A._plan_window(r)
         act = actions.codex_login_for(r)
-        caps = _codex_caps(A, r)
+        caps = _codex_caps(A, r, compact=True)
         if r is best:
             caps.insert(0, ("best ⚡", "tag"))
         if act is not None:
@@ -1052,10 +1070,10 @@ def _codex_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) ->
 def _attn_head(count: int) -> Callable[[Any, float], float]:
     def draw(pen: Any, y0: float) -> float:
         base = y0 + HEAD_BASE
-        symbol(pen, "exclamationmark.triangle.fill", X0, base - 4.5, 12, "belkins_warn_fill")
-        text(pen, "Needs attention", "title", "label", X0 + 19, base)
+        symbol(pen, "exclamationmark.triangle.fill", X0, base - 4.5, 11.5, "belkins_warn_fill")
+        text(pen, "Needs attention", "title", "label", X0 + 18, base)
         text(pen, str(count), "num_bar", "secondary", X1, base, right=True)
-        return base + 9
+        return base + 8
     return draw
 
 
@@ -1064,7 +1082,7 @@ def _attn_item(it: dict[str, Any]) -> Callable[[Any, float], float]:
 
     def draw(pen: Any, y0: float) -> float:
         b1 = y0 + 16
-        wname = text(pen, it["name"], "primary_med", "label", X0, b1, maxw=120)
+        wname = text(pen, it["name"], "primary_med", "label", X0, b1, maxw=125)
         age_w = text_w(pen, it["age"], "secondary") if it["age"] else 0.0
         if chevron:
             chev_x = X1 - 6
@@ -1079,6 +1097,36 @@ def _attn_item(it: dict[str, Any]) -> Callable[[Any, float], float]:
             return b1 + ROW_END
         b2 = b1 + 17
         segments(pen, it["action_segs"], X0, b2, W_INNER - (14 if chevron else 0))
+        return b2 + ROW_END
+
+    return draw
+
+
+def _attn_grouped_item(group: list[dict[str, Any]]) -> Callable[[Any, float], float]:
+    """Compact 2-line summary for multiple accounts sharing the same alert state (e.g. 8 re-login slots)."""
+    first = group[0]
+    n = len(group)
+    provider = first["provider"]
+    state = first["state"]
+    state_role = first["state_role"]
+    names = [g["name"] for g in group]
+    if len(names) <= 3:
+        names_s = ", ".join(names)
+    else:
+        names_s = f"{', '.join(names[:3])} +{len(names) - 3} more"
+
+    def draw(pen: Any, y0: float) -> float:
+        b1 = y0 + 16.0
+        head_s = f"{n} {provider} slots"
+        whead = text(pen, head_s, "primary_med", "label", X0, b1)
+        text(pen, state, "primary", state_role, X0 + whead + 7.0, b1, maxw=X1 - (X0 + whead + 55.0))
+        text(pen, f"{provider} ▸", "caption_med", "secondary", X1, b1, right=True)
+
+        b2 = b1 + 17.0
+        segs: list[tuple] = [(f"{names_s}  ·  ", "caption", "secondary")]
+        for seg in first.get("action_segs") or ():
+            segs.append(seg)
+        segments(pen, segs, X0, b2, W_INNER)
         return b2 + ROW_END
 
     return draw
@@ -1124,7 +1172,7 @@ def _hair() -> Callable[[Any, float], float]:
     return draw
 
 
-def _card_head(spec: dict[str, Any]) -> Callable[[Any, float], float]:
+def _card_head(spec: dict[str, Any], *, one_line: bool = False) -> Callable[[Any, float], float]:
     def draw(pen: Any, y0: float) -> float:
         base = y0 + HEAD_BASE
         if spec.get("icon"):
@@ -1134,8 +1182,9 @@ def _card_head(spec: dict[str, Any]) -> Callable[[Any, float], float]:
         room = X1 - (tx + tw + 10)
         parts = spec.get("right_parts") or []
         full = spec["right"]
-        if len(parts) < 2 or text_w(pen, full, "secondary") <= room:
-            text(pen, full, "secondary", "secondary", X1, base, maxw=room, right=True)
+        if one_line or len(parts) < 2 or text_w(pen, full, "secondary") <= room:
+            shown_r = " · ".join(parts[:2]) if (one_line and len(parts) > 2) else full
+            text(pen, shown_r, "secondary", "secondary", X1, base, maxw=room, right=True)
             return base + HEAD_AFTER
         text(pen, parts[0], "secondary", "secondary", X1, base, maxw=room, right=True)
         cap = base + 15
@@ -1145,12 +1194,12 @@ def _card_head(spec: dict[str, Any]) -> Callable[[Any, float], float]:
     return draw
 
 
-def _hero(hero: dict[str, Any]) -> Callable[[Any, float], float]:
+def _hero(hero: dict[str, Any], *, compact: bool = False) -> Callable[[Any, float], float]:
     from .. import render as R
 
     def draw(pen: Any, y0: float) -> float:
-        b1 = y0 + 13
-        b2 = b1 + 17
+        b1 = y0 + 14.0
+        b2 = b1 + 17.0
         big = hero["big"]
         bw = 0.0
         if big:
@@ -1161,10 +1210,10 @@ def _hero(hero: dict[str, Any]) -> Callable[[Any, float], float]:
                 "hero_big",
                 "secondary" if sev == "dim" else "label",
                 X1,
-                b1 + 12,
+                b1 + 12.0,
                 right=True,
             )
-        name_max = X1 - bw - 12 - X0 - 12
+        name_max = X1 - bw - 12 - X0 - 14
         symbol(pen, "star.fill", X0, b1 - 4.5, 9, "belkins_flame_rule")
         plan = hero.get("plan") or ""
         pw = text_w(pen, plan, "secondary_med") + 6 if plan else 0.0
@@ -1173,7 +1222,7 @@ def _hero(hero: dict[str, Any]) -> Callable[[Any, float], float]:
             hero["name"],
             "hero_name",
             "label",
-            X0 + 13,
+            X0 + 14,
             b1,
             maxw=max(name_max - pw, name_max * 0.45),
         )
@@ -1183,7 +1232,7 @@ def _hero(hero: dict[str, Any]) -> Callable[[Any, float], float]:
                 plan,
                 "secondary_med",
                 "secondary",
-                X0 + 13 + nw + 6,
+                X0 + 14 + nw + 6,
                 b1,
                 maxw=name_max - nw - 6,
             )
@@ -1194,12 +1243,12 @@ def _hero(hero: dict[str, Any]) -> Callable[[Any, float], float]:
         if sub:
             parts_sub.append(sub)
         sub = " · ".join(parts_sub)
-        text(pen, sub, "caption", "secondary", X0 + 13, b2, maxw=name_max)
+        text(pen, sub, "caption", "secondary", X0 + 14, b2, maxw=name_max)
         ink = b2 + INK
         if hero["status"]:
             s, kind = hero["status"]
             b = ink + 16
-            text(pen, s, "primary_med", SEV_TEXT.get(kind, kind), X0 + 13, b, maxw=X1 - X0 - 13)
+            text(pen, s, "primary_med", SEV_TEXT.get(kind, kind), X0 + 14, b, maxw=X1 - X0 - 14)
             ink = b + INK
         bx = HX + WIN_LABEL_W
         b = ink + 17 - WIN_STEP
@@ -1222,8 +1271,9 @@ def _hero(hero: dict[str, Any]) -> Callable[[Any, float], float]:
             text(pen, format_pct(pct), "num_bar", pct_role, COL_PCT_R, b, right=True)
             text(pen, "↺ ended" if expired else mark, "num_small", "secondary", X1, b, right=True)
             ink = b + INK
-        chips = [c for c in hero["captions"] if c[1] == "good" and c[0].startswith("↺")]
-        rest = [c for c in hero["captions"] if c not in chips]
+        caps_source = hero.get("captions_compact") if compact and "captions_compact" in hero else hero["captions"]
+        chips = [c for c in caps_source if c[1] == "good" and c[0].startswith("↺")]
+        rest = [c for c in caps_source if c not in chips]
         for cap, _kind in chips:
             y = ink + 8
             pen.rrect(HX - 4, y, X1 - HX + 4, 22, 6, "belkins_good_pill")
@@ -1293,7 +1343,7 @@ def _ax(tip: str) -> str:
     return tip.replace("\n", ". ")
 
 
-def _provider_card(spec: dict[str, Any]) -> _Card:
+def _provider_card(spec: dict[str, Any], attn_items: list[dict[str, Any]] | None = None) -> _Card:
     card = _Card("belkins_card", "belkins_card_edge", rule=spec.get("rule"))
     key = spec["key"]
     card.add(
@@ -1305,7 +1355,7 @@ def _provider_card(spec: dict[str, Any]) -> _Card:
     hero = spec["hero"]
     if hero:
         card.add(
-            _hero(hero),
+            _hero(hero, compact=False),
             key=f"belkins-{key}-active",
             tooltip=hero["tip"],
             ax=_ax(hero["tip"]),
@@ -1323,34 +1373,106 @@ def _provider_card(spec: dict[str, Any]) -> _Card:
                 action=r["action"],
                 **ROW_HL,
             )
+    if attn_items:
+        card.add(_hair(), key=f"belkins-{key}-attn-rule")
+        if len(attn_items) >= 2:
+            tips = "\n".join(it["tip"] for it in attn_items)
+            card.add(
+                _attn_grouped_item(attn_items),
+                key=f"belkins-{key}-attn-grouped",
+                tooltip=tips,
+                ax=_ax(tips),
+            )
+        else:
+            it = attn_items[0]
+            card.add(
+                _attn_item(it),
+                key=f"belkins-{key}-attn-single",
+                tooltip=it["tip"],
+                ax=_ax(it["tip"]),
+                action=it["action"],
+                **ROW_HL,
+            )
     card.add(_gap(6), key=f"belkins-{key}-foot")
     return card
 
 
 def _attention_card(spec: dict[str, Any]) -> _Card:
+    """Smart Needs-Attention card: collapses 2+ identical re-login slots into one clean summary row."""
     card = _Card("belkins_card", "belkins_card_edge", rule="belkins_attn_rule")
     count = len(spec["items"]) + len(spec["extras"])
     card.add(_attn_head(count), key="belkins-attn-head", ax=f"Needs attention: {count}")
-    for it in spec["items"]:
-        opens = "Logs in again." if it["action"] is not None else ""
-        label = " ".join(
-            x
-            for x in (
-                f"{it['provider']} {it['name']}: {it['state']}.",
-                f"{it['cause']}." if it["cause"] else "",
-                f"Last seen {it['age']}." if it["age"] else "",
-                opens,
+
+    items = spec["items"]
+    if len(items) > 1:
+        # Group non-interactive items by (provider, state) so 8 re-login slots don't flood the screen
+        grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        standalone: list[dict[str, Any]] = []
+        for it in items:
+            if it["action"] is None:
+                grouped.setdefault((it["provider"], it["state"]), []).append(it)
+            else:
+                standalone.append(it)
+
+        for (prov, st_name), grp in grouped.items():
+            if len(grp) >= 2:
+                combined_tip = "\n".join(g["tip"] for g in grp)
+                combined_ax = " ".join(f"{g['provider']} {g['name']}: {g['state']}." for g in grp)
+                target_tab = "claude" if prov.lower() == "claude" else "codex"
+                card.add(
+                    _attn_grouped_item(grp),
+                    key=f"belkins-attn-grouped-{prov.lower()}-{st_name[:12]}",
+                    tooltip=combined_tip,
+                    ax=combined_ax,
+                    action=lambda t=target_tab: set_active_tab(t),
+                    keep_open=True,
+                    **ROW_HL,
+                )
+            else:
+                standalone.extend(grp)
+
+        for it in standalone:
+            opens = "Logs in again." if it["action"] is not None else ""
+            label = " ".join(
+                x
+                for x in (
+                    f"{it['provider']} {it['name']}: {it['state']}.",
+                    f"{it['cause']}." if it["cause"] else "",
+                    f"Last seen {it['age']}." if it["age"] else "",
+                    opens,
+                )
+                if x
             )
-            if x
-        )
-        card.add(
-            _attn_item(it),
-            key=it["key"],
-            tooltip=it["tip"],
-            ax=label,
-            action=it["action"],
-            **ROW_HL,
-        )
+            card.add(
+                _attn_item(it),
+                key=it["key"],
+                tooltip=it["tip"],
+                ax=label,
+                action=it["action"],
+                **ROW_HL,
+            )
+    else:
+        for it in items:
+            opens = "Logs in again." if it["action"] is not None else ""
+            label = " ".join(
+                x
+                for x in (
+                    f"{it['provider']} {it['name']}: {it['state']}.",
+                    f"{it['cause']}." if it["cause"] else "",
+                    f"Last seen {it['age']}." if it["age"] else "",
+                    opens,
+                )
+                if x
+            )
+            card.add(
+                _attn_item(it),
+                key=it["key"],
+                tooltip=it["tip"],
+                ax=label,
+                action=it["action"],
+                **ROW_HL,
+            )
+
     for i, line in enumerate(spec["extras"]):
         card.add(_attn_extra(line), key=f"belkins-attn-extra-{i}", tooltip=line, ax=line)
     card.add(_gap(6), key="belkins-attn-foot")
@@ -1361,38 +1483,37 @@ def _attention_card(spec: dict[str, Any]) -> _Card:
 
 
 def _tab_bar_block(claude_count: int, codex_count: int) -> Block:
-    """Interactive 5-tab bar (`⚡ Party | Claude | Codex | 🐾 Dex | 🛒 Mart`) that switches in-place."""
+    """Segmented 5-tab bar (`⚡ Party | Claude | Codex | 🐾 Dex | 🛒 Mart`) with crisp Light/Dark contrast."""
     bar_w = W - 2 * CARD_X
     seg_w = bar_w / float(len(TABS))
     bar_h = 28.0
-    total_h = 34.0
+    total_h = 38.0
 
     def paint(pen: Pen, w: float, h: float) -> None:
-        y = 3.0
+        y = 5.0
         pen.rrect(CARD_X, y, bar_w, bar_h, 8.0, "belkins_card", stroke="belkins_card_edge")
         for idx, (tab_id, label) in enumerate(TABS):
             tx = CARD_X + idx * seg_w
             is_act = _ACTIVE_TAB == tab_id
             if is_act:
                 pen.rrect(
-                    tx + 2.0,
-                    y + 2.0,
-                    seg_w - 4.0,
-                    bar_h - 4.0,
+                    tx + 2.5,
+                    y + 2.5,
+                    seg_w - 5.0,
+                    bar_h - 5.0,
                     6.0,
-                    "belkins_tab_active",
-                    stroke="belkins_tab_edge",
+                    "belkins_tab_active_fill",
                 )
             shown = label
             if tab_id == "claude" and claude_count:
-                shown = f"Claude {claude_count}"
+                shown = f"Claude · {claude_count}"
             elif tab_id == "codex" and codex_count:
-                shown = f"Codex {codex_count}"
+                shown = f"Codex · {codex_count}"
             text(
                 pen,
                 shown,
-                "caption_med" if is_act else "caption",
-                "belkins_flame_text" if is_act else "secondary",
+                "caption_med",
+                "belkins_tab_active_text" if is_act else "belkins_tab_inactive_text",
                 tx + seg_w / 2.0,
                 y + 18.0,
                 center=True,
@@ -1414,14 +1535,12 @@ def _tab_bar_block(claude_count: int, codex_count: int) -> Block:
         total_h,
         paint,
         key="belkins-tab-bar",
-        tooltip="Click a tab to switch between Party Overview, Claude Fleet, Codex Fleet, Companion Dex, and Belkins Mart",
+        tooltip="",
         ax="Belkins Tabs: Party, Claude, Codex, Dex, Mart",
         action=cycle_tab,
         on_click_x=on_click_x,
         keep_open=True,
-        hl_inset=CARD_X,
-        hl_vinset=3.0,
-        hl_radius=8.0,
+        no_hover_bg=True,
     )
 
 
@@ -1429,95 +1548,54 @@ def _party_overview_card(
     claude_spec: dict[str, Any] | None,
     codex_spec: dict[str, Any] | None,
 ) -> _Card | None:
-    """Compact Overview card for the default `⚡ Party` tab — shows only active heroes + quick tab links."""
+    """Clean, high-signal Active Champions card for the default `⚡ Party` tab."""
     if not claude_spec and not codex_spec:
         return None
     card = _Card("belkins_card", "belkins_card_edge", rule="belkins_flame_rule")
 
     if claude_spec:
         card.add(
-            _card_head(claude_spec),
+            _card_head(claude_spec, one_line=True),
             key="belkins-party-claude-head",
             ax=f"{claude_spec['title']}. {claude_spec['right']}".strip(". "),
-            tooltip=claude_spec["right"],
+            tooltip=f"{claude_spec['right']}\nClick to switch to Claude tab",
+            action=lambda: set_active_tab("claude"),
+            keep_open=True,
+            **ROW_HL,
         )
         if claude_spec["hero"]:
             hero = claude_spec["hero"]
             card.add(
-                _hero(hero),
+                _hero(hero, compact=True),
                 key="belkins-party-claude-active",
                 tooltip=hero["tip"],
                 ax=_ax(hero["tip"]),
                 action=hero["action"],
                 **ROW_HL,
             )
-        standby_n = len(claude_spec.get("rows") or ())
-        if standby_n > 0:
-            def draw_claude_more(pen: Any, y0: float, n: int = standby_n) -> float:
-                b = y0 + 14.0
-                text(
-                    pen,
-                    f"▸ View all {n} standby Claude account{'s' if n != 1 else ''} (Claude tab)",
-                    "caption_med",
-                    "belkins_flame_text",
-                    HX,
-                    b,
-                    maxw=X1 - HX,
-                )
-                return b + 8.0
-
-            card.add(
-                draw_claude_more,
-                key="belkins-party-claude-more",
-                tooltip="Click to open the Claude tab and view all standby accounts",
-                ax=f"View all {standby_n} standby Claude accounts",
-                action=lambda: set_active_tab("claude"),
-                keep_open=True,
-                **ROW_HL,
-            )
 
     if claude_spec and codex_spec:
+        card.add(_gap(3.0), key="belkins-party-pad-top")
         card.add(_hair(), key="belkins-party-sep")
 
     if codex_spec:
         card.add(
-            _card_head(codex_spec),
+            _card_head(codex_spec, one_line=True),
             key="belkins-party-codex-head",
             ax=f"{codex_spec['title']}. {codex_spec['right']}".strip(". "),
-            tooltip=codex_spec["right"],
+            tooltip=f"{codex_spec['right']}\nClick to switch to Codex tab",
+            action=lambda: set_active_tab("codex"),
+            keep_open=True,
+            **ROW_HL,
         )
         if codex_spec["hero"]:
             hero = codex_spec["hero"]
             card.add(
-                _hero(hero),
+                _hero(hero, compact=True),
                 key="belkins-party-codex-active",
                 tooltip=hero["tip"],
                 ax=_ax(hero["tip"]),
                 action=hero["action"],
-                **ROW_HL,
-            )
-        standby_c = len(codex_spec.get("rows") or ())
-        if standby_c > 0:
-            def draw_codex_more(pen: Any, y0: float, n: int = standby_c) -> float:
-                b = y0 + 14.0
-                text(
-                    pen,
-                    f"▸ View all {n} standby Codex account{'s' if n != 1 else ''} (Codex tab)",
-                    "caption_med",
-                    "belkins_flame_text",
-                    HX,
-                    b,
-                    maxw=X1 - HX,
-                )
-                return b + 8.0
-
-            card.add(
-                draw_codex_more,
-                key="belkins-party-codex-more",
-                tooltip="Click to open the Codex tab and view all standby Codex accounts",
-                ax=f"View all {standby_c} standby Codex accounts",
-                action=lambda: set_active_tab("codex"),
-                keep_open=True,
                 **ROW_HL,
             )
 
@@ -1526,7 +1604,7 @@ def _party_overview_card(
 
 
 def _dex_card(companion: CompanionState) -> _Card:
-    """`🐾 Dex` Tab Card: 5-Stage Evolution Pokedex + 8 Belkins Trophy Badges."""
+    """`🐾 Dex` Tab Card: 5-Stage Evolution Pokedex + 2x4 Bento Grid of Belkins Trophy Badges."""
     card = _Card("belkins_card", "belkins_card_edge", rule="belkins_flame_rule")
     head_spec = {
         "icon": "sparkles",
@@ -1548,20 +1626,26 @@ def _dex_card(companion: CompanionState) -> _Card:
             cur: bool = is_cur,
             unl: bool = unlocked,
         ) -> float:
-            top = y0 + 4.0
-            draw_pixel_companion(pen, stage, X0, top, 28.0, mood_key="overdrive" if cur else "locked_in")
-            bx = X0 + 36.0
-            b1 = top + 12.0
-            b2 = top + 25.0
+            top = y0 + 3.0
+            draw_pixel_companion(pen, stage, X0, top, 24.0, mood_key="overdrive" if cur else "locked_in")
+            bx = X0 + 32.0
+            b1 = top + 16.0
             tag_txt = "ACTIVE" if cur else ("UNLOCKED" if unl else f"Lv.{stage.min_level}")
             tag_role = "belkins_flame_text" if cur else ("good_text" if unl else "secondary")
             tag_bg = "belkins_flame_pill" if cur else ("belkins_good_pill" if unl else "belkins_badge_off")
             tw_pill = _pill_w(pen, tag_txt)
             pen.pill(tag_txt, X1 - tw_pill, b1 - 0.5, F["tag"][0], role=tag_role, bg=tag_bg, weight="semibold")
             name_w = text(pen, f"{stage.stage}. {stage.name}", "primary_med", "label" if unl else "secondary", bx, b1)
-            text(pen, f"· {stage.title}", "caption", "secondary", bx + name_w + 5.0, b1, maxw=X1 - tw_pill - bx - name_w - 10.0)
-            text(pen, stage.lore, "caption", "secondary", bx, b2, maxw=X1 - bx)
-            return top + 32.0
+            text(
+                pen,
+                f"·  {stage.title}",
+                "caption",
+                "secondary",
+                bx + name_w + 6.0,
+                b1,
+                maxw=X1 - tw_pill - bx - name_w - 12.0,
+            )
+            return top + 27.0
 
         card.add(
             draw_stage,
@@ -1570,43 +1654,60 @@ def _dex_card(companion: CompanionState) -> _Card:
             tooltip=f"{st.name} (Lv.{st.min_level} · {st.title})\n{st.lore}",
         )
 
+    card.add(_gap(4.0), key="belkins-dex-pad")
     card.add(_hair(), key="belkins-dex-sep")
     trophy_head = {
         "icon": "trophy.fill",
         "rule": "belkins_gold_rule",
-        "title": "Belkins Trophies",
+        "title": "Trophy Room",
         "right": f"{companion.unlocked_badges_count}/{len(companion.badges)} unlocked",
         "right_parts": [f"{companion.unlocked_badges_count}/{len(companion.badges)} unlocked"],
     }
-    card.add(_card_head(trophy_head), key="belkins-dex-trophy-head", ax="Belkins Trophies")
+    card.add(_card_head(trophy_head), key="belkins-dex-trophy-head", ax="Trophy Room")
 
-    for badge in companion.badges:
-        def draw_badge(pen: Any, y0: float, b_item: Any = badge) -> float:
-            b1 = y0 + 14.0
-            b2 = y0 + 27.0
-            status = "✓" if b_item.unlocked else b_item.progress_text
-            st_role = "good_text" if b_item.unlocked else "secondary"
-            sw = text(pen, status, "caption_med", st_role, X1, b1, right=True)
-            text(
-                pen,
-                f"{b_item.icon} {b_item.name}",
-                "primary_med",
-                "label" if b_item.unlocked else "secondary",
-                X0,
-                b1,
-                maxw=X1 - X0 - sw - 8.0,
-            )
-            text(pen, b_item.description, "caption", "secondary", X0 + 18.0, b2, maxw=X1 - X0 - 18.0)
-            return b2 + 6.0
+    # 2-column x 4-row Bento Badge Grid
+    badges = companion.badges
+    col_gap = 8.0
+    col_w = (W_INNER - col_gap) / 2.0
+    for row_idx in range(0, len(badges), 2):
+        pair = badges[row_idx : row_idx + 2]
 
+        def draw_badge_pair(pen: Any, y0: float, items: tuple = pair) -> float:
+            box_y = y0 + 2.0
+            box_h = 26.0
+            base = box_y + 17.0
+            for c_idx, b_item in enumerate(items):
+                cx = X0 + c_idx * (col_w + col_gap)
+                bg_role = "belkins_badge_on" if b_item.unlocked else "belkins_badge_off"
+                edge_role = "belkins_badge_on_edge" if b_item.unlocked else "belkins_badge_off_edge"
+                pen.rrect(cx, box_y, col_w, box_h, 6.0, bg_role, stroke=edge_role)
+                mark = "✓" if b_item.unlocked else "🔒"
+                mark_role = "good_text" if b_item.unlocked else "secondary"
+                mw = text(pen, mark, "caption_med", mark_role, cx + col_w - 8.0, base, right=True)
+                text(
+                    pen,
+                    f"{b_item.icon} {b_item.name}",
+                    "caption_med",
+                    "label" if b_item.unlocked else "secondary",
+                    cx + 8.0,
+                    base,
+                    maxw=col_w - mw - 20.0,
+                )
+            return box_y + box_h + 4.0
+
+        tips = "\n\n".join(
+            f"{b.icon} {b.name} ({'UNLOCKED ✓' if b.unlocked else b.progress_text})\n{b.description}"
+            for b in pair
+        )
+        axs = " · ".join(f"{b.name}: {b.progress_text}" for b in pair)
         card.add(
-            draw_badge,
-            key=f"belkins-dex-badge-{badge.slug}",
-            ax=f"{badge.name}: {badge.description} ({badge.progress_text})",
-            tooltip=f"{badge.icon} {badge.name} — {badge.description}\nProgress: {badge.progress_text}",
+            draw_badge_pair,
+            key=f"belkins-dex-badge-row-{row_idx // 2}",
+            ax=axs,
+            tooltip=tips,
         )
 
-    card.add(_gap(6), key="belkins-dex-foot")
+    card.add(_gap(8.0), key="belkins-dex-foot")
     return card
 
 
@@ -1622,13 +1723,13 @@ def _shop_card(companion: CompanionState) -> _Card:
         symbol(pen, "cart.fill", X0, base - 4.0, 11.5, "belkins_gold_rule", "semibold")
         tx = X0 + 18.0
         text(pen, "Belkins Poké Mart", "title", "label", tx, base)
-        wallet = f"🪙 {coins_live:,} Coins"
+        wallet = f"🪙 {_fmt_compact_coins(coins_live)} Coins"
         pw = _pill_w(pen, wallet)
         pen.pill(wallet, X1 - pw, base - 0.5, F["tag"][0], role="belkins_gold_text", bg="belkins_gold_pill", weight="semibold")
-        b2 = base + 15.0
-        sub = _LAST_SHOP_NOTE or "Earn 🪙 from token burn & trophies. Click any item to buy or equip:"
+        b2 = base + 16.0
+        sub = _LAST_SHOP_NOTE or "Click any item below to buy or toggle equip on your Companion:"
         text(pen, sub, "caption", "belkins_flame_text" if _LAST_SHOP_NOTE else "secondary", X0, b2, maxw=W_INNER)
-        return b2 + 8.0
+        return b2 + 9.0
 
     card.add(
         draw_shop_head,
@@ -1646,8 +1747,8 @@ def _shop_card(companion: CompanionState) -> _Card:
             is_owned = item_spec.slug in owned_live
             is_eq = item_spec.slug in eq_live
 
-            b1 = y0 + 15.0
-            b2 = y0 + 28.0
+            b1 = y0 + 16.0
+            b2 = y0 + 30.0
             if is_eq:
                 btn_txt, btn_role, btn_bg = "EQUIPPED ✓", "good_text", "belkins_good_pill"
             elif is_owned:
@@ -1661,15 +1762,15 @@ def _shop_card(companion: CompanionState) -> _Card:
             pen.pill(btn_txt, X1 - bw, b1 - 0.5, F["tag"][0], role=btn_role, bg=btn_bg, weight="semibold")
             text(
                 pen,
-                f"{item_spec.icon} {item_spec.name}",
+                f"{item_spec.icon}  {item_spec.name}",
                 "primary_med",
                 "label",
                 X0,
                 b1,
                 maxw=X1 - X0 - bw - 8.0,
             )
-            text(pen, item_spec.description, "caption", "secondary", X0 + 18.0, b2, maxw=X1 - X0 - 18.0)
-            return b2 + 7.0
+            text(pen, item_spec.description, "caption", "secondary", X0 + 20.0, b2, maxw=W_INNER - 20.0)
+            return b2 + 8.0
 
         def on_click_item(slug: str = spec.slug) -> None:
             global _LAST_SHOP_NOTE
@@ -1686,7 +1787,7 @@ def _shop_card(companion: CompanionState) -> _Card:
             **ROW_HL,
         )
 
-    card.add(_gap(6), key="belkins-shop-foot")
+    card.add(_gap(8.0), key="belkins-shop-foot")
     return card
 
 
@@ -1709,9 +1810,9 @@ def build(snapshot: Any, now: float, actions: ThemeActions | None = None) -> lis
     acts = actions or ThemeActions()
     companion = companion_from_snapshot(snapshot)
 
-    # 1. Always-visible Companion Hero + 5-Tab Bar
+    # 1. Always-visible Companion Hero + Segmented 5-Tab Bar
     hero_card = _companion_card(snapshot, companion, acts)
-    blocks: list[Block] = hero_card.blocks(TOP_GAP, 4.0)
+    blocks: list[Block] = hero_card.blocks(TOP_GAP, 2.0)
 
     claude_sp = _claude_spec(A, R, snapshot, now, acts)
     codex_sp = _codex_spec(A, R, snapshot, now, acts)
@@ -1719,29 +1820,34 @@ def build(snapshot: Any, now: float, actions: ThemeActions | None = None) -> lis
     codex_cnt = len([r for r in A._visible_quota_rows_of(snapshot) if r.vendor != A.VENDOR_CLAUDE and r.slot < 0])
     blocks.append(_tab_bar_block(claude_cnt, codex_cnt))
 
-    # 2. Tab "party": Needs Attention + Compact Active Party Overview
+    # 2. Tab "party": Active Party Champions FIRST + Compact Grouped Needs-Attention below
     attn = _attention_spec(A, snapshot, acts)
     party_cards: list[_Card] = []
-    if attn:
-        party_cards.append(_attention_card(attn))
     overview = _party_overview_card(claude_sp, codex_sp)
     if overview:
         party_cards.append(overview)
+    if attn:
+        party_cards.append(_attention_card(attn))
     for i, c in enumerate(party_cards):
-        blocks += _tag_blocks(c.blocks(4.0 if i == 0 else GAP, TAIL_GAP if i == len(party_cards) - 1 else 0.0), "party")
+        blocks += _tag_blocks(
+            c.blocks(2.0 if i == 0 else GAP, TAIL_GAP if i == len(party_cards) - 1 else 0.0),
+            "party",
+        )
 
-    # 3. Tab "claude": Full Claude Fleet
+    # 3. Tab "claude": Full Claude Fleet + Compact Claude Attention Summary
     if claude_sp:
-        blocks += _tag_blocks(_provider_card(claude_sp).blocks(4.0, TAIL_GAP), "claude")
+        claude_attn = [it for it in (attn["items"] if attn else ()) if it["provider"] == "Claude"]
+        blocks += _tag_blocks(_provider_card(claude_sp, claude_attn).blocks(2.0, TAIL_GAP), "claude")
 
-    # 4. Tab "codex": Full Codex Fleet
+    # 4. Tab "codex": Full Codex Fleet + Compact Codex Attention Summary
     if codex_sp:
-        blocks += _tag_blocks(_provider_card(codex_sp).blocks(4.0, TAIL_GAP), "codex")
+        codex_attn = [it for it in (attn["items"] if attn else ()) if it["provider"] == "Codex"]
+        blocks += _tag_blocks(_provider_card(codex_sp, codex_attn).blocks(2.0, TAIL_GAP), "codex")
 
-    # 5. Tab "dex": 5-Stage Evolution Pokedex + 8 Trophy Badges
-    blocks += _tag_blocks(_dex_card(companion).blocks(4.0, TAIL_GAP), "dex")
+    # 5. Tab "dex": 5-Stage Evolution Pokedex + 2x4 Trophy Badge Bento Grid
+    blocks += _tag_blocks(_dex_card(companion).blocks(2.0, TAIL_GAP), "dex")
 
     # 6. Tab "shop": Belkins Poké Mart (SparkCoins & Cosmetics)
-    blocks += _tag_blocks(_shop_card(companion).blocks(4.0, TAIL_GAP), "shop")
+    blocks += _tag_blocks(_shop_card(companion).blocks(2.0, TAIL_GAP), "shop")
 
     return blocks

@@ -152,6 +152,7 @@ class Block:
         keep_open: bool = False,
         on_click_x: Callable[[float], Any] | None = None,
         is_visible: Callable[[], bool] | None = None,
+        no_hover_bg: bool = False,
     ) -> None:
         self.height = float(height)
         self.paint = paint
@@ -166,6 +167,7 @@ class Block:
         self.keep_open = bool(keep_open)
         self.on_click_x = on_click_x
         self.is_visible = is_visible
+        self.no_hover_bg = bool(no_hover_bg)
 
     def __repr__(self) -> str:
         return f"Block(key={self.key!r}, height={self.height}, selectable={self.selectable})"
@@ -814,7 +816,7 @@ if _APPKIT:
             if block is None:
                 return
             b = self.bounds()
-            hl = self.isHighlightedNow()
+            hl = self.isHighlightedNow() and not getattr(block, "no_hover_bg", False)
             try:
                 if hl:
                     Pen().rrect(block.hl_inset, block.hl_vinset, b.size.width - 2 * block.hl_inset,

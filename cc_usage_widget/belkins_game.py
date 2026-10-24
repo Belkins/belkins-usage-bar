@@ -255,7 +255,7 @@ SHOP_CATALOG: tuple[ShopItemSpec, ...] = (
         name="Context Berry",
         category="berry",
         price=150,
-        description="Sweet neural berry. Soothes Wall Guard & boosts mood to Overdrive.",
+        description="Soothes Wall Guard · Boosts mood & +10% XP",
     ),
     ShopItemSpec(
         slug="deal_shades",
@@ -263,7 +263,7 @@ SHOP_CATALOG: tuple[ShopItemSpec, ...] = (
         name="Deal Closer Shades",
         category="eyewear",
         price=400,
-        description="Equips cyber-cyan pixel sunglasses onto your Companion sprite.",
+        description="Equips cyber-cyan pixel shades on your Companion",
     ),
     ShopItemSpec(
         slug="solar_pad",
@@ -271,7 +271,7 @@ SHOP_CATALOG: tuple[ShopItemSpec, ...] = (
         name="Solar Forge Pad",
         category="pad",
         price=500,
-        description="Transforms your Companion showcase into a crimson-gold forge.",
+        description="Crimson-gold forge habitat pad for your Companion",
     ),
     ShopItemSpec(
         slug="emerald_pad",
@@ -279,7 +279,7 @@ SHOP_CATALOG: tuple[ShopItemSpec, ...] = (
         name="Emerald Grove Pad",
         category="pad",
         price=500,
-        description="Transforms your Companion showcase into a bioluminescent cyber-grove.",
+        description="Bioluminescent grove habitat pad for your Companion",
     ),
     ShopItemSpec(
         slug="cyber_halo",
@@ -287,7 +287,7 @@ SHOP_CATALOG: tuple[ShopItemSpec, ...] = (
         name="Cyber Halo Aura",
         category="aura",
         price=600,
-        description="Surrounds your Companion sprite with a pulsing golden-cyan halo.",
+        description="Surrounds your Companion with a pulsing cyan halo",
     ),
     ShopItemSpec(
         slug="sovereign_crown",
@@ -295,7 +295,7 @@ SHOP_CATALOG: tuple[ShopItemSpec, ...] = (
         name="Sovereign Crown",
         category="headgear",
         price=800,
-        description="Equips a golden pixel crown on your Companion + 25% XP boost.",
+        description="Golden pixel crown on your Companion · +25% XP",
     ),
 )
 
