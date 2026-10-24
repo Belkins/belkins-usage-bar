@@ -2895,8 +2895,8 @@ SETTINGS_DEFAULTS: dict[str, Any] = {
     "title_merge_alerts": False,
     "title_show_reset_credit": True,
     "menu_layout_classic": False,
-    # --- menu themes (design 3, 2026-09-25) ------------------------------
-    "menu_theme": "cards",
+    # --- menu themes (design 3, 2026-09-25; belkins default) -------------
+    "menu_theme": "belkins",
 }
 """Full ``settings.json`` schema with defaults.
 
@@ -3082,7 +3082,7 @@ would defeat the whole design.
 
 SETTINGS_CHOICES: dict[str, tuple[str, ...]] = {
     "codex_pricing_tier": ("standard", "fast", "batch"),
-    "menu_theme": ("apple", "dense", "cards", "glance", "classic"),
+    "menu_theme": ("belkins", "apple", "dense", "cards", "glance", "classic"),
 }
 """Allowed values for the string settings, first entry = the default.
 

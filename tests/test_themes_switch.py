@@ -143,22 +143,22 @@ def _view(item: Any) -> Any:
 def test_menu_theme_is_a_declared_enum_defaulting_to_cards() -> None:
     """Undeclared keys are dropped on save, and a string setting is an enum:
     junk falls back to the default instead of reaching a label."""
-    # Cards is the default since design 4 (2026-09-25, the operator asked for it).
-    assert SETTINGS_DEFAULTS["menu_theme"] == "cards"
-    assert SETTINGS_CHOICES["menu_theme"] == ("apple", "dense", "cards", "glance", "classic")
+    # Belkins is the default since the Belkins Companion redesign.
+    assert SETTINGS_DEFAULTS["menu_theme"] == "belkins"
+    assert SETTINGS_CHOICES["menu_theme"] == ("belkins", "apple", "dense", "cards", "glance", "classic")
     assert themes.MENU_THEMES == SETTINGS_CHOICES["menu_theme"], "one list, two owners would drift"
     for theme in SETTINGS_CHOICES["menu_theme"]:
         assert normalize_settings({"menu_theme": theme})["menu_theme"] == theme
-    assert normalize_settings({"menu_theme": "neon"})["menu_theme"] == "cards"
-    assert normalize_settings({"menu_theme": 3})["menu_theme"] == "cards"
+    assert normalize_settings({"menu_theme": "neon"})["menu_theme"] == "belkins"
+    assert normalize_settings({"menu_theme": 3})["menu_theme"] == "belkins"
 
 
 def test_a_classic_operator_keeps_the_classic_menu_after_the_upgrade() -> None:
     """A settings.json from before design 3 with the classic rollback on must
     not wake up in a card theme; one without it gets the new default."""
     assert normalize_settings({"menu_layout_classic": True})["menu_theme"] == "classic"
-    assert normalize_settings({"menu_layout_classic": False})["menu_theme"] == "cards"
-    assert normalize_settings({})["menu_theme"] == "cards", "a fresh install opens on the Cards theme"
+    assert normalize_settings({"menu_layout_classic": False})["menu_theme"] == "belkins"
+    assert normalize_settings({})["menu_theme"] == "belkins", "a fresh install opens on the Belkins theme"
     # An explicit theme is never rewritten by the migration.
     assert normalize_settings({"menu_layout_classic": True, "menu_theme": "dense"})["menu_theme"] == "dense"
     with tempfile.TemporaryDirectory() as name:
@@ -169,7 +169,7 @@ def test_a_classic_operator_keeps_the_classic_menu_after_the_upgrade() -> None:
         assert store.set("menu_theme", "cards") and store.get("menu_theme") == "cards"
         assert json.loads(path.read_text())["menu_theme"] == "cards", "persisted"
         store.set("menu_theme", "not-a-theme")
-        assert store.get("menu_theme") == "cards", "junk coerces to the default, never to a label"
+        assert store.get("menu_theme") == "belkins", "junk coerces to the default, never to a label"
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +183,7 @@ def test_layout_follows_the_theme_and_the_classic_switch_still_wins() -> None:
         app = h.app
         for theme in themes.THEMES:
             assert app._menu_layout(_snapshot(theme)) == theme
-        assert app._menu_layout(_snapshot(None)) == "cards", "the default is the Cards theme"
+        assert app._menu_layout(_snapshot(None)) == "belkins", "the default is the Belkins theme"
         assert app._menu_layout(_snapshot("glance")) == "glance"
         assert app._menu_layout(_snapshot("classic")) == "classic"
         assert app._menu_layout(_snapshot("dense", menu_layout_classic=True)) == "classic"
@@ -373,7 +373,7 @@ def test_theme_menu_checks_the_current_choice_and_applies_on_click() -> None:
         app.rebuild_menu(app._snapshot)
         menu = app.menu["Settings"]["Theme"]
         states = {_title(i): i.state for i in menu.values() if i is not None}
-        assert states == {"Apple": 1, "Dense": 0, "Cards": 0, "Glance (text)": 0, "Classic (text)": 0}, states
+        assert states == {"Belkins ⚡ (Companion & Party)": 0, "Apple": 1, "Dense": 0, "Cards": 0, "Glance (text)": 0, "Classic (text)": 0}, states
         menu["Dense"].callback(menu["Dense"])
         assert app.snapshot().settings["menu_theme"] == "dense", "optimistic: applied before the worker"
         assert app._menu_layout(app.snapshot()) == "dense"
@@ -443,7 +443,12 @@ def test_theme_actions_enqueue_and_never_act_on_the_ui_thread() -> None:
 
 # The block that describes the active Claude account, per theme. The lanes
 # chose their own keys; the honesty rule below holds for every one of them.
-ACTIVE_CLAUDE_KEY = {"apple": "claude-head", "dense": "claude-head", "cards": "cards-claude-active"}
+ACTIVE_CLAUDE_KEY = {
+    "belkins": "belkins-claude-active",
+    "apple": "claude-head",
+    "dense": "claude-head",
+    "cards": "cards-claude-active",
+}
 
 
 def test_every_theme_header_is_honest() -> None:

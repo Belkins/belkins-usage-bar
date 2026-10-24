@@ -97,6 +97,28 @@ cd "$HERE" && exec "\$PY" -m cc_usage_widget "\$@"
 EOF
 chmod +x "$HERE/run.sh"
 
+# ── 3b. Belkins CLI (`bswap` & `belkins`) ────────────────────────────────────
+mkdir -p "$HOME/.local/bin"
+cat > "$HOME/.local/bin/bswap" <<EOF
+#!/usr/bin/env bash
+PY="$PYTHON"
+if [ ! -x "\$PY" ]; then
+  TOOLS_DIR="\$(uv tool dir 2>/dev/null)"
+  if [ -n "\$TOOLS_DIR" ] && [ -x "\$TOOLS_DIR/claude-swap/bin/python" ]; then
+    PY="\$TOOLS_DIR/claude-swap/bin/python"
+  else
+    PY="python3"
+  fi
+fi
+export PYTHONPATH="$HERE\${PYTHONPATH:+:\$PYTHONPATH}"
+exec "\$PY" -c "import sys; sys.path.insert(0, '$HERE'); from cc_usage_widget.bswap_cli import main; raise SystemExit(main())" "\$@"
+EOF
+cat > "$HOME/.local/bin/belkins" <<'EOF'
+#!/usr/bin/env bash
+exec "$HOME/.local/bin/bswap" "$@"
+EOF
+chmod +x "$HOME/.local/bin/bswap" "$HOME/.local/bin/belkins"
+
 # ── 4. Optional start-at-login ───────────────────────────────────────────────
 if [ "$LAUNCH_AGENT" = 1 ]; then
     LABEL="com.cc-usage-widget"

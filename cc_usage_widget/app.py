@@ -6269,6 +6269,7 @@ class CCUsageWidgetApp(rumps.App):
             codex_login_for=codex_login_for,
             open_url=_open_web_url,
             refresh=lambda: self._on_refresh_now(None),
+            open_dashboard=lambda: self._on_open_dashboard(None),
             attention_extras=extras,
         )
 

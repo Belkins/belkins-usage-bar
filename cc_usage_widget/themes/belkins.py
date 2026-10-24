@@ -1,0 +1,1747 @@
+"""The ``belkins`` menu theme — Belkins AI Companion, XP Bar & Party Stamina Cards.
+
+Custom flagship theme for Belkins Usage Bar (`bswap` / `belkins`), inspired by
+PokeTokenBar. Replaces all ``cswap`` references with ``bswap`` and adds:
+
+1. **Belkins Companion Hero Card**: Live 14x14 pixel-art evolving AI companion
+   (Sparkbit -> Outreachik -> Pipelinex -> Belkinosaur -> Belkins Prime),
+   segmented XP progress bar, real-time mood badge, and Trophy Dex strip.
+   Clicking the card opens the Belkins HTML Dashboard & Dex.
+2. **Needs Attention Card**: High-signal alert rows with ``bswap`` remedy chips
+   and one-click Codex relogin actions.
+3. **Claude Fleet & Party Stamina Card**: Active account HP/Stamina segmented
+   bars (5h / 7d / scoped) plus compact clickable Party Stamina rows for every
+   standby account in the pool (one click switches via ``bswap``).
+4. **Codex Fleet & Party Card**: Active Codex hero + standby party accounts with
+   reset-credit badges and one-click relogin.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Any, Callable
+
+from ..belkins_game import (
+    EVOLUTION_LINE,
+    SHOP_CATALOG,
+    CompanionState,
+    EvolutionStage,
+    companion_from_snapshot,
+    load_shop_save,
+    toggle_or_buy_shop_item,
+)
+from ..card_base import W, Block, Pen, register_role
+from ..contracts import format_pct, format_tokens, format_usd
+from . import ThemeActions
+
+TABS: tuple[tuple[str, str], ...] = (
+    ("party", "⚡ Party"),
+    ("claude", "Claude"),
+    ("codex", "Codex"),
+    ("dex", "🐾 Dex"),
+    ("shop", "🛒 Mart"),
+)
+_ACTIVE_TAB: str = "party"
+_LAST_SHOP_NOTE: str = ""
+
+
+def get_active_tab() -> str:
+    return _ACTIVE_TAB
+
+
+def set_active_tab(tab_id: str) -> None:
+    global _ACTIVE_TAB
+    if any(t[0] == tab_id for t in TABS):
+        _ACTIVE_TAB = tab_id
+
+# ---------------------------------------------------------------- layout ---
+CARD_X = 10.0
+PAD = 14.0
+CARD_R = 10.0
+GAP = 8.0
+TOP_GAP = 2.0
+TAIL_GAP = 0.0
+X0 = CARD_X + PAD                          # 24
+X1 = W - CARD_X - PAD                      # 336
+W_INNER = X1 - X0                          # 312
+HX = X0 + 12
+COL_RESET_W = 78.0
+COL_PCT_R = X1 - COL_RESET_W - 4           # 254
+COL_PCT_W = 40.0
+COL_BAR_W = 62.0
+COL_BAR_X = COL_PCT_R - COL_PCT_W - 6 - COL_BAR_W
+COL_LABEL_R = COL_BAR_X - 6
+CAP_STEP = 14.0
+HEAD_BASE = 22.0
+HEAD_AFTER = 12.0
+WIN_LABEL_W = 50.0
+WIN_STEP = 21.0
+ROW_BASE = 17.0
+ROW_CAP = 15.0
+ROW_END = 10.0
+INK = 3.0
+PART_END = 8.0
+ACCENT_W = 3.5
+ROW_HL = {"hl_inset": CARD_X + 4, "hl_vinset": 1.0, "hl_radius": 6.0}
+
+# ------------------------------------------------------------------ fonts ---
+F: dict[str, tuple[float, str, bool, bool, bool]] = {
+    "title": (12.0, "bold", False, False, False),
+    "hero_name": (13.5, "semibold", False, False, False),
+    "hero_big": (22.0, "bold", True, False, True),
+    "primary": (12.5, "regular", False, False, False),
+    "primary_med": (12.5, "semibold", False, False, False),
+    "secondary": (11.0, "regular", False, False, False),
+    "secondary_med": (11.0, "medium", False, False, False),
+    "caption": (10.5, "regular", False, False, False),
+    "caption_med": (10.5, "medium", False, False, False),
+    "num": (12.0, "semibold", True, False, True),
+    "num_bar": (11.0, "semibold", True, False, True),
+    "num_small": (10.5, "regular", True, False, False),
+    "slot": (10.5, "semibold", True, False, False),
+    "code": (10.0, "medium", False, True, False),
+    "tag": (9.5, "semibold", False, False, False),
+}
+
+_WHITE = (255, 255, 255)
+_ROLES: tuple[tuple[str, tuple, tuple, Any], ...] = (
+    ("belkins_card", (255, 255, 255, 0.90), (24, 25, 32, 0.90), None),
+    ("belkins_card_edge", (0, 0, 0, 0.07), (255, 255, 255, 0.10), None),
+    ("belkins_hero_card", (255, 248, 244, 0.94), (32, 24, 28, 0.92), None),
+    ("belkins_hero_edge", (235, 88, 42, 0.28), (255, 108, 58, 0.36), None),
+    ("belkins_flame_rule", (242, 82, 34), (255, 102, 51), _WHITE),
+    ("belkins_claude_rule", (217, 119, 87), (232, 136, 104), _WHITE),
+    ("belkins_codex_rule", (16, 163, 127), (52, 211, 153), _WHITE),
+    ("belkins_attn_rule", (255, 149, 0), (255, 159, 10), _WHITE),
+    ("belkins_sprite_pad", (24, 26, 34, 0.96), (14, 15, 21, 0.98), None),
+    ("belkins_sprite_edge", (242, 82, 34, 0.45), (255, 108, 58, 0.50), None),
+    ("belkins_solar_pad", (48, 20, 16, 0.96), (38, 14, 12, 0.98), None),
+    ("belkins_solar_edge", (250, 190, 25, 0.70), (250, 204, 21, 0.75), None),
+    ("belkins_emerald_pad", (14, 38, 30, 0.96), (10, 28, 22, 0.98), None),
+    ("belkins_emerald_edge", (40, 199, 138, 0.65), (52, 211, 153, 0.75), None),
+    ("belkins_gold_rule", (217, 155, 12), (250, 204, 21), _WHITE),
+    ("belkins_gold_text", (176, 118, 0), (250, 204, 21), _WHITE),
+    ("belkins_gold_pill", (250, 190, 25, 0.18), (250, 204, 21, 0.22), (255, 255, 255, 0.22)),
+    ("belkins_tab_bar", (0, 0, 0, 0.05), (255, 255, 255, 0.06), None),
+    ("belkins_tab_active", (242, 82, 34, 0.18), (255, 102, 51, 0.28), None),
+    ("belkins_tab_edge", (242, 82, 34, 0.45), (255, 112, 56, 0.55), None),
+    ("belkins_xp_fill", (242, 82, 34), (255, 112, 56), _WHITE),
+    ("belkins_xp_track", (0, 0, 0, 0.10), (255, 255, 255, 0.14), (255, 255, 255, 0.28)),
+    ("belkins_flame_text", (208, 62, 18), (255, 126, 74), _WHITE),
+    ("belkins_flame_pill", (242, 82, 34, 0.14), (255, 108, 58, 0.20), (255, 255, 255, 0.22)),
+    ("belkins_good_pill", (40, 167, 69, 0.14), (48, 209, 88, 0.20), (255, 255, 255, 0.22)),
+    ("belkins_warn_pill", (255, 149, 0, 0.15), (255, 159, 10, 0.22), (255, 255, 255, 0.22)),
+    ("belkins_badge_on", (250, 190, 25, 0.22), (250, 204, 21, 0.22), (255, 255, 255, 0.22)),
+    ("belkins_badge_off", (0, 0, 0, 0.045), (255, 255, 255, 0.05), (255, 255, 255, 0.12)),
+    ("belkins_hair", (0, 0, 0, 0.08), (255, 255, 255, 0.09), None),
+    ("belkins_track", (0, 0, 0, 0.10), (255, 255, 255, 0.14), (255, 255, 255, 0.30)),
+    ("belkins_warn_fill", (255, 149, 0), (255, 159, 10), _WHITE),
+    ("belkins_crit_fill", (255, 59, 48), (255, 69, 58), _WHITE),
+    ("belkins_good_fill", (40, 167, 69), (48, 209, 88), _WHITE),
+)
+
+SEV_FILL = {
+    "ok": "belkins_good_fill",
+    "warn": "belkins_warn_fill",
+    "crit": "belkins_crit_fill",
+    "good": "belkins_good_fill",
+    "dim": "dead_fill",
+}
+SEV_TEXT = {
+    "ok": "label",
+    "warn": "warn_text",
+    "crit": "crit_text",
+    "good": "good_text",
+    "dim": "secondary",
+}
+CAP_ROLE = {"dim": "secondary", "accent": "belkins_flame_text", "ok": "secondary", "tag": "belkins_flame_text"}
+
+_roles_done = False
+
+
+def _ensure_roles() -> None:
+    global _roles_done
+    if _roles_done:
+        return
+    for name, light, dark, hover in _ROLES:
+        register_role(name, light, dark, hover=hover)
+    _roles_done = True
+
+
+def _rebrand_bswap(s: str) -> str:
+    """Replace legacy ``cswap`` references with ``bswap``."""
+    return s.replace("cswap ", "bswap ").replace("`cswap`", "`bswap`").replace(": cswap", ": bswap")
+
+
+# ---------------------------------------------------------- draw helpers ---
+
+
+class _Measure:
+    """A Pen stand-in for the layout pass: measures text, draws nothing."""
+
+    hl = False
+
+    def __init__(self) -> None:
+        self._pen = Pen()
+
+    def width(self, *a: Any, **k: Any) -> float:
+        return self._pen.width(*a, **k)
+
+    def fit(self, *a: Any, **k: Any) -> str:
+        return self._pen.fit(*a, **k)
+
+    def text(
+        self,
+        s: str,
+        x: float,
+        y: float,
+        size: float,
+        weight: Any = "regular",
+        role: Any = "label",
+        *,
+        mono: bool = False,
+        right: bool = False,
+        center: bool = False,
+        maxw: float | None = None,
+        code: bool = False,
+        kern: float | None = None,
+        rounded: bool = False,
+    ) -> float:
+        if not s:
+            return 0.0
+        s = self._pen.fit(s, size, weight, maxw, mono=mono, code=code, kern=kern, rounded=rounded)
+        return self._pen.width(s, size, weight, mono=mono, code=code, kern=kern, rounded=rounded) if s else 0.0
+
+    def chip(
+        self,
+        text_s: str,
+        x: float,
+        y: float,
+        size: float = 10.0,
+        *,
+        role: Any = "secondary",
+        bg: Any = "chip",
+        maxw: float | None = None,
+        weight: Any = "regular",
+    ) -> float:
+        if not text_s:
+            return 0.0
+        inner = None if maxw is None else max(0.0, maxw - 6.0)
+        return (
+            self._pen.width(self._pen.fit(text_s, size, weight, inner, code=True), size, weight, code=True)
+            + 6.0
+        )
+
+    def pill(
+        self,
+        text_s: str,
+        x: float,
+        y: float,
+        size: float = 10.0,
+        *,
+        role: Any = "accent_tag",
+        bg: Any = "accent_pill",
+        weight: Any = "semibold",
+    ) -> float:
+        return self._pen.width(text_s, size, weight) + 10.0 if text_s else 0.0
+
+    def symbol(self, name: str, x: float, y: float, size: float, *a: Any, **k: Any) -> float:
+        return size
+
+    def _nothing(self, *a: Any, **k: Any) -> None:
+        return None
+
+    rrect = panel = bar = circle = line = _nothing
+
+
+def text(
+    pen: Any,
+    s: str,
+    fk: str,
+    role: str,
+    x: float,
+    baseline: float,
+    *,
+    maxw: float | None = None,
+    right: bool = False,
+    center: bool = False,
+) -> float:
+    if not s or (maxw is not None and maxw <= 0):
+        return 0.0
+    size, weight, mono, code, rounded = F[fk]
+    return pen.text(
+        s,
+        x,
+        baseline,
+        size,
+        weight,
+        role,
+        mono=mono,
+        code=code,
+        right=right,
+        center=center,
+        maxw=maxw,
+        rounded=rounded,
+    )
+
+
+def text_w(pen: Any, s: str, fk: str) -> float:
+    size, weight, mono, code, rounded = F[fk]
+    return pen.width(s, size, weight, mono=mono, code=code, rounded=rounded)
+
+
+def segments(pen: Any, segs: list[tuple], x: float, baseline: float, maxw: float) -> float:
+    cur, end = x, x + maxw
+    for s, fk, role, *style in segs:
+        room = end - cur
+        if room <= 6:
+            break
+        if style and style[0] == "code":
+            cur += pen.chip(s, cur, baseline, F[fk][0], role=role, maxw=room, weight=F[fk][1])
+        else:
+            cur += text(pen, s, fk, role, cur, baseline, maxw=room)
+    return cur - x
+
+
+def segmented_bar(
+    pen: Any,
+    x: float,
+    mid_y: float,
+    w: float,
+    pct: float | None,
+    sev: str,
+    *,
+    h: float = 5.5,
+    cells: int = 8,
+    expired: bool = False,
+    fill_override: str | None = None,
+) -> None:
+    """Segmented RPG stamina bar centered vertically on *mid_y*."""
+    if isinstance(pen, _Measure):
+        return
+    y = mid_y - h / 2.0
+    gap = 1.8
+    cell_w = max(2.0, (w - gap * (cells - 1)) / float(cells))
+    r = h / 2.0
+    fill_role = "dead_fill" if expired else (fill_override or SEV_FILL.get(sev, "ok"))
+    frac = 0.0 if (pct is None or expired) else max(0.0, min(1.0, float(pct) / 100.0))
+    exact = frac * cells
+    for i in range(cells):
+        cx = x + i * (cell_w + gap)
+        pen.rrect(cx, y, cell_w, h, r, "belkins_track")
+        if i + 1 <= int(exact):
+            pen.rrect(cx, y, cell_w, h, r, fill_role)
+        elif i < exact:
+            part = max(r, cell_w * (exact - i))
+            pen.rrect(cx, y, part, h, r, fill_role)
+
+
+def draw_pixel_companion(
+    pen: Any,
+    stage: EvolutionStage,
+    x: float,
+    y: float,
+    size: float,
+    *,
+    mood_key: str = "locked_in",
+    equipped: set[str] | tuple[str, ...] = (),
+) -> None:
+    """Draw the 14x14 pixel-art Belkins companion in flipped coordinates (with equipped cosmetics)."""
+    if isinstance(pen, _Measure):
+        return
+    eq = set(equipped or ())
+    pad_role = "belkins_sprite_pad"
+    edge_role = "belkins_sprite_edge"
+    if "solar_pad" in eq:
+        pad_role, edge_role = "belkins_solar_pad", "belkins_solar_edge"
+    elif "emerald_pad" in eq:
+        pad_role, edge_role = "belkins_emerald_pad", "belkins_emerald_edge"
+
+    pen.rrect(x, y, size, size, 8.0, pad_role, stroke=edge_role, stroke_width=1.0)
+    grid = stage.sprite
+    rows = len(grid)
+    cols = len(grid[0]) if rows else 14
+    pad = max(2.5, size * 0.095)
+    cell = (size - 2.0 * pad) / float(max(rows, cols))
+    ox = x + pad
+    oy = y + pad
+
+    b_r, b_g, b_b = stage.body_rgb
+    a_r, a_g, a_b = stage.accent_rgb
+    c_r, c_g, c_b = stage.crest_rgb
+    s_r, s_g, s_b = stage.spark_rgb
+    if mood_key == "overdrive":
+        s_r, s_g, s_b = (255, 110, 48)
+    elif mood_key == "wall_guard":
+        s_r, s_g, s_b = (251, 191, 36)
+
+    palette = {
+        "O": (20, 20, 26, 1.0),
+        "B": (b_r, b_g, b_b, 1.0),
+        "A": (a_r, a_g, a_b, 1.0),
+        "C": (c_r, c_g, c_b, 1.0),
+        "E": (255, 255, 255, 1.0),
+        "S": (s_r, s_g, s_b, 0.95),
+    }
+    try:
+        from AppKit import NSBezierPath, NSColor
+        from Foundation import NSMakeRect
+    except Exception:
+        return
+
+    if "cyber_halo" in eq:
+        NSColor.colorWithSRGBRed_green_blue_alpha_(56 / 255.0, 189 / 255.0, 248 / 255.0, 0.95).setFill()
+        for hc, hr in ((1, 1), (12, 1), (0, 6), (13, 6), (1, 12), (12, 12)):
+            NSBezierPath.fillRect_(NSMakeRect(ox + hc * cell, oy + hr * cell, cell + 0.2, cell + 0.2))
+
+    for r_idx, row_str in enumerate(grid):
+        for c_idx, ch in enumerate(row_str):
+            rgba = palette.get(ch)
+            if rgba is None:
+                continue
+            cr, cg, cb_val, alpha = rgba
+            NSColor.colorWithSRGBRed_green_blue_alpha_(
+                cr / 255.0, cg / 255.0, cb_val / 255.0, alpha
+            ).setFill()
+            px = ox + c_idx * cell
+            py = oy + r_idx * cell
+            NSBezierPath.fillRect_(NSMakeRect(px, py, cell + 0.2, cell + 0.2))
+            if ch == "E" and "deal_shades" in eq:
+                NSColor.colorWithSRGBRed_green_blue_alpha_(6 / 255.0, 182 / 255.0, 212 / 255.0, 1.0).setFill()
+                NSBezierPath.fillRect_(NSMakeRect(px - cell * 0.2, py, cell * 1.4, cell + 0.2))
+
+    if "sovereign_crown" in eq:
+        NSColor.colorWithSRGBRed_green_blue_alpha_(250 / 255.0, 204 / 255.0, 21 / 255.0, 1.0).setFill()
+        for cc, cr_y in ((5, 0), (7, 0), (9, 0), (5, 1), (6, 1), (7, 1), (8, 1), (9, 1)):
+            NSBezierPath.fillRect_(NSMakeRect(ox + cc * cell, oy + cr_y * cell, cell + 0.2, cell + 0.2))
+
+
+def symbol(
+    pen: Any, name: str, x: float, mid: float, size: float, role: str, weight: str = "semibold"
+) -> float:
+    return pen.symbol(name, x, mid, size, role, weight, anchor="leftmid")
+
+
+def hairline(pen: Any, x0: float, x1: float, y: float) -> None:
+    pen.line(x0, y, x1, "belkins_hair", thickness=0.5)
+
+
+def _pill_w(pen: Any, s: str) -> float:
+    return text_w(pen, s, "tag") + 10.0
+
+
+def flow(pen: Any, caps: list[tuple[str, str]], x: float, baseline: float, maxw: float) -> int:
+    lines, cur = 1, x
+    sep = "  ·  "
+    sep_w = text_w(pen, sep, "caption")
+    prev_tag = False
+    for i, (cap, kind) in enumerate(caps):
+        tag = kind == "tag"
+        fk = "caption_med" if kind in ("accent", "good", "crit", "warn") else "caption"
+        w = _pill_w(pen, cap) if tag else text_w(pen, cap, fk)
+        gap = 6.0 if (tag or prev_tag) else sep_w
+        if i and cur + gap + w > x + maxw:
+            lines += 1
+            baseline += CAP_STEP
+            cur = x
+        elif i:
+            if not (tag or prev_tag):
+                text(pen, sep, "caption", "tertiary", cur, baseline)
+            cur += gap
+        if tag:
+            cur += pen.pill(
+                cap,
+                cur,
+                baseline - 0.5,
+                F["tag"][0],
+                role="belkins_flame_text",
+                bg="belkins_flame_pill",
+                weight=F["tag"][1],
+            )
+        else:
+            cur += text(
+                pen,
+                cap,
+                fk,
+                CAP_ROLE.get(kind, SEV_TEXT.get(kind, "secondary")),
+                cur,
+                baseline,
+                maxw=x + maxw - cur,
+            )
+        prev_tag = tag
+    return lines
+
+
+def _clip_to(w: float, h: float, draw: Callable[[], None]) -> None:
+    from AppKit import NSBezierPath, NSGraphicsContext
+    from Foundation import NSMakeRect
+
+    NSGraphicsContext.saveGraphicsState()
+    try:
+        NSBezierPath.clipRect_(NSMakeRect(0, 0, w, h))
+        draw()
+    finally:
+        NSGraphicsContext.restoreGraphicsState()
+
+
+class _Card:
+    """One rounded card spread over consecutive blocks ("parts")."""
+
+    def __init__(self, fill: str, edge: str, rule: str | None = None) -> None:
+        self.fill, self.edge, self.rule = fill, edge, rule
+        self.parts: list[tuple[float, Callable[[Any, float], None], dict[str, Any]]] = []
+
+    def add(self, draw: Callable[[Any, float], float], **block_kw: Any) -> None:
+        height = float(round(draw(_Measure(), 0.0)))
+        self.parts.append((height, draw, block_kw))
+
+    def blocks(self, gap_before: float, gap_after: float) -> list[Block]:
+        card_h = sum(h for h, _, _ in self.parts)
+        out: list[Block] = []
+        off = 0.0
+        last = len(self.parts) - 1
+        for i, (h, draw, kw) in enumerate(self.parts):
+            lead = gap_before if i == 0 else 0.0
+            trail = gap_after if i == last else 0.0
+            out.append(
+                Block(lead + h + trail, self._painter(draw, lead - off, lead, h, card_h, kw), **kw)
+            )
+            off += h
+        return out
+
+    def _painter(
+        self,
+        draw: Callable[[Any, float], float],
+        card_y: float,
+        lead: float,
+        h: float,
+        card_h: float,
+        kw: dict[str, Any],
+    ) -> Callable[[Pen, float, float], None]:
+        fill, edge, rule = self.fill, self.edge, self.rule
+        inset = kw.get("hl_inset", ROW_HL["hl_inset"])
+        vinset = kw.get("hl_vinset", ROW_HL["hl_vinset"])
+        radius = kw.get("hl_radius", ROW_HL["hl_radius"])
+
+        def paint(pen: Pen, w: float, bh: float) -> None:
+            def surface() -> None:
+                pen.rrect(CARD_X, card_y, w - 2 * CARD_X, card_h, CARD_R, fill, stroke=edge)
+                if rule:
+                    from AppKit import NSBezierPath
+                    from Foundation import NSMakeRect
+
+                    NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                        NSMakeRect(CARD_X, card_y, w - 2 * CARD_X, card_h), CARD_R, CARD_R
+                    ).addClip()
+                    pen.rrect(CARD_X, card_y, ACCENT_W, card_h, 0.0, rule)
+
+            _clip_to(w, bh, surface)
+            if pen.hl:
+                pen.rrect(inset, lead + vinset, w - 2 * inset, h - 2 * vinset, radius, "hl")
+            draw(pen, lead)
+
+        return paint
+
+
+# ------------------------------------------------ Companion Hero Card ---
+
+
+def _companion_card(snapshot: Any, companion: CompanionState, actions: ThemeActions) -> _Card:
+    card = _Card("belkins_hero_card", "belkins_hero_edge", rule="belkins_flame_rule")
+    open_dash = getattr(actions, "open_dashboard", None)
+    dash_enabled = bool(snapshot.settings.get("dashboard_enabled", True))
+    act = open_dash if (callable(open_dash) and dash_enabled) else None
+
+    def draw_hero(pen: Any, y0: float) -> float:
+        owned_live, eq_live = load_shop_save()
+        spent_live = sum(it.price for it in SHOP_CATALOG if it.slug in owned_live)
+        coins_live = max(0, companion.coins_earned - spent_live)
+        mood_k = "overdrive" if "context_berry" in eq_live else companion.mood_key
+        mood_lbl = "🍒 Berry Overdrive" if "context_berry" in eq_live else companion.mood_label
+
+        pad_top = y0 + 10.0
+        sprite_sz = 46.0
+        draw_pixel_companion(
+            pen,
+            companion.stage,
+            X0,
+            pad_top,
+            sprite_sz,
+            mood_key=mood_k,
+            equipped=eq_live,
+        )
+        rx = X0 + sprite_sz + 10.0
+        rw = X1 - rx
+
+        # Line 1: Companion Stage Name + Level + Mood Pill
+        b1 = pad_top + 13.0
+        mood_role = (
+            "warn_text"
+            if mood_k == "wall_guard"
+            else ("belkins_flame_text" if mood_k == "overdrive" else "good_text")
+        )
+        mood_bg = (
+            "belkins_warn_pill"
+            if mood_k == "wall_guard"
+            else ("belkins_flame_pill" if mood_k == "overdrive" else "belkins_good_pill")
+        )
+        mw = _pill_w(pen, mood_lbl)
+        pen.pill(
+            mood_lbl,
+            X1 - mw,
+            b1 - 0.5,
+            F["tag"][0],
+            role=mood_role,
+            bg=mood_bg,
+            weight="semibold",
+        )
+        name_s = f"⚡ {companion.stage.name}"
+        nw = text(pen, name_s, "hero_name", "label", rx, b1, maxw=rw - mw - 6)
+        lvl_s = f"Lv.{companion.level} · {companion.stage.title}"
+        text(
+            pen,
+            lvl_s,
+            "caption_med",
+            "belkins_flame_text",
+            rx + nw + 6.0,
+            b1,
+            maxw=max(0.0, rw - mw - nw - 12.0),
+        )
+
+        # Line 2: Segmented XP Progress Bar
+        bar_mid = pad_top + 25.0
+        segmented_bar(
+            pen,
+            rx,
+            bar_mid,
+            rw,
+            companion.xp_fraction * 100.0,
+            "ok",
+            h=6.0,
+            cells=12,
+            fill_override="belkins_xp_fill",
+        )
+
+        # Line 3: XP stats & next evolution
+        b3 = pad_top + 41.0
+        if companion.next_stage is not None:
+            evo_s = f"Next: {companion.next_stage.name} (Lv.{companion.next_stage.min_level})"
+        else:
+            evo_s = "MAX EVOLUTION · SOVEREIGN"
+        xp_s = f"{companion.xp_total:,} XP (+{companion.xp_today:,}/d) · {evo_s}"
+        text(pen, xp_s, "caption", "secondary", rx, b3, maxw=rw)
+
+        # Line 4: Trophy Badges Strip + SparkCoins Wallet
+        rule_y = pad_top + sprite_sz + 6.0
+        hairline(pen, X0, X1, rule_y)
+        b4 = rule_y + 15.0
+        bx = X0
+        for badge in companion.badges:
+            bw = 17.5
+            if not isinstance(pen, _Measure):
+                pen.rrect(
+                    bx,
+                    b4 - 11.5,
+                    bw,
+                    15.0,
+                    4.0,
+                    "belkins_badge_on" if badge.unlocked else "belkins_badge_off",
+                )
+            text(
+                pen,
+                badge.icon,
+                "caption_med",
+                "label" if badge.unlocked else "secondary",
+                bx + bw / 2.0,
+                b4,
+                center=True,
+            )
+            bx += bw + 2.5
+
+        right_s = f"🪙 {coins_live:,} · Dex ▸"
+        text(pen, right_s, "caption_med", "belkins_gold_text", X1, b4, right=True, maxw=X1 - bx - 4.0)
+        return b4 + 8.0
+
+    tip_lines = [
+        f"Belkins Companion: {companion.stage.name} (Lv.{companion.level} · {companion.stage.title})",
+        f"Mood: {companion.mood_label} · XP: {companion.xp_total:,} (+{companion.xp_today:,} today)",
+        f"Trophies unlocked: {companion.unlocked_badges_count}/{len(companion.badges)}",
+        "Click to open Belkins Dex & Usage Dashboard",
+    ]
+    tip = "\n".join(tip_lines)
+    card.add(
+        draw_hero,
+        key="belkins-companion-hero",
+        tooltip=tip,
+        ax=tip.replace("\n", ". "),
+        action=act,
+        **ROW_HL,
+    )
+    return card
+
+
+# --------------------------------------------------------- Specs & Cards ---
+
+
+def _short_state(note: str, kind: str) -> tuple[str, str]:
+    clean = _rebrand_bswap(note)
+    head, _, tail = clean.partition(" — ")
+    if kind == "fetch-failing":
+        code = re.search(r"HTTP (\d{3})", clean)
+        days = re.search(r"for (\d+ days?)", clean)
+        state = f"HTTP {code.group(1)}" if code else "usage refused"
+        if days:
+            state += f" for {days.group(1)}"
+        polls = re.search(r"(\d[\d,]*) failed polls", clean)
+        return state, (f"{polls.group(1)} failed polls" if polls else "")
+    cause = tail.split(";")[0].strip() if tail else ""
+    return head.strip(), cause
+
+
+def _short_action(note: str, kind: str) -> list[tuple]:
+    clean = _rebrand_bswap(note)
+    cmds = re.findall(r"`([^`]+)`", clean) or re.findall(r"run: (bswap [a-z]+(?: \d+)?)", clean)
+    if kind == "fetch-failing":
+        segs: list[tuple] = [("Log in again, then ", "secondary", "secondary")]
+        if cmds:
+            segs.append((cmds[0], "code", "secondary", "code"))
+        rm = next((c for c in cmds if c.startswith("bswap remove")), None)
+        if rm:
+            segs += [("  or stop: ", "secondary", "secondary"), (rm, "code", "secondary", "code")]
+        return segs
+    if "re-login" in (kind + clean).lower():
+        segs = [("Log in with Claude Code, then ", "secondary", "secondary")]
+        if cmds:
+            segs.append((cmds[-1], "code", "secondary", "code"))
+        return segs
+    return [(clean.split(" — ")[-1][:80], "secondary", "secondary")]
+
+
+def _attention_spec(A: Any, snap: Any, actions: ThemeActions) -> dict[str, Any] | None:
+    items = []
+    by_slot = {r.slot: r for r in snap.accounts}
+    for vendor, ref in A.needs_attention_rows(snap):
+        if vendor == "claude":
+            row = by_slot.get(ref)
+            raw_note = snap.account_notes.get(ref, "")
+            note = _rebrand_bswap(raw_note)
+            kind = snap.account_note_kinds.get(ref, "")
+            state, cause = _short_state(note, kind)
+            age = (
+                f"{A._age_label(row.usage_age_seconds)} ago"
+                if row and row.usage_age_seconds is not None
+                else ""
+            )
+            name = A._display_name(row) if row else f"slot {ref}"
+            tip_text = f"{name} (slot {ref}) · {note}"
+            if raw_note and raw_note != note:
+                tip_text += f"\n{raw_note}"
+            items.append(
+                {
+                    "key": f"belkins-attn-claude-{ref}",
+                    "name": name,
+                    "provider": "Claude",
+                    "state": state,
+                    "state_role": "warn_text",
+                    "cause": cause,
+                    "age": age,
+                    "action_segs": _short_action(note, kind),
+                    "action": None,
+                    "tip": tip_text,
+                }
+            )
+        else:
+            row = ref
+            act = actions.codex_login_for(row)
+            login = getattr(A, "_codex_login", None)
+            detail = _rebrand_bswap(login.relogin_detail(row)) if login is not None else ""
+            if act is not None:
+                segs = [("Log in again…", "secondary_med", "belkins_flame_text")]
+            else:
+                segs = [(detail, "secondary", "secondary")] if detail else []
+            items.append(
+                {
+                    "key": f"belkins-attn-codex-{row.slot}",
+                    "name": A._quota_alias(row),
+                    "provider": "Codex",
+                    "state": row.attention_note,
+                    "state_role": "crit_text" if row.attention_kind == "crit" else "warn_text",
+                    "cause": detail,
+                    "age": f"{A._age_label(row.usage_age_seconds)} ago" if row.usage_age_seconds else "",
+                    "action_segs": segs,
+                    "action": act,
+                    "tip": "\n".join(
+                        x for x in (f"Codex {A._quota_head(row)} · {row.attention_note}", detail) if x
+                    ),
+                }
+            )
+    extras = [_rebrand_bswap(e) for e in actions.attention_extras if e]
+    if not items and not extras:
+        return None
+    return {"items": items, "extras": extras}
+
+
+def _claude_bars(A: Any, row: Any, now: float) -> list[tuple[str, float, str, bool]]:
+    dead = set(row.expired_windows or ())
+    out = []
+    for label, key, pct, raw in (
+        ("5h", "five_hour", row.five_hour_pct, row.five_hour_resets_at),
+        ("7d", "seven_day", row.seven_day_pct, row.seven_day_resets_at),
+    ):
+        if pct is not None:
+            out.append((label, pct, A._reset_mark_text(raw, now), key in dead))
+    for name, pct in row.scoped_windows:
+        if pct is not None:
+            raw = next((r for n, r in row.scoped_resets_at if n == name), None)
+            out.append((name, pct, A._reset_mark_text(raw, now), name in dead))
+    return out
+
+
+def _claude_tip(A: Any, row: Any, now: float, note: str = "", accounts: tuple = ()) -> str:
+    parts = [f"{A._display_name(row)} · slot #{row.slot} · {row.email}"]
+    plan = " · ".join(
+        x
+        for x in (
+            A._claude_plan_text(accounts, row),
+            row.org_name,
+            A._same_login_note(accounts, row),
+        )
+        if x
+    )
+    if plan:
+        parts.append(plan)
+    if note:
+        parts.append(_rebrand_bswap(note))
+    else:
+        for label, pct, mark, expired in _claude_bars(A, row, now):
+            parts.append(
+                f"{label} {format_pct(pct)}{' (window ended)' if expired else ''} {mark}".strip()
+            )
+    if row.usage_is_stale:
+        parts.append(f"reading {A._age_label(row.usage_age_seconds)} old")
+    if row.disabled:
+        parts.append("disabled (bswap disable): never auto-selected, still polled")
+    parts.append("active login" if row.is_active else f"click to switch (bswap {row.slot})")
+    return "\n".join(parts)
+
+
+def _claude_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) -> dict[str, Any] | None:
+    if not snap.accounts:
+        return None
+    models = tuple(snap.autoswitch_models or ())
+    notes = snap.account_notes
+    active = snap.active
+    room = A._claude_room(snap)
+    right = []
+    if room:
+        right.append(f"{room[0]}/{room[1]} room")
+    if snap.autoswitch_enabled:
+        right.append("⚡ auto")
+    if snap.settings.get("scoped_fleet_line_enabled", True):
+        scoped = dict.fromkeys(n for r in snap.accounts for n, _ in r.scoped_windows)
+        right += [
+            h
+            for h in (
+                A._scoped_fleet_heading(snap.accounts, name=n, now=now, notes=notes) for n in scoped
+            )
+            if h
+        ]
+    hero = None
+    accounts = tuple(snap.accounts)
+    if active is not None:
+        note = _rebrand_bswap(notes.get(active.slot, ""))
+        binding = None if note else A._binding_window(active, models)
+        captions = []
+        if active.usage_is_stale and not note:
+            captions.append((f"reading {A._age_label(active.usage_age_seconds)} old", "dim"))
+        spend = A._spend_of(active)
+        if spend:
+            used, limit, cur = spend
+            sp = A._spend_pct(active)
+            captions.append(
+                (
+                    f"extra usage {A._money(used, cur)} of {A._money(limit, cur)}",
+                    R.severity(sp) if sp else "dim",
+                )
+            )
+        hero = {
+            "name": A._display_name(active),
+            "slot": active.slot,
+            "plan": A._claude_plan_text(accounts, active),
+            "sub": active.email,
+            "big": (format_pct(binding[1]), binding[0], R.severity(binding[1])) if binding else None,
+            "status": (
+                _rebrand_bswap(
+                    A._account_status_note(
+                        active, note, snap.account_note_kinds.get(active.slot, "")
+                    )
+                ),
+                "warn",
+            )
+            if note
+            else None,
+            "bars": [] if note else _claude_bars(A, active, now),
+            "captions": captions,
+            "tip": _claude_tip(A, active, now, note, accounts),
+            "action": None,
+        }
+    targets = [r for r in A._switch_targets(snap.accounts) if r.slot not in notes]
+    nxt = next((r for r in targets if not r.disabled), None)
+    rows = []
+    for r in targets:
+        binding = A._binding_window(r, models)
+        caps = []
+        if r is nxt:
+            caps.append(("next ⚡", "tag"))
+        sub = A._subscription_caption(accounts, r)
+        if sub:
+            caps.append((sub, "dim"))
+        caps += [
+            (mark, "dim")
+            for mark in A._window_reset_marks(r, now, skip=binding[0] if binding else None)
+        ]
+        if r.disabled:
+            caps.append(("disabled · bswap enable", "dim"))
+        if r.usage_is_stale:
+            caps.append((f"{A._age_label(r.usage_age_seconds)} old", "dim"))
+        rows.append(
+            {
+                "key": f"belkins-claude-{r.slot}",
+                "slot": f"#{r.slot}",
+                "name": A._display_name(r),
+                "plan": A.plan_label(r.plan_type),
+                "label": binding[0] if binding else "",
+                "pct": binding[1] if binding else None,
+                "sev": R.severity(binding[1]) if binding else "dim",
+                "reset": A._reset_mark_text(A._window_reset(r, binding[0]), now) if binding else "",
+                "withheld": None,
+                "captions": caps,
+                "tip": _claude_tip(A, r, now, accounts=accounts),
+                "action": (lambda slot=r.slot: actions.switch_to(slot)),
+            }
+        )
+    return {
+        "title": "Claude Party",
+        "icon": "bolt.fill",
+        "rule": "belkins_claude_rule",
+        "right": " · ".join(right),
+        "right_parts": right,
+        "hero": hero,
+        "rows": rows,
+        "key": "claude",
+    }
+
+
+def _codex_caps(A: Any, row: Any) -> list[tuple[str, str]]:
+    caps = []
+    if row.attention_note and row.attention_kind == "crit":
+        caps.append((row.attention_note, "crit"))
+    for line in row.info_notes or ():
+        if (line.startswith("↺") and "usable now" in line) or re.search(r"\bback\b", line):
+            caps.append((line, "good"))
+        elif line.startswith(A._PACE_NOTE_PREFIX):
+            caps.append((line, "warn"))
+        else:
+            caps.append((line, "dim"))
+    if row.usage_is_stale:
+        caps.append((f"{A._age_label(row.usage_age_seconds)} old", "dim"))
+    if row.disabled:
+        caps.append(("disabled", "dim"))
+    return caps
+
+
+def _codex_tip(A: Any, row: Any, now: float) -> str:
+    lines = [f"Codex {A._quota_head(row)} · {row.email}"]
+    win = A._plan_window(row)
+    if win and win[1] is not None:
+        lines.append(f"{win[0]} {format_pct(win[1])} {A._quota_reset_mark(row, now)}")
+    note, _ = A._quota_note(row)
+    if note:
+        lines.append(note)
+    lines += list(row.info_notes or ())
+    lines.append("active in ~/.codex" if row.is_active else "switch via bswap codex")
+    return "\n".join(lines)
+
+
+def _codex_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) -> dict[str, Any] | None:
+    rows_all = A._visible_quota_rows_of(snap)
+    live = [r for r in rows_all if r.vendor != A.VENDOR_CLAUDE and r.slot < 0]
+    if not live:
+        return None
+    parts = (
+        A._codex_fleet_parts(rows_all, now=now)
+        if snap.settings.get("codex_fleet_line_enabled", True)
+        else None
+    )
+    right = []
+    if parts:
+        right.append(f"{parts.room}/{parts.total} room")
+        mark = R.reset_mark(parts.next_at, now)
+        if mark:
+            right.append(f"next {mark}" + (f" ({parts.next_alias})" if parts.next_alias else ""))
+        if parts.resets:
+            right.append(parts.resets)
+    active = next((r for r in live if r.is_active), None)
+    best_of = getattr(A, "best_codex_row", None)
+    best = best_of(live) if best_of is not None else None
+    hero = None
+    if active is not None:
+        win = A._plan_window(active)
+        alarm = A._quota_alarm(active)
+        known = bool(win) and win[1] is not None and not alarm
+        act = actions.codex_login_for(active)
+        caps = _codex_caps(A, active)
+        if act is not None:
+            caps.append(("Log in again…", "accent"))
+        hero = {
+            "name": A._quota_alias(active),
+            "plan": A.plan_label(active.plan_type),
+            "slot": None,
+            "sub": active.email,
+            "big": (format_pct(win[1]), win[0], "dim" if win[2] else R.severity(win[1]))
+            if known
+            else None,
+            "status": (active.attention_note, "warn") if alarm else None,
+            "bars": [(win[0], win[1], A._quota_reset_mark(active, now), win[2])] if known else [],
+            "captions": caps,
+            "tip": _codex_tip(A, active, now),
+            "action": act,
+        }
+    rows = []
+    for r in live:
+        if r is active or A._quota_alarm(r):
+            continue
+        win = A._plan_window(r)
+        act = actions.codex_login_for(r)
+        caps = _codex_caps(A, r)
+        if r is best:
+            caps.insert(0, ("best ⚡", "tag"))
+        if act is not None:
+            caps.append(("Log in again…", "accent"))
+        rows.append(
+            {
+                "key": f"belkins-codex-{r.slot}",
+                "slot": "",
+                "name": A._quota_alias(r),
+                "plan": A.plan_label(r.plan_type),
+                "label": "",
+                "pct": win[1] if win else None,
+                "sev": "dim" if (not win or win[2]) else R.severity(win[1]),
+                "reset": A._quota_reset_mark(r, now) if win else "",
+                "withheld": None,
+                "captions": caps,
+                "tip": _codex_tip(A, r, now),
+                "action": act,
+            }
+        )
+    return {
+        "title": "Codex Party",
+        "icon": "terminal.fill",
+        "rule": "belkins_codex_rule",
+        "right": " · ".join(right),
+        "right_parts": right,
+        "hero": hero,
+        "rows": rows,
+        "key": "codex",
+    }
+
+
+# ---------------------------------------------------------------- painters ---
+
+
+def _attn_head(count: int) -> Callable[[Any, float], float]:
+    def draw(pen: Any, y0: float) -> float:
+        base = y0 + HEAD_BASE
+        symbol(pen, "exclamationmark.triangle.fill", X0, base - 4.5, 12, "belkins_warn_fill")
+        text(pen, "Needs attention", "title", "label", X0 + 19, base)
+        text(pen, str(count), "num_bar", "secondary", X1, base, right=True)
+        return base + 9
+    return draw
+
+
+def _attn_item(it: dict[str, Any]) -> Callable[[Any, float], float]:
+    chevron = it["action"] is not None
+
+    def draw(pen: Any, y0: float) -> float:
+        b1 = y0 + 16
+        wname = text(pen, it["name"], "primary_med", "label", X0, b1, maxw=120)
+        age_w = text_w(pen, it["age"], "secondary") if it["age"] else 0.0
+        if chevron:
+            chev_x = X1 - 6
+            age_r = chev_x - 8
+            symbol(pen, "chevron.right", chev_x, b1 - 4, 9, "secondary")
+        else:
+            age_r = X1
+        text(pen, it["age"], "secondary", "secondary", age_r, b1, right=True)
+        sx = X0 + wname + 6
+        text(pen, it["state"], "primary", it["state_role"], sx, b1, maxw=age_r - age_w - 8 - sx)
+        if not it["action_segs"]:
+            return b1 + ROW_END
+        b2 = b1 + 17
+        segments(pen, it["action_segs"], X0, b2, W_INNER - (14 if chevron else 0))
+        return b2 + ROW_END
+
+    return draw
+
+
+def _word_lines(pen: Any, s: str, fk: str, maxw: float, most: int) -> list[str]:
+    if most <= 1:
+        return [s]
+    words, lines, cur = s.split(), [], ""
+    for i, word in enumerate(words):
+        trial = f"{cur} {word}" if cur else word
+        if cur and text_w(pen, trial, fk) > maxw:
+            lines.append(cur)
+            if len(lines) == most - 1:
+                return lines + [" ".join(words[i:])]
+            cur = word
+        else:
+            cur = trial
+    return lines + [cur] if cur else lines
+
+
+def _attn_extra(line: str) -> Callable[[Any, float], float]:
+    def draw(pen: Any, y0: float) -> float:
+        b = y0 + 16
+        for i, part in enumerate(_word_lines(pen, line.split("\n")[0], "primary", W_INNER, 3)):
+            if i:
+                b += 16.0
+            text(pen, part, "primary", "label", X0, b, maxw=W_INNER)
+        return b + ROW_END
+
+    return draw
+
+
+def _gap(h: float) -> Callable[[Any, float], float]:
+    return lambda pen, y0: y0 + h
+
+
+def _hair() -> Callable[[Any, float], float]:
+    def draw(pen: Any, y0: float) -> float:
+        hairline(pen, X0, X1, y0 + 2)
+        return y0 + 3
+
+    return draw
+
+
+def _card_head(spec: dict[str, Any]) -> Callable[[Any, float], float]:
+    def draw(pen: Any, y0: float) -> float:
+        base = y0 + HEAD_BASE
+        if spec.get("icon"):
+            symbol(pen, spec["icon"], X0, base - 4.0, 11.5, spec.get("rule", "belkins_flame_text"), "semibold")
+        tx = X0 + (17 if spec.get("icon") else 0)
+        tw = text(pen, spec["title"], "title", "label", tx, base)
+        room = X1 - (tx + tw + 10)
+        parts = spec.get("right_parts") or []
+        full = spec["right"]
+        if len(parts) < 2 or text_w(pen, full, "secondary") <= room:
+            text(pen, full, "secondary", "secondary", X1, base, maxw=room, right=True)
+            return base + HEAD_AFTER
+        text(pen, parts[0], "secondary", "secondary", X1, base, maxw=room, right=True)
+        cap = base + 15
+        text(pen, " · ".join(parts[1:]), "secondary", "secondary", tx, cap, maxw=X1 - tx)
+        return cap + HEAD_AFTER
+
+    return draw
+
+
+def _hero(hero: dict[str, Any]) -> Callable[[Any, float], float]:
+    from .. import render as R
+
+    def draw(pen: Any, y0: float) -> float:
+        b1 = y0 + 13
+        b2 = b1 + 17
+        big = hero["big"]
+        bw = 0.0
+        if big:
+            pct, _label, sev = big
+            bw = text(
+                pen,
+                pct,
+                "hero_big",
+                "secondary" if sev == "dim" else "label",
+                X1,
+                b1 + 12,
+                right=True,
+            )
+        name_max = X1 - bw - 12 - X0 - 12
+        symbol(pen, "star.fill", X0, b1 - 4.5, 9, "belkins_flame_rule")
+        plan = hero.get("plan") or ""
+        pw = text_w(pen, plan, "secondary_med") + 6 if plan else 0.0
+        nw = text(
+            pen,
+            hero["name"],
+            "hero_name",
+            "label",
+            X0 + 13,
+            b1,
+            maxw=max(name_max - pw, name_max * 0.45),
+        )
+        if plan:
+            text(
+                pen,
+                plan,
+                "secondary_med",
+                "secondary",
+                X0 + 13 + nw + 6,
+                b1,
+                maxw=name_max - nw - 6,
+            )
+        sub = hero["sub"]
+        parts_sub = ["Active"]
+        if hero.get("slot") is not None:
+            parts_sub.append(f"slot #{hero['slot']}")
+        if sub:
+            parts_sub.append(sub)
+        sub = " · ".join(parts_sub)
+        text(pen, sub, "caption", "secondary", X0 + 13, b2, maxw=name_max)
+        ink = b2 + INK
+        if hero["status"]:
+            s, kind = hero["status"]
+            b = ink + 16
+            text(pen, s, "primary_med", SEV_TEXT.get(kind, kind), X0 + 13, b, maxw=X1 - X0 - 13)
+            ink = b + INK
+        bx = HX + WIN_LABEL_W
+        b = ink + 17 - WIN_STEP
+        for label, pct, mark, expired in hero["bars"]:
+            b += WIN_STEP
+            sev = R.severity(pct)
+            text(pen, label, "secondary_med", "secondary", HX, b, maxw=WIN_LABEL_W - 6)
+            segmented_bar(
+                pen,
+                bx,
+                b - 4,
+                COL_PCT_R - COL_PCT_W - 6 - bx,
+                pct,
+                sev,
+                h=6.0,
+                cells=10,
+                expired=expired,
+            )
+            pct_role = "secondary" if expired else (SEV_TEXT[sev] if sev != "ok" else "label")
+            text(pen, format_pct(pct), "num_bar", pct_role, COL_PCT_R, b, right=True)
+            text(pen, "↺ ended" if expired else mark, "num_small", "secondary", X1, b, right=True)
+            ink = b + INK
+        chips = [c for c in hero["captions"] if c[1] == "good" and c[0].startswith("↺")]
+        rest = [c for c in hero["captions"] if c not in chips]
+        for cap, _kind in chips:
+            y = ink + 8
+            pen.rrect(HX - 4, y, X1 - HX + 4, 22, 6, "belkins_good_pill")
+            text(pen, cap, "secondary_med", "good_text", HX + 4, y + 15, maxw=X1 - HX - 8)
+            ink = y + 22
+        if rest:
+            cb_y = ink + 14
+            ink = cb_y + CAP_STEP * (flow(pen, rest, HX, cb_y, X1 - HX) - 1) + INK
+        return ink + PART_END
+
+    return draw
+
+
+def _row(r: dict[str, Any]) -> Callable[[Any, float], float]:
+    def draw(pen: Any, y0: float) -> float:
+        x = X0 + 18 if r["slot"] else X0 + 12
+        label_w = text_w(pen, r["label"], "caption") if r["label"] else 0.0
+        name_max = (COL_LABEL_R - label_w - 8 - x) if r["label"] else (COL_BAR_X - 12 - x)
+        caps = list(r["captions"])
+        plan_inline = bool(r["plan"]) and (
+            text_w(pen, r["name"], "primary_med") + 5 + text_w(pen, r["plan"], "caption") <= name_max
+        )
+        if r["plan"] and not plan_inline:
+            caps.insert(0, (r["plan"], "dim"))
+        b = y0 + ROW_BASE
+        if r["slot"]:
+            text(pen, r["slot"], "slot", "belkins_flame_text", X0 + 14, b, right=True)
+        nw = text(pen, r["name"], "primary_med", "label", x, b, maxw=name_max)
+        if plan_inline:
+            text(pen, r["plan"], "caption", "secondary", x + nw + 5, b)
+        if r.get("withheld"):
+            note, kind = r["withheld"]
+            text(
+                pen,
+                "⚠ " + note,
+                "secondary_med",
+                "crit_text" if kind == "crit" else "warn_text",
+                X1,
+                b,
+                right=True,
+                maxw=X1 - COL_BAR_X,
+            )
+        else:
+            if r["label"]:
+                text(pen, r["label"], "caption", "secondary", COL_LABEL_R, b, right=True)
+            segmented_bar(pen, COL_BAR_X, b - 4, COL_BAR_W, r["pct"], r["sev"], h=5.0, cells=6)
+            if r["pct"] is not None:
+                text(
+                    pen,
+                    format_pct(r["pct"]),
+                    "num",
+                    SEV_TEXT[r["sev"]] if r["sev"] != "ok" else "label",
+                    COL_PCT_R,
+                    b,
+                    right=True,
+                )
+            text(pen, r["reset"], "num_small", "secondary", X1, b, right=True)
+        if not caps:
+            return b + ROW_END
+        lines = flow(pen, caps, x, b + ROW_CAP, X1 - x)
+        return b + ROW_CAP + CAP_STEP * (lines - 1) + ROW_END
+
+    return draw
+
+
+def _ax(tip: str) -> str:
+    return tip.replace("\n", ". ")
+
+
+def _provider_card(spec: dict[str, Any]) -> _Card:
+    card = _Card("belkins_card", "belkins_card_edge", rule=spec.get("rule"))
+    key = spec["key"]
+    card.add(
+        _card_head(spec),
+        key=f"belkins-{key}-head",
+        ax=f"{spec['title']}. {spec['right']}".strip(". "),
+        tooltip=spec["right"],
+    )
+    hero = spec["hero"]
+    if hero:
+        card.add(
+            _hero(hero),
+            key=f"belkins-{key}-active",
+            tooltip=hero["tip"],
+            ax=_ax(hero["tip"]),
+            action=hero["action"],
+            **ROW_HL,
+        )
+    if spec["rows"]:
+        card.add(_hair(), key=f"belkins-{key}-rule")
+        for r in spec["rows"]:
+            card.add(
+                _row(r),
+                key=r["key"],
+                tooltip=r["tip"],
+                ax=_ax(r["tip"]),
+                action=r["action"],
+                **ROW_HL,
+            )
+    card.add(_gap(6), key=f"belkins-{key}-foot")
+    return card
+
+
+def _attention_card(spec: dict[str, Any]) -> _Card:
+    card = _Card("belkins_card", "belkins_card_edge", rule="belkins_attn_rule")
+    count = len(spec["items"]) + len(spec["extras"])
+    card.add(_attn_head(count), key="belkins-attn-head", ax=f"Needs attention: {count}")
+    for it in spec["items"]:
+        opens = "Logs in again." if it["action"] is not None else ""
+        label = " ".join(
+            x
+            for x in (
+                f"{it['provider']} {it['name']}: {it['state']}.",
+                f"{it['cause']}." if it["cause"] else "",
+                f"Last seen {it['age']}." if it["age"] else "",
+                opens,
+            )
+            if x
+        )
+        card.add(
+            _attn_item(it),
+            key=it["key"],
+            tooltip=it["tip"],
+            ax=label,
+            action=it["action"],
+            **ROW_HL,
+        )
+    for i, line in enumerate(spec["extras"]):
+        card.add(_attn_extra(line), key=f"belkins-attn-extra-{i}", tooltip=line, ax=line)
+    card.add(_gap(6), key="belkins-attn-foot")
+    return card
+
+
+# ------------------------------------------ Interactive Tabs, Dex & Shop ---
+
+
+def _tab_bar_block(claude_count: int, codex_count: int) -> Block:
+    """Interactive 5-tab bar (`⚡ Party | Claude | Codex | 🐾 Dex | 🛒 Mart`) that switches in-place."""
+    bar_w = W - 2 * CARD_X
+    seg_w = bar_w / float(len(TABS))
+    bar_h = 28.0
+    total_h = 34.0
+
+    def paint(pen: Pen, w: float, h: float) -> None:
+        y = 3.0
+        pen.rrect(CARD_X, y, bar_w, bar_h, 8.0, "belkins_card", stroke="belkins_card_edge")
+        for idx, (tab_id, label) in enumerate(TABS):
+            tx = CARD_X + idx * seg_w
+            is_act = _ACTIVE_TAB == tab_id
+            if is_act:
+                pen.rrect(
+                    tx + 2.0,
+                    y + 2.0,
+                    seg_w - 4.0,
+                    bar_h - 4.0,
+                    6.0,
+                    "belkins_tab_active",
+                    stroke="belkins_tab_edge",
+                )
+            shown = label
+            if tab_id == "claude" and claude_count:
+                shown = f"Claude {claude_count}"
+            elif tab_id == "codex" and codex_count:
+                shown = f"Codex {codex_count}"
+            text(
+                pen,
+                shown,
+                "caption_med" if is_act else "caption",
+                "belkins_flame_text" if is_act else "secondary",
+                tx + seg_w / 2.0,
+                y + 18.0,
+                center=True,
+                maxw=seg_w - 4.0,
+            )
+
+    def on_click_x(click_x: float) -> None:
+        rel = max(0.0, min(bar_w - 1.0, click_x - CARD_X))
+        idx = int(rel // seg_w)
+        if 0 <= idx < len(TABS):
+            set_active_tab(TABS[idx][0])
+
+    def cycle_tab() -> None:
+        ids = [t[0] for t in TABS]
+        cur = ids.index(_ACTIVE_TAB) if _ACTIVE_TAB in ids else 0
+        set_active_tab(ids[(cur + 1) % len(ids)])
+
+    return Block(
+        total_h,
+        paint,
+        key="belkins-tab-bar",
+        tooltip="Click a tab to switch between Party Overview, Claude Fleet, Codex Fleet, Companion Dex, and Belkins Mart",
+        ax="Belkins Tabs: Party, Claude, Codex, Dex, Mart",
+        action=cycle_tab,
+        on_click_x=on_click_x,
+        keep_open=True,
+        hl_inset=CARD_X,
+        hl_vinset=3.0,
+        hl_radius=8.0,
+    )
+
+
+def _party_overview_card(
+    claude_spec: dict[str, Any] | None,
+    codex_spec: dict[str, Any] | None,
+) -> _Card | None:
+    """Compact Overview card for the default `⚡ Party` tab — shows only active heroes + quick tab links."""
+    if not claude_spec and not codex_spec:
+        return None
+    card = _Card("belkins_card", "belkins_card_edge", rule="belkins_flame_rule")
+
+    if claude_spec:
+        card.add(
+            _card_head(claude_spec),
+            key="belkins-party-claude-head",
+            ax=f"{claude_spec['title']}. {claude_spec['right']}".strip(". "),
+            tooltip=claude_spec["right"],
+        )
+        if claude_spec["hero"]:
+            hero = claude_spec["hero"]
+            card.add(
+                _hero(hero),
+                key="belkins-party-claude-active",
+                tooltip=hero["tip"],
+                ax=_ax(hero["tip"]),
+                action=hero["action"],
+                **ROW_HL,
+            )
+        standby_n = len(claude_spec.get("rows") or ())
+        if standby_n > 0:
+            def draw_claude_more(pen: Any, y0: float, n: int = standby_n) -> float:
+                b = y0 + 14.0
+                text(
+                    pen,
+                    f"▸ View all {n} standby Claude account{'s' if n != 1 else ''} (Claude tab)",
+                    "caption_med",
+                    "belkins_flame_text",
+                    HX,
+                    b,
+                    maxw=X1 - HX,
+                )
+                return b + 8.0
+
+            card.add(
+                draw_claude_more,
+                key="belkins-party-claude-more",
+                tooltip="Click to open the Claude tab and view all standby accounts",
+                ax=f"View all {standby_n} standby Claude accounts",
+                action=lambda: set_active_tab("claude"),
+                keep_open=True,
+                **ROW_HL,
+            )
+
+    if claude_spec and codex_spec:
+        card.add(_hair(), key="belkins-party-sep")
+
+    if codex_spec:
+        card.add(
+            _card_head(codex_spec),
+            key="belkins-party-codex-head",
+            ax=f"{codex_spec['title']}. {codex_spec['right']}".strip(". "),
+            tooltip=codex_spec["right"],
+        )
+        if codex_spec["hero"]:
+            hero = codex_spec["hero"]
+            card.add(
+                _hero(hero),
+                key="belkins-party-codex-active",
+                tooltip=hero["tip"],
+                ax=_ax(hero["tip"]),
+                action=hero["action"],
+                **ROW_HL,
+            )
+        standby_c = len(codex_spec.get("rows") or ())
+        if standby_c > 0:
+            def draw_codex_more(pen: Any, y0: float, n: int = standby_c) -> float:
+                b = y0 + 14.0
+                text(
+                    pen,
+                    f"▸ View all {n} standby Codex account{'s' if n != 1 else ''} (Codex tab)",
+                    "caption_med",
+                    "belkins_flame_text",
+                    HX,
+                    b,
+                    maxw=X1 - HX,
+                )
+                return b + 8.0
+
+            card.add(
+                draw_codex_more,
+                key="belkins-party-codex-more",
+                tooltip="Click to open the Codex tab and view all standby Codex accounts",
+                ax=f"View all {standby_c} standby Codex accounts",
+                action=lambda: set_active_tab("codex"),
+                keep_open=True,
+                **ROW_HL,
+            )
+
+    card.add(_gap(6), key="belkins-party-foot")
+    return card
+
+
+def _dex_card(companion: CompanionState) -> _Card:
+    """`🐾 Dex` Tab Card: 5-Stage Evolution Pokedex + 8 Belkins Trophy Badges."""
+    card = _Card("belkins_card", "belkins_card_edge", rule="belkins_flame_rule")
+    head_spec = {
+        "icon": "sparkles",
+        "rule": "belkins_flame_rule",
+        "title": "Evolution Pokedex",
+        "right": f"Stage {companion.stage.stage}/5 · Lv.{companion.level}",
+        "right_parts": [f"Stage {companion.stage.stage}/5", f"Lv.{companion.level}"],
+    }
+    card.add(_card_head(head_spec), key="belkins-dex-head", ax="Evolution Pokedex")
+
+    for st in EVOLUTION_LINE:
+        is_cur = st.stage == companion.stage.stage
+        unlocked = companion.level >= st.min_level
+
+        def draw_stage(
+            pen: Any,
+            y0: float,
+            stage: EvolutionStage = st,
+            cur: bool = is_cur,
+            unl: bool = unlocked,
+        ) -> float:
+            top = y0 + 4.0
+            draw_pixel_companion(pen, stage, X0, top, 28.0, mood_key="overdrive" if cur else "locked_in")
+            bx = X0 + 36.0
+            b1 = top + 12.0
+            b2 = top + 25.0
+            tag_txt = "ACTIVE" if cur else ("UNLOCKED" if unl else f"Lv.{stage.min_level}")
+            tag_role = "belkins_flame_text" if cur else ("good_text" if unl else "secondary")
+            tag_bg = "belkins_flame_pill" if cur else ("belkins_good_pill" if unl else "belkins_badge_off")
+            tw_pill = _pill_w(pen, tag_txt)
+            pen.pill(tag_txt, X1 - tw_pill, b1 - 0.5, F["tag"][0], role=tag_role, bg=tag_bg, weight="semibold")
+            name_w = text(pen, f"{stage.stage}. {stage.name}", "primary_med", "label" if unl else "secondary", bx, b1)
+            text(pen, f"· {stage.title}", "caption", "secondary", bx + name_w + 5.0, b1, maxw=X1 - tw_pill - bx - name_w - 10.0)
+            text(pen, stage.lore, "caption", "secondary", bx, b2, maxw=X1 - bx)
+            return top + 32.0
+
+        card.add(
+            draw_stage,
+            key=f"belkins-dex-stage-{st.stage}",
+            ax=f"Stage {st.stage} {st.name}: {st.title}. {st.lore}",
+            tooltip=f"{st.name} (Lv.{st.min_level} · {st.title})\n{st.lore}",
+        )
+
+    card.add(_hair(), key="belkins-dex-sep")
+    trophy_head = {
+        "icon": "trophy.fill",
+        "rule": "belkins_gold_rule",
+        "title": "Belkins Trophies",
+        "right": f"{companion.unlocked_badges_count}/{len(companion.badges)} unlocked",
+        "right_parts": [f"{companion.unlocked_badges_count}/{len(companion.badges)} unlocked"],
+    }
+    card.add(_card_head(trophy_head), key="belkins-dex-trophy-head", ax="Belkins Trophies")
+
+    for badge in companion.badges:
+        def draw_badge(pen: Any, y0: float, b_item: Any = badge) -> float:
+            b1 = y0 + 14.0
+            b2 = y0 + 27.0
+            status = "✓" if b_item.unlocked else b_item.progress_text
+            st_role = "good_text" if b_item.unlocked else "secondary"
+            sw = text(pen, status, "caption_med", st_role, X1, b1, right=True)
+            text(
+                pen,
+                f"{b_item.icon} {b_item.name}",
+                "primary_med",
+                "label" if b_item.unlocked else "secondary",
+                X0,
+                b1,
+                maxw=X1 - X0 - sw - 8.0,
+            )
+            text(pen, b_item.description, "caption", "secondary", X0 + 18.0, b2, maxw=X1 - X0 - 18.0)
+            return b2 + 6.0
+
+        card.add(
+            draw_badge,
+            key=f"belkins-dex-badge-{badge.slug}",
+            ax=f"{badge.name}: {badge.description} ({badge.progress_text})",
+            tooltip=f"{badge.icon} {badge.name} — {badge.description}\nProgress: {badge.progress_text}",
+        )
+
+    card.add(_gap(6), key="belkins-dex-foot")
+    return card
+
+
+def _shop_card(companion: CompanionState) -> _Card:
+    """`🛒 Mart` Tab Card: Belkins Poké Mart where SparkCoins (`🪙`) buy & equip items live!"""
+    card = _Card("belkins_card", "belkins_card_edge", rule="belkins_gold_rule")
+
+    def draw_shop_head(pen: Any, y0: float) -> float:
+        owned_live, _ = load_shop_save()
+        spent_live = sum(it.price for it in SHOP_CATALOG if it.slug in owned_live)
+        coins_live = max(0, companion.coins_earned - spent_live)
+        base = y0 + HEAD_BASE
+        symbol(pen, "cart.fill", X0, base - 4.0, 11.5, "belkins_gold_rule", "semibold")
+        tx = X0 + 18.0
+        text(pen, "Belkins Poké Mart", "title", "label", tx, base)
+        wallet = f"🪙 {coins_live:,} Coins"
+        pw = _pill_w(pen, wallet)
+        pen.pill(wallet, X1 - pw, base - 0.5, F["tag"][0], role="belkins_gold_text", bg="belkins_gold_pill", weight="semibold")
+        b2 = base + 15.0
+        sub = _LAST_SHOP_NOTE or "Earn 🪙 from token burn & trophies. Click any item to buy or equip:"
+        text(pen, sub, "caption", "belkins_flame_text" if _LAST_SHOP_NOTE else "secondary", X0, b2, maxw=W_INNER)
+        return b2 + 8.0
+
+    card.add(
+        draw_shop_head,
+        key="belkins-shop-head",
+        ax=f"Belkins Poke Mart. {companion.coins_available} Coins available.",
+        tooltip="Earn SparkCoins from token burn (+8/1M tok, +15/$1) and Trophy Badges (+200/badge)",
+    )
+    card.add(_hair(), key="belkins-shop-rule")
+
+    for spec in SHOP_CATALOG:
+        def draw_item(pen: Any, y0: float, item_spec: Any = spec) -> float:
+            owned_live, eq_live = load_shop_save()
+            spent_live = sum(it.price for it in SHOP_CATALOG if it.slug in owned_live)
+            coins_live = max(0, companion.coins_earned - spent_live)
+            is_owned = item_spec.slug in owned_live
+            is_eq = item_spec.slug in eq_live
+
+            b1 = y0 + 15.0
+            b2 = y0 + 28.0
+            if is_eq:
+                btn_txt, btn_role, btn_bg = "EQUIPPED ✓", "good_text", "belkins_good_pill"
+            elif is_owned:
+                btn_txt, btn_role, btn_bg = "EQUIP", "belkins_flame_text", "belkins_flame_pill"
+            elif coins_live >= item_spec.price:
+                btn_txt, btn_role, btn_bg = f"BUY · 🪙 {item_spec.price}", "belkins_gold_text", "belkins_gold_pill"
+            else:
+                btn_txt, btn_role, btn_bg = f"🔒 🪙 {item_spec.price}", "secondary", "belkins_badge_off"
+
+            bw = _pill_w(pen, btn_txt)
+            pen.pill(btn_txt, X1 - bw, b1 - 0.5, F["tag"][0], role=btn_role, bg=btn_bg, weight="semibold")
+            text(
+                pen,
+                f"{item_spec.icon} {item_spec.name}",
+                "primary_med",
+                "label",
+                X0,
+                b1,
+                maxw=X1 - X0 - bw - 8.0,
+            )
+            text(pen, item_spec.description, "caption", "secondary", X0 + 18.0, b2, maxw=X1 - X0 - 18.0)
+            return b2 + 7.0
+
+        def on_click_item(slug: str = spec.slug) -> None:
+            global _LAST_SHOP_NOTE
+            _ok, msg = toggle_or_buy_shop_item(slug, companion.coins_earned)
+            _LAST_SHOP_NOTE = msg
+
+        card.add(
+            draw_item,
+            key=f"belkins-shop-item-{spec.slug}",
+            ax=f"{spec.name} ({spec.price} Coins): {spec.description}",
+            tooltip=f"{spec.icon} {spec.name} ({spec.price} SparkCoins)\n{spec.description}\nClick to buy or toggle equip",
+            action=on_click_item,
+            keep_open=True,
+            **ROW_HL,
+        )
+
+    card.add(_gap(6), key="belkins-shop-foot")
+    return card
+
+
+def _tag_blocks(blocks: list[Block], tab_id: str) -> list[Block]:
+    for b in blocks:
+        b.tab = tab_id
+        b.is_visible = lambda t=tab_id: _ACTIVE_TAB == t
+    return blocks
+
+
+# ------------------------------------------------------------------ build ---
+
+
+def build(snapshot: Any, now: float, actions: ThemeActions | None = None) -> list[Block]:
+    """Blocks for the top of the Belkins dropdown; the app appends the native tail."""
+    from .. import app as A
+    from .. import render as R
+
+    _ensure_roles()
+    acts = actions or ThemeActions()
+    companion = companion_from_snapshot(snapshot)
+
+    # 1. Always-visible Companion Hero + 5-Tab Bar
+    hero_card = _companion_card(snapshot, companion, acts)
+    blocks: list[Block] = hero_card.blocks(TOP_GAP, 4.0)
+
+    claude_sp = _claude_spec(A, R, snapshot, now, acts)
+    codex_sp = _codex_spec(A, R, snapshot, now, acts)
+    claude_cnt = len(getattr(snapshot, "accounts", ()) or ())
+    codex_cnt = len([r for r in A._visible_quota_rows_of(snapshot) if r.vendor != A.VENDOR_CLAUDE and r.slot < 0])
+    blocks.append(_tab_bar_block(claude_cnt, codex_cnt))
+
+    # 2. Tab "party": Needs Attention + Compact Active Party Overview
+    attn = _attention_spec(A, snapshot, acts)
+    party_cards: list[_Card] = []
+    if attn:
+        party_cards.append(_attention_card(attn))
+    overview = _party_overview_card(claude_sp, codex_sp)
+    if overview:
+        party_cards.append(overview)
+    for i, c in enumerate(party_cards):
+        blocks += _tag_blocks(c.blocks(4.0 if i == 0 else GAP, TAIL_GAP if i == len(party_cards) - 1 else 0.0), "party")
+
+    # 3. Tab "claude": Full Claude Fleet
+    if claude_sp:
+        blocks += _tag_blocks(_provider_card(claude_sp).blocks(4.0, TAIL_GAP), "claude")
+
+    # 4. Tab "codex": Full Codex Fleet
+    if codex_sp:
+        blocks += _tag_blocks(_provider_card(codex_sp).blocks(4.0, TAIL_GAP), "codex")
+
+    # 5. Tab "dex": 5-Stage Evolution Pokedex + 8 Trophy Badges
+    blocks += _tag_blocks(_dex_card(companion).blocks(4.0, TAIL_GAP), "dex")
+
+    # 6. Tab "shop": Belkins Poké Mart (SparkCoins & Cosmetics)
+    blocks += _tag_blocks(_shop_card(companion).blocks(4.0, TAIL_GAP), "shop")
+
+    return blocks

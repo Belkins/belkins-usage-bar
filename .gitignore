@@ -41,3 +41,4 @@ attribution.json
 # copy of rollups.json and the scan states - i.e. real spend and real file
 # paths - so the directory is as un-committable as the originals above.
 backup-state-*/
+belkins_shop.json

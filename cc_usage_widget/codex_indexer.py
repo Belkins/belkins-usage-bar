@@ -930,8 +930,10 @@ class CodexIndexer:
         with self._scan_lock:
             self._ensure_states_loaded()
             by_day: dict[DayKey, dict[str, ModelUsage]] = {}
-            for state in self._states.values():
-                if not state.is_tombstone:
+            for path, state in self._states.items():
+                if not state.is_tombstone and (
+                    not state.ledger_complete or os.path.exists(path)
+                ):
                     continue
                 for entry in state.ledger:
                     if entry.day < since:
@@ -979,7 +981,9 @@ class CodexIndexer:
             self._ensure_states_loaded()
             out: list[tuple[str, int, int, tuple[DayKey, ...]]] = []
             for path, state in self._states.items():
-                if state.is_tombstone:
+                if state.is_tombstone or (
+                    state.ledger_complete and not os.path.exists(path)
+                ):
                     continue
                 days = tuple(
                     sorted({entry.day for entry in state.ledger if entry.day >= since})
@@ -1802,7 +1806,7 @@ class CodexIndexer:
 
         if not interrupted and processed >= len(work):
             # A full pass with no leftovers: the window is fully indexed.
-            if walk_ok and len(self._states) != len(seen_paths):
+            if walk_ok:
                 # Drop state for rollouts that no longer exist. Only ever on a
                 # clean full pass - a transient scandir error must not be allowed
                 # to evict live entries.

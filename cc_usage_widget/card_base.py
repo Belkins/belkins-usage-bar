@@ -148,6 +148,10 @@ class Block:
         hl_inset: float = HL_INSET,
         hl_vinset: float = 0.0,
         hl_radius: float = HL_RADIUS,
+        tab: str | None = None,
+        keep_open: bool = False,
+        on_click_x: Callable[[float], Any] | None = None,
+        is_visible: Callable[[], bool] | None = None,
     ) -> None:
         self.height = float(height)
         self.paint = paint
@@ -158,13 +162,17 @@ class Block:
         self.hl_inset = float(hl_inset)
         self.hl_vinset = float(hl_vinset)
         self.hl_radius = float(hl_radius)
+        self.tab = tab
+        self.keep_open = bool(keep_open)
+        self.on_click_x = on_click_x
+        self.is_visible = is_visible
 
     def __repr__(self) -> str:
         return f"Block(key={self.key!r}, height={self.height}, selectable={self.selectable})"
 
     @property
     def selectable(self) -> bool:
-        return self.action is not None
+        return self.action is not None or self.on_click_x is not None
 
     @property
     def label(self) -> str:
@@ -819,29 +827,46 @@ if _APPKIT:
 
         def performBlockAction(self) -> bool:
             block = self.block
-            if block is None or block.action is None:
+            if block is None or (block.action is None and block.on_click_x is None):
                 return False
+            click_x = getattr(self, "_last_click_x", None)
             try:
-                block.action()
+                if block.on_click_x is not None and click_x is not None:
+                    block.on_click_x(click_x)
+                elif block.action is not None:
+                    block.action()
             except Exception as exc:
                 _log_once(f"action:{block.key}:{type(exc).__name__}",
                           f"card action {block.key or '?'} failed: {exc!r}")
             return True
 
         def performAndClose(self) -> bool:
-            """Run the action once, then close the menu - as a click does."""
+            """Run the action once, then close the menu (unless ``keep_open`` is set)."""
             if not self.performBlockAction():
                 return False
             item = self.enclosingMenuItem()
             menu = item.menu() if item is not None else None
+            block = self.block
+            if block is not None and block.keep_open:
+                _sync_menu_visibility(menu)
+                self.setNeedsDisplay_(True)
+                return True
             if menu is not None:
                 menu.cancelTracking()
             return True
 
-        def mouseUp_(self, _event: Any) -> None:
+        def mouseUp_(self, event: Any) -> None:
+            self._last_click_x = None
+            if event is not None:
+                try:
+                    pt = self.convertPoint_fromView_(event.locationInWindow(), None)
+                    self._last_click_x = float(pt.x)
+                except Exception:
+                    self._last_click_x = None
             self.performAndClose()
 
         def accessibilityPerformPress(self) -> bool:
+            self._last_click_x = None
             return self.performAndClose()
 
     class _MaterialView(NSView):
@@ -884,6 +909,21 @@ else:  # pragma: no cover - no AppKit
 # ---------------------------------------------------------------------------
 
 
+def _sync_menu_visibility(menu: Any) -> None:
+    if menu is None:
+        return
+    try:
+        for mi in menu.itemArray():
+            v = mi.view()
+            if isinstance(v, BlockView) and v.block is not None:
+                if v.block.is_visible is not None:
+                    mi.setHidden_(not bool(v.block.is_visible()))
+                v.setNeedsDisplay_(True)
+        menu.update()
+    except Exception:
+        pass
+
+
 def menu_items_for(blocks: Sequence[Block], *, width: float = W) -> list[Any]:
     """One ``rumps.MenuItem`` per block, each carrying a :class:`BlockView`.
 
@@ -912,6 +952,8 @@ def menu_items_for(blocks: Sequence[Block], *, width: float = W) -> list[Any]:
         item._menuitem.setView_(view)
         if block.tooltip:
             item._menuitem.setToolTip_(block.tooltip)
+        if block.is_visible is not None and not block.is_visible():
+            item._menuitem.setHidden_(True)
         items.append(item)
     return items
 
@@ -1031,10 +1073,11 @@ def render_png(
     """
     if not _APPKIT:
         raise RuntimeError("AppKit is not available")
+    visible_blocks = [b for b in blocks if b.is_visible is None or b.is_visible()]
     rows = list(tail or ())
-    if rows and blocks and rows[0] is not None:
+    if rows and visible_blocks and rows[0] is not None:
         rows = [None] + rows  # the separator the app puts between blocks and tail
-    every = list(blocks) + _tail_blocks(rows, width)
+    every = list(visible_blocks) + _tail_blocks(rows, width)
     total = sum(b.height for b in every) + 2 * MATERIAL_PAD
     container = _MaterialView.alloc().initWithFrame_(NSMakeRect(0, 0, width, total))
     container.stops = [tuple(c) for c in material] if material else None

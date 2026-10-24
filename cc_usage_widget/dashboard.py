@@ -1102,6 +1102,123 @@ def _unpriced_section(cells: Sequence[Cell], today: DayKey) -> str:
     )
 
 
+def _belkins_dex_section(
+    cells: Sequence[Cell],
+    accounts: Sequence[AccountRow],
+    quota_rows: Sequence[AccountRow],
+    today: DayKey,
+) -> str:
+    """Belkins Companion Hero, 5-stage Evolution Dex, and 8-badge Trophy Room."""
+    if not cells and not accounts and not quota_rows:
+        return ""
+    from .belkins_game import EVOLUTION_LINE, compute_companion, render_sprite_svg
+
+    cells_30d = _window_cells(cells, day_keys_back(today, 30))
+    cells_today = tuple(c for c in cells_30d if c.day == today)
+    tok_30d = sum(c.tokens for c in cells_30d)
+    usd_30d = sum(c.usd for c in cells_30d)
+    tok_today = sum(c.tokens for c in cells_today)
+    usd_today = sum(c.usd for c in cells_today)
+    models_count = len({(c.vendor, c.model) for c in cells_30d})
+
+    companion = compute_companion(
+        tokens_today=tok_today,
+        tokens_30d=tok_30d,
+        usd_today=usd_today,
+        usd_30d=usd_30d,
+        accounts=accounts,
+        quota_rows=quota_rows,
+        distinct_models_count=models_count,
+    )
+
+    hero_svg = render_sprite_svg(companion.stage, size=80, equipped=companion.equipped_items)
+    xp_pct = int(round(companion.xp_fraction * 100))
+    next_text = (
+        f"Next evolution: {companion.next_stage.name} at Lv.{companion.next_stage.min_level}"
+        if companion.next_stage is not None
+        else "MAX EVOLUTION UNLOCKED — Mythic Sovereign"
+    )
+    party_bits: list[str] = []
+    if companion.claude_total > 0:
+        party_bits.append(f"Claude Party {companion.claude_ready}/{companion.claude_total} ready")
+    if companion.codex_total > 0:
+        party_bits.append(f"Codex Party {companion.codex_ready}/{companion.codex_total} ready")
+    party_bits.append(f"Trophies {companion.unlocked_badges_count}/{len(companion.badges)}")
+    party_bits.append(f"🪙 {companion.coins_available:,} SparkCoins")
+
+    hero_html = (
+        '<div class="bk-hero">'
+        f'<div class="bk-sprite-pad">{hero_svg}</div>'
+        '<div class="bk-hero-meta">'
+        '<div class="bk-hero-top">'
+        f'<strong>{_esc(companion.stage.name)}</strong>'
+        f'<span class="bk-lv">Lv.{companion.level} · {_esc(companion.stage.title)}</span>'
+        f'<span class="bk-mood">{_esc(companion.mood_label)}</span>'
+        "</div>"
+        f'<p class="note">{_esc(companion.stage.lore)}</p>'
+        '<div class="bk-xp-row">'
+        f'<span>{companion.xp_total:,} XP total (+{companion.xp_today:,} XP today)</span>'
+        f'<span>{xp_pct}% to Lv.{companion.level + 1} · {_esc(next_text)}</span>'
+        "</div>"
+        '<div class="bk-xp-track">'
+        f'<div class="bk-xp-fill" style="width:{xp_pct}%"></div>'
+        "</div>"
+        f'<p class="sub" style="margin:6px 0 0">{" · ".join(_esc(b) for b in party_bits)} · CLI: <code>bswap</code> / <code>belkins</code></p>'
+        "</div></div>"
+    )
+
+    evo_cards: list[str] = []
+    for st in EVOLUTION_LINE:
+        unlocked = companion.level >= st.min_level
+        is_current = st.stage == companion.stage.stage
+        cls = "bk-stage active" if is_current else ("bk-stage unlocked" if unlocked else "bk-stage locked")
+        tag = "ACTIVE" if is_current else ("UNLOCKED" if unlocked else f"Lv.{st.min_level}")
+        svg = render_sprite_svg(st, size=44)
+        evo_cards.append(
+            f'<div class="{cls}">'
+            f'<div class="bk-stage-head">{svg}<div>'
+            f'<h4>{_esc(st.name)}</h4>'
+            f'<span class="bk-tag">{_esc(tag)} · Lv.{st.min_level}+</span>'
+            "</div></div>"
+            f'<p class="note">{_esc(st.lore)}</p>'
+            "</div>"
+        )
+
+    badge_cards: list[str] = []
+    for b in companion.badges:
+        cls = "bk-badge unlocked" if b.unlocked else "bk-badge locked"
+        status = "UNLOCKED" if b.unlocked else b.progress_text
+        badge_cards.append(
+            f'<div class="{cls}">'
+            f'<div class="bk-badge-head"><span class="bk-badge-icon">{_esc(b.icon)}</span>'
+            f'<div><h4>{_esc(b.name)}</h4><span class="bk-tag">{_esc(status)}</span></div></div>'
+            f'<p class="note">{_esc(b.description)}</p>'
+            "</div>"
+        )
+
+    shop_cards: list[str] = []
+    for it in companion.shop_items:
+        cls = "bk-badge unlocked" if it.owned else "bk-badge locked"
+        status = "EQUIPPED ✓" if it.equipped else ("OWNED" if it.owned else f"🪙 {it.price:,} Coins")
+        shop_cards.append(
+            f'<div class="{cls}">'
+            f'<div class="bk-badge-head"><span class="bk-badge-icon">{_esc(it.icon)}</span>'
+            f'<div><h4>{_esc(it.name)}</h4><span class="bk-tag">{_esc(status)}</span></div></div>'
+            f'<p class="note">{_esc(it.description)}</p>'
+            "</div>"
+        )
+
+    return (
+        hero_html
+        + "<h3>Evolution Lineage</h3>"
+        + f'<div class="bk-evo-grid">{"".join(evo_cards)}</div>'
+        + '<h3 style="margin-top:14px">Belkins Trophy Room</h3>'
+        + f'<div class="bk-badge-grid">{"".join(badge_cards)}</div>'
+        + f'<h3 style="margin-top:14px">🛒 Belkins Poké Mart (🪙 {companion.coins_available:,} SparkCoins available — buy/equip in menu bar or via <code>bswap shop</code>)</h3>'
+        + f'<div class="bk-badge-grid">{"".join(shop_cards)}</div>'
+    )
+
+
 # ---------------------------------------------------------------------------
 # Style
 # ---------------------------------------------------------------------------
@@ -1187,6 +1304,25 @@ def _style() -> str:
         "rect.fill-capped{fill:var(--accent)}rect.fill-expired{fill:var(--dim)}"
         "line.limit{stroke:var(--rule);stroke-width:2}"
         ".empty{padding:28px 0;text-align:center;color:var(--dim)}"
+        ".bk-hero{display:flex;gap:16px;align-items:center;border:1px solid var(--rule);border-radius:8px;padding:14px;margin-bottom:14px}"
+        ".bk-sprite-pad{flex:0 0 92px;height:92px;border-radius:8px;background:#18181b;border:1px solid var(--rule);display:flex;align-items:center;justify-content:center}"
+        ".bk-hero-meta{flex:1;min-width:0}"
+        ".bk-hero-top{display:flex;flex-wrap:wrap;gap:8px;align-items:baseline;margin-bottom:4px}"
+        ".bk-hero-top strong{font-size:18px}"
+        ".bk-lv{color:var(--accent);font-weight:600;font-size:13px}"
+        ".bk-mood{margin-left:auto;border:1px solid var(--rule);border-radius:99px;padding:2px 10px;font-size:12px;font-weight:600}"
+        ".bk-xp-row{display:flex;justify-content:space-between;font-size:12px;color:var(--dim);margin:6px 0 4px}"
+        ".bk-xp-track{height:8px;background:var(--track);border-radius:4px;overflow:hidden}"
+        ".bk-xp-fill{height:100%;background:var(--accent);border-radius:4px}"
+        ".bk-evo-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px}"
+        ".bk-badge-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}"
+        ".bk-stage,.bk-badge{border:1px solid var(--rule);border-radius:6px;padding:10px}"
+        ".bk-stage.active,.bk-badge.unlocked{border-color:var(--accent)}"
+        ".bk-stage.locked,.bk-badge.locked{opacity:.65}"
+        ".bk-stage-head,.bk-badge-head{display:flex;gap:10px;align-items:center;margin-bottom:6px}"
+        ".bk-stage-head h4,.bk-badge-head h4{margin:0;font-size:13px}"
+        ".bk-badge-icon{font-size:20px}"
+        ".bk-tag{font-size:11px;color:var(--dim);font-weight:600}"
         "footer{padding:8px 20px 32px;color:var(--dim);font-size:11px}"
         "footer p{margin:2px 0}"
     )
@@ -1246,6 +1382,7 @@ def render_dashboard(
     rows = tuple(accounts) + tuple(quota_rows)
 
     sections = [
+        _section("Belkins Companion & Trophy Dex", _belkins_dex_section(cells, accounts, quota_rows, today)),
         _section("Windows", _totals_section(cells, today)),
         _section("Tokens per day", _daily_section(cells, today)),
         _section("By model", _model_section(cells, today)),

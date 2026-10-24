@@ -105,12 +105,30 @@ tools. Every reset reads the same way everywhere: `↺ 14:50` today, `↺ Thu
 bars are one submenu away (**All Claude bars ▸**, **All Codex bars ▸**).
 
 **Settings ▸ Theme** (`menu_theme`) picks how the dropdown is drawn:
-**Cards** (default: one rounded panel per provider, the active account large,
-the others one line each, fixes as copyable `cswap` chips), **Apple** (the
+**Belkins ⚡ (Companion & Party)** (default: features your evolving pixel-art Belkins AI Companion, segmented XP bar, Trophy Badges, SparkCoins `🪙`, and **5 interactive in-menu tabs** — `⚡ Party`, `Claude`, `Codex`, `🐾 Dex`, and `🛒 Mart` / Belkins Poké Mart — plus `bswap` remedy chips), **Cards** (one rounded panel per provider, the active account large,
+the others one line each), **Apple** (the
 language of Control Center: hero lines, section headers, symbols, two-line
 rows), **Dense** (every account on one aligned line; the shortest menu), or the
 text layouts **Glance** (described above) and **Classic** (the previous menu,
-exactly). The three card themes are drawn by native views in the system font,
+exactly).
+
+### Belkins Companion, Interactive Tabs & Poké Mart (`bswap` / `belkins`)
+
+`./install.sh` also installs the unified **`bswap`** (and **`belkins`**) CLI in `~/.local/bin`:
+
+```bash
+bswap                  # Companion HUD + Claude & Codex fleet status
+bswap dex              # 5-stage Evolution Pokedex & 8 Belkins Trophy Badges
+bswap shop             # Belkins Poké Mart (view SparkCoins 🪙 & cosmetics)
+bswap buy shades       # Buy or equip/unequip Deal Closer Shades, Sovereign Crown, etc.
+bswap best             # Switch to the healthiest Claude account with most room
+bswap <slot|alias>     # Switch active Claude account
+bswap codex status     # Manage Codex accounts
+bswap dashboard        # Open the HTML Usage & Companion Dashboard
+bswap bar restart      # Restart the menu-bar LaunchAgent
+```
+
+The card themes are drawn by native views in the system font,
 with rounded figures and colours chosen to stay readable on a menu tinted by
 your wallpaper; clicking a Claude row switches to it, a dead Codex login opens
 Log in again. A stored `menu_layout_classic: true` still means Classic, and

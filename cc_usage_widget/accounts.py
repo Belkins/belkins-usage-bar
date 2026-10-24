@@ -681,6 +681,12 @@ class SwapAccountSource:
         # ...). Kept beside the prose so the menu classifies on a stable
         # identifier instead of substring-matching upstream's wording.
         self._sentinel_kinds: dict[int, str] = {}
+        # Keychain 5s timeout debouncing: slots previously observed healthy
+        # require 2 consecutive "no credentials" passes before surfacing a
+        # sentinel, preventing transient `security` CLI timeouts from firing
+        # false-positive notifications.
+        self._healthy_slots: set[int] = set()
+        self._no_cred_streak: dict[int, int] = {}
         # All-exhausted WARNING dedupe: holds an _episode_key(), NOT a
         # raw line (the line's timestamp jitters). See _drain_events.
         self._last_exhausted_key: str | None = None
@@ -1265,6 +1271,24 @@ class SwapAccountSource:
             if derived is None:
                 # swap-1: no upstream word for it, so the refusal is named here.
                 derived = self._fetch_failure_note(account)
+            if derived is None and row.five_hour_pct is not None:
+                self._healthy_slots.add(row.slot)
+                self._no_cred_streak.pop(row.slot, None)
+            elif (
+                derived is not None
+                and derived[0] == "no credentials"
+                and row.slot in self._healthy_slots
+            ):
+                streak = self._no_cred_streak.get(row.slot, 0) + 1
+                self._no_cred_streak[row.slot] = streak
+                if streak < 2:
+                    self._log.debug(
+                        "accounts: suppressed transient 'no credentials' blip on healthy slot %d",
+                        row.slot,
+                    )
+                    derived = None
+            elif derived is not None:
+                self._no_cred_streak.pop(row.slot, None)
             if derived is not None:
                 kind, note = derived
                 sentinels[row.slot] = note

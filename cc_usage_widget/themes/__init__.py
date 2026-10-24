@@ -36,7 +36,7 @@ __all__ = [
     "placeholder_blocks",
 ]
 
-THEMES: tuple[str, ...] = ("apple", "dense", "cards")
+THEMES: tuple[str, ...] = ("belkins", "apple", "dense", "cards")
 """The native card themes, in Settings ▸ Theme order."""
 
 TEXT_LAYOUTS: tuple[str, ...] = ("glance", "classic")
@@ -44,9 +44,10 @@ TEXT_LAYOUTS: tuple[str, ...] = ("glance", "classic")
 
 MENU_THEMES: tuple[str, ...] = THEMES + TEXT_LAYOUTS
 """Every valid ``menu_theme`` value, in Settings ▸ Theme order; the default is
-``SETTINGS_DEFAULTS["menu_theme"]`` (cards), not the first entry."""
+``SETTINGS_DEFAULTS["menu_theme"]`` (belkins)."""
 
 THEME_LABELS: dict[str, str] = {
+    "belkins": "Belkins ⚡ (Companion & Party)",
     "apple": "Apple",
     "dense": "Dense",
     "cards": "Cards",
@@ -90,6 +91,7 @@ class ThemeActions:
     codex_login_for: Callable[[Any], Callable[[], Any] | None] = _no_login
     open_url: Callable[[str], bool] = lambda _url: False
     refresh: Callable[[], Any] = _noop
+    open_dashboard: Callable[[], Any] = _noop
     attention_extras: tuple[str, ...] = field(default_factory=tuple)
 
 
