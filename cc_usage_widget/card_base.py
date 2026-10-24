@@ -153,6 +153,7 @@ class Block:
         on_click_x: Callable[[float], Any] | None = None,
         is_visible: Callable[[], bool] | None = None,
         no_hover_bg: bool = False,
+        animated: bool = False,
     ) -> None:
         self.height = float(height)
         self.paint = paint
@@ -168,6 +169,7 @@ class Block:
         self.on_click_x = on_click_x
         self.is_visible = is_visible
         self.no_hover_bg = bool(no_hover_bg)
+        self.animated = bool(animated)
 
     def __repr__(self) -> str:
         return f"Block(key={self.key!r}, height={self.height}, selectable={self.selectable})"
@@ -762,6 +764,58 @@ def _log_once(key: str, message: str) -> None:
 
 
 if _APPKIT:
+    import weakref
+    from Foundation import NSObject, NSRunLoop, NSRunLoopCommonModes, NSTimer
+
+    _ANIMATED_VIEWS: weakref.WeakSet[Any] = weakref.WeakSet()
+    _ANIM_TIMER: Any = None
+
+    def _tick_idle_anim() -> None:
+        global _ANIM_TIMER
+        live = []
+        for v in list(_ANIMATED_VIEWS):
+            try:
+                if v.window() is not None and getattr(v, "block", None) is not None:
+                    live.append(v)
+            except Exception:
+                pass
+        if not live:
+            if _ANIM_TIMER is not None:
+                try:
+                    _ANIM_TIMER.invalidate()
+                except Exception:
+                    pass
+                _ANIM_TIMER = None
+            return
+        for v in live:
+            try:
+                mi = v.enclosingMenuItem()
+                if mi is not None and mi.isHidden():
+                    continue
+                b = v.bounds()
+                # Redraw only the 64pt-wide pixel sprite strip on the left!
+                v.setNeedsDisplayInRect_(NSMakeRect(16.0, 0.0, 64.0, b.size.height))
+            except Exception:
+                pass
+
+    class _AnimTickTarget(NSObject):
+        def onTick_(self, _timer: Any) -> None:
+            _tick_idle_anim()
+
+    _ANIM_TARGET = _AnimTickTarget.alloc().init()
+
+    def _ensure_anim_timer() -> None:
+        global _ANIM_TIMER
+        if _ANIM_TIMER is not None:
+            return
+        try:
+            timer = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
+                0.45, _ANIM_TARGET, "onTick:", None, True
+            )
+            NSRunLoop.mainRunLoop().addTimer_forMode_(timer, NSRunLoopCommonModes)
+            _ANIM_TIMER = timer
+        except Exception:
+            _ANIM_TIMER = None
 
     class BlockView(NSView):
         """One block's custom menu-item view.
@@ -801,6 +855,19 @@ if _APPKIT:
 
         def acceptsFirstMouse_(self, _event: Any) -> bool:
             return True
+
+        def viewDidMoveToWindow(self) -> None:
+            objc.super(BlockView, self).viewDidMoveToWindow()
+            try:
+                block = self.block
+                if self.window() is not None and block is not None and getattr(block, "animated", False):
+                    _ANIMATED_VIEWS.add(self)
+                    _ensure_anim_timer()
+                else:
+                    _ANIMATED_VIEWS.discard(self)
+                    _tick_idle_anim()
+            except Exception:
+                pass
 
         def isHighlightedNow(self) -> bool:
             block = self.block

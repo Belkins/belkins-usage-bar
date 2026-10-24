@@ -25,6 +25,7 @@ dropdown into 5 clean, in-place tabs (`⚡ Party`, `Claude`, `Codex`, `🐾 Dex`
 from __future__ import annotations
 
 import re
+import time
 from typing import Any, Callable
 
 from ..belkins_game import (
@@ -413,8 +414,9 @@ def draw_pixel_companion(
     mood_key: str = "locked_in",
     equipped: set[str] | tuple[str, ...] = (),
     is_boss: bool = False,
+    animate: bool = False,
 ) -> None:
-    """Draw a 14x14 pixel-art Belkins companion or Raid Boss (with all equipped Mart cosmetics!)."""
+    """Draw a 14x14 pixel-art Belkins companion or Raid Boss (with equipped Mart cosmetics & optional 2.2Hz idle animation)."""
     if isinstance(pen, _Measure):
         return
     eq = set(equipped or ())
@@ -437,6 +439,12 @@ def draw_pixel_companion(
     cell = (size - 2.0 * pad) / float(max(rows, cols))
     ox = x + pad
     oy = y + pad
+
+    # 4-frame lightweight retro idle phase (~2.2 FPS, zero state retention)
+    frame = (int(time.monotonic() * 2.2) + (2 if is_boss else 0)) % 4 if animate else 0
+    body_bob_y = (cell * 0.48) if (animate and frame in (1, 2)) else 0.0
+    spark_bob_y = (-cell * 0.38) if (animate and frame % 2 == 1) else 0.0
+    blink_frame = animate and (frame == 3)
 
     if not is_boss and "shiny_core" in eq:
         # Mythic Shiny Palette Mutation!
@@ -471,55 +479,77 @@ def draw_pixel_companion(
 
     # Nebula Pad twinkling starfield pixels
     if not is_boss and "nebula_pad" in eq:
-        NSColor.colorWithSRGBRed_green_blue_alpha_(216 / 255.0, 180 / 255.0, 254 / 255.0, 0.75).setFill()
-        for sc, sr in ((1, 3), (12, 2), (2, 11), (11, 12)):
-            NSBezierPath.fillRect_(NSMakeRect(ox + sc * cell, oy + sr * cell, cell * 0.7, cell * 0.7))
+        for s_idx, (sc, sr) in enumerate(((1, 3), (12, 2), (2, 11), (11, 12))):
+            twinkle_a = 0.92 if (not animate or (s_idx + frame) % 2 == 0) else 0.35
+            sz_mul = 0.82 if (animate and (s_idx + frame) % 2 == 0) else 0.62
+            NSColor.colorWithSRGBRed_green_blue_alpha_(216 / 255.0, 180 / 255.0, 254 / 255.0, twinkle_a).setFill()
+            NSBezierPath.fillRect_(NSMakeRect(ox + sc * cell, oy + sr * cell, cell * sz_mul, cell * sz_mul))
 
     # Context Berry glowing crimson aura sparks
     if not is_boss and "context_berry" in eq:
         NSColor.colorWithSRGBRed_green_blue_alpha_(244 / 255.0, 63 / 255.0, 94 / 255.0, 0.90).setFill()
-        for bc, br in ((0, 4), (13, 4), (0, 9), (13, 9)):
-            NSBezierPath.fillRect_(NSMakeRect(ox + bc * cell, oy + br * cell, cell + 0.1, cell + 0.1))
+        for b_idx, (bc, br) in enumerate(((0, 4), (13, 4), (0, 9), (13, 9))):
+            by_off = (-cell * 0.35) if (animate and (b_idx + frame) % 2 == 1) else 0.0
+            NSBezierPath.fillRect_(NSMakeRect(ox + bc * cell, oy + br * cell + by_off, cell + 0.1, cell + 0.1))
 
     # Cyber Halo orbital lightning nodes
     if not is_boss and "cyber_halo" in eq:
-        NSColor.colorWithSRGBRed_green_blue_alpha_(56 / 255.0, 189 / 255.0, 248 / 255.0, 0.95).setFill()
-        for hc, hr in ((1, 1), (12, 1), (0, 6), (13, 6), (1, 12), (12, 12)):
+        halo_nodes = ((1, 1), (12, 1), (13, 6), (12, 12), (1, 12), (0, 6))
+        for h_idx, (hc, hr) in enumerate(halo_nodes):
+            is_pulse = animate and (h_idx % 3 == frame % 3)
+            if is_pulse:
+                NSColor.colorWithSRGBRed_green_blue_alpha_(224 / 255.0, 242 / 255.0, 254 / 255.0, 1.0).setFill()
+            else:
+                NSColor.colorWithSRGBRed_green_blue_alpha_(56 / 255.0, 189 / 255.0, 248 / 255.0, 0.90).setFill()
             NSBezierPath.fillRect_(NSMakeRect(ox + hc * cell, oy + hr * cell, cell + 0.2, cell + 0.2))
 
     # Mini-Drone Sidekick hovering in top-left corner
     if not is_boss and "mini_drone" in eq:
+        drone_bob = (-cell * 0.45) if (animate and frame in (1, 3)) else 0.0
+        beacon_rgb = (250, 204, 21) if frame % 2 == 0 else (52, 211, 153)
         drone_px = (
             (0, 1, (56, 189, 248)),
-            (1, 1, (250, 204, 21)),
+            (1, 1, beacon_rgb),
             (0, 2, (248, 250, 252)),
             (1, 2, (56, 189, 248)),
         )
         for dc, dr, (rr, gg, bb) in drone_px:
             NSColor.colorWithSRGBRed_green_blue_alpha_(rr / 255.0, gg / 255.0, bb / 255.0, 1.0).setFill()
-            NSBezierPath.fillRect_(NSMakeRect(ox + dc * cell, oy + dr * cell, cell + 0.2, cell + 0.2))
+            NSBezierPath.fillRect_(NSMakeRect(ox + dc * cell, oy + dr * cell + drone_bob, cell + 0.2, cell + 0.2))
 
     for r_idx, row_str in enumerate(grid):
+        # Feet stay planted in bottom 2 rows while upper torso/head gently breathes
+        row_bob = body_bob_y if r_idx < (rows - 2) else 0.0
         for c_idx, ch in enumerate(row_str):
             rgba = palette.get(ch)
             if rgba is None:
                 continue
             cr, cg, cb_val, alpha = rgba
+            py_off = spark_bob_y if ch == "S" else row_bob
+            if ch == "E" and blink_frame and (is_boss or "deal_shades" not in eq):
+                # Subtle 1-frame eye blink
+                cr, cg, cb_val = b_r, b_g, b_b
             NSColor.colorWithSRGBRed_green_blue_alpha_(
                 cr / 255.0, cg / 255.0, cb_val / 255.0, alpha
             ).setFill()
             px = ox + c_idx * cell
-            py = oy + r_idx * cell
+            py = oy + r_idx * cell + py_off
             NSBezierPath.fillRect_(NSMakeRect(px, py, cell + 0.2, cell + 0.2))
             if not is_boss and ch == "E" and "deal_shades" in eq:
-                NSColor.colorWithSRGBRed_green_blue_alpha_(6 / 255.0, 182 / 255.0, 212 / 255.0, 1.0).setFill()
+                if blink_frame and c_idx >= (cols // 2):
+                    NSColor.colorWithSRGBRed_green_blue_alpha_(224 / 255.0, 242 / 255.0, 254 / 255.0, 1.0).setFill()
+                else:
+                    NSColor.colorWithSRGBRed_green_blue_alpha_(6 / 255.0, 182 / 255.0, 212 / 255.0, 1.0).setFill()
                 NSBezierPath.fillRect_(NSMakeRect(px - cell * 0.2, py, cell * 1.4, cell + 0.2))
 
-    # Sovereign Crown headgear
+    # Sovereign Crown headgear (follows head breathing bob)
     if not is_boss and "sovereign_crown" in eq:
-        NSColor.colorWithSRGBRed_green_blue_alpha_(250 / 255.0, 204 / 255.0, 21 / 255.0, 1.0).setFill()
         for cc, cr_y in ((5, 0), (7, 0), (9, 0), (5, 1), (6, 1), (7, 1), (8, 1), (9, 1)):
-            NSBezierPath.fillRect_(NSMakeRect(ox + cc * cell, oy + cr_y * cell, cell + 0.2, cell + 0.2))
+            if animate and frame == 1 and (cc, cr_y) == (7, 0):
+                NSColor.colorWithSRGBRed_green_blue_alpha_(254 / 255.0, 249 / 255.0, 195 / 255.0, 1.0).setFill()
+            else:
+                NSColor.colorWithSRGBRed_green_blue_alpha_(250 / 255.0, 204 / 255.0, 21 / 255.0, 1.0).setFill()
+            NSBezierPath.fillRect_(NSMakeRect(ox + cc * cell, oy + cr_y * cell + body_bob_y, cell + 0.2, cell + 0.2))
 
     # Plasma Token Blade weapon on right side
     if not is_boss and "plasma_blade" in eq:
@@ -532,9 +562,12 @@ def draw_pixel_companion(
             (13, 7, (250, 204, 21)),
             (13, 8, (148, 163, 184)),
         )
+        gleam_row = 3 + (frame % 3) if animate else -1
         for bc, br, (rr, gg, bb) in blade_px:
+            if br == gleam_row:
+                rr, gg, bb = (224, 242, 254)
             NSColor.colorWithSRGBRed_green_blue_alpha_(rr / 255.0, gg / 255.0, bb / 255.0, 1.0).setFill()
-            NSBezierPath.fillRect_(NSMakeRect(ox + bc * cell, oy + br * cell, cell + 0.2, cell + 0.2))
+            NSBezierPath.fillRect_(NSMakeRect(ox + bc * cell, oy + br * cell + body_bob_y * 0.6, cell + 0.2, cell + 0.2))
 
 
 def symbol(
@@ -701,6 +734,7 @@ def _companion_card(snapshot: Any, companion: CompanionState, actions: ThemeActi
             sprite_sz,
             mood_key=mood_k,
             equipped=eq_live,
+            animate=True,
         )
         rx = X0 + sprite_sz + 11.0
         rw = X1 - rx
@@ -786,10 +820,8 @@ def _companion_card(snapshot: Any, companion: CompanionState, actions: ThemeActi
         )
         if live.tokens_today > 0:
             left_s = f"Today: {format_tokens(live.tokens_today)} ({format_usd(live.usd_today)})"
-        elif live.next_stage is not None:
-            left_s = f"{live.stage.passive} · Next: Lv.{live.next_stage.min_level}"
         else:
-            left_s = f"{live.stage.passive} · {_fmt_num(live.xp_total)} XP"
+            left_s = live.stage.passive
         tw_right = text(pen, trophies_s, "caption_med", "belkins_gold_text", X1, b3, right=True)
         text(pen, left_s, "caption", "secondary", rx, b3, maxw=rw - tw_right - 6.0)
 
@@ -809,6 +841,7 @@ def _companion_card(snapshot: Any, companion: CompanionState, actions: ThemeActi
         tooltip=tip,
         ax=tip.replace("\n", ". "),
         action=act,
+        animated=True,
         **ROW_HL,
     )
     return card
@@ -1741,7 +1774,7 @@ def _dex_card(snapshot: Any, companion: CompanionState, subtab: str) -> _Card:
 
         box_top = base + 8.0
         sprite_sz = 38.0
-        draw_pixel_companion(pen, boss.spec, X0, box_top, sprite_sz, is_boss=True)
+        draw_pixel_companion(pen, boss.spec, X0, box_top, sprite_sz, is_boss=True, animate=True)
 
         rx = X0 + sprite_sz + 10.0
         rw = X1 - rx
@@ -1758,8 +1791,8 @@ def _dex_card(snapshot: Any, companion: CompanionState, subtab: str) -> _Card:
             weight="semibold",
         )
         bname = f"{boss.spec.icon} {boss.spec.name}"
-        nw_boss = text(pen, bname, "primary_med", "label", rx, b1, maxw=rw - bw - 38.0)
-        text(pen, f"Lv.{boss.level}", "caption_med", "crit_text", rx + nw_boss + 5.0, b1, maxw=max(0.0, rw - bw - nw_boss - 8.0))
+        nw_boss = text(pen, bname, "primary_med", "label", rx, b1, maxw=rw - bw - 30.0)
+        text(pen, f"Lv.{boss.level}", "caption_med", "crit_text", rx + nw_boss + 4.0, b1, maxw=max(0.0, rw - bw - nw_boss - 5.0))
 
         b2 = box_top + 26.0
         hp_txt = f"{boss.hp_current:,}/{boss.hp_max:,} HP"
@@ -1802,6 +1835,7 @@ def _dex_card(snapshot: Any, companion: CompanionState, subtab: str) -> _Card:
         tooltip="Click to strike the Raid Boss with your Companion and equipped Mart Weapons! Defeating bosses drops huge SparkCoins and Bonus XP.",
         action=on_strike_boss,
         keep_open=True,
+        animated=True,
         **ROW_HL,
     )
     card.add(_hair(), key=f"belkins-dex-boss-sep-{subtab}")
@@ -1924,8 +1958,9 @@ def _dex_card(snapshot: Any, companion: CompanionState, subtab: str) -> _Card:
                 live = companion if isinstance(pen, _Measure) else companion_from_snapshot(snapshot)
                 items = live.badges[r_idx : r_idx + 2] if r_idx < len(live.badges) else default_pair
                 box_y = y0 + 2.0
-                box_h = 26.0
-                base = box_y + 17.0
+                box_h = 34.0
+                b1 = box_y + 13.5
+                b2 = box_y + 26.5
                 for c_idx, b_item in enumerate(items):
                     cx = X0 + c_idx * (col_w + col_gap)
                     bg_role = "belkins_badge_on" if b_item.unlocked else "belkins_badge_off"
@@ -1933,15 +1968,26 @@ def _dex_card(snapshot: Any, companion: CompanionState, subtab: str) -> _Card:
                     pen.rrect(cx, box_y, col_w, box_h, 6.0, bg_role, stroke=edge_role)
                     mark = "✓" if b_item.unlocked else "🔒"
                     mark_role = "good_text" if b_item.unlocked else "secondary"
-                    mw = text(pen, mark, "caption_med", mark_role, cx + col_w - 8.0, base, right=True)
+                    mw = text(pen, mark, "caption_med", mark_role, cx + col_w - 7.0, b1, right=True)
                     text(
                         pen,
                         f"{b_item.icon} {b_item.name}",
                         "caption_med",
                         "label" if b_item.unlocked else "secondary",
-                        cx + 8.0,
-                        base,
-                        maxw=col_w - mw - 20.0,
+                        cx + 7.5,
+                        b1,
+                        maxw=col_w - mw - 18.0,
+                    )
+                    sub_txt = b_item.description if b_item.unlocked else b_item.progress_text
+                    sub_role = "belkins_gold_text" if b_item.unlocked else "secondary"
+                    text(
+                        pen,
+                        sub_txt,
+                        "tag",
+                        sub_role,
+                        cx + 7.5,
+                        b2,
+                        maxw=col_w - 15.0,
                     )
                 return box_y + box_h + 4.0
 
