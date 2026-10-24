@@ -91,3 +91,35 @@ def item_hidden(windows: Iterable[tuple[int, bool]], pid: int) -> bool | None:
 def own_item_hidden() -> bool | None:
     """:func:`item_hidden` for this process, read from the window server."""
     return item_hidden(status_item_windows(), os.getpid())
+
+
+def own_window_hidden(window_number: int | None) -> bool | None:
+    """Detect whether *window_number* (from ``nsstatusitem.button().window().windowNumber()``)
+    is hidden by the MacBook camera notch or menu-bar overflow on macOS 15 / 26+.
+
+    On macOS 26 (Tahoe), status-item windows on layer 25 report ``Control Centre``
+    as ``kCGWindowOwnerPID`` rather than ``os.getpid()``, and ``CGWindowListCopyWindowInfo``
+    with ``kCGWindowListOptionOnScreenOnly`` (1) lists only the status-item windows
+    actually composited onscreen.
+    """
+    if not window_number or window_number <= 0:
+        return own_item_hidden()
+    try:
+        onscreen_rows = _window_list()(1, 0)  # kCGWindowListOptionOnScreenOnly = 1
+        onscreen_nums: set[int] = set()
+        others_onscreen = 0
+        for row in onscreen_rows or ():
+            if row.get("kCGWindowLayer") != STATUS_ITEM_LAYER:
+                continue
+            bounds = row.get("kCGWindowBounds") or {}
+            if bounds.get("Height", 0) < 10 or bounds.get("X", -1) < 0:
+                continue
+            wnum = int(row.get("kCGWindowNumber", 0))
+            onscreen_nums.add(wnum)
+            if wnum != window_number:
+                others_onscreen += 1
+        if others_onscreen < MIN_OTHERS_ONSCREEN:
+            return None
+        return window_number not in onscreen_nums
+    except Exception:
+        return own_item_hidden()

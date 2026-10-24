@@ -365,6 +365,7 @@ def status_icon(symbols: Sequence[str] = ()) -> Any | None:
     # unrecognisable box-with-a-line at that size. Three ascending bars read
     # instantly and match what the dropdown shows.
     candidates = tuple(symbols) or (
+        "bolt.fill",
         "chart.bar.fill",
         "chart.bar",
         "speedometer",
@@ -376,13 +377,13 @@ def status_icon(symbols: Sequence[str] = ()) -> Any | None:
         return None
     for name in candidates:
         try:
-            image = getter(name, "Claude usage")
+            image = getter(name, "Belkins usage")
         except Exception:
             image = None
         if image is not None:
             try:
                 image.setTemplate_(True)
-                image.setSize_(AppKit.NSMakeSize(17.0, 17.0))
+                image.setSize_(AppKit.NSMakeSize(14.5, 14.5))
             except Exception:
                 pass
             return image

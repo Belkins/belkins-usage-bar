@@ -87,25 +87,25 @@ Remove everything: `./uninstall.sh`
 `./install.sh` also installs the unified **`bswap`** and **`belkins`** CLI commands into `~/.local/bin` and enables the default **`Belkins ⚡ (Companion & Party)`** theme:
 
 ### Interactive 5-Tab Menu Bar UI
-- **`⚡ Party` (Default)**: Shows your **Active Claude** and **Active Codex** champions first, with smart grouped alert summaries below.
+- **`⚡ Squad` (Default)**: Shows your **Active Claude** and **Active Codex** champions first, with smart grouped alert summaries below.
 - **`Claude` & `Codex` Tabs**: Full fleet rosters with one-click account switching.
-- **`🐾 Dex` Tab**:
+- **`🧬 Evo` Tab**:
   - **⚔️ Boss Raid Arena**: Click directly in the menu to strike Raid Bosses (`HTTP-429 Golem`, `Context Leviathan`, `Latency Archlich`, `Quota Behemoth`, `Null Singularity`) using your Companion's **ATK & Crit** to loot **SparkCoins (`🪙`)** and **Bonus XP**!
-  - **📖 8-Stage Evolution Pokedex**: `Sparkbit` (Lv.1) → `Outreachik` (Lv.8) → `Pipelinex` (Lv.18) → `Contexton` (Lv.30) → `Belkinosaur` (Lv.45) → `Chronoflare` (Lv.62) → `Belkins Prime` (Lv.80) → `Omega Belkion` (Lv.95). Click any unlocked stage to morph your active Companion and activate its passive buff!
-  - **🏆 14 Hard-to-Achieve Trophy Badges**: 7×2 Bento Grid tracking mid-to-endgame milestones (`Kilowatt Day` \$1.5K/day, `Quarter-Trillion` 250B tokens, `Fleet Admiral` 8+ healthy accounts, `Flawless Rotator` 15+ rotations with 0 alerts, `Leviathan Hunter` 10+ Bosses, `Raid Godslayer` 50+ Bosses, `Candy Alchemist` 25+ Candies, `Grand Tycoon` 12/12 Mart items, `Chromatic Triad`, `Omega Ascendant` Lv.95, and `Lv.99 Immortal`).
+  - **🧬 8-Stage Cyber-Forms**: `Sparkbit` (Lv.1) → `Outreachik` (Lv.8) → `Pipelinex` (Lv.18) → `Contexton` (Lv.30) → `Belkinosaur` (Lv.45) → `Chronoflare` (Lv.62) → `Belkins Prime` (Lv.80) → `Omega Belkion` (Lv.95). Click any unlocked form to morph your active Companion and activate its passive buff!
+  - **🏆 14 Hall of Fame Trophies**: 7×2 Bento Grid tracking mid-to-endgame milestones (`Kilowatt Day` \$1.5K/day, `Quarter-Trillion` 250B tokens, `Fleet Admiral` 8+ healthy accounts, `Flawless Rotator` 15+ rotations with 0 alerts, `Leviathan Hunter` 10+ Bosses, `Raid Godslayer` 50+ Bosses, `Serum Alchemist` 25+ Serums, `Vault Tycoon` 12/12 Vault relics, `Prismatic Triad`, `Omega Ascendant` Lv.95, and `Lv.99 Immortal`).
 - **👾 Zero-Overhead 2.2Hz Retro Pixel Idle Animations**: Your Companion, Raid Boss, Mini-Drone sidekick, Plasma Blade, and Cyber Halo gently breathe, blink, hover, and twinkle while the menu is open (`0.00%` background CPU & `0` extra RAM when closed).
-- **`🛒 Mart` Tab (12-Item Belkins Poké Mart)**:
-  - **`⚔️ Gear & Lab`**: `🍒 Context Berry`, repeatable `🧪 Rare Token Candy` (`+60K XP & +20 ATK` per candy), `🕶️ Deal Closer Shades`, `⚔️ Plasma Token Blade` (pixel sword), `👑 Sovereign Crown`, and `✨ Shiny Chroma Core` (mutates your Companion into its ★ Shiny gold/violet/cyan palette!).
-  - **`🎨 Skins & Pets`**: `🔥 Solar Forge Pad`, `🌿 Emerald Grove Pad`, `🌌 Void Nebula Pad` (each recolors your showcase pad & XP bar!), `⚡ Cyber Halo Aura`, `🤖 Mini-Drone Sidekick` (pixel AI drone pet), and `🕹️ Cyber Arcade UI Skin` (reskins all menu cards into a Gold Arcade Console!).
+- **`⚡ Vault` Tab (12-Item Belkins Spark Vault)**:
+  - **`⚔️ Relics & Lab`**: `🔋 Cool-Down Cell`, repeatable `🧪 Overclock Serum` (`+60K XP & +20 ATK` per serum), `🕶️ Deal Closer Visor`, `⚔️ Plasma Token Blade` (pixel sword), `👑 Sovereign Crown`, and `✨ Prismatic Core` (mutates your Companion into its ★ Prismatic gold/violet/cyan palette!).
+  - **`🎨 Skins & Bots`**: `🔥 Solar Forge Pad`, `🌿 Emerald Grove Pad`, `🌌 Void Nebula Pad` (each recolors your holopad & XP bar!), `⚡ Cyber Halo Aura`, `🤖 Mini-Drone Sidekick` (pixel AI drone bot), and `🕹️ Cyber Arcade UI Skin` (reskins all menu cards into a Gold Arcade Console!).
 
 ### `bswap` / `belkins` CLI Reference
 ```bash
 bswap                       # Companion HUD + Claude & Codex fleet status (alias: belkins)
-bswap dex                   # 8-Stage Pokedex, Boss Raid status & 10 Trophy Badges
+bswap evo                   # 8-Stage Cyber-Forms, Boss Raid status & 14 Hall of Fame Trophies
 bswap raid [strikes]        # Attack the active Raid Boss for SparkCoins & Bonus XP (e.g. bswap raid 3)
-bswap morph <1..8|auto>     # Morph your active Companion into any unlocked Pokedex stage
-bswap mart                  # Open the 12-item Belkins Poké Mart in terminal (alias: bswap shop)
-bswap buy <item>            # Buy, equip, or feed an item (e.g. bswap buy candy, blade, shiny, arcade)
+bswap morph <1..8|auto>     # Morph your active Companion into any unlocked Cyber-Form
+bswap vault                 # Open the 12-item Belkins Spark Vault in terminal (alias: bswap shop)
+bswap buy <item>            # Buy, equip, or inject a relic (e.g. bswap buy serum, blade, core, arcade)
 bswap <slot|alias>          # Switch active Claude account to slot number or alias
 bswap best                  # Switch to the healthiest Claude account with the most headroom
 bswap codex [status|switch] # Manage Codex accounts

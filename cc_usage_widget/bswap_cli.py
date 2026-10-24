@@ -180,7 +180,7 @@ def _print_banner() -> None:
     dollar = chr(36)
 
     print(
-        f"{BOLD}{ORANGE}⚡ BELKINS AI FLEET & COMPANION DEX{RESET}  "
+        f"{BOLD}{ORANGE}⚡ BELKINS AI SQUAD & CYBER-FORGE{RESET}  "
         f"{DIM}│{RESET}  {shiny_prefix}{BOLD}{st.name}{RESET} {GOLD}Lv.{comp.level}{RESET} ({st.passive})  "
         f"{DIM}│{RESET}  {RED}⚔️ {boss.player_atk} ATK ({boss.player_crit_pct}% Crit){RESET}  "
         f"{DIM}│{RESET}  {BOLD}{comp.mood_label}{RESET}  "
@@ -212,7 +212,7 @@ def _cmd_dex() -> int:
     )
     print(f"  {DIM}Attack from CLI:{RESET} {ORANGE}bswap raid [strikes]{RESET}   (e.g. {ORANGE}bswap raid 3{RESET})\n")
 
-    print(f"{BOLD}{CYAN}━━━ 📖 8-STAGE EVOLUTION POKEDEX (Current: #{comp.stage.stage} {comp.stage.name}) ━━━{RESET}")
+    print(f"{BOLD}{CYAN}━━━ 🧬 8-STAGE CYBER-FORM EVOLUTION TREE (Current: #{comp.stage.stage} {comp.stage.name}) ━━━{RESET}")
     for st in belkins_game.EVOLUTION_LINE:
         is_current = st.stage == comp.stage.stage
         unlocked = comp.level >= st.min_level
@@ -227,7 +227,7 @@ def _cmd_dex() -> int:
         )
     print(f"  {DIM}Morph active Companion:{RESET} {ORANGE}bswap morph <1..8|auto>{RESET}\n")
 
-    print(f"{BOLD}{GOLD}━━━ 🏆 BELKINS TROPHY ROOM ({comp.unlocked_badges_count}/{len(comp.badges)} UNLOCKED) ━━━{RESET}")
+    print(f"{BOLD}{GOLD}━━━ 🏆 BELKINS HALL OF FAME ({comp.unlocked_badges_count}/{len(comp.badges)} UNLOCKED) ━━━{RESET}")
     for b in comp.badges:
         status = f"{GREEN}✓{RESET}" if b.unlocked else f"{DIM}·{RESET}"
         name_col = f"{BOLD}{b.name:<20}{RESET}" if b.unlocked else f"{DIM}{b.name:<20}{RESET}"
@@ -277,6 +277,30 @@ def _resolve_shop_slug(query: str) -> str | None:
         idx = int(q) - 1
         if 0 <= idx < len(belkins_game.SHOP_CATALOG):
             return belkins_game.SHOP_CATALOG[idx].slug
+    aliases = {
+        "cell": "context_berry",
+        "berry": "context_berry",
+        "cool": "context_berry",
+        "serum": "rare_candy",
+        "candy": "rare_candy",
+        "overclock": "rare_candy",
+        "visor": "deal_shades",
+        "shades": "deal_shades",
+        "blade": "plasma_blade",
+        "sword": "plasma_blade",
+        "crown": "sovereign_crown",
+        "core": "shiny_core",
+        "prismatic": "shiny_core",
+        "shiny": "shiny_core",
+        "solar": "solar_pad",
+        "emerald": "emerald_pad",
+        "nebula": "nebula_pad",
+        "halo": "cyber_halo",
+        "drone": "mini_drone",
+        "arcade": "arcade_skin",
+    }
+    if q in aliases:
+        return aliases[q]
     for spec in belkins_game.SHOP_CATALOG:
         if q == spec.slug or q in spec.slug or q in spec.name.lower():
             return spec.slug
@@ -287,10 +311,10 @@ def _cmd_shop(args: list[str]) -> int:
     comp = _load_companion_state()
     if args:
         sub = args[0].lower()
-        target = args[1] if len(args) > 1 and sub in {"buy", "equip", "unequip", "use", "feed"} else args[0]
+        target = args[1] if len(args) > 1 and sub in {"buy", "equip", "unequip", "use", "feed", "inject"} else args[0]
         slug = _resolve_shop_slug(target)
         if not slug:
-            print(f"{RED}Unknown Belkins Mart item: {target!r}{RESET}")
+            print(f"{RED}Unknown Belkins Spark Vault relic: {target!r}{RESET}")
             print(f"Available items: {', '.join(it.slug for it in belkins_game.SHOP_CATALOG)}")
             return 1
         ok, msg = belkins_game.toggle_or_buy_shop_item(slug, comp.coins_earned)
@@ -300,20 +324,20 @@ def _cmd_shop(args: list[str]) -> int:
 
     _print_banner()
     print(
-        f"{BOLD}{GOLD}━━━ 🛒 BELKINS POKÉ MART (Wallet: 🪙 {comp.coins_available:,} SparkCoins) ━━━{RESET}"
+        f"{BOLD}{GOLD}━━━ ⚡ BELKINS SPARK VAULT (Wallet: 🪙 {comp.coins_available:,} SparkCoins) ━━━{RESET}"
     )
     print(f"  {DIM}Earn 🪙 from token burn, Trophies (+250/badge), and Boss Raids (`bswap raid`).{RESET}\n")
 
     for tab_key, tab_title in (
-        ("gear", f"{ORANGE}⚔️ GEAR, WEAPONS & LAB UPGRADES{RESET}"),
-        ("style", f"{PURPLE}🎨 WORLD PADS, PETS & CONSOLE SKINS{RESET}"),
+        ("gear", f"{ORANGE}⚔️ RELICS, WEAPONS & LAB SERUMS{RESET}"),
+        ("style", f"{PURPLE}🎨 HOLOPADS, BOTS & CONSOLE SKINS{RESET}"),
     ):
         print(f"  {BOLD}{tab_title}")
         for idx, it in enumerate(comp.shop_items, start=1):
             if it.tab != tab_key:
                 continue
             if it.slug == "rare_candy":
-                tag = f"{GOLD}[FEED · 🪙 {it.price} (×{it.count})]{RESET}"
+                tag = f"{GOLD}[INJECT · 🪙 {it.price} (×{it.count})]{RESET}"
             elif it.equipped:
                 tag = f"{GREEN}[EQUIPPED ✓]{RESET}"
             elif it.owned:
@@ -329,8 +353,8 @@ def _cmd_shop(args: list[str]) -> int:
         print()
 
     print(
-        f"  {DIM}Buy / Equip / Feed:{RESET} {ORANGE}bswap buy <number|name>{RESET}  "
-        f"(e.g. {ORANGE}bswap buy candy{RESET}, {ORANGE}bswap buy blade{RESET}, {ORANGE}bswap buy shiny{RESET}, {ORANGE}bswap buy arcade{RESET})"
+        f"  {DIM}Buy / Equip / Inject:{RESET} {ORANGE}bswap buy <number|name>{RESET}  "
+        f"(e.g. {ORANGE}bswap buy serum{RESET}, {ORANGE}bswap buy blade{RESET}, {ORANGE}bswap buy core{RESET}, {ORANGE}bswap buy arcade{RESET})"
     )
     print()
     return 0
@@ -373,13 +397,13 @@ def _cmd_help() -> int:
     _print_banner()
     print(f"{BOLD}Usage:{RESET} {ORANGE}bswap{RESET} [command]   (or {ORANGE}belkins{RESET} [command])")
     print()
-    print(f"{BOLD}Belkins Companion, Boss Arena, Mart & Bar Commands:{RESET}")
+    print(f"{BOLD}Belkins Companion, Boss Arena, Spark Vault & Bar Commands:{RESET}")
     print(f"  {ORANGE}bswap{RESET} / {ORANGE}bswap status{RESET}       Show Companion HUD + Claude & Codex fleet status")
-    print(f"  {ORANGE}bswap dex{RESET}                  Inspect 8-Stage Pokedex, Boss Raid Arena & 10 Trophy Badges")
+    print(f"  {ORANGE}bswap evo{RESET} / {ORANGE}bswap dex{RESET}      Inspect 8-Stage Cyber-Forms, Boss Raid Arena & 14 Hall of Fame Trophies")
     print(f"  {ORANGE}bswap raid [strikes]{RESET}       Attack the active Raid Boss for SparkCoins & Bonus XP")
-    print(f"  {ORANGE}bswap morph <1..8|auto>{RESET}    Morph your active Companion into any unlocked Pokedex stage")
-    print(f"  {ORANGE}bswap shop{RESET} / {ORANGE}bswap mart{RESET}    Open the 12-item Belkins Poké Mart (Gear, Skins, Pets & Candies)")
-    print(f"  {ORANGE}bswap buy <item>{RESET}           Buy, equip, or feed a Mart item (e.g. candy, blade, shiny, arcade)")
+    print(f"  {ORANGE}bswap morph <1..8|auto>{RESET}    Morph your active Companion into any unlocked Cyber-Form")
+    print(f"  {ORANGE}bswap vault{RESET} / {ORANGE}bswap shop{RESET}   Open the 12-item Belkins Spark Vault (Relics, Serums, Skins & Bots)")
+    print(f"  {ORANGE}bswap buy <item>{RESET}           Buy, equip, or inject a Vault relic (e.g. serum, blade, core, arcade)")
     print(f"  {ORANGE}bswap dashboard{RESET}            Open the interactive Belkins HTML Dashboard in browser")
     print(f"  {ORANGE}bswap bar{RESET} [on|off|restart|status|logs]  Control the Belkins menu-bar app")
     print(f"  {ORANGE}bswap codex{RESET} [status|switch|add|relogin] Manage Codex accounts")
@@ -430,15 +454,15 @@ def main(argv: list[str] | None = None) -> int:
     cmd = args[0].lower()
     if cmd in {"-h", "--help", "help"}:
         return _cmd_help()
-    if cmd in {"dex", "trophies", "companion", "badges", "pokedex"}:
+    if cmd in {"evo", "dex", "trophies", "companion", "badges", "pokedex", "forms"}:
         return _cmd_dex()
     if cmd in {"raid", "attack", "strike", "boss", "battle"}:
         return _cmd_raid(args[1:])
     if cmd in {"morph", "evolve", "stage"}:
         return _cmd_morph(args[1:])
-    if cmd in {"shop", "mart", "store"}:
+    if cmd in {"vault", "shop", "mart", "store", "armory"}:
         return _cmd_shop(args[1:])
-    if cmd in {"buy", "equip", "unequip", "feed", "use"}:
+    if cmd in {"buy", "equip", "unequip", "feed", "inject", "use"}:
         return _cmd_shop(args)
     if cmd in {"dashboard", "dash"}:
         return _cmd_dashboard()

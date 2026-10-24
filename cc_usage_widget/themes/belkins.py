@@ -45,11 +45,11 @@ from ..contracts import format_pct, format_tokens, format_usd
 from . import ThemeActions
 
 TABS: tuple[tuple[str, str], ...] = (
-    ("party", "⚡ Party"),
+    ("party", "⚡ Squad"),
     ("claude", "Claude"),
     ("codex", "Codex"),
-    ("dex", "🐾 Dex"),
-    ("shop", "🛒 Mart"),
+    ("dex", "🧬 Evo"),
+    ("shop", "⚡ Vault"),
 )
 _ACTIVE_TAB: str = "party"
 _DEX_SUBTAB: str = "pokedex"     # "pokedex" | "trophies"
@@ -1840,7 +1840,7 @@ def _dex_card(snapshot: Any, companion: CompanionState, subtab: str) -> _Card:
     )
     card.add(_hair(), key=f"belkins-dex-boss-sep-{subtab}")
 
-    # 2. Sub-Tab Switcher inside `🐾 Dex`: `[ 📖 8-Stage Pokedex | 🏆 10 Trophies ]`
+    # 2. Sub-Tab Switcher inside `🧬 Evo`: `[ 🧬 Cyber-Forms | 🏆 Hall of Fame ]`
     def draw_dex_subtabs(pen: Any, y0: float) -> float:
         live = companion if isinstance(pen, _Measure) else companion_from_snapshot(snapshot)
         bar_y = y0 + 6.0
@@ -1848,8 +1848,8 @@ def _dex_card(snapshot: Any, companion: CompanionState, subtab: str) -> _Card:
         half_w = (W_INNER - 6.0) / 2.0
         pen.rrect(X0, bar_y, W_INNER, bar_h, 6.0, "belkins_subtab_bg")
         tabs_sub = (
-            ("pokedex", f"📖 Pokedex ({live.highest_stage.stage}/8)"),
-            ("trophies", f"🏆 Trophies ({live.unlocked_badges_count}/{len(live.badges)})"),
+            ("pokedex", f"🧬 Cyber-Forms ({live.highest_stage.stage}/8)"),
+            ("trophies", f"🏆 Hall of Fame ({live.unlocked_badges_count}/{len(live.badges)})"),
         )
         for idx, (sid, slabel) in enumerate(tabs_sub):
             sx = X0 + 2.0 + idx * (half_w + 2.0)
@@ -2008,40 +2008,40 @@ def _dex_card(snapshot: Any, companion: CompanionState, subtab: str) -> _Card:
 
 
 def _shop_card(snapshot: Any, companion: CompanionState, subtab: str) -> _Card:
-    """`🛒 Mart` Tab Card: 12-Item Belkins Poké Mart with `⚔️ Gear & Lab` and `🎨 Skins & Pets` sub-tabs."""
+    """`⚡ Vault` Tab Card: 12-Item Belkins Spark Vault with `⚔️ Relics & Lab` and `🎨 Skins & Bots` sub-tabs."""
     card = _Card("belkins_card", "belkins_card_edge", rule="belkins_gold_rule")
 
     def draw_shop_head(pen: Any, y0: float) -> float:
         live = companion if isinstance(pen, _Measure) else companion_from_snapshot(snapshot)
         coins_live = live.coins_available
         base = y0 + HEAD_BASE
-        symbol(pen, "cart.fill", X0, base - 4.0, 11.5, "belkins_gold_rule", "semibold")
+        symbol(pen, "bolt.shield.fill", X0, base - 4.0, 11.5, "belkins_gold_rule", "semibold")
         tx = X0 + 18.0
-        text(pen, "Belkins Poké Mart", "title", "label", tx, base)
+        text(pen, "Belkins Spark Vault", "title", "label", tx, base)
         wallet = f"🪙 {_fmt_compact_coins(coins_live)} Coins"
         pw = _pill_w(pen, wallet)
         pen.pill(wallet, X1 - pw, base - 0.5, F["tag"][0], role="belkins_gold_text", bg="belkins_gold_pill", weight="semibold")
         b2 = base + 16.0
-        sub = _LAST_SHOP_NOTE or "Every item boosts stats or transforms your Companion & UI:"
+        sub = _LAST_SHOP_NOTE or "Every relic & mod upgrades your Companion, Boss ATK, or UI:"
         text(pen, sub, "caption", "belkins_flame_text" if _LAST_SHOP_NOTE else "secondary", X0, b2, maxw=W_INNER)
         return b2 + 6.0
 
     card.add(
         draw_shop_head,
         key=f"belkins-shop-head-{subtab}",
-        ax=f"Belkins Poke Mart. {companion.coins_available} Coins available.",
-        tooltip="Earn SparkCoins from token burn, Trophies (+250/badge), and Boss Raids in the Dex tab!",
+        ax=f"Belkins Spark Vault. {companion.coins_available} Coins available.",
+        tooltip="Earn SparkCoins from token burn, Trophies (+250/badge), and Boss Raids in the Evo tab!",
     )
 
-    # Sub-Tab Switcher inside `🛒 Mart`: `[ ⚔️ Gear & Lab (6) | 🎨 Skins & Pets (6) ]`
+    # Sub-Tab Switcher inside `⚡ Vault`: `[ ⚔️ Relics & Lab (6) | 🎨 Skins & Bots (6) ]`
     def draw_shop_subtabs(pen: Any, y0: float) -> float:
         bar_y = y0 + 2.0
         bar_h = 24.0
         half_w = (W_INNER - 6.0) / 2.0
         pen.rrect(X0, bar_y, W_INNER, bar_h, 6.0, "belkins_subtab_bg")
         tabs_sub = (
-            ("gear", "⚔️ Gear & Lab (6)"),
-            ("style", "🎨 Skins & Pets (6)"),
+            ("gear", "⚔️ Relics & Lab (6)"),
+            ("style", "🎨 Skins & Bots (6)"),
         )
         for idx, (sid, slabel) in enumerate(tabs_sub):
             sx = X0 + 2.0 + idx * (half_w + 2.0)
@@ -2093,7 +2093,7 @@ def _shop_card(snapshot: Any, companion: CompanionState, subtab: str) -> _Card:
             if item_spec.slug == "rare_candy":
                 fed = live.candies_fed
                 if coins_live >= item_spec.price:
-                    btn_txt = f"FEED · 🪙 {item_spec.price}" + (f" (×{fed})" if fed else "")
+                    btn_txt = f"INJECT · 🪙 {item_spec.price}" + (f" (×{fed})" if fed else "")
                     btn_role, btn_bg = "belkins_gold_text", "belkins_gold_pill"
                 else:
                     btn_txt = f"🔒 🪙 {item_spec.price}" + (f" (×{fed})" if fed else "")

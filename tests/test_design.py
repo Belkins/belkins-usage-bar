@@ -967,7 +967,7 @@ def test_settings_offer_the_three_new_switches() -> None:
         # Design 3: the classic toggle became one of Theme's five choices.
         assert top[0] == "Title" and top[1] == "Theme", top
         themes = [_title(i) for i in settings["Theme"].values() if i is not None]
-        assert themes == ["Apple", "Dense", "Cards", "Glance (text)", "Classic (text)"], themes
+        assert themes == ["Belkins ⚡ (Companion & Party)", "Apple", "Dense", "Cards", "Glance (text)", "Classic (text)"], themes
         title = [_title(i) for i in settings["Title"].values() if i is not None]
         assert "Merge alerts into ⚠N" in title and "Reset-credit marker (↺now)" in title, title
         app.rebuild_menu(claude_only_snapshot())

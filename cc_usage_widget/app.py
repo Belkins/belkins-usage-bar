@@ -5396,13 +5396,26 @@ class CCUsageWidgetApp(rumps.App):
         nothing and counts nothing. *hidden* is the test seam. Returns whether
         the fallback fired on this call.
         """
-        if self._auto_compact or self.snapshot().settings.get("title_compact", False):
+        is_live = hidden is None
+        already_compact = self._auto_compact or bool(self.snapshot().settings.get("title_compact", False))
+        if not is_live and already_compact:
+            return False
+        if getattr(self, "_auto_icon_only", False):
             return False
         now = time.monotonic()
         if hidden is None:
             if now - self._title_fit_checked_at < TITLE_FIT_CHECK_SECONDS:
                 return False
-            hidden = menubar.own_item_hidden
+            win_num: int | None = None
+            try:
+                item = getattr(getattr(self, "_nsapp", None), "nsstatusitem", None)
+                btn = item.button() if item is not None and render._responds(item, "button") else None
+                win = btn.window() if btn is not None and render._responds(btn, "window") else None
+                if win is not None and render._responds(win, "windowNumber"):
+                    win_num = int(win.windowNumber())
+            except Exception:
+                win_num = None
+            hidden = lambda wn=win_num: menubar.own_window_hidden(wn)
         self._title_fit_checked_at = now
         verdict = hidden()
         if verdict is None:
@@ -5410,8 +5423,13 @@ class CCUsageWidgetApp(rumps.App):
         self._title_hidden_streak = self._title_hidden_streak + 1 if verdict else 0
         if self._title_hidden_streak < 2:
             return False
-        self._auto_compact = True
-        _log("title: status item hidden by a full menu bar; showing the compact title until restart")
+        self._title_hidden_streak = 0
+        if not already_compact:
+            self._auto_compact = True
+            _log("title: status item hidden by a full menu bar; showing the compact title until restart")
+        else:
+            self._auto_icon_only = True
+            _log("title: compact status item still hidden by menu bar; showing icon-only until restart")
         self.rebuild_menu()
         return True
 
@@ -5543,6 +5561,8 @@ class CCUsageWidgetApp(rumps.App):
         """
         snapshot = snapshot or self.snapshot()
         settings = snapshot.settings
+        if getattr(self, "_auto_icon_only", False):
+            return []
         if settings.get("title_compact", False) or getattr(self, "_auto_compact", False):
             return self._compact_tokens(snapshot)
         merge = bool(settings.get("title_merge_alerts", False))
@@ -5731,9 +5751,10 @@ class CCUsageWidgetApp(rumps.App):
         pairs = [(initial, figure, kind) for initial, figure, kind in figures if initial and figure]
         tokens: list[list[tuple[str, str | None]]] = []
         if pairs:
-            tokens.append(
-                [(render.COMPACT_TITLE_SEPARATOR.join(initial for initial, _f, _k in pairs), None)]
-            )
+            if snapshot.settings.get("title_show_alias", True):
+                tokens.append(
+                    [(render.COMPACT_TITLE_SEPARATOR.join(initial for initial, _f, _k in pairs), None)]
+                )
             values: list[tuple[str, str | None]] = []
             for index, (_initial, figure, kind) in enumerate(pairs):
                 if index:

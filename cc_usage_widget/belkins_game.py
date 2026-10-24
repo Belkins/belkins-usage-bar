@@ -524,29 +524,29 @@ class ShopItemState:
 
 
 SHOP_CATALOG: tuple[ShopItemSpec, ...] = (
-    # --- Tab 1: "gear" (Weapons, Power-Ups, Consumables & Mutations) ---
+    # --- Tab 1: "gear" (Relics, Lab Serums & Weapons) ---
     ShopItemSpec(
         slug="context_berry",
-        icon="🍒",
-        name="Context Berry",
+        icon="🔋",
+        name="Cool-Down Cell",
         tab="gear",
         category="berry",
         price=150,
-        description="Soothes Wall Guard · +15% XP & +25 Boss ATK",
+        description="Clears Wall Guard · +15% XP & +25 Boss ATK",
     ),
     ShopItemSpec(
         slug="rare_candy",
         icon="🧪",
-        name="Rare Token Candy",
+        name="Overclock Serum",
         tab="gear",
         category="candy",
         price=250,
-        description="Repeatable! Feeds +60K Bonus XP & +20 Permanent ATK",
+        description="Repeatable! Injects +60K XP & +20 Permanent ATK",
     ),
     ShopItemSpec(
         slug="deal_shades",
         icon="🕶️",
-        name="Deal Closer Shades",
+        name="Deal Closer Visor",
         tab="gear",
         category="eyewear",
         price=400,
@@ -573,11 +573,11 @@ SHOP_CATALOG: tuple[ShopItemSpec, ...] = (
     ShopItemSpec(
         slug="shiny_core",
         icon="✨",
-        name="Shiny Chroma Core",
+        name="Prismatic Core",
         tab="gear",
         category="shiny",
         price=1500,
-        description="Unlocks ★ SHINY sprite palette · +50% Coins & +90 ATK",
+        description="Unlocks ★ PRISMATIC sprite · +50% Coins & +90 ATK",
     ),
     # --- Tab 2: "style" (Pads, Auras, Sidekick Drone & Full Console UI Skin) ---
     ShopItemSpec(
@@ -587,7 +587,7 @@ SHOP_CATALOG: tuple[ShopItemSpec, ...] = (
         tab="style",
         category="pad",
         price=450,
-        description="Molten gold showcase pad & Solar Gold XP bar",
+        description="Molten gold holopad & Solar Gold XP bar",
     ),
     ShopItemSpec(
         slug="emerald_pad",
@@ -596,7 +596,7 @@ SHOP_CATALOG: tuple[ShopItemSpec, ...] = (
         tab="style",
         category="pad",
         price=450,
-        description="Matrix grove showcase pad & Emerald XP bar",
+        description="Matrix grove holopad & Emerald XP bar",
     ),
     ShopItemSpec(
         slug="nebula_pad",
@@ -605,7 +605,7 @@ SHOP_CATALOG: tuple[ShopItemSpec, ...] = (
         tab="style",
         category="pad",
         price=600,
-        description="Cosmic starfield pad & Nebula Violet XP bar",
+        description="Cosmic starfield holopad & Nebula Violet XP bar",
     ),
     ShopItemSpec(
         slug="cyber_halo",
@@ -623,7 +623,7 @@ SHOP_CATALOG: tuple[ShopItemSpec, ...] = (
         tab="style",
         category="pet",
         price=950,
-        description="Spawns pixel AI Drone companion · +70 Boss ATK",
+        description="Spawns pixel AI Drone bot · +70 Boss ATK",
     ),
     ShopItemSpec(
         slug="arcade_skin",
@@ -748,17 +748,17 @@ def toggle_or_buy_shop_item(slug: str, coins_earned: int) -> tuple[bool, str]:
     spent = _spent_coins(st)
     available = max(0, int(coins_earned) + int(st.get("bonus_coins", 0)) - spent)
 
-    # Special repeatable item: Rare Token Candy!
+    # Special repeatable item: Overclock Serum!
     if slug == "rare_candy":
         if available < spec.price:
             need = spec.price - available
-            return False, f"Need {need:,} more 🪙 for Rare Token Candy (costs {spec.price} 🪙)."
+            return False, f"Need {need:,} more 🪙 for Overclock Serum (costs {spec.price} 🪙)."
         st["candies_fed"] = int(st.get("candies_fed", 0)) + 1
         st["bonus_xp"] = int(st.get("bonus_xp", 0)) + 60_000
         owned.add("rare_candy")
         equipped.add("rare_candy")
         save_game_state(st)
-        return True, f"🧪 Fed Rare Candy #{st['candies_fed']}! +60,000 XP & +20 Permanent ATK!"
+        return True, f"🧪 Injected Overclock Serum #{st['candies_fed']}! +60,000 XP & +20 Permanent ATK!"
 
     if slug in owned:
         if slug in equipped:
@@ -1018,7 +1018,7 @@ def compute_companion(
     # Mood determination
     if "context_berry" in equipped_slugs:
         mood_key = "overdrive"
-        mood_label = "🍒 Berry Overdrive"
+        mood_label = "🔋 Cell Overdrive"
         mood_role = "Claude"
     elif active_binding_pct >= threshold_pct:
         mood_key = "wall_guard"
@@ -1127,26 +1127,26 @@ def compute_companion(
         BadgeState(
             slug="candy_alchemist",
             icon="🧪",
-            name="Candy Alchemist",
-            description="Feed 25+ Rare Token Candies to your Companion in the Poké Mart.",
+            name="Serum Alchemist",
+            description="Inject 25+ Overclock Serums into your Companion in the Spark Vault.",
             unlocked=candies_fed >= 25,
-            progress_text=f"{candies_fed} / 25 candies fed",
+            progress_text=f"{candies_fed} / 25 serums injected",
             short_progress=f"{candies_fed}/25 🧪",
         ),
         BadgeState(
             slug="mart_tycoon",
-            icon="🛍️",
-            name="Grand Tycoon",
-            description="Own all 12/12 items and cosmetics in the Belkins Poké Mart.",
+            icon="⚡",
+            name="Vault Tycoon",
+            description="Own all 12/12 relics and cyber-mods in the Belkins Spark Vault.",
             unlocked=len(owned_slugs) >= len(SHOP_CATALOG),
-            progress_text=f"{len(owned_slugs)} / {len(SHOP_CATALOG)} items owned",
+            progress_text=f"{len(owned_slugs)} / {len(SHOP_CATALOG)} relics owned",
             short_progress=f"{len(owned_slugs)}/{len(SHOP_CATALOG)}",
         ),
         BadgeState(
             slug="chromatic_triad",
             icon="✨",
-            name="Chromatic Triad",
-            description="Equip Shiny Chroma Core, Sovereign Crown & Plasma Blade simultaneously.",
+            name="Prismatic Triad",
+            description="Equip Prismatic Core, Sovereign Crown & Plasma Blade simultaneously.",
             unlocked=triad_eq >= 3,
             progress_text=f"{triad_eq} / 3 mythic relics equipped",
             short_progress=f"{triad_eq}/3 eq",
