@@ -1,4 +1,4 @@
-"""The ``belkins`` menu theme — Belkins AI Companion, XP Bar & Party Stamina Cards.
+"""The ``belkins`` menu theme — Belkins AI Companion, Boss Raid Arena & 12-Item Poké Mart.
 
 Custom flagship theme for Belkins Usage Bar (`bswap` / `belkins`), inspired by
 PokeTokenBar. Replaces all ``cswap`` references with ``bswap`` and organizes the
@@ -6,17 +6,20 @@ dropdown into 5 clean, in-place tabs (`⚡ Party`, `Claude`, `Codex`, `🐾 Dex`
 `🛒 Mart`):
 
 1. **Belkins Companion Hero Card**: Live 14x14 pixel-art evolving AI companion
-   (Sparkbit -> Outreachik -> Pipelinex -> Belkinosaur -> Belkins Prime),
-   segmented XP progress bar, real-time mood badge, and SparkCoins wallet.
-   Clicking the card opens the Belkins HTML Dashboard & Dex.
+   (8 stages: Sparkbit -> Outreachik -> Pipelinex -> Contexton -> Belkinosaur
+   -> Chronoflare -> Belkins Prime -> Omega Belkion), dynamic pad/XP themes,
+   Shiny palette, Plasma Blade, Mini-Drone sidekick, ATK power, and SparkCoins.
 2. **⚡ Party Tab (Default)**: Clean command center showing active Claude and
-   Codex champions first, plus a smart grouped Needs-Attention summary card
-   that collapses multiple re-login slots into a single compact alert row.
+   Codex champions first, plus a smart grouped Needs-Attention summary card.
 3. **Claude & Codex Tabs**: Dedicated fleet cards with spacious Party Stamina
    rows for one-click account switching via ``bswap``.
-4. **🐾 Dex Tab**: 5-Stage Evolution Pokedex + 2x4 Trophy Badge Bento Grid.
-5. **🛒 Mart Tab**: Interactive Belkins Poké Mart for buying & equipping pixel
-   cosmetics and habitat pads with SparkCoins (`🪙`).
+4. **🐾 Dex Tab**: Interactive **⚔️ Boss Raid Arena** (click to strike Raid
+   Bosses for SparkCoins & XP!) + sub-tabs for the **8-Stage Pokedex** (click
+   any unlocked stage to morph your Companion!) and **10 Trophy Badges**.
+5. **🛒 Mart Tab**: 12-item Belkins Poké Mart with **`⚔️ Gear & Lab`** (Context
+   Berry, repeatable Rare Token Candy, Deal Shades, Plasma Blade, Sovereign
+   Crown, Shiny Chroma Core) and **`🎨 Skins & Pets`** (Solar/Emerald/Nebula
+   Pads, Cyber Halo, Mini-Drone Sidekick, Cyber Arcade UI Skin).
 """
 
 from __future__ import annotations
@@ -29,8 +32,11 @@ from ..belkins_game import (
     SHOP_CATALOG,
     CompanionState,
     EvolutionStage,
+    RaidBossSpec,
     companion_from_snapshot,
-    load_shop_save,
+    load_game_save,
+    select_companion_stage,
+    strike_raid_boss,
     toggle_or_buy_shop_item,
 )
 from ..card_base import W, Block, Pen, register_role
@@ -45,7 +51,10 @@ TABS: tuple[tuple[str, str], ...] = (
     ("shop", "🛒 Mart"),
 )
 _ACTIVE_TAB: str = "party"
+_DEX_SUBTAB: str = "pokedex"     # "pokedex" | "trophies"
+_SHOP_SUBTAB: str = "gear"       # "gear" | "style"
 _LAST_SHOP_NOTE: str = ""
+_LAST_BOSS_NOTE: str = ""
 
 
 def get_active_tab() -> str:
@@ -58,12 +67,23 @@ def set_active_tab(tab_id: str) -> None:
         _ACTIVE_TAB = tab_id
 
 
+def set_dex_subtab(sub: str) -> None:
+    global _DEX_SUBTAB
+    if sub in ("pokedex", "trophies"):
+        _DEX_SUBTAB = sub
+
+
+def set_shop_subtab(sub: str) -> None:
+    global _SHOP_SUBTAB
+    if sub in ("gear", "style"):
+        _SHOP_SUBTAB = sub
+
+
 def _fmt_num(n: int) -> str:
-    """Compact human-readable number for XP and SparkCoins in tight pills."""
     val = int(n)
     if abs(val) >= 1_000_000:
         m = val / 1_000_000.0
-        return f"{m:.1f}M" if abs(m) >= 10.0 else f"{m:.2f}M".rstrip("0").rstrip(".") + ("M" if "." not in f"{m:.2f}".rstrip("0").rstrip(".") else "")
+        return f"{m:.1f}M" if abs(m) >= 10.0 else f"{m:.2f}M"
     if abs(val) >= 10_000:
         k = val / 1_000.0
         return f"{k:.0f}K" if abs(k) >= 100.0 else f"{k:.1f}K"
@@ -134,6 +154,8 @@ _WHITE = (255, 255, 255)
 _ROLES: tuple[tuple[str, tuple, tuple, Any], ...] = (
     ("belkins_card", (255, 255, 255, 0.94), (24, 25, 32, 0.92), None),
     ("belkins_card_edge", (0, 0, 0, 0.08), (255, 255, 255, 0.10), None),
+    ("belkins_arcade_card", (255, 251, 238, 0.96), (19, 18, 34, 0.95), None),
+    ("belkins_arcade_edge", (217, 155, 12, 0.42), (250, 204, 21, 0.45), None),
     ("belkins_hero_card", (255, 249, 245, 0.96), (32, 24, 28, 0.94), None),
     ("belkins_hero_edge", (235, 88, 42, 0.28), (255, 108, 58, 0.36), None),
     ("belkins_flame_rule", (242, 82, 34), (255, 102, 51), _WHITE),
@@ -143,24 +165,37 @@ _ROLES: tuple[tuple[str, tuple, tuple, Any], ...] = (
     ("belkins_sprite_pad", (24, 26, 34, 0.96), (14, 15, 21, 0.98), None),
     ("belkins_sprite_edge", (242, 82, 34, 0.45), (255, 108, 58, 0.50), None),
     ("belkins_solar_pad", (48, 20, 16, 0.96), (38, 14, 12, 0.98), None),
-    ("belkins_solar_edge", (250, 190, 25, 0.70), (250, 204, 21, 0.75), None),
-    ("belkins_emerald_pad", (14, 38, 30, 0.96), (10, 28, 22, 0.98), None),
-    ("belkins_emerald_edge", (40, 199, 138, 0.65), (52, 211, 153, 0.75), None),
+    ("belkins_solar_edge", (250, 190, 25, 0.75), (250, 204, 21, 0.80), None),
+    ("belkins_emerald_pad", (12, 38, 28, 0.96), (10, 28, 22, 0.98), None),
+    ("belkins_emerald_edge", (40, 199, 138, 0.70), (52, 211, 153, 0.80), None),
+    ("belkins_nebula_pad", (26, 16, 48, 0.96), (18, 12, 36, 0.98), None),
+    ("belkins_nebula_edge", (168, 85, 247, 0.75), (192, 132, 252, 0.85), None),
+    ("belkins_boss_pad", (42, 14, 20, 0.96), (32, 10, 16, 0.98), None),
+    ("belkins_boss_edge", (239, 68, 68, 0.65), (248, 113, 113, 0.75), None),
     ("belkins_gold_rule", (217, 155, 12), (250, 204, 21), _WHITE),
     ("belkins_gold_text", (170, 112, 0), (250, 204, 21), _WHITE),
     ("belkins_gold_pill", (250, 190, 25, 0.18), (250, 204, 21, 0.22), (255, 255, 255, 0.22)),
+    ("belkins_purple_rule", (147, 51, 234), (192, 132, 252), _WHITE),
+    ("belkins_purple_text", (126, 34, 206), (216, 180, 254), _WHITE),
+    ("belkins_purple_pill", (168, 85, 247, 0.16), (192, 132, 252, 0.22), (255, 255, 255, 0.22)),
     ("belkins_tab_bar", (0, 0, 0, 0.05), (255, 255, 255, 0.06), None),
     ("belkins_tab_active", (242, 82, 34, 0.16), (255, 102, 51, 0.28), None),
     ("belkins_tab_active_fill", (242, 82, 34), (245, 92, 42), _WHITE),
     ("belkins_tab_active_text", (255, 255, 255), (255, 255, 255), _WHITE),
     ("belkins_tab_inactive_text", (55, 58, 66, 0.90), (225, 228, 236, 0.86), _WHITE),
+    ("belkins_subtab_bg", (0, 0, 0, 0.045), (255, 255, 255, 0.06), None),
+    ("belkins_subtab_active", (242, 82, 34, 0.15), (255, 108, 58, 0.24), None),
     ("belkins_tab_edge", (242, 82, 34, 0.45), (255, 112, 56, 0.55), None),
     ("belkins_xp_fill", (242, 82, 34), (255, 112, 56), _WHITE),
+    ("belkins_xp_solar", (234, 158, 12), (250, 204, 21), _WHITE),
+    ("belkins_xp_emerald", (16, 185, 129), (52, 211, 153), _WHITE),
+    ("belkins_xp_nebula", (168, 85, 247), (192, 132, 252), _WHITE),
     ("belkins_xp_track", (0, 0, 0, 0.10), (255, 255, 255, 0.14), (255, 255, 255, 0.28)),
     ("belkins_flame_text", (208, 62, 18), (255, 126, 74), _WHITE),
     ("belkins_flame_pill", (242, 82, 34, 0.14), (255, 108, 58, 0.20), (255, 255, 255, 0.22)),
     ("belkins_good_pill", (40, 167, 69, 0.14), (48, 209, 88, 0.20), (255, 255, 255, 0.22)),
     ("belkins_warn_pill", (255, 149, 0, 0.15), (255, 159, 10, 0.22), (255, 255, 255, 0.22)),
+    ("belkins_crit_pill", (255, 59, 48, 0.15), (255, 69, 58, 0.22), (255, 255, 255, 0.22)),
     ("belkins_badge_on", (250, 190, 25, 0.16), (250, 204, 21, 0.18), (255, 255, 255, 0.22)),
     ("belkins_badge_on_edge", (217, 155, 12, 0.35), (250, 204, 21, 0.38), None),
     ("belkins_badge_off", (0, 0, 0, 0.04), (255, 255, 255, 0.05), (255, 255, 255, 0.12)),
@@ -370,24 +405,29 @@ def segmented_bar(
 
 def draw_pixel_companion(
     pen: Any,
-    stage: EvolutionStage,
+    stage: EvolutionStage | RaidBossSpec,
     x: float,
     y: float,
     size: float,
     *,
     mood_key: str = "locked_in",
     equipped: set[str] | tuple[str, ...] = (),
+    is_boss: bool = False,
 ) -> None:
-    """Draw the 14x14 pixel-art Belkins companion in flipped coordinates (with equipped cosmetics)."""
+    """Draw a 14x14 pixel-art Belkins companion or Raid Boss (with all equipped Mart cosmetics!)."""
     if isinstance(pen, _Measure):
         return
     eq = set(equipped or ())
-    pad_role = "belkins_sprite_pad"
-    edge_role = "belkins_sprite_edge"
-    if "solar_pad" in eq:
+    if is_boss:
+        pad_role, edge_role = "belkins_boss_pad", "belkins_boss_edge"
+    elif "solar_pad" in eq:
         pad_role, edge_role = "belkins_solar_pad", "belkins_solar_edge"
     elif "emerald_pad" in eq:
         pad_role, edge_role = "belkins_emerald_pad", "belkins_emerald_edge"
+    elif "nebula_pad" in eq:
+        pad_role, edge_role = "belkins_nebula_pad", "belkins_nebula_edge"
+    else:
+        pad_role, edge_role = "belkins_sprite_pad", "belkins_sprite_edge"
 
     pen.rrect(x, y, size, size, 8.0, pad_role, stroke=edge_role, stroke_width=1.0)
     grid = stage.sprite
@@ -398,14 +438,22 @@ def draw_pixel_companion(
     ox = x + pad
     oy = y + pad
 
-    b_r, b_g, b_b = stage.body_rgb
-    a_r, a_g, a_b = stage.accent_rgb
-    c_r, c_g, c_b = stage.crest_rgb
-    s_r, s_g, s_b = stage.spark_rgb
-    if mood_key == "overdrive":
-        s_r, s_g, s_b = (255, 110, 48)
-    elif mood_key == "wall_guard":
-        s_r, s_g, s_b = (251, 191, 36)
+    if not is_boss and "shiny_core" in eq:
+        # Mythic Shiny Palette Mutation!
+        b_r, b_g, b_b = (250, 204, 21)
+        a_r, a_g, a_b = (254, 249, 195)
+        c_r, c_g, c_b = (168, 85, 247)
+        s_r, s_g, s_b = (34, 211, 238)
+    else:
+        b_r, b_g, b_b = stage.body_rgb
+        a_r, a_g, a_b = stage.accent_rgb
+        c_r, c_g, c_b = stage.crest_rgb
+        s_r, s_g, s_b = stage.spark_rgb
+        if not is_boss:
+            if mood_key == "overdrive":
+                s_r, s_g, s_b = (255, 110, 48)
+            elif mood_key == "wall_guard":
+                s_r, s_g, s_b = (251, 191, 36)
 
     palette = {
         "O": (20, 20, 26, 1.0),
@@ -421,10 +469,35 @@ def draw_pixel_companion(
     except Exception:
         return
 
-    if "cyber_halo" in eq:
+    # Nebula Pad twinkling starfield pixels
+    if not is_boss and "nebula_pad" in eq:
+        NSColor.colorWithSRGBRed_green_blue_alpha_(216 / 255.0, 180 / 255.0, 254 / 255.0, 0.75).setFill()
+        for sc, sr in ((1, 3), (12, 2), (2, 11), (11, 12)):
+            NSBezierPath.fillRect_(NSMakeRect(ox + sc * cell, oy + sr * cell, cell * 0.7, cell * 0.7))
+
+    # Context Berry glowing crimson aura sparks
+    if not is_boss and "context_berry" in eq:
+        NSColor.colorWithSRGBRed_green_blue_alpha_(244 / 255.0, 63 / 255.0, 94 / 255.0, 0.90).setFill()
+        for bc, br in ((0, 4), (13, 4), (0, 9), (13, 9)):
+            NSBezierPath.fillRect_(NSMakeRect(ox + bc * cell, oy + br * cell, cell + 0.1, cell + 0.1))
+
+    # Cyber Halo orbital lightning nodes
+    if not is_boss and "cyber_halo" in eq:
         NSColor.colorWithSRGBRed_green_blue_alpha_(56 / 255.0, 189 / 255.0, 248 / 255.0, 0.95).setFill()
         for hc, hr in ((1, 1), (12, 1), (0, 6), (13, 6), (1, 12), (12, 12)):
             NSBezierPath.fillRect_(NSMakeRect(ox + hc * cell, oy + hr * cell, cell + 0.2, cell + 0.2))
+
+    # Mini-Drone Sidekick hovering in top-left corner
+    if not is_boss and "mini_drone" in eq:
+        drone_px = (
+            (0, 1, (56, 189, 248)),
+            (1, 1, (250, 204, 21)),
+            (0, 2, (248, 250, 252)),
+            (1, 2, (56, 189, 248)),
+        )
+        for dc, dr, (rr, gg, bb) in drone_px:
+            NSColor.colorWithSRGBRed_green_blue_alpha_(rr / 255.0, gg / 255.0, bb / 255.0, 1.0).setFill()
+            NSBezierPath.fillRect_(NSMakeRect(ox + dc * cell, oy + dr * cell, cell + 0.2, cell + 0.2))
 
     for r_idx, row_str in enumerate(grid):
         for c_idx, ch in enumerate(row_str):
@@ -438,14 +511,30 @@ def draw_pixel_companion(
             px = ox + c_idx * cell
             py = oy + r_idx * cell
             NSBezierPath.fillRect_(NSMakeRect(px, py, cell + 0.2, cell + 0.2))
-            if ch == "E" and "deal_shades" in eq:
+            if not is_boss and ch == "E" and "deal_shades" in eq:
                 NSColor.colorWithSRGBRed_green_blue_alpha_(6 / 255.0, 182 / 255.0, 212 / 255.0, 1.0).setFill()
                 NSBezierPath.fillRect_(NSMakeRect(px - cell * 0.2, py, cell * 1.4, cell + 0.2))
 
-    if "sovereign_crown" in eq:
+    # Sovereign Crown headgear
+    if not is_boss and "sovereign_crown" in eq:
         NSColor.colorWithSRGBRed_green_blue_alpha_(250 / 255.0, 204 / 255.0, 21 / 255.0, 1.0).setFill()
         for cc, cr_y in ((5, 0), (7, 0), (9, 0), (5, 1), (6, 1), (7, 1), (8, 1), (9, 1)):
             NSBezierPath.fillRect_(NSMakeRect(ox + cc * cell, oy + cr_y * cell, cell + 0.2, cell + 0.2))
+
+    # Plasma Token Blade weapon on right side
+    if not is_boss and "plasma_blade" in eq:
+        blade_px = (
+            (13, 3, (34, 211, 238)),
+            (13, 4, (34, 211, 238)),
+            (13, 5, (56, 189, 248)),
+            (13, 6, (232, 121, 249)),
+            (12, 7, (250, 204, 21)),
+            (13, 7, (250, 204, 21)),
+            (13, 8, (148, 163, 184)),
+        )
+        for bc, br, (rr, gg, bb) in blade_px:
+            NSColor.colorWithSRGBRed_green_blue_alpha_(rr / 255.0, gg / 255.0, bb / 255.0, 1.0).setFill()
+            NSBezierPath.fillRect_(NSMakeRect(ox + bc * cell, oy + br * cell, cell + 0.2, cell + 0.2))
 
 
 def symbol(
@@ -516,6 +605,14 @@ def _clip_to(w: float, h: float, draw: Callable[[], None]) -> None:
         NSGraphicsContext.restoreGraphicsState()
 
 
+def _card_surface_roles(default_fill: str, default_edge: str, default_rule: str | None) -> tuple[str, str, str | None]:
+    """If the user equipped `arcade_skin` in the Mart, reskin all cards into the Gold Arcade Console theme!"""
+    eq = load_game_save()["equipped"]
+    if "arcade_skin" in eq:
+        return "belkins_arcade_card", "belkins_arcade_edge", (default_rule or "belkins_gold_rule")
+    return default_fill, default_edge, default_rule
+
+
 class _Card:
     """One rounded card spread over consecutive blocks ("parts")."""
 
@@ -550,12 +647,14 @@ class _Card:
         card_h: float,
         kw: dict[str, Any],
     ) -> Callable[[Pen, float, float], None]:
-        fill, edge, rule = self.fill, self.edge, self.rule
+        base_fill, base_edge, base_rule = self.fill, self.edge, self.rule
         inset = kw.get("hl_inset", ROW_HL["hl_inset"])
         vinset = kw.get("hl_vinset", ROW_HL["hl_vinset"])
         radius = kw.get("hl_radius", ROW_HL["hl_radius"])
 
         def paint(pen: Pen, w: float, bh: float) -> None:
+            fill, edge, rule = _card_surface_roles(base_fill, base_edge, base_rule)
+
             def surface() -> None:
                 pen.rrect(CARD_X, card_y, w - 2 * CARD_X, card_h, CARD_R, fill, stroke=edge)
                 if rule:
@@ -579,24 +678,24 @@ class _Card:
 
 
 def _companion_card(snapshot: Any, companion: CompanionState, actions: ThemeActions) -> _Card:
-    """Clean, breathable 3-row Companion Header with 48x48 sprite, XP bar, Mood & SparkCoins."""
+    """Clean, dynamic 3-row Companion Header that reflects every Mart purchase & Dex morph live."""
     card = _Card("belkins_hero_card", "belkins_hero_edge", rule="belkins_flame_rule")
     open_dash = getattr(actions, "open_dashboard", None)
     dash_enabled = bool(snapshot.settings.get("dashboard_enabled", True))
     act = open_dash if (callable(open_dash) and dash_enabled) else None
 
     def draw_hero(pen: Any, y0: float) -> float:
-        owned_live, eq_live = load_shop_save()
-        spent_live = sum(it.price for it in SHOP_CATALOG if it.slug in owned_live)
-        coins_live = max(0, companion.coins_earned - spent_live)
-        mood_k = "overdrive" if "context_berry" in eq_live else companion.mood_key
-        mood_lbl = "🍒 Berry Overdrive" if "context_berry" in eq_live else companion.mood_label
+        live = companion if isinstance(pen, _Measure) else companion_from_snapshot(snapshot)
+        eq_live = set(live.equipped_items)
+        coins_live = live.coins_available
+        mood_k = live.mood_key
+        mood_lbl = live.mood_label
 
         pad_top = y0 + 11.0
         sprite_sz = 48.0
         draw_pixel_companion(
             pen,
-            companion.stage,
+            live.stage,
             X0,
             pad_top,
             sprite_sz,
@@ -606,7 +705,7 @@ def _companion_card(snapshot: Any, companion: CompanionState, actions: ThemeActi
         rx = X0 + sprite_sz + 11.0
         rw = X1 - rx
 
-        # Row 1: Companion Stage Name + Level Badge on left · Mood Pill on right
+        # Row 1: Companion Stage Name (+ ★ if Shiny) + Lv & ATK · Mood Pill on right
         b1 = pad_top + 13.0
         mood_role = (
             "warn_text"
@@ -628,20 +727,22 @@ def _companion_card(snapshot: Any, companion: CompanionState, actions: ThemeActi
             bg=mood_bg,
             weight="semibold",
         )
-        name_s = companion.stage.name
-        nw = text(pen, name_s, "hero_name", "label", rx, b1, maxw=rw - mw - 42.0)
-        lvl_s = f"Lv.{companion.level}"
+        prefix = "★ " if "shiny_core" in eq_live else ("🕹️ " if "arcade_skin" in eq_live else "")
+        name_s = f"{prefix}{live.stage.name}"
+        name_role = "belkins_gold_text" if "shiny_core" in eq_live else "label"
+        nw = text(pen, name_s, "hero_name", name_role, rx, b1, maxw=rw - mw - 68.0)
+        lvl_s = f"Lv.{live.level} · ⚔️{live.boss.player_atk}"
         text(
             pen,
             lvl_s,
             "caption_med",
             "belkins_flame_text",
-            rx + nw + 6.0,
+            rx + nw + 5.0,
             b1,
             maxw=max(0.0, rw - mw - nw - 8.0),
         )
 
-        # Row 2: Segmented XP Progress Bar on left · Compact SparkCoins Pill on right
+        # Row 2: Segmented XP Progress Bar (colored by equipped Pad!) · SparkCoins Pill on right
         b2 = pad_top + 29.0
         coin_s = f"🪙 {_fmt_compact_coins(coins_live)}"
         cw = _pill_w(pen, coin_s)
@@ -654,28 +755,41 @@ def _companion_card(snapshot: Any, companion: CompanionState, actions: ThemeActi
             bg="belkins_gold_pill",
             weight="semibold",
         )
+        xp_fill_role = "belkins_xp_fill"
+        if "solar_pad" in eq_live or "shiny_core" in eq_live:
+            xp_fill_role = "belkins_xp_solar"
+        elif "emerald_pad" in eq_live:
+            xp_fill_role = "belkins_xp_emerald"
+        elif "nebula_pad" in eq_live:
+            xp_fill_role = "belkins_xp_nebula"
+
         bar_w = max(60.0, rw - cw - 8.0)
         segmented_bar(
             pen,
             rx,
             b2 - 3.5,
             bar_w,
-            companion.xp_fraction * 100.0,
+            live.xp_fraction * 100.0,
             "ok",
             h=6.0,
             cells=10,
-            fill_override="belkins_xp_fill",
+            fill_override=xp_fill_role,
         )
 
-        # Row 3: Clean Daily Summary / Evolution Title + Trophy Count (zero truncation)
+        # Row 3: Daily Burn / Passive Buff + Trophies & Boss Kills on right
         b3 = pad_top + 45.0
-        trophies_s = f"🏆 {companion.unlocked_badges_count}/{len(companion.badges)}"
-        if companion.tokens_today > 0:
-            left_s = f"Today: {format_tokens(companion.tokens_today)} tok ({format_usd(companion.usd_today)})"
-        elif companion.next_stage is not None:
-            left_s = f"{companion.stage.title} · Next: Lv.{companion.next_stage.min_level}"
+        slain = live.boss.bosses_slain
+        trophies_s = (
+            f"🏆 {live.unlocked_badges_count}/{len(live.badges)} · 💀{slain}"
+            if slain > 0
+            else f"🏆 {live.unlocked_badges_count}/{len(live.badges)}"
+        )
+        if live.tokens_today > 0:
+            left_s = f"Today: {format_tokens(live.tokens_today)} tok ({format_usd(live.usd_today)})"
+        elif live.next_stage is not None:
+            left_s = f"{live.stage.passive} · Next: Lv.{live.next_stage.min_level}"
         else:
-            left_s = f"{companion.stage.title} · {_fmt_num(companion.xp_total)} XP"
+            left_s = f"{live.stage.passive} · {_fmt_num(live.xp_total)} XP"
         tw_right = text(pen, trophies_s, "caption_med", "belkins_gold_text", X1, b3, right=True)
         text(pen, left_s, "caption", "secondary", rx, b3, maxw=rw - tw_right - 8.0)
 
@@ -683,8 +797,9 @@ def _companion_card(snapshot: Any, companion: CompanionState, actions: ThemeActi
 
     tip_lines = [
         f"Belkins Companion: {companion.stage.name} (Lv.{companion.level} · {companion.stage.title})",
+        f"Passive: {companion.stage.passive} · ATK: {companion.boss.player_atk} · Crit: {companion.boss.player_crit_pct}%",
         f"Mood: {companion.mood_label} · XP: {companion.xp_total:,} (+{companion.xp_today:,} today)",
-        f"Trophies unlocked: {companion.unlocked_badges_count}/{len(companion.badges)}",
+        f"Trophies: {companion.unlocked_badges_count}/{len(companion.badges)} · Bosses Slain: {companion.boss.bosses_slain}",
         "Click to open Belkins Dex & Usage Dashboard",
     ]
     tip = "\n".join(tip_lines)
@@ -1412,7 +1527,6 @@ def _attention_card(spec: dict[str, Any]) -> _Card:
 
     items = spec["items"]
     if len(items) > 1:
-        # Group non-interactive items by (provider, state) so 8 re-login slots don't flood the screen
         grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
         standalone: list[dict[str, Any]] = []
         for it in items:
@@ -1498,7 +1612,8 @@ def _tab_bar_block(claude_count: int, codex_count: int) -> Block:
 
     def paint(pen: Pen, w: float, h: float) -> None:
         y = 5.0
-        pen.rrect(CARD_X, y, bar_w, bar_h, 8.0, "belkins_card", stroke="belkins_card_edge")
+        fill, edge, _ = _card_surface_roles("belkins_card", "belkins_card_edge", None)
+        pen.rrect(CARD_X, y, bar_w, bar_h, 8.0, fill, stroke=edge)
         for idx, (tab_id, label) in enumerate(TABS):
             tx = CARD_X + idx * seg_w
             is_act = _ACTIVE_TAB == tab_id
@@ -1610,122 +1725,248 @@ def _party_overview_card(
     return card
 
 
-def _dex_card(companion: CompanionState) -> _Card:
-    """`🐾 Dex` Tab Card: 5-Stage Evolution Pokedex + 2x4 Bento Grid of Belkins Trophy Badges."""
+def _dex_card(snapshot: Any, companion: CompanionState, subtab: str) -> _Card:
+    """`🐾 Dex` Tab: Interactive Boss Raid Arena + 8-Stage Pokedex / 10-Trophy Bento Grid."""
     card = _Card("belkins_card", "belkins_card_edge", rule="belkins_flame_rule")
-    head_spec = {
-        "icon": "sparkles",
-        "rule": "belkins_flame_rule",
-        "title": "Evolution Pokedex",
-        "right": f"Stage {companion.stage.stage}/5 · Lv.{companion.level}",
-        "right_parts": [f"Stage {companion.stage.stage}/5", f"Lv.{companion.level}"],
-    }
-    card.add(_card_head(head_spec), key="belkins-dex-head", ax="Evolution Pokedex")
 
-    for st in EVOLUTION_LINE:
-        is_cur = st.stage == companion.stage.stage
-        unlocked = companion.level >= st.min_level
+    # 1. Interactive Boss Raid Arena at the top of `🐾 Dex`
+    def draw_boss_arena(pen: Any, y0: float) -> float:
+        live = companion if isinstance(pen, _Measure) else companion_from_snapshot(snapshot)
+        boss = live.boss
+        base = y0 + 18.0
+        symbol(pen, "flame.fill", X0, base - 4.0, 11.5, "belkins_crit_fill", "semibold")
+        text(pen, "Boss Raid Arena", "title", "label", X0 + 17.0, base)
+        right_hdr = f"💀 {boss.bosses_slain} Slain · ⚔️ {boss.player_atk} ATK ({boss.player_crit_pct}% Crit)"
+        text(pen, right_hdr, "caption_med", "secondary", X1, base, right=True)
 
-        def draw_stage(
-            pen: Any,
-            y0: float,
-            stage: EvolutionStage = st,
-            cur: bool = is_cur,
-            unl: bool = unlocked,
-        ) -> float:
-            top = y0 + 3.0
-            draw_pixel_companion(pen, stage, X0, top, 24.0, mood_key="overdrive" if cur else "locked_in")
-            bx = X0 + 32.0
-            b1 = top + 16.0
-            tag_txt = "ACTIVE" if cur else ("UNLOCKED" if unl else f"Lv.{stage.min_level}")
-            tag_role = "belkins_flame_text" if cur else ("good_text" if unl else "secondary")
-            tag_bg = "belkins_flame_pill" if cur else ("belkins_good_pill" if unl else "belkins_badge_off")
-            tw_pill = _pill_w(pen, tag_txt)
-            pen.pill(tag_txt, X1 - tw_pill, b1 - 0.5, F["tag"][0], role=tag_role, bg=tag_bg, weight="semibold")
-            name_w = text(pen, f"{stage.stage}. {stage.name}", "primary_med", "label" if unl else "secondary", bx, b1)
+        box_top = base + 8.0
+        sprite_sz = 38.0
+        draw_pixel_companion(pen, boss.spec, X0, box_top, sprite_sz, is_boss=True)
+
+        rx = X0 + sprite_sz + 10.0
+        rw = X1 - rx
+        b1 = box_top + 12.0
+        btn_txt = f"⚔️ STRIKE (-{boss.player_atk})"
+        bw = _pill_w(pen, btn_txt)
+        pen.pill(
+            btn_txt,
+            X1 - bw,
+            b1 - 0.5,
+            F["tag"][0],
+            role="crit_text",
+            bg="belkins_crit_pill",
+            weight="semibold",
+        )
+        bname = f"{boss.spec.icon} {boss.spec.name} · Lv.{boss.level}"
+        text(pen, bname, "primary_med", "label", rx, b1, maxw=rw - bw - 8.0)
+
+        b2 = box_top + 26.0
+        hp_txt = f"{boss.hp_current:,}/{boss.hp_max:,} HP"
+        hw = text(pen, hp_txt, "num_small", "crit_text", X1, b2, right=True)
+        segmented_bar(
+            pen,
+            rx,
+            b2 - 3.5,
+            max(60.0, rw - hw - 8.0),
+            boss.hp_pct,
+            "crit",
+            h=5.5,
+            cells=10,
+            fill_override="belkins_crit_fill",
+        )
+
+        b3 = box_top + sprite_sz + 13.0
+        note_s = _LAST_BOSS_NOTE or f"Bounty: +{boss.spec.coin_reward} 🪙 & +{boss.spec.xp_reward // 1000}K XP · Click to attack!"
+        text(
+            pen,
+            note_s,
+            "caption",
+            "belkins_flame_text" if _LAST_BOSS_NOTE else "secondary",
+            X0,
+            b3,
+            maxw=W_INNER,
+        )
+        return b3 + 8.0
+
+    def on_strike_boss() -> None:
+        global _LAST_BOSS_NOTE
+        live = companion_from_snapshot(snapshot)
+        _ok, msg = strike_raid_boss(live)
+        _LAST_BOSS_NOTE = msg
+
+    card.add(
+        draw_boss_arena,
+        key=f"belkins-dex-boss-arena-{subtab}",
+        ax=f"Boss Raid Arena: {companion.boss.spec.name} ({companion.boss.hp_current} of {companion.boss.hp_max} HP). Click to strike.",
+        tooltip="Click to strike the Raid Boss with your Companion and equipped Mart Weapons! Defeating bosses drops huge SparkCoins and Bonus XP.",
+        action=on_strike_boss,
+        keep_open=True,
+        **ROW_HL,
+    )
+    card.add(_hair(), key=f"belkins-dex-boss-sep-{subtab}")
+
+    # 2. Sub-Tab Switcher inside `🐾 Dex`: `[ 📖 8-Stage Pokedex | 🏆 10 Trophies ]`
+    def draw_dex_subtabs(pen: Any, y0: float) -> float:
+        live = companion if isinstance(pen, _Measure) else companion_from_snapshot(snapshot)
+        bar_y = y0 + 6.0
+        bar_h = 24.0
+        half_w = (W_INNER - 6.0) / 2.0
+        pen.rrect(X0, bar_y, W_INNER, bar_h, 6.0, "belkins_subtab_bg")
+        tabs_sub = (
+            ("pokedex", f"📖 Pokedex ({live.highest_stage.stage}/8)"),
+            ("trophies", f"🏆 Trophies ({live.unlocked_badges_count}/{len(live.badges)})"),
+        )
+        for idx, (sid, slabel) in enumerate(tabs_sub):
+            sx = X0 + 2.0 + idx * (half_w + 2.0)
+            is_on = _DEX_SUBTAB == sid
+            if is_on:
+                pen.rrect(sx, bar_y + 2.0, half_w, bar_h - 4.0, 5.0, "belkins_tab_active_fill")
             text(
                 pen,
-                f"·  {stage.title}",
-                "caption",
-                "secondary",
-                bx + name_w + 6.0,
-                b1,
-                maxw=X1 - tw_pill - bx - name_w - 12.0,
+                slabel,
+                "caption_med",
+                "belkins_tab_active_text" if is_on else "belkins_tab_inactive_text",
+                sx + half_w / 2.0,
+                bar_y + 15.5,
+                center=True,
+                maxw=half_w - 6.0,
             )
-            return top + 27.0
+        return bar_y + bar_h + 6.0
 
-        card.add(
-            draw_stage,
-            key=f"belkins-dex-stage-{st.stage}",
-            ax=f"Stage {st.stage} {st.name}: {st.title}. {st.lore}",
-            tooltip=f"{st.name} (Lv.{st.min_level} · {st.title})\n{st.lore}",
-        )
+    def on_dex_subtab_click(click_x: float) -> None:
+        if click_x < W / 2.0:
+            set_dex_subtab("pokedex")
+        else:
+            set_dex_subtab("trophies")
 
-    card.add(_gap(4.0), key="belkins-dex-pad")
-    card.add(_hair(), key="belkins-dex-sep")
-    trophy_head = {
-        "icon": "trophy.fill",
-        "rule": "belkins_gold_rule",
-        "title": "Trophy Room",
-        "right": f"{companion.unlocked_badges_count}/{len(companion.badges)} unlocked",
-        "right_parts": [f"{companion.unlocked_badges_count}/{len(companion.badges)} unlocked"],
-    }
-    card.add(_card_head(trophy_head), key="belkins-dex-trophy-head", ax="Trophy Room")
+    card.add(
+        draw_dex_subtabs,
+        key=f"belkins-dex-subtabs-{subtab}",
+        ax="Switch between Pokedex and Trophy Room",
+        tooltip="",
+        action=lambda: set_dex_subtab("trophies" if _DEX_SUBTAB == "pokedex" else "pokedex"),
+        on_click_x=on_dex_subtab_click,
+        keep_open=True,
+        no_hover_bg=True,
+    )
 
-    # 2-column x 4-row Bento Badge Grid
-    badges = companion.badges
-    col_gap = 8.0
-    col_w = (W_INNER - col_gap) / 2.0
-    for row_idx in range(0, len(badges), 2):
-        pair = badges[row_idx : row_idx + 2]
+    if subtab == "pokedex":
+        for st in EVOLUTION_LINE:
+            def draw_stage(
+                pen: Any,
+                y0: float,
+                stage: EvolutionStage = st,
+            ) -> float:
+                live = companion if isinstance(pen, _Measure) else companion_from_snapshot(snapshot)
+                cur = stage.stage == live.stage.stage
+                unl = live.level >= stage.min_level
+                eq_live = set(live.equipped_items)
 
-        def draw_badge_pair(pen: Any, y0: float, items: tuple = pair) -> float:
-            box_y = y0 + 2.0
-            box_h = 26.0
-            base = box_y + 17.0
-            for c_idx, b_item in enumerate(items):
-                cx = X0 + c_idx * (col_w + col_gap)
-                bg_role = "belkins_badge_on" if b_item.unlocked else "belkins_badge_off"
-                edge_role = "belkins_badge_on_edge" if b_item.unlocked else "belkins_badge_off_edge"
-                pen.rrect(cx, box_y, col_w, box_h, 6.0, bg_role, stroke=edge_role)
-                mark = "✓" if b_item.unlocked else "🔒"
-                mark_role = "good_text" if b_item.unlocked else "secondary"
-                mw = text(pen, mark, "caption_med", mark_role, cx + col_w - 8.0, base, right=True)
+                top = y0 + 2.5
+                draw_pixel_companion(
+                    pen,
+                    stage,
+                    X0,
+                    top,
+                    23.0,
+                    mood_key="overdrive" if cur else "locked_in",
+                    equipped=eq_live if cur else (),
+                )
+                bx = X0 + 30.0
+                b1 = top + 15.5
+                if cur:
+                    tag_txt = "ACTIVE ✓"
+                    tag_role, tag_bg = "belkins_flame_text", "belkins_flame_pill"
+                elif unl:
+                    tag_txt = "MORPH"
+                    tag_role, tag_bg = "good_text", "belkins_good_pill"
+                else:
+                    tag_txt = f"Lv.{stage.min_level}"
+                    tag_role, tag_bg = "secondary", "belkins_badge_off"
+                tw_pill = _pill_w(pen, tag_txt)
+                pen.pill(tag_txt, X1 - tw_pill, b1 - 0.5, F["tag"][0], role=tag_role, bg=tag_bg, weight="semibold")
+                name_w = text(pen, f"{stage.stage}. {stage.name}", "primary_med", "label" if unl else "secondary", bx, b1)
                 text(
                     pen,
-                    f"{b_item.icon} {b_item.name}",
-                    "caption_med",
-                    "label" if b_item.unlocked else "secondary",
-                    cx + 8.0,
-                    base,
-                    maxw=col_w - mw - 20.0,
+                    f"·  {stage.passive}",
+                    "caption",
+                    "secondary",
+                    bx + name_w + 5.0,
+                    b1,
+                    maxw=X1 - tw_pill - bx - name_w - 10.0,
                 )
-            return box_y + box_h + 4.0
+                return top + 26.0
 
-        tips = "\n\n".join(
-            f"{b.icon} {b.name} ({'UNLOCKED ✓' if b.unlocked else b.progress_text})\n{b.description}"
-            for b in pair
-        )
-        axs = " · ".join(f"{b.name}: {b.progress_text}" for b in pair)
-        card.add(
-            draw_badge_pair,
-            key=f"belkins-dex-badge-row-{row_idx // 2}",
-            ax=axs,
-            tooltip=tips,
-        )
+            def on_morph(st_num: int = st.stage) -> None:
+                global _LAST_BOSS_NOTE
+                live = companion_from_snapshot(snapshot)
+                _ok, msg = select_companion_stage(st_num, live.level)
+                _LAST_BOSS_NOTE = msg
 
-    card.add(_gap(8.0), key="belkins-dex-foot")
+            card.add(
+                draw_stage,
+                key=f"belkins-dex-stage-{st.stage}",
+                ax=f"Stage {st.stage} {st.name}: {st.title} ({st.passive}). {st.lore}",
+                tooltip=f"#{st.stage} {st.name} (Lv.{st.min_level} · {st.title})\nPassive: {st.passive} · Base ATK: {st.base_atk}\n{st.lore}\nClick to morph your active Companion!",
+                action=on_morph,
+                keep_open=True,
+                **ROW_HL,
+            )
+    else:
+        badges = companion.badges
+        col_gap = 8.0
+        col_w = (W_INNER - col_gap) / 2.0
+        for row_idx in range(0, len(badges), 2):
+            pair = badges[row_idx : row_idx + 2]
+
+            def draw_badge_pair(pen: Any, y0: float, r_idx: int = row_idx, default_pair: tuple = pair) -> float:
+                live = companion if isinstance(pen, _Measure) else companion_from_snapshot(snapshot)
+                items = live.badges[r_idx : r_idx + 2] if r_idx < len(live.badges) else default_pair
+                box_y = y0 + 2.0
+                box_h = 26.0
+                base = box_y + 17.0
+                for c_idx, b_item in enumerate(items):
+                    cx = X0 + c_idx * (col_w + col_gap)
+                    bg_role = "belkins_badge_on" if b_item.unlocked else "belkins_badge_off"
+                    edge_role = "belkins_badge_on_edge" if b_item.unlocked else "belkins_badge_off_edge"
+                    pen.rrect(cx, box_y, col_w, box_h, 6.0, bg_role, stroke=edge_role)
+                    mark = "✓" if b_item.unlocked else "🔒"
+                    mark_role = "good_text" if b_item.unlocked else "secondary"
+                    mw = text(pen, mark, "caption_med", mark_role, cx + col_w - 8.0, base, right=True)
+                    text(
+                        pen,
+                        f"{b_item.icon} {b_item.name}",
+                        "caption_med",
+                        "label" if b_item.unlocked else "secondary",
+                        cx + 8.0,
+                        base,
+                        maxw=col_w - mw - 20.0,
+                    )
+                return box_y + box_h + 4.0
+
+            tips = "\n\n".join(
+                f"{b.icon} {b.name} ({'UNLOCKED ✓' if b.unlocked else b.progress_text})\n{b.description}"
+                for b in pair
+            )
+            axs = " · ".join(f"{b.name}: {b.progress_text}" for b in pair)
+            card.add(
+                draw_badge_pair,
+                key=f"belkins-dex-badge-row-{row_idx // 2}",
+                ax=axs,
+                tooltip=tips,
+            )
+
+    card.add(_gap(8.0), key=f"belkins-dex-foot-{subtab}")
     return card
 
 
-def _shop_card(companion: CompanionState) -> _Card:
-    """`🛒 Mart` Tab Card: Belkins Poké Mart where SparkCoins (`🪙`) buy & equip items live!"""
+def _shop_card(snapshot: Any, companion: CompanionState, subtab: str) -> _Card:
+    """`🛒 Mart` Tab Card: 12-Item Belkins Poké Mart with `⚔️ Gear & Lab` and `🎨 Skins & Pets` sub-tabs."""
     card = _Card("belkins_card", "belkins_card_edge", rule="belkins_gold_rule")
 
     def draw_shop_head(pen: Any, y0: float) -> float:
-        owned_live, _ = load_shop_save()
-        spent_live = sum(it.price for it in SHOP_CATALOG if it.slug in owned_live)
-        coins_live = max(0, companion.coins_earned - spent_live)
+        live = companion if isinstance(pen, _Measure) else companion_from_snapshot(snapshot)
+        coins_live = live.coins_available
         base = y0 + HEAD_BASE
         symbol(pen, "cart.fill", X0, base - 4.0, 11.5, "belkins_gold_rule", "semibold")
         tx = X0 + 18.0
@@ -1734,29 +1975,83 @@ def _shop_card(companion: CompanionState) -> _Card:
         pw = _pill_w(pen, wallet)
         pen.pill(wallet, X1 - pw, base - 0.5, F["tag"][0], role="belkins_gold_text", bg="belkins_gold_pill", weight="semibold")
         b2 = base + 16.0
-        sub = _LAST_SHOP_NOTE or "Click any item to buy or equip on your Companion:"
+        sub = _LAST_SHOP_NOTE or "Every item boosts stats or transforms your Companion & UI:"
         text(pen, sub, "caption", "belkins_flame_text" if _LAST_SHOP_NOTE else "secondary", X0, b2, maxw=W_INNER)
-        return b2 + 9.0
+        return b2 + 6.0
 
     card.add(
         draw_shop_head,
-        key="belkins-shop-head",
+        key=f"belkins-shop-head-{subtab}",
         ax=f"Belkins Poke Mart. {companion.coins_available} Coins available.",
-        tooltip="Earn SparkCoins from token burn (+8/1M tok, +15/$1) and Trophy Badges (+200/badge)",
+        tooltip="Earn SparkCoins from token burn, Trophies (+250/badge), and Boss Raids in the Dex tab!",
     )
-    card.add(_hair(), key="belkins-shop-rule")
 
-    for spec in SHOP_CATALOG:
+    # Sub-Tab Switcher inside `🛒 Mart`: `[ ⚔️ Gear & Lab (6) | 🎨 Skins & Pets (6) ]`
+    def draw_shop_subtabs(pen: Any, y0: float) -> float:
+        bar_y = y0 + 2.0
+        bar_h = 24.0
+        half_w = (W_INNER - 6.0) / 2.0
+        pen.rrect(X0, bar_y, W_INNER, bar_h, 6.0, "belkins_subtab_bg")
+        tabs_sub = (
+            ("gear", "⚔️ Gear & Lab (6)"),
+            ("style", "🎨 Skins & Pets (6)"),
+        )
+        for idx, (sid, slabel) in enumerate(tabs_sub):
+            sx = X0 + 2.0 + idx * (half_w + 2.0)
+            is_on = _SHOP_SUBTAB == sid
+            if is_on:
+                pen.rrect(sx, bar_y + 2.0, half_w, bar_h - 4.0, 5.0, "belkins_tab_active_fill")
+            text(
+                pen,
+                slabel,
+                "caption_med",
+                "belkins_tab_active_text" if is_on else "belkins_tab_inactive_text",
+                sx + half_w / 2.0,
+                bar_y + 15.5,
+                center=True,
+                maxw=half_w - 6.0,
+            )
+        return bar_y + bar_h + 5.0
+
+    def on_shop_subtab_click(click_x: float) -> None:
+        if click_x < W / 2.0:
+            set_shop_subtab("gear")
+        else:
+            set_shop_subtab("style")
+
+    card.add(
+        draw_shop_subtabs,
+        key=f"belkins-shop-subtabs-{subtab}",
+        ax="Switch between Gear & Lab and Skins & Pets",
+        tooltip="",
+        action=lambda: set_shop_subtab("style" if _SHOP_SUBTAB == "gear" else "gear"),
+        on_click_x=on_shop_subtab_click,
+        keep_open=True,
+        no_hover_bg=True,
+    )
+    card.add(_hair(), key=f"belkins-shop-rule-{subtab}")
+
+    items_for_sub = [it for it in SHOP_CATALOG if it.tab == subtab]
+    for spec in items_for_sub:
         def draw_item(pen: Any, y0: float, item_spec: Any = spec) -> float:
-            owned_live, eq_live = load_shop_save()
-            spent_live = sum(it.price for it in SHOP_CATALOG if it.slug in owned_live)
-            coins_live = max(0, companion.coins_earned - spent_live)
+            live = companion if isinstance(pen, _Measure) else companion_from_snapshot(snapshot)
+            coins_live = live.coins_available
+            owned_live = {it.slug for it in live.shop_items if it.owned}
+            eq_live = set(live.equipped_items)
             is_owned = item_spec.slug in owned_live
             is_eq = item_spec.slug in eq_live
 
             b1 = y0 + 16.0
             b2 = y0 + 30.0
-            if is_eq:
+            if item_spec.slug == "rare_candy":
+                fed = live.candies_fed
+                if coins_live >= item_spec.price:
+                    btn_txt = f"FEED · 🪙 {item_spec.price}" + (f" (×{fed})" if fed else "")
+                    btn_role, btn_bg = "belkins_gold_text", "belkins_gold_pill"
+                else:
+                    btn_txt = f"🔒 🪙 {item_spec.price}" + (f" (×{fed})" if fed else "")
+                    btn_role, btn_bg = "secondary", "belkins_badge_off"
+            elif is_eq:
                 btn_txt, btn_role, btn_bg = "EQUIPPED ✓", "good_text", "belkins_good_pill"
             elif is_owned:
                 btn_txt, btn_role, btn_bg = "EQUIP", "belkins_flame_text", "belkins_flame_pill"
@@ -1781,7 +2076,8 @@ def _shop_card(companion: CompanionState) -> _Card:
 
         def on_click_item(slug: str = spec.slug) -> None:
             global _LAST_SHOP_NOTE
-            _ok, msg = toggle_or_buy_shop_item(slug, companion.coins_earned)
+            live = companion_from_snapshot(snapshot)
+            _ok, msg = toggle_or_buy_shop_item(slug, live.coins_earned)
             _LAST_SHOP_NOTE = msg
 
         card.add(
@@ -1794,14 +2090,21 @@ def _shop_card(companion: CompanionState) -> _Card:
             **ROW_HL,
         )
 
-    card.add(_gap(8.0), key="belkins-shop-foot")
+    card.add(_gap(8.0), key=f"belkins-shop-foot-{subtab}")
     return card
 
 
-def _tag_blocks(blocks: list[Block], tab_id: str) -> list[Block]:
+def _tag_blocks(
+    blocks: list[Block],
+    tab_id: str,
+    extra_pred: Callable[[], bool] | None = None,
+) -> list[Block]:
     for b in blocks:
         b.tab = tab_id
-        b.is_visible = lambda t=tab_id: _ACTIVE_TAB == t
+        if extra_pred is None:
+            b.is_visible = lambda t=tab_id: _ACTIVE_TAB == t
+        else:
+            b.is_visible = lambda t=tab_id, p=extra_pred: (_ACTIVE_TAB == t) and p()
     return blocks
 
 
@@ -1851,10 +2154,28 @@ def build(snapshot: Any, now: float, actions: ThemeActions | None = None) -> lis
         codex_attn = [it for it in (attn["items"] if attn else ()) if it["provider"] == "Codex"]
         blocks += _tag_blocks(_provider_card(codex_sp, codex_attn).blocks(2.0, TAIL_GAP), "codex")
 
-    # 5. Tab "dex": 5-Stage Evolution Pokedex + 2x4 Trophy Badge Bento Grid
-    blocks += _tag_blocks(_dex_card(companion).blocks(2.0, TAIL_GAP), "dex")
+    # 5. Tab "dex": Interactive Boss Raid Arena + 8-Stage Pokedex / 10-Trophy Bento Grid
+    blocks += _tag_blocks(
+        _dex_card(snapshot, companion, "pokedex").blocks(2.0, TAIL_GAP),
+        "dex",
+        extra_pred=lambda: _DEX_SUBTAB == "pokedex",
+    )
+    blocks += _tag_blocks(
+        _dex_card(snapshot, companion, "trophies").blocks(2.0, TAIL_GAP),
+        "dex",
+        extra_pred=lambda: _DEX_SUBTAB == "trophies",
+    )
 
-    # 6. Tab "shop": Belkins Poké Mart (SparkCoins & Cosmetics)
-    blocks += _tag_blocks(_shop_card(companion).blocks(2.0, TAIL_GAP), "shop")
+    # 6. Tab "shop": 12-Item Belkins Poké Mart ("gear" sub-tab & "style" sub-tab)
+    blocks += _tag_blocks(
+        _shop_card(snapshot, companion, "gear").blocks(2.0, TAIL_GAP),
+        "shop",
+        extra_pred=lambda: _SHOP_SUBTAB == "gear",
+    )
+    blocks += _tag_blocks(
+        _shop_card(snapshot, companion, "style").blocks(2.0, TAIL_GAP),
+        "shop",
+        extra_pred=lambda: _SHOP_SUBTAB == "style",
+    )
 
     return blocks

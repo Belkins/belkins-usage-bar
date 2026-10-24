@@ -82,6 +82,35 @@ cd cc-usage-widget
 Start at login: `./install.sh --launch-agent`
 Remove everything: `./uninstall.sh`
 
+## Belkins ⚡ Companion, 5-Tab Menu, Boss Arena & `bswap` CLI
+
+`./install.sh` also installs the unified **`bswap`** and **`belkins`** CLI commands into `~/.local/bin` and enables the default **`Belkins ⚡ (Companion & Party)`** theme:
+
+### Interactive 5-Tab Menu Bar UI
+- **`⚡ Party` (Default)**: Shows your **Active Claude** and **Active Codex** champions first, with smart grouped alert summaries below.
+- **`Claude` & `Codex` Tabs**: Full fleet rosters with one-click account switching.
+- **`🐾 Dex` Tab**:
+  - **⚔️ Boss Raid Arena**: Click directly in the menu to strike Raid Bosses (`HTTP-429 Golem`, `Context Leviathan`, `Latency Archlich`, `Quota Behemoth`, `Null Singularity`) using your Companion's **ATK & Crit** to loot **SparkCoins (`🪙`)** and **Bonus XP**!
+  - **📖 8-Stage Evolution Pokedex**: `Sparkbit` (Lv.1) → `Outreachik` (Lv.8) → `Pipelinex` (Lv.18) → `Contexton` (Lv.30) → `Belkinosaur` (Lv.45) → `Chronoflare` (Lv.62) → `Belkins Prime` (Lv.80) → `Omega Belkion` (Lv.95). Click any unlocked stage to morph your active Companion and activate its passive buff!
+  - **🏆 10 Trophy Badges**: 5×2 Bento Grid tracking milestones across tokens, spend, fleet size, Boss Raids, and Mart collection.
+- **`🛒 Mart` Tab (12-Item Belkins Poké Mart)**:
+  - **`⚔️ Gear & Lab`**: `🍒 Context Berry`, repeatable `🧪 Rare Token Candy` (`+60K XP & +20 ATK` per candy), `🕶️ Deal Closer Shades`, `⚔️ Plasma Token Blade` (pixel sword), `👑 Sovereign Crown`, and `✨ Shiny Chroma Core` (mutates your Companion into its ★ Shiny gold/violet/cyan palette!).
+  - **`🎨 Skins & Pets`**: `🔥 Solar Forge Pad`, `🌿 Emerald Grove Pad`, `🌌 Void Nebula Pad` (each recolors your showcase pad & XP bar!), `⚡ Cyber Halo Aura`, `🤖 Mini-Drone Sidekick` (pixel AI drone pet), and `🕹️ Cyber Arcade UI Skin` (reskins all menu cards into a Gold Arcade Console!).
+
+### `bswap` / `belkins` CLI Reference
+```bash
+bswap                       # Companion HUD + Claude & Codex fleet status (alias: belkins)
+bswap dex                   # 8-Stage Pokedex, Boss Raid status & 10 Trophy Badges
+bswap raid [strikes]        # Attack the active Raid Boss for SparkCoins & Bonus XP (e.g. bswap raid 3)
+bswap morph <1..8|auto>     # Morph your active Companion into any unlocked Pokedex stage
+bswap mart                  # Open the 12-item Belkins Poké Mart in terminal (alias: bswap shop)
+bswap buy <item>            # Buy, equip, or feed an item (e.g. bswap buy candy, blade, shiny, arcade)
+bswap <slot|alias>          # Switch active Claude account to slot number or alias
+bswap best                  # Switch to the healthiest Claude account with the most headroom
+bswap codex [status|switch] # Manage Codex accounts
+bswap bar [restart|status]  # Control the Belkins menu-bar LaunchAgent
+```
+
 ## Reading the menu
 
 The dropdown opens on two cards that answer the questions you open it for:

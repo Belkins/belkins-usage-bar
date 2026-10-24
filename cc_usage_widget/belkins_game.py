@@ -1,9 +1,8 @@
-"""Belkins AI Companions, XP progression, mood engine, and Trophy Dex.
+"""Belkins AI Companions, 8-Stage Pokedex, Boss Raid Engine, and 12-Item Poké Mart.
 
 Inspired by PokeTokenBar, tailored for Belkins Usage Bar (`bswap` / `belkins`).
 Pure and non-throwing: every computation derives deterministically from the
-live :class:`UiSnapshot` or dashboard cells without touching disk or network on
-the AppKit thread (SPEC 2.3).
+live :class:`UiSnapshot` or dashboard cells without blocking the AppKit thread.
 """
 
 from __future__ import annotations
@@ -15,13 +14,13 @@ from .contracts import AccountRow, VENDOR_CLAUDE, VENDOR_CODEX, format_tokens, f
 
 
 # ---------------------------------------------------------------------------
-# Evolution Stages ("Belkins Dex")
+# 8-Stage Evolution Pokedex ("Belkins Dex")
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True, slots=True)
 class EvolutionStage:
-    """One evolution stage in the Belkins Companion lineage."""
+    """One evolution stage in the 8-stage Belkins Companion lineage."""
 
     stage: int
     slug: str
@@ -29,6 +28,8 @@ class EvolutionStage:
     title: str
     min_level: int
     lore: str
+    passive: str
+    base_atk: int
     # (R, G, B) in 0..255 for primary body, secondary accent, crest/crown, eye/spark
     body_rgb: tuple[int, int, int]
     accent_rgb: tuple[int, int, int]
@@ -38,13 +39,9 @@ class EvolutionStage:
 
 
 # 14x14 pixel-art matrices:
-# '.' = transparent
-# 'O' = dark outline
-# 'B' = primary body
-# 'A' = inner accent / belly / visor
-# 'C' = crest / horn / crown / flame
-# 'E' = eye (glowing)
-# 'S' = ambient spark / energy particle
+# '.' = transparent, 'O' = dark outline, 'B' = primary body,
+# 'A' = inner accent/belly, 'C' = crest/horn/crown/flame,
+# 'E' = glowing eye, 'S' = ambient spark/energy particle
 _SPRITE_SPARKBIT: Final[tuple[str, ...]] = (
     "......CC......",
     ".....CCCC.....",
@@ -96,6 +93,23 @@ _SPRITE_PIPELINEX: Final[tuple[str, ...]] = (
     "..............",
 )
 
+_SPRITE_CONTEXTON: Final[tuple[str, ...]] = (
+    "...S.CCCC.S...",
+    "....CCCCCC....",
+    "..OOOOOOOOOO..",
+    ".OBBCCCCCCBBO.",
+    "OBBBOOOOOOBBBO",
+    "OBBEEBBBBEEBBO",
+    "OBBBBCCCCBBBBO",
+    ".OBBAAAAAAABO.",
+    ".OBBAAAAAAABO.",
+    "..OBBBBBBBBO..",
+    ".OO.OOOOOO.OO.",
+    "OO..OO..OO..OO",
+    "...OO....OO...",
+    "..............",
+)
+
 _SPRITE_BELKINOSAUR: Final[tuple[str, ...]] = (
     "..CC..CC..CC..",
     ".CCCCCCCCCCCC.",
@@ -111,6 +125,23 @@ _SPRITE_BELKINOSAUR: Final[tuple[str, ...]] = (
     ".OOOO.OO.OOOO.",
     "..OOO....OOO..",
     "..OOO....OOO..",
+)
+
+_SPRITE_CHRONOFLARE: Final[tuple[str, ...]] = (
+    "S...CCCCCC...S",
+    ".CC.CCCCCC.CC.",
+    "CCCOOOOOOOACCC",
+    "COOBBBBBBBBOOC",
+    ".OBBCCCCCCBBO.",
+    "SOBBEEBBEEBBOS",
+    "COBBBBBBBBBBOC",
+    "COOBBAAAAABOOC",
+    ".OOBBAAAAABOO.",
+    "..OBBBBBBBBO..",
+    "..OO.OOOO.OO..",
+    ".OO..OO..OO...",
+    "S...OO....OO.S",
+    "..............",
 )
 
 _SPRITE_BELKINS_PRIME: Final[tuple[str, ...]] = (
@@ -130,6 +161,23 @@ _SPRITE_BELKINS_PRIME: Final[tuple[str, ...]] = (
     "S...OO..OO...S",
 )
 
+_SPRITE_OMEGA_BELKION: Final[tuple[str, ...]] = (
+    "S.CC.CCCC.CC.S",
+    ".CCCCCCCCCCCC.",
+    "CCCOOOOOOOACCC",
+    "COOBCCCCCCBOOC",
+    "OBBBBOOOOBBBBO",
+    "OBBEEECCEEEBBO",
+    "SOBBBBBBBBBBOS",
+    "COOBCCCCCCBOOC",
+    "COOBAAAAAAAOBC",
+    "COOBBAAAAABOOC",
+    ".OOBBBBBBBBOO.",
+    ".OO.OOOOOO.OO.",
+    "OO..OO..OO..OO",
+    "S..OOO..OOO..S",
+)
+
 
 EVOLUTION_LINE: Final[tuple[EvolutionStage, ...]] = (
     EvolutionStage(
@@ -139,6 +187,8 @@ EVOLUTION_LINE: Final[tuple[EvolutionStage, ...]] = (
         title="Seedling Pulse",
         min_level=1,
         lore="A curious neural spark born in the Belkins outbound forge. Feeds on fresh context windows.",
+        passive="+5% XP Gain",
+        base_atk=25,
         body_rgb=(255, 98, 56),
         accent_rgb=(255, 214, 165),
         crest_rgb=(56, 189, 248),
@@ -150,8 +200,10 @@ EVOLUTION_LINE: Final[tuple[EvolutionStage, ...]] = (
         slug="outreachik",
         name="Outreachik",
         title="Signal Scout",
-        min_level=5,
+        min_level=8,
         lore="An agile token-prowler with twin radar ears. Tracks multi-account headroom and spots rate walls early.",
+        passive="+10% Coin Drops",
+        base_atk=45,
         body_rgb=(255, 85, 42),
         accent_rgb=(254, 240, 138),
         crest_rgb=(251, 191, 36),
@@ -163,8 +215,10 @@ EVOLUTION_LINE: Final[tuple[EvolutionStage, ...]] = (
         slug="pipelinex",
         name="Pipelinex",
         title="Deal Vanguard",
-        min_level=12,
+        min_level=18,
         lore="Dual-core striker fusing Claude Fable precision with Codex Astra velocity. Never drops a thread.",
+        passive="+15% XP & +10% Crit",
+        base_atk=75,
         body_rgb=(249, 115, 22),
         accent_rgb=(253, 224, 71),
         crest_rgb=(168, 85, 247),
@@ -173,11 +227,28 @@ EVOLUTION_LINE: Final[tuple[EvolutionStage, ...]] = (
     ),
     EvolutionStage(
         stage=4,
+        slug="contexton",
+        name="Contexton",
+        title="Memory Weaver",
+        min_level=30,
+        lore="Psionicweaver of 1M-token context tapestries. Compresses massive codebases without losing a byte.",
+        passive="+20% Crit & +15% Coins",
+        base_atk=110,
+        body_rgb=(59, 130, 246),
+        accent_rgb=(191, 219, 254),
+        crest_rgb=(250, 204, 21),
+        spark_rgb=(168, 85, 247),
+        sprite=_SPRITE_CONTEXTON,
+    ),
+    EvolutionStage(
+        stage=5,
         slug="belkinosaur",
         name="Belkinosaur",
         title="Fleet Titan",
-        min_level=25,
+        min_level=45,
         lore="Armored 9-slot autonomous juggernaut. Shrugs off 5-hour rate walls by rotating accounts in milliseconds.",
+        passive="+25% Boss Raid DMG",
+        base_atk=155,
         body_rgb=(234, 68, 32),
         accent_rgb=(167, 243, 208),
         crest_rgb=(16, 185, 129),
@@ -185,23 +256,223 @@ EVOLUTION_LINE: Final[tuple[EvolutionStage, ...]] = (
         sprite=_SPRITE_BELKINOSAUR,
     ),
     EvolutionStage(
-        stage=5,
+        stage=6,
+        slug="chronoflare",
+        name="Chronoflare",
+        title="Reset Phoenix",
+        min_level=62,
+        lore="Solar-winged phoenix that rises whenever a 5-hour or 7-day quota window resets to 0%.",
+        passive="+25% XP & Coin Gain",
+        base_atk=210,
+        body_rgb=(245, 158, 11),
+        accent_rgb=(254, 249, 195),
+        crest_rgb=(239, 68, 68),
+        spark_rgb=(56, 189, 248),
+        sprite=_SPRITE_CHRONOFLARE,
+    ),
+    EvolutionStage(
+        stage=7,
         slug="belkins-prime",
         name="Belkins Prime",
         title="Apex Sovereign",
-        min_level=50,
+        min_level=80,
         lore="Mythic crowned sovereign of the Belkins AI fleet. Commands billions of tokens across parallel agent swarms.",
+        passive="+35% All Stats",
+        base_atk=280,
         body_rgb=(255, 59, 29),
         accent_rgb=(254, 249, 195),
         crest_rgb=(250, 204, 21),
         spark_rgb=(34, 211, 238),
         sprite=_SPRITE_BELKINS_PRIME,
     ),
+    EvolutionStage(
+        stage=8,
+        slug="omega-belkion",
+        name="Omega Belkion",
+        title="Astral Singularity",
+        min_level=95,
+        lore="Transcendent cosmic singularity forged from 100B+ tokens. Bends rate limits and spacetime to its will.",
+        passive="+50% All Stats & Loot",
+        base_atk=380,
+        body_rgb=(139, 92, 246),
+        accent_rgb=(253, 224, 71),
+        crest_rgb=(34, 211, 238),
+        spark_rgb=(244, 63, 94),
+        sprite=_SPRITE_OMEGA_BELKION,
+    ),
 )
 
 
 # ---------------------------------------------------------------------------
-# Badges / Trophies
+# Raid Bosses ("Belkins Boss Arena")
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class RaidBossSpec:
+    """One Boss in the Belkins Boss Arena."""
+
+    tier: int
+    slug: str
+    icon: str
+    name: str
+    title: str
+    base_hp: int
+    coin_reward: int
+    xp_reward: int
+    body_rgb: tuple[int, int, int]
+    accent_rgb: tuple[int, int, int]
+    crest_rgb: tuple[int, int, int]
+    spark_rgb: tuple[int, int, int]
+    sprite: tuple[str, ...]
+
+
+_BOSS_SPRITE_GOLEM: Final[tuple[str, ...]] = (
+    "...OOOOOOOO...",
+    "..OCCCCCCCCO..",
+    ".OBBBBBBBBBBO.",
+    "OBBBOOOOOOBBBO",
+    "OBBEEBBBBEEBBO",
+    "OBBBBBBBBBBBBO",
+    "OOBBAAAAABBBOO",
+    "OOBBAAAAABBBOO",
+    "OBBBBBBBBBBBBO",
+    ".OOBBBBBBBBOO.",
+    "..OO.OOOO.OO..",
+    ".OOO......OOO.",
+    ".OOO......OOO.",
+    "..............",
+)
+
+_BOSS_SPRITE_HYDRA: Final[tuple[str, ...]] = (
+    ".CC...CC...CC.",
+    "COOC.COOC.COOC",
+    "OEEO.OEEO.OEEO",
+    ".OO..OOOO..OO.",
+    "..OOOOOOOOOO..",
+    ".OBBBBBBBBBBO.",
+    "OBBBCCCCCCBBBO",
+    "OBBBAAAAABBBBO",
+    ".OBBAAAAABBBO.",
+    "..OBBBBBBBBO..",
+    ".OO.OOOOOO.OO.",
+    "OO..OO..OO..OO",
+    "..............",
+    "..............",
+)
+
+_BOSS_SPRITE_SINGULARITY: Final[tuple[str, ...]] = (
+    "S..CCCCCCCC..S",
+    ".CCOOOOOOOOCC.",
+    "COOBBBBBBBBOOC",
+    "OBBCCCCCCCCBBO",
+    "OBBEECCCCEEBBO",
+    "OBBCCEEEECCBBO",
+    "OBBCCCCCCCCBBO",
+    "COOBBAAAAABOOC",
+    ".OOBBAAAAABOO.",
+    "..OBBBBBBBBO..",
+    ".OO.OOOOOO.OO.",
+    "OO..OO..OO..OO",
+    "S...OO..OO...S",
+    "..............",
+)
+
+RAID_BOSSES: Final[tuple[RaidBossSpec, ...]] = (
+    RaidBossSpec(
+        tier=1,
+        slug="rate-golem",
+        icon="👾",
+        name="HTTP-429 Golem",
+        title="Rate-Wall Sentinel",
+        base_hp=600,
+        coin_reward=350,
+        xp_reward=45_000,
+        body_rgb=(239, 68, 68),
+        accent_rgb=(252, 165, 165),
+        crest_rgb=(245, 158, 11),
+        spark_rgb=(254, 240, 138),
+        sprite=_BOSS_SPRITE_GOLEM,
+    ),
+    RaidBossSpec(
+        tier=2,
+        slug="context-hydra",
+        icon="🐉",
+        name="Context Leviathan",
+        title="Truncation Hydra",
+        base_hp=1_200,
+        coin_reward=550,
+        xp_reward=75_000,
+        body_rgb=(16, 185, 129),
+        accent_rgb=(167, 243, 208),
+        crest_rgb=(244, 63, 94),
+        spark_rgb=(56, 189, 248),
+        sprite=_BOSS_SPRITE_HYDRA,
+    ),
+    RaidBossSpec(
+        tier=3,
+        slug="latency-lich",
+        icon="👁️",
+        name="Latency Archlich",
+        title="Stale-Token Specter",
+        base_hp=2_000,
+        coin_reward=800,
+        xp_reward=120_000,
+        body_rgb=(168, 85, 247),
+        accent_rgb=(233, 213, 255),
+        crest_rgb=(34, 211, 238),
+        spark_rgb=(250, 204, 21),
+        sprite=_BOSS_SPRITE_SINGULARITY,
+    ),
+    RaidBossSpec(
+        tier=4,
+        slug="quota-behemoth",
+        icon="🌋",
+        name="Quota Behemoth",
+        title="Seven-Day Colossus",
+        base_hp=3_200,
+        coin_reward=1_200,
+        xp_reward=180_000,
+        body_rgb=(217, 119, 6),
+        accent_rgb=(254, 240, 138),
+        crest_rgb=(239, 68, 68),
+        spark_rgb=(251, 191, 36),
+        sprite=_BOSS_SPRITE_GOLEM,
+    ),
+    RaidBossSpec(
+        tier=5,
+        slug="singularity-mech",
+        icon="🌌",
+        name="Null Singularity",
+        title="Eternal Void Core",
+        base_hp=5_000,
+        coin_reward=1_800,
+        xp_reward=260_000,
+        body_rgb=(99, 102, 241),
+        accent_rgb=(199, 210, 254),
+        crest_rgb=(244, 63, 94),
+        spark_rgb=(34, 211, 238),
+        sprite=_BOSS_SPRITE_SINGULARITY,
+    ),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class RaidBossState:
+    """Live state of the active Raid Boss in the Belkins Arena."""
+
+    spec: RaidBossSpec
+    level: int
+    hp_current: int
+    hp_max: int
+    hp_pct: float
+    bosses_slain: int
+    player_atk: int
+    player_crit_pct: int
+
+
+# ---------------------------------------------------------------------------
+# 10 Badges / Trophies
 # ---------------------------------------------------------------------------
 
 
@@ -218,7 +489,7 @@ class BadgeState:
 
 
 # ---------------------------------------------------------------------------
-# Belkins Poké Mart (Shop & Cosmetics)
+# 12-Item Belkins Poké Mart (2 Categories: "gear" & "style")
 # ---------------------------------------------------------------------------
 
 
@@ -229,7 +500,8 @@ class ShopItemSpec:
     slug: str
     icon: str
     name: str
-    category: str       # "berry" | "eyewear" | "headgear" | "aura" | "pad"
+    tab: str            # "gear" | "style"
+    category: str       # "berry" | "candy" | "eyewear" | "weapon" | "headgear" | "shiny" | "pad" | "aura" | "pet" | "skin"
     price: int          # cost in SparkCoins (🪙)
     description: str
 
@@ -241,61 +513,125 @@ class ShopItemState:
     slug: str
     icon: str
     name: str
+    tab: str
     category: str
     price: int
     description: str
     owned: bool
     equipped: bool
+    count: int = 0
 
 
 SHOP_CATALOG: tuple[ShopItemSpec, ...] = (
+    # --- Tab 1: "gear" (Weapons, Power-Ups, Consumables & Mutations) ---
     ShopItemSpec(
         slug="context_berry",
         icon="🍒",
         name="Context Berry",
+        tab="gear",
         category="berry",
         price=150,
-        description="Soothes Wall Guard · Boosts mood & +10% XP",
+        description="Soothes Wall Guard · +15% XP & +25 Boss ATK",
+    ),
+    ShopItemSpec(
+        slug="rare_candy",
+        icon="🧪",
+        name="Rare Token Candy",
+        tab="gear",
+        category="candy",
+        price=250,
+        description="Repeatable! Feeds +60K Bonus XP & +20 Permanent ATK",
     ),
     ShopItemSpec(
         slug="deal_shades",
         icon="🕶️",
         name="Deal Closer Shades",
+        tab="gear",
         category="eyewear",
         price=400,
-        description="Equips cyber-cyan pixel shades on your Companion",
+        description="Pixel cyan visor · +20% Crit & +40 Boss ATK",
     ),
     ShopItemSpec(
-        slug="solar_pad",
-        icon="🔥",
-        name="Solar Forge Pad",
-        category="pad",
-        price=500,
-        description="Crimson-gold forge habitat pad for your Companion",
-    ),
-    ShopItemSpec(
-        slug="emerald_pad",
-        icon="🌿",
-        name="Emerald Grove Pad",
-        category="pad",
-        price=500,
-        description="Bioluminescent grove habitat pad for your Companion",
-    ),
-    ShopItemSpec(
-        slug="cyber_halo",
-        icon="⚡",
-        name="Cyber Halo Aura",
-        category="aura",
-        price=600,
-        description="Surrounds your Companion with a pulsing cyan halo",
+        slug="plasma_blade",
+        icon="⚔️",
+        name="Plasma Token Blade",
+        tab="gear",
+        category="weapon",
+        price=650,
+        description="Equips glowing pixel sword · +85 Boss Raid ATK",
     ),
     ShopItemSpec(
         slug="sovereign_crown",
         icon="👑",
         name="Sovereign Crown",
+        tab="gear",
         category="headgear",
-        price=800,
-        description="Golden pixel crown on your Companion · +25% XP",
+        price=900,
+        description="Golden pixel crown · +25% XP/Coins & +55 ATK",
+    ),
+    ShopItemSpec(
+        slug="shiny_core",
+        icon="✨",
+        name="Shiny Chroma Core",
+        tab="gear",
+        category="shiny",
+        price=1500,
+        description="Unlocks ★ SHINY sprite palette · +50% Coins & +90 ATK",
+    ),
+    # --- Tab 2: "style" (Pads, Auras, Sidekick Drone & Full Console UI Skin) ---
+    ShopItemSpec(
+        slug="solar_pad",
+        icon="🔥",
+        name="Solar Forge Pad",
+        tab="style",
+        category="pad",
+        price=450,
+        description="Molten gold showcase pad & Solar Gold XP bar",
+    ),
+    ShopItemSpec(
+        slug="emerald_pad",
+        icon="🌿",
+        name="Emerald Grove Pad",
+        tab="style",
+        category="pad",
+        price=450,
+        description="Matrix grove showcase pad & Emerald XP bar",
+    ),
+    ShopItemSpec(
+        slug="nebula_pad",
+        icon="🌌",
+        name="Void Nebula Pad",
+        tab="style",
+        category="pad",
+        price=600,
+        description="Cosmic starfield pad & Nebula Violet XP bar",
+    ),
+    ShopItemSpec(
+        slug="cyber_halo",
+        icon="⚡",
+        name="Cyber Halo Aura",
+        tab="style",
+        category="aura",
+        price=550,
+        description="Orbital cyan lightning ring · +15% Crit & +45 ATK",
+    ),
+    ShopItemSpec(
+        slug="mini_drone",
+        icon="🤖",
+        name="Mini-Drone Sidekick",
+        tab="style",
+        category="pet",
+        price=950,
+        description="Spawns pixel AI Drone companion · +70 Boss ATK",
+    ),
+    ShopItemSpec(
+        slug="arcade_skin",
+        icon="🕹️",
+        name="Cyber Arcade UI Skin",
+        tab="style",
+        category="skin",
+        price=1200,
+        description="Transforms all widget cards into Gold Arcade Console",
     ),
 )
 
@@ -310,11 +646,22 @@ def _shop_save_path() -> Any:
     return Path.home() / ".claude" / "cc-usage-widget" / "belkins_shop.json"
 
 
-def load_shop_save() -> tuple[set[str], set[str]]:
-    """Return ``(owned_slugs, equipped_slugs)`` from persistent storage."""
+def load_game_save() -> dict[str, Any]:
+    """Return full persistent game state from ``belkins_shop.json``."""
     import json
 
     path = _shop_save_path()
+    default: dict[str, Any] = {
+        "owned": set(),
+        "equipped": set(),
+        "candies_fed": 0,
+        "boss_tier": 1,
+        "boss_damage": 0,
+        "bosses_slain": 0,
+        "bonus_coins": 0,
+        "bonus_xp": 0,
+        "selected_stage": 0,
+    }
     try:
         if path.is_file():
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -322,23 +669,42 @@ def load_shop_save() -> tuple[set[str], set[str]]:
                 valid = {it.slug for it in SHOP_CATALOG}
                 owned = {str(s) for s in (data.get("owned") or ()) if str(s) in valid}
                 equipped = {str(s) for s in (data.get("equipped") or ()) if str(s) in owned}
-                return owned, equipped
+                return {
+                    "owned": owned,
+                    "equipped": equipped,
+                    "candies_fed": max(0, int(data.get("candies_fed", 0) or 0)),
+                    "boss_tier": max(1, int(data.get("boss_tier", 1) or 1)),
+                    "boss_damage": max(0, int(data.get("boss_damage", 0) or 0)),
+                    "bosses_slain": max(0, int(data.get("bosses_slain", 0) or 0)),
+                    "bonus_coins": int(data.get("bonus_coins", 0) or 0),
+                    "bonus_xp": max(0, int(data.get("bonus_xp", 0) or 0)),
+                    "selected_stage": max(0, int(data.get("selected_stage", 0) or 0)),
+                }
     except Exception:
         pass
-    return set(), set()
+    return default
 
 
-def save_shop_state(owned: set[str], equipped: set[str]) -> bool:
-    """Persist ``(owned, equipped)`` atomically to ``belkins_shop.json``."""
+def save_game_state(state: dict[str, Any]) -> bool:
+    """Persist full game state atomically to ``belkins_shop.json``."""
     import json
 
     path = _shop_save_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
+        owned = set(state.get("owned") or ())
+        equipped = set(state.get("equipped") or ()) & owned
         payload = {
             "owned": sorted(owned),
-            "equipped": sorted(equipped & owned),
+            "equipped": sorted(equipped),
+            "candies_fed": max(0, int(state.get("candies_fed", 0) or 0)),
+            "boss_tier": max(1, int(state.get("boss_tier", 1) or 1)),
+            "boss_damage": max(0, int(state.get("boss_damage", 0) or 0)),
+            "bosses_slain": max(0, int(state.get("bosses_slain", 0) or 0)),
+            "bonus_coins": int(state.get("bonus_coins", 0) or 0),
+            "bonus_xp": max(0, int(state.get("bonus_xp", 0) or 0)),
+            "selected_stage": max(0, int(state.get("selected_stage", 0) or 0)),
         }
         tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         tmp.replace(path)
@@ -347,45 +713,140 @@ def save_shop_state(owned: set[str], equipped: set[str]) -> bool:
         return False
 
 
-def toggle_or_buy_shop_item(slug: str, coins_earned: int) -> tuple[bool, str]:
-    """Buy *slug* (if unowned and affordable) or toggle its equipped state.
+def load_shop_save() -> tuple[set[str], set[str]]:
+    """Return ``(owned_slugs, equipped_slugs)`` from persistent storage."""
+    st = load_game_save()
+    return st["owned"], st["equipped"]
 
-    Returns ``(changed, status_message)``.
-    """
+
+def save_shop_state(owned: set[str], equipped: set[str]) -> bool:
+    """Persist ``(owned, equipped)`` while preserving other game fields."""
+    st = load_game_save()
+    st["owned"] = set(owned)
+    st["equipped"] = set(equipped) & set(owned)
+    return save_game_state(st)
+
+
+def _spent_coins(state: dict[str, Any]) -> int:
+    owned = state["owned"]
+    candies = int(state.get("candies_fed", 0) or 0)
+    candy_price = next((it.price for it in SHOP_CATALOG if it.slug == "rare_candy"), 250)
+    gear_spent = sum(it.price for it in SHOP_CATALOG if it.slug in owned and it.slug != "rare_candy")
+    return gear_spent + candies * candy_price
+
+
+def toggle_or_buy_shop_item(slug: str, coins_earned: int) -> tuple[bool, str]:
+    """Buy *slug* (if unowned and affordable), feed a repeatable candy, or toggle equip."""
     spec = next((it for it in SHOP_CATALOG if it.slug == slug), None)
     if spec is None:
         return False, f"Unknown item: {slug}"
 
-    owned, equipped = load_shop_save()
-    spent = sum(it.price for it in SHOP_CATALOG if it.slug in owned)
-    available = max(0, int(coins_earned) - spent)
+    st = load_game_save()
+    owned: set[str] = st["owned"]
+    equipped: set[str] = st["equipped"]
+    spent = _spent_coins(st)
+    available = max(0, int(coins_earned) + int(st.get("bonus_coins", 0)) - spent)
+
+    # Special repeatable item: Rare Token Candy!
+    if slug == "rare_candy":
+        if available < spec.price:
+            need = spec.price - available
+            return False, f"Need {need:,} more 🪙 for Rare Token Candy (costs {spec.price} 🪙)."
+        st["candies_fed"] = int(st.get("candies_fed", 0)) + 1
+        st["bonus_xp"] = int(st.get("bonus_xp", 0)) + 60_000
+        owned.add("rare_candy")
+        equipped.add("rare_candy")
+        save_game_state(st)
+        return True, f"🧪 Fed Rare Candy #{st['candies_fed']}! +60,000 XP & +20 Permanent ATK!"
 
     if slug in owned:
         if slug in equipped:
             equipped.discard(slug)
-            save_shop_state(owned, equipped)
+            save_game_state(st)
             return True, f"Unequipped {spec.icon} {spec.name}."
-        # Unequip any other item in the same exclusive slot category (e.g. pad)
-        if spec.category in {"pad", "headgear", "eyewear"}:
+        if spec.category in {"pad", "headgear", "eyewear", "weapon", "skin"}:
             for other in SHOP_CATALOG:
                 if other.category == spec.category and other.slug != slug:
                     equipped.discard(other.slug)
         equipped.add(slug)
-        save_shop_state(owned, equipped)
-        return True, f"Equipped {spec.icon} {spec.name}!"
+        save_game_state(st)
+        return True, f"Equipped {spec.icon} {spec.name}! ({spec.description})"
 
     if available < spec.price:
         need = spec.price - available
-        return False, f"Need {need:,} more SparkCoins (costs {spec.price:,}, have {available:,})."
+        return False, f"Need {need:,} more SparkCoins (costs {spec.price:,} 🪙, have {available:,} 🪙)."
 
     owned.add(slug)
-    if spec.category in {"pad", "headgear", "eyewear"}:
+    if spec.category in {"pad", "headgear", "eyewear", "weapon", "skin"}:
         for other in SHOP_CATALOG:
             if other.category == spec.category and other.slug != slug:
                 equipped.discard(other.slug)
     equipped.add(slug)
-    save_shop_state(owned, equipped)
-    return True, f"Purchased & equipped {spec.icon} {spec.name} for {spec.price:,} SparkCoins!"
+    save_game_state(st)
+    return True, f"🎉 Bought & equipped {spec.icon} {spec.name} (-{spec.price} 🪙)!"
+
+
+def select_companion_stage(stage_num: int, max_unlocked_level: int = 99) -> tuple[bool, str]:
+    """Morph the active Companion to *stage_num* (1..8), or 0 to auto-follow highest stage."""
+    st = load_game_save()
+    if stage_num <= 0:
+        st["selected_stage"] = 0
+        save_game_state(st)
+        return True, "⚡ Companion set to AUTO (highest evolved form)."
+    target = next((s for s in EVOLUTION_LINE if s.stage == stage_num), None)
+    if target is None:
+        return False, f"Unknown stage #{stage_num}."
+    if max_unlocked_level < target.min_level:
+        return False, f"🔒 {target.name} unlocks at Lv.{target.min_level} (current: Lv.{max_unlocked_level})."
+    if int(st.get("selected_stage", 0)) == stage_num:
+        st["selected_stage"] = 0
+        save_game_state(st)
+        return True, f"Switched back from {target.name} to AUTO evolution."
+    st["selected_stage"] = stage_num
+    save_game_state(st)
+    return True, f"🐾 Morphed active Companion to #{target.stage} {target.name} ({target.passive})!"
+
+
+def strike_raid_boss(companion: CompanionState) -> tuple[bool, str]:
+    """Execute one RPG attack against the current Raid Boss using the Companion's ATK & Crit."""
+    import time
+
+    st = load_game_save()
+    boss = companion.boss
+    atk = max(25, boss.player_atk)
+    crit_pct = boss.player_crit_pct
+    # Deterministic-feel pseudo-random crit based on current timestamp + damage state
+    seed = int(time.time() * 1000) ^ ( int(st.get("boss_damage", 0)) * 31 + int(st.get("bosses_slain", 0)) * 97 )
+    is_crit = (seed % 100) < crit_pct
+    dmg = int(atk * (1.75 if is_crit else 1.0))
+
+    new_dmg = int(st.get("boss_damage", 0)) + dmg
+    if new_dmg >= boss.hp_max:
+        # Boss Slain!
+        st["bosses_slain"] = int(st.get("bosses_slain", 0)) + 1
+        st["boss_tier"] = int(st.get("boss_tier", 1)) + 1
+        st["boss_damage"] = 0
+        coin_mult = 1.50 if "shiny_core" in st["equipped"] else 1.0
+        if "sovereign_crown" in st["equipped"]:
+            coin_mult += 0.25
+        reward_coins = int(boss.spec.coin_reward * coin_mult)
+        reward_xp = int(boss.spec.xp_reward)
+        st["bonus_coins"] = int(st.get("bonus_coins", 0)) + reward_coins
+        st["bonus_xp"] = int(st.get("bonus_xp", 0)) + reward_xp
+        save_game_state(st)
+        return (
+            True,
+            f"🏆 SLAIN {boss.spec.icon} {boss.spec.name}! Looted +{reward_coins:,} 🪙 & +{reward_xp:,} XP!",
+        )
+
+    st["boss_damage"] = new_dmg
+    hit_coins = 25 if is_crit else 12
+    st["bonus_coins"] = int(st.get("bonus_coins", 0)) + hit_coins
+    st["bonus_xp"] = int(st.get("bonus_xp", 0)) + (4_500 if is_crit else 2_000)
+    save_game_state(st)
+    rem = max(0, boss.hp_max - new_dmg)
+    prefix = "💥 CRIT STRIKE!" if is_crit else "⚔️ Hit!"
+    return True, f"{prefix} -{dmg} HP to {boss.spec.name} ({rem}/{boss.hp_max} HP left) · +{hit_coins} 🪙"
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +859,7 @@ class CompanionState:
     """Complete gamified state rendered by the Belkins theme, CLI, and Dashboard."""
 
     stage: EvolutionStage
+    highest_stage: EvolutionStage
     next_stage: EvolutionStage | None
     level: int
     xp_total: int
@@ -418,8 +880,11 @@ class CompanionState:
     codex_total: int
     active_sessions: int
     badges: tuple[BadgeState, ...]
+    boss: RaidBossState
     coins_earned: int = 300
     coins_available: int = 300
+    candies_fed: int = 0
+    selected_stage: int = 0
     shop_items: tuple[ShopItemState, ...] = ()
     equipped_items: tuple[str, ...] = ()
 
@@ -429,15 +894,15 @@ class CompanionState:
 
 
 # ---------------------------------------------------------------------------
-# Pure XP & Level Math
+# Pure XP, Economy & Level Math
 # ---------------------------------------------------------------------------
 
 
 def xp_for_level(level: int) -> int:
-    """Cumulative XP required to reach *level* (Lv 1 = 0 XP)."""
+    """Cumulative XP required to reach *level* (Lv 1 = 0 XP, Lv 80 = ~4.2M XP, Lv 95 = ~6.2M XP)."""
     if level <= 1:
         return 0
-    return int(90 * ((level - 1) ** 2))
+    return int(480 * ((level - 1) ** 2.08))
 
 
 def level_from_xp(xp: int) -> tuple[int, int, int, float]:
@@ -479,7 +944,7 @@ def compute_companion(
     distinct_models_count: int = 0,
     threshold_pct: float = 85.0,
 ) -> CompanionState:
-    """Compute the full :class:`CompanionState` from raw usage and fleet metrics."""
+    """Compute the full :class:`CompanionState` from raw usage, game save, and fleet metrics."""
     notes = account_notes or {}
     claude_slots = [
         r for r in accounts
@@ -511,30 +976,45 @@ def compute_companion(
         and (r.seven_day_pct is None or r.seven_day_pct < 100.0)
     )
 
-    # XP Calculation:
-    # - 25 XP per 1M tokens in 30d
-    # - 40 XP per $1 notional spend in 30d
-    # - 250 XP per switchable Claude slot
-    # - 300 XP per Codex slot
-    # - 200 XP per recorded switch
     tok_30d = max(0, int(tokens_30d), int(tokens_today))
     tok_today = max(0, int(tokens_today))
     spend_30d = max(0.0, float(usd_30d), float(usd_today))
     spend_today = max(0.0, float(usd_today))
 
-    owned_slugs, equipped_slugs = load_shop_save()
-    xp_mult = 1.25 if "sovereign_crown" in equipped_slugs else (1.10 if "context_berry" in equipped_slugs else 1.0)
+    game_st = load_game_save()
+    owned_slugs: set[str] = game_st["owned"]
+    equipped_slugs: set[str] = game_st["equipped"]
+    candies_fed = int(game_st.get("candies_fed", 0) or 0)
+    bonus_xp = int(game_st.get("bonus_xp", 0) or 0)
+    bonus_coins = int(game_st.get("bonus_coins", 0) or 0)
+    bosses_slain = int(game_st.get("bosses_slain", 0) or 0)
+    boss_tier = max(1, int(game_st.get("boss_tier", 1) or 1))
+    boss_damage = max(0, int(game_st.get("boss_damage", 0) or 0))
+    selected_stage_num = int(game_st.get("selected_stage", 0) or 0)
 
-    xp_from_tokens = int((tok_30d / 1_000_000.0) * 25.0)
-    xp_from_spend = int(spend_30d * 40.0)
-    xp_from_fleet = len(claude_slots) * 250 + len(live_codex) * 300 + recent_switches_count * 200
-    xp_total = int(max(100, xp_from_tokens + xp_from_spend + xp_from_fleet) * xp_mult)
-    xp_today = int(((tok_today / 1_000_000.0) * 25.0 + spend_today * 40.0) * xp_mult)
+    xp_mult = 1.0
+    if "sovereign_crown" in equipped_slugs:
+        xp_mult += 0.25
+    if "context_berry" in equipped_slugs:
+        xp_mult += 0.15
+
+    xp_from_tokens = int((tok_30d / 1_000_000.0) * 18.0)
+    xp_from_spend = int(spend_30d * 28.0)
+    xp_from_fleet = len(claude_slots) * 350 + len(live_codex) * 400 + recent_switches_count * 250
+    xp_total = int((max(150, xp_from_tokens + xp_from_spend + xp_from_fleet) + bonus_xp) * xp_mult)
+    xp_today = int(((tok_today / 1_000_000.0) * 18.0 + spend_today * 28.0) * xp_mult)
 
     level, xp_into, xp_band, xp_frac = level_from_xp(xp_total)
-    stage, next_stage = stage_for_level(level)
+    highest_stage, next_stage = stage_for_level(level)
 
-    # Mood determination (Context Berry soothes Wall Guard into Overdrive)
+    # Allow morphing into any unlocked stage from the Pokedex
+    stage = highest_stage
+    if selected_stage_num > 0:
+        chosen = next((s for s in EVOLUTION_LINE if s.stage == selected_stage_num), None)
+        if chosen is not None and level >= chosen.min_level:
+            stage = chosen
+
+    # Mood determination
     if "context_berry" in equipped_slugs:
         mood_key = "overdrive"
         mood_label = "🍒 Berry Overdrive"
@@ -556,7 +1036,7 @@ def compute_companion(
         mood_label = "💤 Recharging"
         mood_role = "Codex"
 
-    # 8 Belkins Badges
+    # 10 Belkins Trophy Badges
     badges = (
         BadgeState(
             slug="first_spark",
@@ -588,7 +1068,7 @@ def compute_companion(
             name="Wall Breaker",
             description="Rotate accounts with bswap to bypass rate walls.",
             unlocked=recent_switches_count > 0 or len(claude_slots) >= 2,
-            progress_text=f"{max(1, recent_switches_count)} rotations logged" if (recent_switches_count > 0 or len(claude_slots) >= 2) else "0 rotations",
+            progress_text=f"{max(1, recent_switches_count)} rotations" if (recent_switches_count > 0 or len(claude_slots) >= 2) else "0 rotations",
         ),
         BadgeState(
             slug="centurion",
@@ -615,40 +1095,99 @@ def compute_companion(
             progress_text=f"{max(distinct_models_count, active_sessions)} active streams",
         ),
         BadgeState(
+            slug="boss_slayer",
+            icon="🐉",
+            name="Boss Slayer",
+            description="Defeat a Raid Boss in the Belkins Dex Arena.",
+            unlocked=bosses_slain >= 1,
+            progress_text=f"{bosses_slain} bosses slain",
+        ),
+        BadgeState(
+            slug="mart_collector",
+            icon="🛍️",
+            name="Mart Collector",
+            description="Unlock 4+ items or cosmetics in the Belkins Poké Mart.",
+            unlocked=len(owned_slugs) >= 4,
+            progress_text=f"{len(owned_slugs)} / 4 items owned",
+        ),
+        BadgeState(
             slug="apex_sovereign",
             icon="👑",
             name="Apex Sovereign",
-            description="Evolve to Lv.50 Belkins Prime.",
-            unlocked=level >= 50,
-            progress_text=f"Lv.{level} / Lv.50",
+            description="Evolve to Lv.80 Belkins Prime (or Lv.95 Omega Belkion).",
+            unlocked=level >= 80,
+            progress_text=f"Lv.{level} / Lv.80",
         ),
     )
 
+    # Balanced RPG Coin Economy:
+    # Base 500 + power-scaled token/spend coins + 250 per unlocked trophy + Boss loot
     unlocked_count = sum(1 for b in badges if b.unlocked)
-    coins_earned = (
-        300
-        + int((tok_30d / 1_000_000.0) * 8.0)
-        + int(spend_30d * 15.0)
-        + unlocked_count * 200
+    token_m = max(0.0, tok_30d / 1_000_000.0)
+    token_coins = int((token_m ** 0.58) * 14.0)
+    spend_coins = int((max(0.0, spend_30d) ** 0.65) * 3.2)
+    coins_earned = 500 + token_coins + spend_coins + unlocked_count * 250 + bonus_coins
+    spent_total = _spent_coins(game_st)
+    coins_available = max(0, coins_earned - spent_total)
+
+    # Compute Companion Battle Stats (ATK & Crit) from Stage + Level + Equipped Mart Gear
+    atk = stage.base_atk + level * 2 + candies_fed * 20
+    crit_pct = 15 + (10 if stage.stage >= 3 else 0) + (15 if stage.stage >= 4 else 0)
+    if "context_berry" in equipped_slugs:
+        atk += 25
+    if "deal_shades" in equipped_slugs:
+        atk += 40
+        crit_pct += 20
+    if "plasma_blade" in equipped_slugs:
+        atk += 85
+    if "sovereign_crown" in equipped_slugs:
+        atk += 55
+    if "shiny_core" in equipped_slugs:
+        atk += 90
+        crit_pct += 15
+    if "cyber_halo" in equipped_slugs:
+        atk += 45
+        crit_pct += 15
+    if "mini_drone" in equipped_slugs:
+        atk += 70
+    crit_pct = min(95, crit_pct)
+
+    # Active Raid Boss state
+    boss_idx = (boss_tier - 1) % len(RAID_BOSSES)
+    cycle = (boss_tier - 1) // len(RAID_BOSSES)
+    boss_spec = RAID_BOSSES[boss_idx]
+    hp_max = int(boss_spec.base_hp * (1.0 + cycle * 0.65))
+    hp_cur = max(1, hp_max - min(hp_max - 1, boss_damage))
+    boss_state = RaidBossState(
+        spec=boss_spec,
+        level=boss_tier * 12,
+        hp_current=hp_cur,
+        hp_max=hp_max,
+        hp_pct=(hp_cur / float(hp_max)) * 100.0,
+        bosses_slain=bosses_slain,
+        player_atk=atk,
+        player_crit_pct=crit_pct,
     )
-    coins_spent = sum(it.price for it in SHOP_CATALOG if it.slug in owned_slugs)
-    coins_available = max(0, coins_earned - coins_spent)
+
     shop_items = tuple(
         ShopItemState(
             slug=it.slug,
             icon=it.icon,
             name=it.name,
+            tab=it.tab,
             category=it.category,
             price=it.price,
             description=it.description,
             owned=(it.slug in owned_slugs),
             equipped=(it.slug in equipped_slugs),
+            count=candies_fed if it.slug == "rare_candy" else (1 if it.slug in owned_slugs else 0),
         )
         for it in SHOP_CATALOG
     )
 
     return CompanionState(
         stage=stage,
+        highest_stage=highest_stage,
         next_stage=next_stage,
         level=level,
         xp_total=xp_total,
@@ -669,8 +1208,11 @@ def compute_companion(
         codex_total=len(live_codex),
         active_sessions=active_sessions,
         badges=badges,
+        boss=boss_state,
         coins_earned=coins_earned,
         coins_available=coins_available,
+        candies_fed=candies_fed,
+        selected_stage=selected_stage_num,
         shop_items=shop_items,
         equipped_items=tuple(sorted(equipped_slugs)),
     )
@@ -725,10 +1267,17 @@ def render_sprite_svg(
     equipped: Sequence[str] = (),
 ) -> str:
     """Render *stage*'s 14x14 pixel-art sprite as a crisp inline SVG (with equipped cosmetics)."""
-    b_r, b_g, b_b = stage.body_rgb
-    a_r, a_g, a_b = stage.accent_rgb
-    c_r, c_g, c_b = stage.crest_rgb
-    s_r, s_g, s_b = stage.spark_rgb
+    eq = set(equipped or ())
+    if "shiny_core" in eq:
+        b_r, b_g, b_b = (250, 204, 21)
+        a_r, a_g, a_b = (254, 249, 195)
+        c_r, c_g, c_b = (168, 85, 247)
+        s_r, s_g, s_b = (34, 211, 238)
+    else:
+        b_r, b_g, b_b = stage.body_rgb
+        a_r, a_g, a_b = stage.accent_rgb
+        c_r, c_g, c_b = stage.crest_rgb
+        s_r, s_g, s_b = stage.spark_rgb
     palette = {
         "O": "#18181b",
         "B": f"rgb({b_r},{b_g},{b_b})",
@@ -737,11 +1286,13 @@ def render_sprite_svg(
         "E": "#ffffff",
         "S": f"rgb({s_r},{s_g},{s_b})",
     }
-    eq = set(equipped or ())
     rects: list[str] = []
     if "cyber_halo" in eq:
         for hx, hy in ((1, 1), (12, 1), (0, 6), (13, 6), (1, 12), (12, 12)):
             rects.append(f'<rect x="{hx}" y="{hy}" width="1" height="1" fill="#38bdf8"/>')
+    if "mini_drone" in eq:
+        for dx, dy, dc in ((0, 1, "#38bdf8"), (1, 1, "#facc15"), (0, 2, "#f8fafc"), (1, 2, "#38bdf8")):
+            rects.append(f'<rect x="{dx}" y="{dy}" width="1" height="1" fill="{dc}"/>')
     for y, row in enumerate(stage.sprite):
         for x, ch in enumerate(row):
             color = palette.get(ch)
@@ -753,6 +1304,17 @@ def render_sprite_svg(
     if "sovereign_crown" in eq:
         for cx, cy in ((5, 0), (7, 0), (9, 0), (5, 1), (6, 1), (7, 1), (8, 1), (9, 1)):
             rects.append(f'<rect x="{cx}" y="{cy}" width="1" height="1" fill="#facc15"/>')
+    if "plasma_blade" in eq:
+        for bx, by, bc in (
+            (13, 3, "#22d3ee"),
+            (13, 4, "#22d3ee"),
+            (13, 5, "#38bdf8"),
+            (13, 6, "#e879f9"),
+            (12, 7, "#facc15"),
+            (13, 7, "#facc15"),
+            (13, 8, "#94a3b8"),
+        ):
+            rects.append(f'<rect x="{bx}" y="{by}" width="1" height="1" fill="{bc}"/>')
     return (
         f'<svg class="belkins-sprite" width="{size}" height="{size}" '
         f'viewBox="0 0 14 14" shape-rendering="crispEdges" '
