@@ -179,11 +179,12 @@ _TIMESTAMP_TAIL_RE: Final[re.Pattern[str]] = re.compile(
 )
 """Matches an ISO instant and keeps only its date - see :func:`_episode_key`."""
 
-_TESTED_CLAUDE_SWAP_PREFIX: Final[str] = "0.26."
+_TESTED_CLAUDE_SWAP_PREFIX: Final[tuple[str, ...]] = ("0.26.", "0.27.", "0.28.")
 """claude-swap versions this adapter's private-symbol reach-ins were verified
-against (tests/test_ops.py contract; 0.26.0 on 2026-09-30, with a live switch
-round trip). A mismatch WARNS (never refuses): the failure policy already
-degrades gracefully, this just makes the degradation datable."""
+against (tests/test_ops.py contract; 0.26.0 on 2026-09-30 and 0.28.0 on
+2026-10-24, with a live switch round trip). A mismatch WARNS (never refuses):
+the failure policy already degrades gracefully, this just makes the degradation
+datable."""
 
 FETCH_FAILING_KIND: Final[str] = "fetch-failing"
 """Sentinel kind (:meth:`SwapAccountSource.sentinel_kinds`) for a slot whose
