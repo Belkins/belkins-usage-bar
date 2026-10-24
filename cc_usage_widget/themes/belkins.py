@@ -1102,7 +1102,7 @@ def _attn_item(it: dict[str, Any]) -> Callable[[Any, float], float]:
     return draw
 
 
-def _attn_grouped_item(group: list[dict[str, Any]]) -> Callable[[Any, float], float]:
+def _attn_grouped_item(group: list[dict[str, Any]], *, show_tab_hint: bool = True) -> Callable[[Any, float], float]:
     """Compact 2-line summary for multiple accounts sharing the same alert state (e.g. 8 re-login slots)."""
     first = group[0]
     n = len(group)
@@ -1115,17 +1115,24 @@ def _attn_grouped_item(group: list[dict[str, Any]]) -> Callable[[Any, float], fl
     else:
         names_s = f"{', '.join(names[:3])} +{len(names) - 3} more"
 
+    cmd_chip = next(
+        (seg[0] for seg in (first.get("action_segs") or ()) if len(seg) >= 4 and seg[3] == "code"),
+        "bswap add",
+    )
+
     def draw(pen: Any, y0: float) -> float:
         b1 = y0 + 16.0
         head_s = f"{n} {provider} slots"
         whead = text(pen, head_s, "primary_med", "label", X0, b1)
         text(pen, state, "primary", state_role, X0 + whead + 7.0, b1, maxw=X1 - (X0 + whead + 55.0))
-        text(pen, f"{provider} ▸", "caption_med", "secondary", X1, b1, right=True)
+        if show_tab_hint:
+            text(pen, f"{provider} ▸", "caption_med", "secondary", X1, b1, right=True)
 
         b2 = b1 + 17.0
-        segs: list[tuple] = [(f"{names_s}  ·  ", "caption", "secondary")]
-        for seg in first.get("action_segs") or ():
-            segs.append(seg)
+        segs: list[tuple] = [
+            (f"{names_s}  ·  Run ", "caption", "secondary"),
+            (cmd_chip, "code", "secondary", "code"),
+        ]
         segments(pen, segs, X0, b2, W_INNER)
         return b2 + ROW_END
 
@@ -1289,9 +1296,9 @@ def _hero(hero: dict[str, Any], *, compact: bool = False) -> Callable[[Any, floa
 
 def _row(r: dict[str, Any]) -> Callable[[Any, float], float]:
     def draw(pen: Any, y0: float) -> float:
-        x = X0 + 18 if r["slot"] else X0 + 12
+        x = X0 + 18 if r["slot"] else X0 + 8
         label_w = text_w(pen, r["label"], "caption") if r["label"] else 0.0
-        name_max = (COL_LABEL_R - label_w - 8 - x) if r["label"] else (COL_BAR_X - 12 - x)
+        name_max = (COL_LABEL_R - label_w - 8 - x) if r["label"] else (COL_BAR_X - 6 - x)
         caps = list(r["captions"])
         plan_inline = bool(r["plan"]) and (
             text_w(pen, r["name"], "primary_med") + 5 + text_w(pen, r["plan"], "caption") <= name_max
@@ -1378,7 +1385,7 @@ def _provider_card(spec: dict[str, Any], attn_items: list[dict[str, Any]] | None
         if len(attn_items) >= 2:
             tips = "\n".join(it["tip"] for it in attn_items)
             card.add(
-                _attn_grouped_item(attn_items),
+                _attn_grouped_item(attn_items, show_tab_hint=False),
                 key=f"belkins-{key}-attn-grouped",
                 tooltip=tips,
                 ax=_ax(tips),
@@ -1727,7 +1734,7 @@ def _shop_card(companion: CompanionState) -> _Card:
         pw = _pill_w(pen, wallet)
         pen.pill(wallet, X1 - pw, base - 0.5, F["tag"][0], role="belkins_gold_text", bg="belkins_gold_pill", weight="semibold")
         b2 = base + 16.0
-        sub = _LAST_SHOP_NOTE or "Click any item below to buy or toggle equip on your Companion:"
+        sub = _LAST_SHOP_NOTE or "Click any item to buy or equip on your Companion:"
         text(pen, sub, "caption", "belkins_flame_text" if _LAST_SHOP_NOTE else "secondary", X0, b2, maxw=W_INNER)
         return b2 + 9.0
 
