@@ -730,8 +730,8 @@ def _companion_card(snapshot: Any, companion: CompanionState, actions: ThemeActi
         prefix = "★ " if "shiny_core" in eq_live else ("🕹️ " if "arcade_skin" in eq_live else "")
         name_s = f"{prefix}{live.stage.name}"
         name_role = "belkins_gold_text" if "shiny_core" in eq_live else "label"
-        nw = text(pen, name_s, "hero_name", name_role, rx, b1, maxw=rw - mw - 68.0)
-        lvl_s = f"Lv.{live.level} · ⚔️{live.boss.player_atk}"
+        nw = text(pen, name_s, "hero_name", name_role, rx, b1, maxw=rw - mw - 40.0)
+        lvl_s = f"Lv.{live.level}"
         text(
             pen,
             lvl_s,
@@ -739,7 +739,7 @@ def _companion_card(snapshot: Any, companion: CompanionState, actions: ThemeActi
             "belkins_flame_text",
             rx + nw + 5.0,
             b1,
-            maxw=max(0.0, rw - mw - nw - 8.0),
+            maxw=max(0.0, rw - mw - nw - 6.0),
         )
 
         # Row 2: Segmented XP Progress Bar (colored by equipped Pad!) · SparkCoins Pill on right
@@ -776,22 +776,22 @@ def _companion_card(snapshot: Any, companion: CompanionState, actions: ThemeActi
             fill_override=xp_fill_role,
         )
 
-        # Row 3: Daily Burn / Passive Buff + Trophies & Boss Kills on right
+        # Row 3: Daily Burn / Passive Buff + ATK, Trophies & Boss Kills on right
         b3 = pad_top + 45.0
         slain = live.boss.bosses_slain
         trophies_s = (
-            f"🏆 {live.unlocked_badges_count}/{len(live.badges)} · 💀{slain}"
+            f"⚔️{live.boss.player_atk} · 🏆{live.unlocked_badges_count}/{len(live.badges)} · 💀{slain}"
             if slain > 0
-            else f"🏆 {live.unlocked_badges_count}/{len(live.badges)}"
+            else f"⚔️{live.boss.player_atk} · 🏆{live.unlocked_badges_count}/{len(live.badges)}"
         )
         if live.tokens_today > 0:
-            left_s = f"Today: {format_tokens(live.tokens_today)} tok ({format_usd(live.usd_today)})"
+            left_s = f"Today: {format_tokens(live.tokens_today)} ({format_usd(live.usd_today)})"
         elif live.next_stage is not None:
             left_s = f"{live.stage.passive} · Next: Lv.{live.next_stage.min_level}"
         else:
             left_s = f"{live.stage.passive} · {_fmt_num(live.xp_total)} XP"
         tw_right = text(pen, trophies_s, "caption_med", "belkins_gold_text", X1, b3, right=True)
-        text(pen, left_s, "caption", "secondary", rx, b3, maxw=rw - tw_right - 8.0)
+        text(pen, left_s, "caption", "secondary", rx, b3, maxw=rw - tw_right - 6.0)
 
         return pad_top + sprite_sz + 11.0
 
@@ -1757,8 +1757,9 @@ def _dex_card(snapshot: Any, companion: CompanionState, subtab: str) -> _Card:
             bg="belkins_crit_pill",
             weight="semibold",
         )
-        bname = f"{boss.spec.icon} {boss.spec.name} · Lv.{boss.level}"
-        text(pen, bname, "primary_med", "label", rx, b1, maxw=rw - bw - 8.0)
+        bname = f"{boss.spec.icon} {boss.spec.name}"
+        nw_boss = text(pen, bname, "primary_med", "label", rx, b1, maxw=rw - bw - 38.0)
+        text(pen, f"Lv.{boss.level}", "caption_med", "crit_text", rx + nw_boss + 5.0, b1, maxw=max(0.0, rw - bw - nw_boss - 8.0))
 
         b2 = box_top + 26.0
         hp_txt = f"{boss.hp_current:,}/{boss.hp_max:,} HP"
