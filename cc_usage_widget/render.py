@@ -353,7 +353,7 @@ ICON_STYLE_SYMBOLS: dict[str, tuple[str, ...]] = {
     "bolt": ("bolt.fill", "bolt.horizontal.fill"),
     "bars": ("chart.bar.fill", "chart.bar"),
     "flame": ("flame.fill", "flame"),
-    "cpu": ("cpu.fill", "cpu", "memorychip.fill"),
+    "cpu": ("display", "laptopcomputer", "cpu.fill"),
     "crown": ("crown.fill", "crown", "star.fill"),
     "shield": ("shield.lefthalf.filled", "bolt.shield.fill", "shield.fill"),
     "sparkles": ("sparkles", "wand.and.stars", "star.fill"),

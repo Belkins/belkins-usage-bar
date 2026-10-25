@@ -179,22 +179,27 @@ F: dict[str, tuple[float, str, bool, bool, bool]] = {
 
 _WHITE = (255, 255, 255)
 _ROLES: tuple[tuple[str, tuple, tuple, Any], ...] = (
-    ("belkins_card", (255, 255, 255, 0.72), (24, 28, 40, 0.44), None),
-    ("belkins_card_edge", (0, 0, 0, 0.08), (255, 255, 255, 0.14), None),
-    ("belkins_tile_claude", (255, 248, 245, 0.74), (36, 26, 34, 0.46), None),
-    ("belkins_tile_claude_edge", (217, 119, 87, 0.24), (242, 138, 102, 0.25), None),
-    ("belkins_tile_codex", (242, 253, 249, 0.74), (18, 34, 40, 0.46), None),
-    ("belkins_tile_codex_edge", (16, 163, 127, 0.24), (52, 211, 153, 0.25), None),
-    ("belkins_glass_btn", (0, 0, 0, 0.055), (255, 255, 255, 0.085), None),
-    ("belkins_glass_btn_edge", (0, 0, 0, 0.10), (255, 255, 255, 0.16), None),
-    ("belkins_inner_panel", (0, 0, 0, 0.04), (8, 10, 18, 0.34), None),
+    ("belkins_cmm_canvas", (244, 242, 252, 0.94), (36, 22, 74, 0.92), None),
+    ("belkins_cmm_aqua", (12, 168, 148), (94, 242, 214), _WHITE),
+    ("belkins_cmm_icon", (108, 96, 156), (182, 170, 222), _WHITE),
+    ("belkins_cmm_sub", (92, 84, 128), (204, 196, 232), _WHITE),
+    ("belkins_cmm_coral", (220, 62, 56), (255, 122, 112), _WHITE),
+    ("belkins_card", (255, 255, 255, 0.78), (255, 255, 255, 0.08), None),
+    ("belkins_card_edge", (0, 0, 0, 0.07), (255, 255, 255, 0.12), None),
+    ("belkins_tile_claude", (255, 255, 255, 0.78), (255, 255, 255, 0.08), None),
+    ("belkins_tile_claude_edge", (0, 0, 0, 0.07), (255, 255, 255, 0.12), None),
+    ("belkins_tile_codex", (255, 255, 255, 0.78), (255, 255, 255, 0.08), None),
+    ("belkins_tile_codex_edge", (0, 0, 0, 0.07), (255, 255, 255, 0.12), None),
+    ("belkins_glass_btn", (0, 0, 0, 0.06), (255, 255, 255, 0.10), None),
+    ("belkins_glass_btn_edge", (0, 0, 0, 0.09), (255, 255, 255, 0.15), None),
+    ("belkins_inner_panel", (0, 0, 0, 0.04), (16, 10, 38, 0.42), None),
     ("belkins_inner_edge", (0, 0, 0, 0.07), (255, 255, 255, 0.10), None),
     ("belkins_plan_pill", (0, 0, 0, 0.06), (255, 255, 255, 0.11), (255, 255, 255, 0.18)),
     ("belkins_plan_text", (72, 78, 92), (212, 218, 232), _WHITE),
-    ("belkins_arcade_card", (255, 251, 238, 0.80), (22, 20, 38, 0.56), None),
+    ("belkins_arcade_card", (255, 251, 238, 0.80), (42, 28, 82, 0.65), None),
     ("belkins_arcade_edge", (217, 155, 12, 0.42), (250, 204, 21, 0.45), None),
-    ("belkins_hero_card", (255, 250, 246, 0.76), (32, 24, 34, 0.48), None),
-    ("belkins_hero_edge", (235, 88, 42, 0.26), (255, 130, 82, 0.28), None),
+    ("belkins_hero_card", (255, 255, 255, 0.78), (255, 255, 255, 0.08), None),
+    ("belkins_hero_edge", (0, 0, 0, 0.07), (255, 255, 255, 0.12), None),
     ("belkins_flame_rule", (242, 82, 34), (255, 102, 51), _WHITE),
     ("belkins_claude_rule", (217, 119, 87), (235, 138, 104), _WHITE),
     ("belkins_codex_rule", (16, 163, 127), (52, 211, 153), _WHITE),
@@ -769,6 +774,76 @@ def _card_surface_roles(default_fill: str, default_edge: str, default_rule: str 
     return default_fill, default_edge, default_rule
 
 
+def _draw_cmm_backdrop(pen: Any, w: float, h: float, *, top_glow: bool = False) -> None:
+    """Paint CleanMyMac's cohesive deep indigo-violet ambient canvas across a block."""
+    if isinstance(pen, _Measure) or w <= 0 or h <= 0:
+        return
+    pen.rrect(0.0, 0.0, w, h, 0.0, "belkins_cmm_canvas")
+    if not top_glow:
+        return
+    try:
+        from AppKit import NSBezierPath, NSColor, NSGradient, NSGraphicsContext
+        from Foundation import NSMakePoint, NSMakeRect
+
+        NSGraphicsContext.saveGraphicsState()
+        try:
+            NSBezierPath.clipRect_(NSMakeRect(0.0, 0.0, w, h))
+            c0 = NSColor.colorWithSRGBRed_green_blue_alpha_(0.37, 0.95, 0.84, 0.28)
+            c1 = NSColor.colorWithSRGBRed_green_blue_alpha_(0.37, 0.95, 0.84, 0.0)
+            grad = NSGradient.alloc().initWithStartingColor_endingColor_(c0, c1)
+            center = NSMakePoint(w - 39.0, 29.0)
+            grad.drawFromCenter_radius_toCenter_radius_options_(center, 2.0, center, 46.0, 0)
+        finally:
+            NSGraphicsContext.restoreGraphicsState()
+    except Exception:
+        pass
+
+
+def _draw_cmm_laptop_emblem(pen: Any, x: float, y: float) -> None:
+    """Draw CleanMyMac's glowing Aqua-Mint MacBook illustration on the top-right of the header."""
+    if isinstance(pen, _Measure):
+        return
+    try:
+        from AppKit import NSBezierPath, NSColor, NSGraphicsContext
+        from Foundation import NSMakeRect
+
+        NSGraphicsContext.saveGraphicsState()
+        try:
+            # Outer screen lid bezel (34 x 22pt)
+            lid_x, lid_y, lid_w, lid_h = x + 4.0, y + 6.0, 34.0, 22.0
+            NSColor.colorWithSRGBRed_green_blue_alpha_(0.18, 0.24, 0.38, 0.95).setFill()
+            NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                NSMakeRect(lid_x, lid_y, lid_w, lid_h), 3.2, 3.2
+            ).fill()
+            # Luminous Aqua-Mint inner display (31 x 19pt)
+            scr_x, scr_y, scr_w, scr_h = lid_x + 1.5, lid_y + 1.5, lid_w - 3.0, lid_h - 3.0
+            NSColor.colorWithSRGBRed_green_blue_alpha_(0.48, 0.97, 0.89, 0.96).setFill()
+            NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                NSMakeRect(scr_x, scr_y, scr_w, scr_h), 2.2, 2.2
+            ).fill()
+            # Top-half bright white-aqua screen sheen
+            NSColor.colorWithSRGBRed_green_blue_alpha_(0.84, 1.0, 0.98, 0.55).setFill()
+            NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                NSMakeRect(scr_x + 1.0, scr_y + 1.0, scr_w - 2.0, scr_h * 0.48), 1.5, 1.5
+            ).fill()
+            # Chamfered MacBook aluminum-indigo base deck (42 x 4.5pt)
+            base_x, base_y, base_w, base_h = x, lid_y + lid_h + 1.2, 42.0, 4.2
+            NSColor.colorWithSRGBRed_green_blue_alpha_(0.56, 0.64, 0.86, 0.92).setFill()
+            NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                NSMakeRect(base_x, base_y, base_w, base_h), 2.0, 2.0
+            ).fill()
+            # Glowing cyan front lip highlight on the base
+            NSColor.colorWithSRGBRed_green_blue_alpha_(0.37, 0.95, 0.84, 0.85).setFill()
+            NSBezierPath.fillRect_(NSMakeRect(base_x + 3.0, base_y + 0.6, base_w - 6.0, 1.2))
+            # Center lid-open notch
+            NSColor.colorWithSRGBRed_green_blue_alpha_(0.16, 0.14, 0.32, 0.90).setFill()
+            NSBezierPath.fillRect_(NSMakeRect(base_x + 17.0, base_y, 8.0, 1.4))
+        finally:
+            NSGraphicsContext.restoreGraphicsState()
+    except Exception:
+        pass
+
+
 def draw_glass_tile(
     pen: Any,
     x: float,
@@ -780,31 +855,13 @@ def draw_glass_tile(
     edge: str,
     *,
     rule: str | None = None,
-    stroke_width: float = 0.85,
+    stroke_width: float = 0.75,
 ) -> None:
-    """Draw a macOS Tahoe Liquid Glass tile with frosted fill, subtle top sheen, and top specular rim light."""
+    """Draw a CleanMyMac-style soft frosted glass tile over the deep indigo-violet canvas."""
+    del rule
     if isinstance(pen, _Measure) or w <= 0 or h <= 0:
         return
     pen.rrect(x, y, w, h, r, fill, stroke=edge, stroke_width=stroke_width)
-    try:
-        from AppKit import NSBezierPath, NSColor, NSGraphicsContext
-        from Foundation import NSMakeRect
-
-        NSGraphicsContext.saveGraphicsState()
-        try:
-            NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-                NSMakeRect(x, y, w, h), r, r
-            ).addClip()
-            NSColor.colorWithSRGBRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.032).setFill()
-            NSBezierPath.fillRect_(NSMakeRect(x, y, w, min(18.0, h * 0.36)))
-            NSColor.colorWithSRGBRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.22).setFill()
-            NSBezierPath.fillRect_(NSMakeRect(x + r * 0.65, y + 0.6, max(2.0, w - r * 1.3), 0.85))
-            if rule:
-                pen.rrect(x + 2.2, y + 8.0, 2.4, max(4.0, h - 16.0), 1.2, rule)
-        finally:
-            NSGraphicsContext.restoreGraphicsState()
-    except Exception:
-        pass
 
 
 class _Card:
@@ -848,10 +905,11 @@ class _Card:
         radius = kw.get("hl_radius", ROW_HL["hl_radius"])
 
         def paint(pen: Pen, w: float, bh: float) -> None:
+            _draw_cmm_backdrop(pen, w, bh)
             fill, edge, rule = _card_surface_roles(base_fill, base_edge, base_rule)
 
             def surface() -> None:
-                draw_glass_tile(pen, CARD_X, card_y, w - 2 * CARD_X, card_h, CARD_R, fill, edge, rule=rule)
+                draw_glass_tile(pen, CARD_X, card_y, w - 2 * CARD_X, card_h, 12.0, fill, edge, rule=rule)
 
             _clip_to(w, bh, surface)
             if pen.hl:
@@ -861,124 +919,45 @@ class _Card:
         return paint
 
 
-# ------------------------------------------------ Companion Hero Card ---
+# ------------------------------------------------ CleanMyMac Header ---
 
 
 def _companion_card(snapshot: Any, companion: CompanionState, actions: ThemeActions) -> _Card:
-    """Clean 2-row Liquid Glass Companion Header Tile with studio medallion, XP gauge & RPG stats."""
-    card = _Card("belkins_hero_card", "belkins_hero_edge", rule="belkins_flame_rule")
+    """CleanMyMac-style borderless top header (`Mac Health: Good` / `MacBook Pro` + glowing laptop on top-right)."""
     open_dash = getattr(actions, "open_dashboard", None)
     dash_enabled = bool(snapshot.settings.get("dashboard_enabled", True))
     act = open_dash if (callable(open_dash) and dash_enabled) else None
 
-    def draw_hero(pen: Any, y0: float) -> float:
-        live = companion if isinstance(pen, _Measure) else companion_from_snapshot(snapshot)
-        eq_live = set(live.equipped_items)
+    def paint_header(pen: Pen, w: float, bh: float) -> None:
+        _draw_cmm_backdrop(pen, w, bh, top_glow=True)
+        live = companion_from_snapshot(snapshot)
         coins_live = live.coins_available
-        mood_k = live.mood_key
 
-        pad_top = y0 + 9.0
-        sprite_sz = 42.0
-        anim_on = bool(snapshot.settings.get("belkins_animations_enabled", True))
-        draw_pixel_companion(
-            pen,
-            live.stage,
-            X0,
-            pad_top,
-            sprite_sz,
-            mood_key=mood_k,
-            equipped=eq_live,
-            animate=anim_on,
-        )
-        rx = X0 + sprite_sz + 11.0
-        rw = X1 - rx
+        # Determine overall health label ("Good" vs "Attention")
+        notes = getattr(snapshot, "account_notes", {}) or {}
+        active_acc = getattr(snapshot, "active", None)
+        active_pct = max(
+            float(getattr(active_acc, "five_hour_pct", 0.0) or 0.0),
+            float(getattr(active_acc, "seven_day_pct", 0.0) or 0.0),
+        ) if active_acc else 0.0
+        health_word = "Good" if active_pct < 85.0 else "High Load"
+        health_role = "belkins_cmm_aqua" if active_pct < 85.0 else "belkins_cmm_coral"
 
-        # Row 1: Vector Crown/Sparkle + Stage Name + LV.XX Capsule · Gold Credit Pill on right
-        b1 = pad_top + 15.0
-        coin_s = f"✦ {_fmt_compact_coins(coins_live)} CR"
-        cw = _pill_w(pen, coin_s)
-        pen.pill(
-            coin_s,
-            X1 - cw,
-            b1 - 0.5,
-            F["tag"][0],
-            role="belkins_gold_text",
-            bg="belkins_gold_pill",
-            weight="semibold",
-        )
-        is_royal = ("shiny_core" in eq_live) or ("sovereign_crown" in eq_live)
-        badge_icon = "crown.fill" if is_royal else ("gamecontroller.fill" if "arcade_skin" in eq_live else "sparkles")
-        badge_icon_role = "belkins_gold_text" if is_royal else "belkins_flame_text"
-        symbol(pen, badge_icon, rx, b1 - 4.0, 10.0, badge_icon_role, "semibold")
-        nx = rx + 18.0
-        lvl_s = f"LV.{live.level}"
-        lvl_w = _pill_w(pen, lvl_s)
-        nw = text(
-            pen,
-            live.stage.name,
-            "hero_name",
-            "label",
-            nx,
-            b1,
-            maxw=max(40.0, X1 - cw - lvl_w - nx - 12.0),
-        )
-        pen.pill(
-            lvl_s,
-            nx + nw + 6.5,
-            b1 - 0.5,
-            F["tag"][0],
-            role="belkins_flame_text",
-            bg="belkins_plan_pill",
-            weight="semibold",
-        )
+        lx = 18.0
+        b1 = 27.0
+        w_prefix = pen.text("AI Health: ", lx, b1, 17.0, "semibold", "label")
+        pen.text(health_word, lx + w_prefix, b1, 17.0, "bold", health_role)
 
-        # Row 2: Precision Liquid Glass XP Bar on left · Vector RPG Stat Cluster on right
-        b2 = pad_top + 34.5
-        slain = live.boss.bosses_slain
-        stat_items: list[tuple[str, str, str]] = [
-            ("bolt.shield.fill", str(live.boss.player_atk), "belkins_flame_text"),
-            ("trophy.fill", f"{live.unlocked_badges_count}/{len(live.badges)}", "belkins_gold_text"),
-        ]
-        if slain > 0:
-            stat_items.append(("flame.fill", str(slain), "crit_text"))
+        b2 = 45.5
+        sub_parts = [live.stage.name, f"Lv.{live.level}"]
+        if coins_live > 0:
+            sub_parts.append(f"✦ {_fmt_compact_coins(coins_live)} CR")
+        elif notes:
+            sub_parts.append(f"{len(notes)} slot{'s' if len(notes) != 1 else ''} flagged")
+        pen.text("  ·  ".join(sub_parts), lx, b2, 11.5, "regular", "belkins_cmm_sub", maxw=w - 94.0)
 
-        sep_dot = " · "
-        sep_w = text_w(pen, sep_dot, "num_small")
-        total_stat_w = 0.0
-        for idx, (_ic, val_s, _rl) in enumerate(stat_items):
-            if idx:
-                total_stat_w += sep_w
-            total_stat_w += 13.5 + text_w(pen, val_s, "num_small")
-
-        sx_cur = X1 - total_stat_w
-        for idx, (ic_name, val_s, rl_name) in enumerate(stat_items):
-            if idx:
-                sx_cur += text(pen, sep_dot, "num_small", "tertiary", sx_cur, b2)
-            symbol(pen, ic_name, sx_cur, b2 - 3.6, 8.8, rl_name, "semibold")
-            sx_cur += 13.5
-            sx_cur += text(pen, val_s, "num_small", "label", sx_cur, b2)
-
-        xp_fill_role = "belkins_xp_fill"
-        if "solar_pad" in eq_live or "shiny_core" in eq_live:
-            xp_fill_role = "belkins_xp_solar"
-        elif "emerald_pad" in eq_live:
-            xp_fill_role = "belkins_xp_emerald"
-        elif "nebula_pad" in eq_live:
-            xp_fill_role = "belkins_xp_nebula"
-
-        bar_w = max(56.0, rw - total_stat_w - 10.0)
-        luxury_bar(
-            pen,
-            rx,
-            b2 - 3.5,
-            bar_w,
-            live.xp_fraction * 100.0,
-            "ok",
-            h=5.5,
-            fill_override=xp_fill_role,
-        )
-
-        return pad_top + sprite_sz + 9.0
+        # Glowing Aqua-Mint MacBook illustration on the top-right
+        _draw_cmm_laptop_emblem(pen, w - 60.0, 12.0)
 
     tip_lines = [
         f"Belkins Companion: {companion.stage.name} (Lv.{companion.level} · {companion.stage.title})",
@@ -988,16 +967,22 @@ def _companion_card(snapshot: Any, companion: CompanionState, actions: ThemeActi
         "Click to open Belkins Dex & Usage Dashboard",
     ]
     tip = "\n".join(tip_lines)
-    card.add(
-        draw_hero,
-        key="belkins-companion-hero",
-        tooltip=tip,
-        ax=tip.replace("\n", ". "),
-        action=act,
-        animated=True,
-        **ROW_HL,
-    )
-    return card
+
+    class _HeaderWrap:
+        def blocks(self, _before: float, _after: float) -> list[Block]:
+            return [
+                Block(
+                    58.0,
+                    paint_header,
+                    key="belkins-companion-hero",
+                    tooltip=tip,
+                    ax=tip.replace("\n", ". "),
+                    action=act,
+                    no_hover_bg=True,
+                )
+            ]
+
+    return _HeaderWrap()  # type: ignore[return-value]
 
 
 # --------------------------------------------------------- Specs & Cards ---
@@ -1891,21 +1876,21 @@ def _attention_card(spec: dict[str, Any]) -> _Card:
 
 
 def _tab_bar_block(claude_count: int, codex_count: int) -> Block:
-    """Floating Liquid Glass Segmented Tab Dock (`Hub | Claude | Codex | Evo | Vault | Studio`)."""
+    """CleanMyMac-inspired low-profile glass pill strip (`Hub | Claude | Codex | Evo | Vault | Studio`)."""
     del claude_count, codex_count
     bar_w = W - 2 * CARD_X
     seg_w = bar_w / float(len(TABS))
-    bar_h = 30.0
-    total_h = 36.0
+    bar_h = 28.0
+    total_h = 34.0
 
     def paint(pen: Pen, w: float, h: float) -> None:
-        y = 3.0
-        fill, edge, _ = _card_surface_roles("belkins_tab_bar", "belkins_card_edge", None)
-        draw_glass_tile(pen, CARD_X, y, bar_w, bar_h, 9.5, fill, edge)
+        _draw_cmm_backdrop(pen, w, h)
+        y = 2.0
+        fill, edge, _ = _card_surface_roles("belkins_card", "belkins_card_edge", None)
+        draw_glass_tile(pen, CARD_X, y, bar_w, bar_h, 9.0, fill, edge)
         for idx, (tab_id, label) in enumerate(TABS):
             tx = CARD_X + idx * seg_w
             is_act = _ACTIVE_TAB == tab_id
-            acc_role = _TAB_ACCENTS.get(tab_id, "belkins_flame_rule")
             if is_act:
                 draw_glass_tile(
                     pen,
@@ -1913,37 +1898,27 @@ def _tab_bar_block(claude_count: int, codex_count: int) -> Block:
                     y + 2.0,
                     seg_w - 4.0,
                     bar_h - 4.0,
-                    7.5,
+                    7.0,
                     "belkins_tab_active_glass",
                     "belkins_tab_active_edge",
                 )
-                pen.rrect(
-                    tx + (seg_w - 16.0) / 2.0,
-                    y + bar_h - 4.6,
-                    16.0,
-                    2.0,
-                    1.0,
-                    acc_role,
-                )
-            elif idx > 0 and _ACTIVE_TAB != TABS[idx - 1][0]:
-                pen.line(tx, y + 8.0, tx + 0.5, "belkins_hair", thickness=bar_h - 16.0)
 
-            txt_role = "belkins_tab_active_text" if is_act else "belkins_tab_inactive_text"
-            ic_role = acc_role if is_act else "belkins_tab_inactive_text"
+            txt_role = "label" if is_act else "belkins_cmm_sub"
+            ic_role = "belkins_cmm_aqua" if is_act else "belkins_cmm_icon"
             ic_name = _TAB_ICONS.get(tab_id, "sparkles")
             tw_lbl = text_w(pen, label, "caption_med")
             ic_sz = 8.0
-            ic_adv = 12.2
+            ic_adv = 12.0
             tot_w = ic_adv + tw_lbl
             start_x = tx + (seg_w - tot_w) / 2.0
-            symbol(pen, ic_name, start_x, y + 15.0, ic_sz, ic_role, "semibold")
+            symbol(pen, ic_name, start_x, y + 14.0, ic_sz, ic_role, "semibold")
             text(
                 pen,
                 label,
                 "caption_med",
                 txt_role,
                 start_x + ic_adv,
-                y + 19.0,
+                y + 18.0,
                 maxw=seg_w - ic_adv - 2.0,
             )
 
@@ -1995,129 +1970,65 @@ def _draw_provider_bento_tile(
     fallback_icon: str,
     accent_role: str,
 ) -> None:
-    """Render one half of the 2-column Liquid Glass Provider Bento Row (`Claude` or `Codex`)."""
+    """Render one CleanMyMac-style tile (`Macintosh HD` / `Memory` twin) with left icon, title, subtitle & borderless cyan action."""
+    del accent_role
     fill, edge, _ = _card_surface_roles(tile_fill, tile_edge, None)
-    draw_glass_tile(pen, tx, ty, tw, th, 11.0, fill, edge)
-    ix0 = tx + 10.5
-    ix1 = tx + tw - 10.5
-    iw = ix1 - ix0
+    draw_glass_tile(pen, tx, ty, tw, th, 12.0, fill, edge)
 
-    b1 = ty + 18.5
+    ix_icon = tx + 13.0
+    ix_text = tx + 36.0
+    ix_right = tx + tw - 13.0
+    text_maxw = max(40.0, ix_right - ix_text)
+
+    b1 = ty + 23.5
     title = spec["title"] if spec else fallback_title
     icon_name = spec["icon"] if spec else fallback_icon
-    symbol(pen, icon_name, ix0, b1 - 4.0, 10.0, accent_role, "semibold")
-    text(pen, title, "title", "label", ix0 + 16.5, b1)
-    symbol(pen, "chevron.right", ix1 - 6.0, b1 - 3.6, 8.0, "secondary", "semibold")
+    symbol(pen, icon_name, ix_icon, b1 - 2.0, 14.5, "belkins_cmm_icon", "medium")
+    text(pen, title, "hero_name", "label", ix_text, b1)
 
     if not spec:
-        text(pen, "No accounts linked", "caption_med", "secondary", ix0, ty + 48.0, maxw=iw)
+        text(pen, "No accounts linked", "secondary", "belkins_cmm_sub", ix_text, ty + 42.0, maxw=text_maxw)
         return
 
     right_parts = spec.get("right_parts") or []
     room_part = next((p for p in right_parts if "room" in p), "")
-    if room_part:
-        room_short = room_part.replace(" room", " ok")
-        r_role = "warn_text" if room_short.startswith("0/") else "good_text"
-        text(pen, room_short, "caption_med", r_role, ix1 - 9.0, b1, right=True)
+    room_short = room_part.replace(" room", "") if room_part else ""
 
-    b2 = ty + 37.5
     hero = spec.get("hero")
+    raw_pct = hero.get("raw_pct") if hero else None
+    if raw_pct is not None and not (hero and hero.get("status")):
+        free_pct = max(0, min(100, int(round(100.0 - float(raw_pct)))))
+        top_right_s = f"{free_pct}% free"
+        top_right_role = "belkins_cmm_coral" if free_pct <= 15 else "label"
+    else:
+        top_right_s = f"{room_short} ok" if room_short else ""
+        top_right_role = "belkins_cmm_sub"
+    if top_right_s:
+        text(pen, top_right_s, "caption_med", top_right_role, ix_right, b1, right=True)
+
+    b2 = ty + 41.5
     if hero:
-        raw_pct = hero.get("raw_pct")
-        sev = hero["big"][2] if hero.get("big") else ("warn" if hero.get("status") else "ok")
-        dot_role = SEV_FILL.get(sev, "belkins_good_fill")
-        pen.circle(ix0, b2 - 7.5, 6.0, dot_role)
-
-        plan_w = 0.0
-        if hero.get("plan"):
-            plan_s = (
-                str(hero["plan"])
-                .upper()
-                .replace("MAX ", "")
-                .replace("MAX_", "")
-                .replace("PROMAX", "PRO")
-            )
-            if len(plan_s) > 6:
-                plan_s = plan_s[:6]
-            plan_w = _pill_w(pen, plan_s)
-            pen.pill(
-                plan_s,
-                ix1 - plan_w,
-                b2 - 0.5,
-                F["tag"][0],
-                role="belkins_plan_text",
-                bg="belkins_plan_pill",
-                weight="semibold",
-            )
-        hero_nm = str(hero.get("name") or "")
-        nm_font = "secondary_med" if len(hero_nm) > 10 else "primary_med"
-        text(
-            pen,
-            hero_nm,
-            nm_font,
-            "label",
-            ix0 + 9.5,
-            b2,
-            maxw=max(40.0, iw - plan_w - 12.5),
-        )
-
-        b3 = ty + 55.5
         if hero.get("status"):
             st_txt, _ = hero["status"]
-            text(pen, st_txt, "caption_med", "warn_text", ix0, b3, maxw=iw)
-            luxury_bar(pen, ix0, ty + 65.5, iw, 0.0, "dim", h=5.2, expired=True)
+            text(pen, st_txt, "caption", "belkins_cmm_coral", ix_text, b2, maxw=text_maxw)
         else:
-            free_w = 0.0
-            if raw_pct is not None:
-                free_pct = max(0, min(100, int(round(100.0 - float(raw_pct)))))
-                free_s = f"{free_pct}% free"
-                free_role = "crit_text" if free_pct <= 10 else ("warn_text" if free_pct <= 25 else "good_text")
-                free_w = text(pen, free_s, "num_small", free_role, ix1, b3, right=True)
-
-            bars = hero.get("bars") or []
-            win_parts: list[str] = []
-            for b_lbl, b_pct, _b_rst, _b_exp in bars[:2]:
-                short_lbl = "wk" if b_lbl == "weekly" else b_lbl
-                win_parts.append(f"{short_lbl} {format_pct(b_pct)}")
-            if spec["key"] == "codex":
-                banked = next((p for p in right_parts if "reset" in p), "")
-                if banked:
-                    m_num = re.search(r"(\d+)", banked)
-                    if m_num:
-                        win_parts.append(f"{m_num.group(1)}↺")
-            win_str = " · ".join(win_parts) if win_parts else "Active"
-            text(pen, win_str, "caption", "secondary", ix0, b3, maxw=max(36.0, iw - free_w - 4.0))
-            luxury_bar(pen, ix0, ty + 65.5, iw, raw_pct, sev, h=5.2)
+            hero_nm = str(hero.get("name") or "Active")
+            sub_str = f"{hero_nm} ({room_short})" if (room_short and len(hero_nm) <= 10) else hero_nm
+            text(pen, sub_str, "caption", "belkins_cmm_sub", ix_text, b2, maxw=text_maxw)
     else:
-        text(pen, "No active session", "caption_med", "secondary", ix0, b2, maxw=iw)
-        luxury_bar(pen, ix0, ty + 65.5, iw, 0.0, "dim", h=5.2, expired=True)
+        text(pen, "No active session", "caption", "belkins_cmm_sub", ix_text, b2, maxw=text_maxw)
 
-    # Bottom 1-click frosted glass switch button (split Left/Right so quota % NEVER truncates)
-    btn_y = ty + 76.5
-    btn_h = 19.5
-    pen.rrect(ix0, btn_y, iw, btn_h, 6.0, "belkins_glass_btn", stroke="belkins_glass_btn_edge", stroke_width=0.65)
+    # Bottom-right borderless Aqua-Mint action link (just like CleanMyMac's `Free Up` / `Test Speed`)
+    b3 = ty + th - 13.0
     rows = spec.get("rows") or []
     best_r = rows[0] if rows else None
     if best_r and callable(best_r.get("action")):
-        btn_role = "belkins_flame_text" if spec["key"] == "claude" else "good_text"
-        pct_r_str = f"{format_pct(best_r['pct'])} ▸" if best_r.get("pct") is not None else "▸"
-        pct_rw = text(pen, pct_r_str, "num_small", btn_role, ix1 - 6.5, btn_y + 13.5, right=True)
-        symbol(pen, "bolt.fill", ix0 + 6.5, btn_y + 9.8, 8.2, btn_role, "semibold")
         nm = str(best_r.get("name") or "")
-        lhs_lbl = f"Next · {nm}"
-        text(
-            pen,
-            lhs_lbl,
-            "caption_med",
-            btn_role,
-            ix0 + 16.5,
-            btn_y + 13.5,
-            maxw=max(32.0, iw - pct_rw - 23.0),
-        )
+        act_txt = f"Switch → {nm}"
     else:
         total_c = int(spec.get("total_count") or 1)
-        btn_txt = f"View Fleet ({total_c}) ▸"
-        text(pen, btn_txt, "caption_med", "secondary", ix0 + iw / 2.0, btn_y + 13.5, center=True, maxw=iw - 6.0)
+        act_txt = f"Fleet ({total_c})"
+    text(pen, act_txt, "primary_med", "belkins_cmm_aqua", ix_right, b3, right=True, maxw=tw - 24.0)
 
 
 def _hub_bento_blocks(
@@ -2127,7 +2038,7 @@ def _hub_bento_blocks(
     attn: dict[str, Any] | None,
     actions: ThemeActions,
 ) -> list[Block]:
-    """Build the 2x2 Liquid Glass Bento Tile Grid + Sleek 1-Line Alert Capsule for the `Hub` (`party`) tab."""
+    """Build CleanMyMac-style Protection Banner + 2x2 Bento Grid (`Claude | Codex` and `Today Burn | 30d Spend`)."""
     from .. import card_base as _cb
 
     out: list[Block] = []
@@ -2136,19 +2047,85 @@ def _hub_bento_blocks(
     lx0 = CARD_X
     rx0 = CARD_X + tile_w + tile_gap
 
-    # 1. Bento Row 1: Side-by-Side Claude & Codex Provider Tiles
+    # 1. Full-Width Protection / Engine Status Card (twin of CleanMyMac's `Protection by Moonlock · ✓ Protected`)
+    auto_on = bool(getattr(snapshot, "autoswitch_enabled", True))
+    thr = getattr(snapshot, "autoswitch_threshold", 85.0)
+    thr_int = int(round(float(thr if thr is not None else 85.0)))
+    items = (attn.get("items") or []) if attn else []
+    extras = (attn.get("extras") or []) if attn else []
+    claude_n = sum(1 for it in items if it.get("provider") == "Claude")
+    codex_n = sum(1 for it in items if it.get("provider") == "Codex")
+
+    if claude_n:
+        scan_line = f"{claude_n} Claude slot{'s' if claude_n != 1 else ''} {'need' if claude_n != 1 else 'needs'} re-login · Run bswap add"
+        target_banner_tab = "claude"
+    elif codex_n:
+        scan_line = f"{codex_n} Codex account{'s' if codex_n != 1 else ''} {'need' if codex_n != 1 else 'needs'} attention"
+        target_banner_tab = "codex"
+    elif extras:
+        scan_line = str(extras[0]).lstrip("⚠ ").strip()
+        target_banner_tab = "claude"
+    else:
+        c_nm = claude_spec["hero"]["name"] if (claude_spec and claude_spec.get("hero")) else "none"
+        x_nm = codex_spec["hero"]["name"] if (codex_spec and codex_spec.get("hero")) else "none"
+        scan_line = f"Active: {c_nm} (Claude) · {x_nm} (Codex)"
+        target_banner_tab = "claude"
+
+    all_tips = [it.get("tip", "") for it in items if it.get("tip")] + list(extras)
+    full_tip = "\n".join(all_tips) if all_tips else "Auto-Switch Engine active"
+    full_ax = ". ".join([scan_line] + list(extras))
+
+    def paint_protection_banner(pen: Pen, w: float, h: float) -> None:
+        _draw_cmm_backdrop(pen, w, h)
+        ty = 4.0
+        th = 74.0
+        fill, edge, _ = _card_surface_roles("belkins_card", "belkins_card_edge", None)
+        draw_glass_tile(pen, CARD_X, ty, w - 2 * CARD_X, th, 12.0, fill, edge)
+
+        ix0 = CARD_X + 14.0
+        ix1 = w - CARD_X - 14.0
+        b1 = ty + 22.0
+        symbol(pen, "checkmark.shield.fill", ix0, b1 - 4.0, 12.5, "good_text", "semibold")
+        w_prot = text(pen, "Protection by ", "primary_med", "label", ix0 + 19.0, b1)
+        symbol(pen, "bolt.fill", ix0 + 19.0 + w_prot + 1.0, b1 - 3.8, 10.0, "belkins_cmm_aqua", "semibold")
+        text(pen, "Belkins", "primary_med", "label", ix0 + 19.0 + w_prot + 13.0, b1)
+        status_right = f"✓ Active ({thr_int}%)" if auto_on else "Paused"
+        text(pen, status_right, "caption_med", "belkins_cmm_sub", ix1, b1, right=True)
+
+        b2 = ty + 44.5
+        mon_txt = "Real-time quota & burn monitor ON" if auto_on else "Auto-switch monitor paused"
+        text(pen, mon_txt, "primary_med", "label", ix0, b2, maxw=ix1 - ix0)
+
+        b3 = ty + 62.5
+        sub_role = "belkins_cmm_coral" if (claude_n or codex_n) else "belkins_cmm_sub"
+        text(pen, scan_line, "secondary", sub_role, ix0, b3, maxw=ix1 - ix0)
+
+    out.append(
+        Block(
+            82.0,
+            paint_protection_banner,
+            key="belkins-hub-alert-pill",
+            ax=full_ax,
+            tooltip=full_tip,
+            action=lambda t=target_banner_tab: set_active_tab(t),
+            keep_open=True,
+            no_hover_bg=True,
+        )
+    )
+
+    # 2. Bento Row 1: Side-by-Side Claude & Codex Tiles (`Macintosh HD` & `Memory` twins)
     if claude_spec or codex_spec:
-        row1_h = 108.0
+        row1_h = 90.0
 
         def paint_providers(pen: Pen, w: float, h: float) -> None:
-            del w, h
+            _draw_cmm_backdrop(pen, w, h)
             _draw_provider_bento_tile(
                 pen,
                 claude_spec,
                 lx0,
-                2.0,
+                3.0,
                 tile_w,
-                102.0,
+                82.0,
                 "belkins_tile_claude",
                 "belkins_card_edge",
                 "Claude",
@@ -2159,9 +2136,9 @@ def _hub_bento_blocks(
                 pen,
                 codex_spec,
                 rx0,
-                2.0,
+                3.0,
                 tile_w,
-                102.0,
+                82.0,
                 "belkins_tile_codex",
                 "belkins_card_edge",
                 "Codex",
@@ -2177,7 +2154,7 @@ def _hub_bento_blocks(
                 target_sp = claude_spec or codex_spec
                 target_tab = "claude" if claude_spec else "codex"
             click_y = getattr(_cb, "LAST_CLICK_Y", None)
-            if click_y is not None and click_y >= 74.0 and target_sp:
+            if click_y is not None and click_y >= 54.0 and target_sp:
                 rows = target_sp.get("rows") or []
                 if rows and callable(rows[0].get("action")):
                     rows[0]["action"]()
@@ -2197,7 +2174,7 @@ def _hub_bento_blocks(
                 paint_providers,
                 key="belkins-hub-providers-bento",
                 ax=". ".join(bento_ax_parts) or "Claude and Codex Bento Tiles",
-                tooltip=f"{c_tip}\n\n{x_tip}\n\nClick top of a tile to open its fleet tab, or click the bottom Switch button to rotate immediately.",
+                tooltip=f"{c_tip}\n\n{x_tip}",
                 action=lambda: set_active_tab("claude" if claude_spec else "codex"),
                 on_click_x=on_provider_bento_click,
                 keep_open=True,
@@ -2205,7 +2182,7 @@ def _hub_bento_blocks(
             )
         )
 
-    # 2. Bento Row 2: Side-by-Side Today Burn & 30d Spend / Fleet Mini-Tiles
+    # 3. Bento Row 2: Side-by-Side Today Burn & 30d Spend Tiles (`Battery` & `CPU` twins)
     cost = getattr(snapshot, "cost", None)
     if cost is not None and not getattr(cost, "is_partial", False):
         today_w = getattr(cost, "today", None)
@@ -2218,53 +2195,38 @@ def _hub_bento_blocks(
             usd_30d = float(getattr(last30_w, "usd", 0.0) or 0.0)
             if usd_30d > 0.0 or tok_today > 0:
                 avg_7d = usd_7d / 7.0
-                if avg_7d > 0.5 and usd_today > avg_7d * 1.35:
-                    pace_lbl, pace_role, pace_bg = "SURGE", "warn_text", "belkins_warn_pill"
-                elif usd_today > 0.0:
-                    pace_lbl, pace_role, pace_bg = "STEADY", "good_text", "belkins_good_pill"
-                else:
-                    pace_lbl, pace_role, pace_bg = "IDLE", "secondary", "belkins_plan_pill"
-
                 sess_cnt = len(getattr(snapshot, "sessions", ()) or ())
                 open_dash = getattr(actions, "open_dashboard", None)
                 dash_on = bool(snapshot.settings.get("dashboard_enabled", True))
                 dash_act = open_dash if (callable(open_dash) and dash_on) else None
 
                 def paint_telemetry(pen: Pen, w: float, h: float) -> None:
-                    del w, h
-                    ty = 1.0
-                    th = 50.0
+                    _draw_cmm_backdrop(pen, w, h)
+                    ty = 2.0
+                    th = 60.0
                     fill, edge, _ = _card_surface_roles("belkins_card", "belkins_card_edge", None)
-                    # Left Mini-Tile: Today Burn & Pace
-                    draw_glass_tile(pen, lx0, ty, tile_w, th, 10.5, fill, edge)
-                    lix0, lix1 = lx0 + 10.5, lx0 + tile_w - 10.5
-                    b1 = ty + 17.5
-                    symbol(pen, "flame.fill", lix0, b1 - 3.8, 9.5, "belkins_xp_fill", "semibold")
-                    text(pen, "Today Burn", "caption_med", "secondary", lix0 + 13.0, b1)
-                    pw = _pill_w(pen, pace_lbl)
-                    pen.pill(pace_lbl, lix1 - pw, b1 - 0.5, F["tag"][0], role=pace_role, bg=pace_bg, weight="semibold")
 
-                    b2 = ty + 38.0
-                    tok_s = f"{format_tokens(tok_today)} tok" if tok_today > 0 else "0 tok"
-                    tw_tok = text(pen, tok_s, "caption_med", "belkins_flame_text", lix1, b2, right=True)
-                    text(pen, _compact_usd_str(usd_today), "title", "label", lix0, b2, maxw=max(40.0, (lix1 - lix0) - tw_tok - 6.0))
+                    # Left Tile: Today Burn (`Battery` twin)
+                    draw_glass_tile(pen, lx0, ty, tile_w, th, 12.0, fill, edge)
+                    b1 = ty + 23.5
+                    b2 = ty + 42.0
+                    symbol(pen, "bolt.horizontal.fill", lx0 + 13.0, b1 - 2.0, 14.0, "belkins_cmm_icon", "medium")
+                    text(pen, "Today Burn", "hero_name", "label", lx0 + 36.0, b1)
+                    text(pen, _compact_usd_str(usd_today), "primary_med", "label", lx0 + tile_w - 13.0, b1, right=True)
+                    tok_s = f"{format_tokens(tok_today)} tokens" if tok_today > 0 else "Idle today"
+                    text(pen, tok_s, "secondary", "belkins_cmm_sub", lx0 + 36.0, b2, maxw=tile_w - 48.0)
 
-                    # Right Mini-Tile: 30-Day Spend & Active Sessions
-                    draw_glass_tile(pen, rx0, ty, tile_w, th, 10.5, fill, edge)
-                    rix0, rix1 = rx0 + 10.5, rx0 + tile_w - 10.5
-                    symbol(pen, "chart.bar.xaxis", rix0, b1 - 3.8, 9.5, "belkins_gold_text", "semibold")
-                    text(pen, "30d Spend", "caption_med", "secondary", rix0 + 14.0, b1)
-                    avg_pill = f"{_compact_usd_str(avg_7d)}/d"
-                    apw = _pill_w(pen, avg_pill)
-                    pen.pill(avg_pill, rix1 - apw, b1 - 0.5, F["tag"][0], role="belkins_gold_text", bg="belkins_gold_pill", weight="semibold")
-
-                    sess_s = f"{sess_cnt} sess ↗" if sess_cnt > 0 else "Analytics ↗"
-                    tw_s = text(pen, sess_s, "caption_med", "secondary", rix1, b2, right=True)
-                    text(pen, _compact_usd_str(usd_30d), "title", "label", rix0, b2, maxw=max(40.0, (rix1 - rix0) - tw_s - 6.0))
+                    # Right Tile: 30d Spend (`CPU` twin)
+                    draw_glass_tile(pen, rx0, ty, tile_w, th, 12.0, fill, edge)
+                    symbol(pen, "cpu", rx0 + 13.0, b1 - 2.0, 14.0, "belkins_cmm_icon", "medium")
+                    text(pen, "30d Spend", "hero_name", "label", rx0 + 36.0, b1)
+                    text(pen, _compact_usd_str(usd_30d), "primary_med", "belkins_cmm_coral", rx0 + tile_w - 13.0, b1, right=True)
+                    sub_30 = f"{_compact_usd_str(avg_7d)}/d · {sess_cnt} sess" if sess_cnt > 0 else f"Avg {_compact_usd_str(avg_7d)}/day"
+                    text(pen, sub_30, "secondary", "belkins_cmm_sub", rx0 + 36.0, b2, maxw=tile_w - 48.0)
 
                 out.append(
                     Block(
-                        56.0,
+                        66.0,
                         paint_telemetry,
                         key="belkins-party-burn-velocity",
                         ax=f"Today Burn {format_usd(usd_today)}, 30d Spend {format_usd(usd_30d)}, 7d average {format_usd(avg_7d)} per day.",
@@ -2273,68 +2235,6 @@ def _hub_bento_blocks(
                         no_hover_bg=True,
                     )
                 )
-
-    # 3. Bento Row 3: Sleek 1-Line Liquid Glass Alert Pill (only when alerts exist)
-    if attn:
-        items = attn.get("items") or []
-        extras = attn.get("extras") or []
-        claude_n = sum(1 for it in items if it.get("provider") == "Claude")
-        codex_n = sum(1 for it in items if it.get("provider") == "Codex")
-        if claude_n and codex_n:
-            summary_txt = f"{claude_n} Claude · {codex_n} Codex need re-login"
-            target_alert_tab = "claude"
-        elif claude_n:
-            summary_txt = f"{claude_n} Claude slot{'s' if claude_n != 1 else ''} {'need' if claude_n != 1 else 'needs'} re-login"
-            target_alert_tab = "claude"
-        elif codex_n:
-            summary_txt = f"{codex_n} Codex account{'s' if codex_n != 1 else ''} {'need' if codex_n != 1 else 'needs'} attention"
-            target_alert_tab = "codex"
-        elif extras:
-            summary_txt = str(extras[0]).lstrip("⚠ ").strip()
-            target_alert_tab = "claude"
-        else:
-            summary_txt = "Accounts need attention"
-            target_alert_tab = "claude"
-
-        all_tips = [it.get("tip", "") for it in items if it.get("tip")] + list(extras)
-        full_tip = "\n".join(all_tips)
-        full_ax = ". ".join([summary_txt] + list(extras))
-
-        def paint_alert_pill(pen: Pen, w: float, h: float) -> None:
-            del h
-            y = 1.0
-            ph = 32.0
-            draw_glass_tile(pen, CARD_X, y, w - 2 * CARD_X, ph, 9.5, "belkins_card", "belkins_warn_pill")
-            b = y + 20.0
-            symbol(pen, "exclamationmark.triangle.fill", X0, b - 4.0, 10.5, "belkins_warn_fill", "semibold")
-            right_lbl = f"{target_alert_tab.capitalize()} ▸"
-            rw = text(pen, right_lbl, "caption_med", "warn_text", X1, b, right=True)
-            chip_w = 0.0
-            if claude_n:
-                chip_txt = "bswap add"
-                chip_w = pen.chip(chip_txt, X1 - rw - 69.0, b, F["code"][0], role="secondary") + 8.0
-            text(
-                pen,
-                summary_txt,
-                "secondary_med",
-                "warn_text",
-                X0 + 16.0,
-                b,
-                maxw=max(60.0, W_INNER - rw - chip_w - 22.0),
-            )
-
-        out.append(
-            Block(
-                36.0,
-                paint_alert_pill,
-                key="belkins-hub-alert-pill",
-                ax=full_ax,
-                tooltip=full_tip + "\nClick to inspect and fix in the fleet tab.",
-                action=lambda t=target_alert_tab: set_active_tab(t),
-                keep_open=True,
-                no_hover_bg=True,
-            )
-        )
 
     return out
 
@@ -2829,7 +2729,7 @@ def _config_card(snapshot: Any, actions: ThemeActions, subtab: str = "header") -
         "companion": "sparkles",
         "crown": "crown.fill",
         "flame": "flame.fill",
-        "cpu": "cpu",
+        "cpu": "display",
         "bars": "chart.bar.fill",
         "shield": "bolt.shield.fill",
     }
@@ -2955,10 +2855,10 @@ def _config_card(snapshot: Any, actions: ThemeActions, subtab: str = "header") -
         "belkins-cfg-icon-bar",
         "1. MENU-BAR ICON STYLE",
         [
+            ("Mac", "display", lambda: _cur_icon() == "cpu", lambda: _set_icon("cpu", "Mac Display"), "CleanMyMac-style Mac Display icon"),
             ("Bolt", "bolt.fill", lambda: _cur_icon() == "bolt", lambda: _set_icon("bolt", "Belkins Bolt"), "Belkins Lightning Bolt icon"),
             ("Sprite", "sparkles", lambda: _cur_icon() == "companion", lambda: _set_icon("companion", "Companion Sprite"), "Live 12x12 color pixel sprite of your active Companion"),
             ("Crown", "crown.fill", lambda: _cur_icon() == "crown", lambda: _set_icon("crown", "Crown"), "Sovereign Crown icon"),
-            ("Flame", "flame.fill", lambda: _cur_icon() == "flame", lambda: _set_icon("flame", "Flame"), "Cyber Flame icon"),
             ("Bars", "chart.bar.fill", lambda: _cur_icon() == "bars", lambda: _set_icon("bars", "Bars"), "Classic Usage Bars icon"),
             ("None", "nosign", lambda: _cur_icon() == "none", lambda: _set_icon("none", "No Icon"), "Text only (hide menu-bar icon)"),
         ],
@@ -3161,58 +3061,60 @@ def _tag_blocks(
 
 
 def _footer_dock_block(snapshot: Any, actions: ThemeActions) -> Block:
-    """Always-visible 4-pill Liquid Glass Utility Dock (`Refresh | Dashboard | Auto | Quit`) replacing the raw NSMenu tail."""
-    auto_on = bool(getattr(snapshot, "autoswitch_enabled", True))
-    thr = getattr(snapshot, "autoswitch_threshold", 85.0)
-    thr_int = int(round(float(thr if thr is not None else 85.0)))
-    auto_lbl = f"Auto {thr_int}%" if auto_on else "Auto OFF"
-
-    pills: list[tuple[str, str, str, Callable[[], Any] | None]] = [
-        ("arrow.clockwise", "Refresh", "secondary", actions.refresh),
-        ("chart.bar.xaxis", "Analytics", "belkins_gold_text", actions.open_dashboard),
-        ("bolt.fill", auto_lbl, "good_text" if auto_on else "secondary", actions.toggle_autoswitch),
-        ("power", "Quit", "crit_text", actions.quit_app),
-    ]
-    gap = 6.0
-    tot_w = W - 2 * CARD_X
-    pw = (tot_w - gap * (len(pills) - 1)) / float(len(pills))
-    ph = 26.0
+    """CleanMyMac-style bottom bar (`[🖥]   Open Belkins Dashboard   [↻] [⚙️] [⏻]`)."""
+    del snapshot
+    btn_sz = 26.0
 
     def paint(pen: Pen, w: float, h: float) -> None:
-        del w, h
-        y = 3.0
-        fill, edge, _ = _card_surface_roles("belkins_card", "belkins_card_edge", None)
-        for idx, (ic_name, lbl, role_nm, _act) in enumerate(pills):
-            px = CARD_X + idx * (pw + gap)
-            draw_glass_tile(pen, px, y, pw, ph, 8.0, fill, edge)
-            tw = text_w(pen, lbl, "caption_med")
-            ic_adv = 13.5
-            start_x = px + (pw - (ic_adv + tw)) / 2.0
-            symbol(pen, ic_name, start_x, y + 13.0, 8.2, role_nm, "semibold")
-            text(
-                pen,
-                lbl,
-                "caption_med",
-                "label" if idx < 3 else "secondary",
-                start_x + ic_adv,
-                y + 17.0,
-                maxw=pw - ic_adv - 4.0,
-            )
+        _draw_cmm_backdrop(pen, w, h)
+        pen.line(0.0, 1.0, w, "belkins_hair", thickness=0.5)
+        y = 7.0
+        fill, edge, _ = _card_surface_roles("belkins_glass_btn", "belkins_glass_btn_edge", None)
+
+        # Left square icon button (`display`)
+        lx = CARD_X
+        draw_glass_tile(pen, lx, y, btn_sz, btn_sz, 6.5, fill, edge)
+        symbol(pen, "display", lx + 6.5, y + 13.0, 11.0, "belkins_cmm_sub", "medium")
+
+        # Center action text (`Open Belkins Dashboard`)
+        text(pen, "Open Belkins Dashboard", "primary_med", "label", w / 2.0 - 12.0, y + 17.5, center=True)
+
+        # Right square icon buttons (`Refresh`, `Settings`, `Quit`)
+        right_icons = [
+            ("arrow.clockwise", "belkins_cmm_sub"),
+            ("gearshape.fill", "belkins_cmm_sub"),
+            ("power", "belkins_cmm_coral"),
+        ]
+        for idx, (ic_nm, ic_rl) in enumerate(right_icons):
+            rx = w - CARD_X - (len(right_icons) - idx) * btn_sz - (len(right_icons) - 1 - idx) * 5.0
+            draw_glass_tile(pen, rx, y, btn_sz, btn_sz, 6.5, fill, edge)
+            symbol(pen, ic_nm, rx + 7.2, y + 13.0, 10.5, ic_rl, "semibold")
 
     def on_click_x(click_x: float) -> None:
-        rel = max(0.0, min(tot_w - 1.0, click_x - CARD_X))
-        idx = min(len(pills) - 1, max(0, int(rel // (pw + gap))))
-        fn = pills[idx][3]
-        if callable(fn):
-            fn()
+        r_start = W - CARD_X - 3 * btn_sz - 10.0
+        if click_x >= r_start:
+            rel = click_x - r_start
+            slot = int(rel // (btn_sz + 5.0))
+            if slot <= 0:
+                if callable(actions.refresh):
+                    actions.refresh()
+            elif slot == 1:
+                set_active_tab("config")
+            else:
+                if callable(actions.quit_app):
+                    actions.quit_app()
+            return
+        if callable(actions.open_dashboard):
+            actions.open_dashboard()
 
     return Block(
-        35.0,
+        40.0,
         paint,
         key="belkins-footer-dock",
-        ax=f"Utility Dock: Refresh, Analytics Dashboard, {auto_lbl}, Quit",
-        action=actions.refresh,
+        ax="Open Belkins Dashboard, Refresh, Settings, Quit",
+        action=actions.open_dashboard,
         on_click_x=on_click_x,
+        keep_open=False,
         no_hover_bg=True,
     )
 
