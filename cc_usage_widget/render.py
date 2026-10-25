@@ -413,10 +413,62 @@ def companion_sprite_icon(stage_num: int = 1, *, mono: bool = False) -> Any | No
         return status_icon()
 
 
+def clean_mac_status_icon() -> Any | None:
+    """Render a CleanMyMac-style vector iMac/Display silhouette with a diagonal lightning sweep (template NSImage)."""
+    AppKit = _appkit()
+    if AppKit is None:
+        return None
+    try:
+        w, h = 16.0, 15.0
+        image = AppKit.NSImage.alloc().initWithSize_(AppKit.NSMakeSize(w, h))
+        image.lockFocus()
+        try:
+            col = AppKit.NSColor.blackColor()
+            col.setFill()
+            col.setStroke()
+
+            # 1. Monitor screen frame (rounded rect x=1.5, y=4.2, w=13.0, h=9.5)
+            scr = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                AppKit.NSMakeRect(1.5, 4.2, 13.0, 9.5), 2.0, 2.0
+            )
+            scr.fill()
+
+            # 2. Diagonal CleanMyMac-style sweep cutout across the screen using DestinationOut
+            ctx = AppKit.NSGraphicsContext.currentContext()
+            old_op = ctx.compositingOperation()
+            ctx.setCompositingOperation_(AppKit.NSCompositingOperationDestinationOut)
+            slash = AppKit.NSBezierPath.bezierPath()
+            slash.moveToPoint_(AppKit.NSMakePoint(4.5, 4.0))
+            slash.lineToPoint_(AppKit.NSMakePoint(7.2, 4.0))
+            slash.lineToPoint_(AppKit.NSMakePoint(11.5, 13.9))
+            slash.lineToPoint_(AppKit.NSMakePoint(8.8, 13.9))
+            slash.closePath()
+            slash.fill()
+            # Bottom chin bezel line cutout
+            AppKit.NSBezierPath.fillRect_(AppKit.NSMakeRect(2.5, 5.4, 11.0, 0.85))
+            ctx.setCompositingOperation_(old_op)
+
+            # 3. Monitor stand neck & base foot
+            col.setFill()
+            AppKit.NSBezierPath.fillRect_(AppKit.NSMakeRect(6.6, 2.0, 2.8, 2.2))
+            foot = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                AppKit.NSMakeRect(4.5, 1.1, 7.0, 1.2), 0.6, 0.6
+            )
+            foot.fill()
+        finally:
+            image.unlockFocus()
+        image.setTemplate_(True)
+        return image
+    except Exception:
+        return status_icon(("display", "laptopcomputer"))
+
+
 def status_icon_for_style(style: str = "bolt", *, stage_num: int = 1) -> Any | None:
     """Resolve the status-bar NSImage for the chosen ``title_icon_style``."""
     if style == "none":
         return None
+    if style == "cpu":
+        return clean_mac_status_icon()
     if style == "companion":
         return companion_sprite_icon(stage_num, mono=False)
     if style == "companion_mono":

@@ -173,7 +173,7 @@ SYNC_INTERVAL_SECONDS = 1.0
 """Main-thread repaint tick. Does a lock-guarded flag read and returns; the
 menu is only rebuilt when the worker published something new."""
 
-TITLE_FIT_CHECK_SECONDS = 30.0
+TITLE_FIT_CHECK_SECONDS = 2.0
 """How often the repaint tick asks the window server whether the status item
 is drawn (:mod:`menubar`). Two hidden readings in a row switch the title to
 compact for the rest of the run (:meth:`CCUsageWidgetApp._check_title_fits`)."""
