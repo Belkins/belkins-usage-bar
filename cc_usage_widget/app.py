@@ -391,6 +391,7 @@ than painting from the worker."""
 
 _DESKTOP_TERMINAL = "terminal"  # CX-5: a codex_login .command, opened in Terminal
 _CMD_CODEX_LOGIN = "codex_login"  # CX-5: payload = account_id | None
+_CMD_SWITCH_CODEX = "switch_codex"  # explicit user-clicked Codex account switch
 
 
 def _log(message: str) -> None:
@@ -2717,6 +2718,65 @@ class BackgroundWorker:
         _log(f"codex login: wrote {path.name}")
         self._ask_desktop(_DESKTOP_TERMINAL, path)
 
+    def _switch_codex(self, target: str) -> None:
+        """Atomically switch ``~/.codex/auth.json`` to a tracked Codex account on explicit user click."""
+        query = (target or "").strip().lower()
+        if not query:
+            return
+        try:
+            registry = _codex_registry(self._sources)
+            entries = list(self._codex_accounts)
+            if not entries and registry is not None:
+                entries = [
+                    (str(getattr(e, "account_id", "")), str(getattr(e, "alias", "")), bool(getattr(e, "enabled", True)))
+                    for e in (registry.entries() or ())
+                ]
+            if not entries and CODEX_ACCOUNTS_REGISTRY_PATH.exists():
+                raw_reg = json.loads(CODEX_ACCOUNTS_REGISTRY_PATH.read_text(encoding="utf-8"))
+                for item in raw_reg.get("accounts", ()):
+                    if isinstance(item, dict) and item.get("account_id"):
+                        entries.append(
+                            (str(item["account_id"]), str(item.get("alias") or ""), bool(item.get("enabled", True)))
+                        )
+            matched_id: str | None = None
+            for acct_id, alias, _en in entries:
+                if query in (acct_id.lower(), alias.lower(), acct_id[:8].lower()):
+                    matched_id = acct_id
+                    break
+            if matched_id is None:
+                for acct_id, alias, _en in entries:
+                    if acct_id.lower().startswith(query) or (alias and query in alias.lower()):
+                        matched_id = acct_id
+                        break
+            if matched_id is None:
+                _log(f"codex switch: no tracked account matching {target!r}")
+                return
+            accounts_dir = (
+                _codex_login.accounts_dir_for(self._sources)
+                if _codex_login is not None
+                else CODEX_ACCOUNTS_REGISTRY_PATH.parent / "codex-accounts"
+            )
+            src_auth = Path(accounts_dir) / matched_id / "auth.json"
+            if not src_auth.is_file():
+                _log(f"codex switch: missing credential {src_auth}")
+                return
+            raw_bytes = src_auth.read_bytes()
+            json.loads(raw_bytes.decode("utf-8"))
+            dest_auth = Path.home() / ".codex" / "auth.json"
+            dest_auth.parent.mkdir(parents=True, exist_ok=True)
+            tmp_auth = dest_auth.with_name(f".auth.json.tmp.{os.getpid()}")
+            fd = os.open(str(tmp_auth), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, raw_bytes)
+            finally:
+                os.close(fd)
+            os.replace(str(tmp_auth), str(dest_auth))
+            _log(f"codex switch: switched active ~/.codex/auth.json -> {target} ({matched_id[:8]})")
+            self._force_sources_due()
+            self._run_accounts_job(force=True)
+        except Exception as exc:
+            _log(f"codex switch failed: {_describe(exc)}")
+
     # -- cost attribution (roadmap item 6) ---------------------------------
 
     @property
@@ -3791,6 +3851,9 @@ class BackgroundWorker:
             if name == _CMD_CODEX_LOGIN:  # CX-5
                 self._start_codex_login(str(payload) if payload else None)
                 return False, False
+            if name == _CMD_SWITCH_CODEX:
+                self._switch_codex(str(payload) if payload else "")
+                return True, False
         except Exception as exc:
             self._publish(replace(self._snapshot, accounts_error=_describe(exc)))
         else:
@@ -5275,6 +5338,7 @@ class CCUsageWidgetApp(rumps.App):
         self._worker_alive_since = 0.0
         self._running = False
         self._auto_compact = False
+        self._auto_icon_only = False
         self._title_hidden_streak = 0
         self._title_fit_checked_at = 0.0
         self.rebuild_menu()
@@ -6404,9 +6468,14 @@ class CCUsageWidgetApp(rumps.App):
             str(getattr(item, "title", ""))
             for item in self._alert_items(snapshot, inline_recent=False)[len(snapshot.account_notes):]
         )
+        def switch_codex(target: str) -> None:
+            if target:
+                self._worker.submit(_CMD_SWITCH_CODEX, str(target))
+
         return _themes.ThemeActions(
             switch_to=switch_to,
             switch_best=lambda: self._on_switch_best(None),
+            switch_codex=switch_codex,
             codex_login=codex_login,
             codex_login_for=codex_login_for,
             open_url=_open_web_url,
@@ -8421,6 +8490,9 @@ class CCUsageWidgetApp(rumps.App):
         return callback
 
     def _apply_header_icon_choice(self, style: str, *, rebuild: bool = True) -> None:
+        self._auto_compact = False
+        self._auto_icon_only = False
+        self._title_hidden_streak = 0
         snapshot = self.snapshot()
         show_icon = style != "none"
         updates: dict[str, Any] = {

@@ -68,39 +68,59 @@ Optionally, one live row **per Codex account** — see below.
 and a [notification](#notifications) the moment an account crosses 85 %, hits the
 wall, or comes back — once per transition, macOS and optionally Telegram.
 
-## Install
+## Install & One-Command Update
 
 Requires macOS 13+ and either [uv](https://docs.astral.sh/uv/) or Python 3.12+.
 
 ```bash
-unzip cc-usage-widget-*.zip
-cd cc-usage-widget
-./install.sh          # creates a local venv — installs nothing globally
-./run.sh              # a bar-chart icon appears in your menu bar
+git clone https://github.com/Belkins/belkins-usage-bar.git ~/.claude/cc-usage-widget
+cd ~/.claude/cc-usage-widget
+./install.sh --launch-agent --reload   # creates a local venv, installs bswap CLI & starts LaunchAgent
 ```
 
-Start at login: `./install.sh --launch-agent`
+### Updating to the Latest Version
+
+Once installed, anyone can pull the latest update, byte-compile, and reload the menu-bar widget with a single command:
+
+```bash
+bswap update
+# or: belkins update
+```
+
+You can also trigger **🔄 Update Belkins Usage Bar** directly inside the interactive `bswap` TUI menu.
+
+Start manually in foreground: `./run.sh`
 Remove everything: `./uninstall.sh`
 
-## Belkins ⚡ Companion, 5-Tab Menu, Boss Arena & `bswap` CLI
+## Belkins ⚡ Luxury 6-Tab Menu Bar UI, Cyber-Forge & `bswap` CLI
 
-`./install.sh` also installs the unified **`bswap`** and **`belkins`** CLI commands into `~/.local/bin` and enables the default **`Belkins ⚡ (Companion & Party)`** theme:
+`./install.sh` installs the unified **`bswap`** and **`belkins`** CLI commands into `~/.local/bin` and enables the default **`Belkins ⚡ (Companion & Party)`** luxury glassmorphic theme (`#121318` Obsidian panels, `#FF6B2C` Belkins Flame accents, `#D97757` Claude Terracotta, `#10A37F` Codex Emerald, and crisp vector SF Symbols):
 
-### Interactive 5-Tab Menu Bar UI
-- **`⚡ Squad` (Default)**: Shows your **Active Claude** and **Active Codex** champions first, with smart grouped alert summaries below.
-- **`Claude` & `Codex` Tabs**: Full fleet rosters with one-click account switching.
-- **`🧬 Evo` Tab**:
-  - **⚔️ Boss Raid Arena**: Click directly in the menu to strike Raid Bosses (`HTTP-429 Golem`, `Context Leviathan`, `Latency Archlich`, `Quota Behemoth`, `Null Singularity`) using your Companion's **ATK & Crit** to loot **SparkCoins (`🪙`)** and **Bonus XP**!
-  - **🧬 8-Stage Cyber-Forms**: `Sparkbit` (Lv.1) → `Outreachik` (Lv.8) → `Pipelinex` (Lv.18) → `Contexton` (Lv.30) → `Belkinosaur` (Lv.45) → `Chronoflare` (Lv.62) → `Belkins Prime` (Lv.80) → `Omega Belkion` (Lv.95). Click any unlocked form to morph your active Companion and activate its passive buff!
-  - **🏆 14 Hall of Fame Trophies**: 7×2 Bento Grid tracking mid-to-endgame milestones (`Kilowatt Day` \$1.5K/day, `Quarter-Trillion` 250B tokens, `Fleet Admiral` 8+ healthy accounts, `Flawless Rotator` 15+ rotations with 0 alerts, `Leviathan Hunter` 10+ Bosses, `Raid Godslayer` 50+ Bosses, `Serum Alchemist` 25+ Serums, `Vault Tycoon` 12/12 Vault relics, `Prismatic Triad`, `Omega Ascendant` Lv.95, and `Lv.99 Immortal`).
-- **👾 Zero-Overhead 2.2Hz Retro Pixel Idle Animations**: Your Companion, Raid Boss, Mini-Drone sidekick, Plasma Blade, and Cyber Halo gently breathe, blink, hover, and twinkle while the menu is open (`0.00%` background CPU & `0` extra RAM when closed).
-- **`⚡ Vault` Tab (12-Item Belkins Spark Vault)**:
-  - **`⚔️ Relics & Lab`**: `🔋 Cool-Down Cell`, repeatable `🧪 Overclock Serum` (`+60K XP & +20 ATK` per serum), `🕶️ Deal Closer Visor`, `⚔️ Plasma Token Blade` (pixel sword), `👑 Sovereign Crown`, and `✨ Prismatic Core` (mutates your Companion into its ★ Prismatic gold/violet/cyan palette!).
-  - **`🎨 Skins & Bots`**: `🔥 Solar Forge Pad`, `🌿 Emerald Grove Pad`, `🌌 Void Nebula Pad` (each recolors your holopad & XP bar!), `⚡ Cyber Halo Aura`, `🤖 Mini-Drone Sidekick` (pixel AI drone bot), and `🕹️ Cyber Arcade UI Skin` (reskins all menu cards into a Gold Arcade Console!).
+### Interactive 6-Tab Menu Bar Architecture
+- **`⚡ Squad` (Side-by-Side Command Deck)**:
+  - **Belkins Companion Hero**: Vector **Belkins Core Crest** (`1.5pt` anti-aliased stroke, dual outer ring + inner power core) and vector SF Symbol HUD pills (`flame.fill` ATK/Crit, `sparkles` SparkCoins `✦ CR`, `trophy.fill` Trophies) with a smooth luxury XP track.
+  - **Side-by-Side Provider Cards**: **CLAUDE SQUAD** (left, `204pt`) and **CODEX SQUAD** (right, `204pt`) side-by-side in a single `130pt` row, each with active alias, `READY N/M` pill, binding quota window + reset clock, `luxury_bar` progress gauge, and `NEXT UP` standby recommendation.
+  - **Needs Attention Banner**: Compact glass alert card below the Command Deck — click the `bswap add` row to copy `bswap add` to your clipboard or click a Codex relogin row to launch `codex login`.
+- **`Claude` & `Codex` Full Fleet Tabs**:
+  - **Recessed Active Account Panel**: Shows `● ACTIVE`, plan badge, email, and individual `luxury_bar` tracks for `5h`, `7d`, and `Fable` / `weekly` windows.
+  - **2-Column Standby Bento Grid**: Every standby account in a compact `204pt × 50pt` glass tile. Click **any** standby Claude or Codex tile to switch your active login immediately!
+- **`✨ Evo` Tab (Boss Raid Arena, 8 Cyber-Forms & 14 Trophies)**:
+  - **Boss Raid Arena**: Recessed glass inner panel with a `luxury_bar` Boss HP gauge. Click directly in the menu to strike Raid Bosses (`HTTP-429 Golem`, `Context Leviathan`, `Latency Archlich`, `Quota Behemoth`, `Null Singularity`) using your Companion's **ATK & Crit** to loot **SparkCoins (`✦ CR`)** and **Bonus XP**!
+  - **8-Stage Cyber-Forms**: `Sparkbit` (Lv.1) → `Outreachik` (Lv.8) → `Pipelinex` (Lv.18) → `Contexton` (Lv.30) → `Belkinosaur` (Lv.45) → `Chronoflare` (Lv.62) → `Belkins Prime` (Lv.80) → `Omega Belkion` (Lv.95). Click any unlocked form to morph your active Companion and activate its passive buff!
+  - **14 Hall of Fame Trophies**: `7×2` Bento Grid tracking mid-to-endgame milestones (`Kilowatt Day` \$1.5K/day, `Quarter-Trillion` 250B tokens, `Fleet Admiral` 8+ healthy accounts, `Flawless Rotator` 15+ rotations with 0 alerts, `Leviathan Hunter` 10+ Bosses, `Raid Godslayer` 50+ Bosses, `Serum Alchemist` 25+ Serums, `Vault Tycoon` 12/12 Vault relics, `Prismatic Triad`, `Omega Ascendant` Lv.95, and `Lv.99 Immortal`).
+- **`🛡️ Vault` Tab (12-Item Belkins Spark Vault)**:
+  - **`⚔️ Relics & Lab`**: `Cool-Down Cell`, repeatable `Overclock Serum` (`+60K XP & +20 ATK` per serum), `Deal Closer Visor`, `Plasma Token Blade`, `Sovereign Crown`, and `Prismatic Core` (mutates your Companion into its ★ Prismatic gold/violet/cyan palette!).
+  - **`🎨 Skins & Bots`**: `Solar Forge Pad`, `Emerald Grove Pad`, `Void Nebula Pad`, `Cyber Halo Aura`, `Mini-Drone Sidekick`, and `Cyber Arcade UI Skin` (reskins all menu cards into a Gold Arcade Console!).
+- **`🎛️ Studio` Tab (Header & Icon Studio + General Settings)**:
+  - **`🎨 Header & Icon`**: Customize your macOS menu-bar status item in real time with **6 Header View Presets** (`Compact`, `Balanced`, `Full`, `Fleet`, `Cost`, `Icon Only`), **9 Header Icon Styles** (`⚡ Belkins Bolt`, `📊 Classic Bars`, `🔥 Flame`, `🧠 CPU`, `✨ Sparkles`, `🛡️ Shield`, `🚀 Rocket`, `💎 Crown`, `None`), and **10 Live Header Component Toggles** (`Alias`, `Claude %`, `Codex %`, `Reset ↺`, `Room N/M`, `Alerts ⚠`, `Burn $/d`, `Reset Cr`, `Short ⚠`, `Companion`). Automatically recovers from macOS menu-bar crowding behind the notch.
+  - **`⚙️ General`**: Full settings control panel (Theme selector, Auto-Switch, Cost Tracking, Codex Refresh, Alert Thresholds `80%`/`85%`/`90%`/`95%`, Poll Intervals `1m`/`5m`/`10m`/`15m`, Sound & Telegram Alerts, Launch at Login, and Copy Diagnostics).
 
-### `bswap` / `belkins` CLI Reference
+### `bswap` / `belkins` Interactive TUI & CLI Reference
 ```bash
-bswap                       # Companion HUD + Claude & Codex fleet status (alias: belkins)
+bswap                       # Launch interactive arrow-key TUI (Switch, Watch, Spark Vault, Boss Raid)
+bswap update                # Pull latest Belkins Usage Bar from GitHub & restart menu-bar agent
+bswap status                # Print Companion HUD + Claude & Codex fleet status in terminal
+bswap watch                 # Launch live multi-account Watch monitor in TUI
 bswap evo                   # 8-Stage Cyber-Forms, Boss Raid status & 14 Hall of Fame Trophies
 bswap raid [strikes]        # Attack the active Raid Boss for SparkCoins & Bonus XP (e.g. bswap raid 3)
 bswap morph <1..8|auto>     # Morph your active Companion into any unlocked Cyber-Form
@@ -108,7 +128,9 @@ bswap vault                 # Open the 12-item Belkins Spark Vault in terminal (
 bswap buy <item>            # Buy, equip, or inject a relic (e.g. bswap buy serum, blade, core, arcade)
 bswap <slot|alias>          # Switch active Claude account to slot number or alias
 bswap best                  # Switch to the healthiest Claude account with the most headroom
-bswap codex [status|switch] # Manage Codex accounts
+bswap codex switch <alias>  # Switch active Codex account in ~/.codex/auth.json
+bswap codex list            # List tracked Codex accounts and active login
+bswap dashboard             # Open the local Belkins HTML Usage & Companion Dashboard
 bswap bar [restart|status]  # Control the Belkins menu-bar LaunchAgent
 ```
 
@@ -135,28 +157,12 @@ tools. Every reset reads the same way everywhere: `↺ 14:50` today, `↺ Thu
 bars are one submenu away (**All Claude bars ▸**, **All Codex bars ▸**).
 
 **Settings ▸ Theme** (`menu_theme`) picks how the dropdown is drawn:
-**Belkins ⚡ (Companion & Party)** (default: features your evolving pixel-art Belkins AI Companion, segmented XP bar, Trophy Badges, SparkCoins `🪙`, and **5 interactive in-menu tabs** — `⚡ Party`, `Claude`, `Codex`, `🐾 Dex`, and `🛒 Mart` / Belkins Poké Mart — plus `bswap` remedy chips), **Cards** (one rounded panel per provider, the active account large,
+**Belkins ⚡ (Companion & Party)** (default: features your Belkins Companion Medallion, Side-by-Side Squad Command Deck, Boss Raid Arena, 14-Trophy Hall of Fame, Spark Vault `✦ CR`, and **6 interactive in-menu tabs** — `⚡ Squad`, `Claude`, `Codex`, `✨ Evo`, `🛡️ Vault`, and `🎛️ Studio`), **Cards** (one rounded panel per provider, the active account large,
 the others one line each), **Apple** (the
 language of Control Center: hero lines, section headers, symbols, two-line
 rows), **Dense** (every account on one aligned line; the shortest menu), or the
 text layouts **Glance** (described above) and **Classic** (the previous menu,
 exactly).
-
-### Belkins Companion, Interactive Tabs & Poké Mart (`bswap` / `belkins`)
-
-`./install.sh` also installs the unified **`bswap`** (and **`belkins`**) CLI in `~/.local/bin`:
-
-```bash
-bswap                  # Companion HUD + Claude & Codex fleet status
-bswap dex              # 5-stage Evolution Pokedex & 8 Belkins Trophy Badges
-bswap shop             # Belkins Poké Mart (view SparkCoins 🪙 & cosmetics)
-bswap buy shades       # Buy or equip/unequip Deal Closer Shades, Sovereign Crown, etc.
-bswap best             # Switch to the healthiest Claude account with most room
-bswap <slot|alias>     # Switch active Claude account
-bswap codex status     # Manage Codex accounts
-bswap dashboard        # Open the HTML Usage & Companion Dashboard
-bswap bar restart      # Restart the menu-bar LaunchAgent
-```
 
 The card themes are drawn by native views in the system font,
 with rounded figures and colours chosen to stay readable on a menu tinted by

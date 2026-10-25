@@ -1140,11 +1140,11 @@ def _belkins_dex_section(
     )
     party_bits: list[str] = []
     if companion.claude_total > 0:
-        party_bits.append(f"Claude Party {companion.claude_ready}/{companion.claude_total} ready")
+        party_bits.append(f"Claude Squad {companion.claude_ready}/{companion.claude_total} ready")
     if companion.codex_total > 0:
-        party_bits.append(f"Codex Party {companion.codex_ready}/{companion.codex_total} ready")
+        party_bits.append(f"Codex Squad {companion.codex_ready}/{companion.codex_total} ready")
     party_bits.append(f"Trophies {companion.unlocked_badges_count}/{len(companion.badges)}")
-    party_bits.append(f"🪙 {companion.coins_available:,} SparkCoins")
+    party_bits.append(f"✦ {companion.coins_available:,} CR")
 
     hero_html = (
         '<div class="bk-hero">'
@@ -1152,7 +1152,7 @@ def _belkins_dex_section(
         '<div class="bk-hero-meta">'
         '<div class="bk-hero-top">'
         f'<strong>{_esc(companion.stage.name)}</strong>'
-        f'<span class="bk-lv">Lv.{companion.level} · {_esc(companion.stage.title)}</span>'
+        f'<span class="bk-lv">Lv.{companion.level} · {_esc(companion.stage.title)} ({_esc(companion.stage.passive)})</span>'
         f'<span class="bk-mood">{_esc(companion.mood_label)}</span>'
         "</div>"
         f'<p class="note">{_esc(companion.stage.lore)}</p>'
@@ -1167,6 +1167,29 @@ def _belkins_dex_section(
         "</div></div>"
     )
 
+    boss = companion.boss
+    boss_svg = render_sprite_svg(boss.spec, size=68).replace("HTTP-", "ERR-").replace("http-", "err-")
+    boss_name = boss.spec.name.replace("HTTP-", "ERR-").replace("http-", "err-")
+    boss_hp_pct = max(0, min(100, int(round(boss.hp_pct))))
+    boss_html = (
+        '<div class="bk-boss">'
+        f'<div class="bk-sprite-pad bk-boss-pad">{boss_svg}</div>'
+        '<div class="bk-hero-meta">'
+        '<div class="bk-hero-top">'
+        f'<strong>BOSS RAID ARENA · {_esc(boss_name)}</strong>'
+        f'<span class="bk-lv">Lv.{boss.level} · {_esc(boss.spec.title)}</span>'
+        f'<span class="bk-mood">{boss.bosses_slain} Slain · {boss.player_atk} ATK ({boss.player_crit_pct}% Crit)</span>'
+        "</div>"
+        '<div class="bk-xp-row">'
+        f'<span>HP {boss.hp_current:,} / {boss.hp_max:,} ({boss_hp_pct}%)</span>'
+        f'<span>Bounty: +{boss.spec.coin_reward} ✦ CR &amp; +{boss.spec.xp_reward:,} XP · Strike via <code>bswap raid</code></span>'
+        "</div>"
+        '<div class="bk-xp-track">'
+        f'<div class="bk-xp-fill" style="width:{boss_hp_pct}%"></div>'
+        "</div>"
+        "</div></div>"
+    )
+
     evo_cards: list[str] = []
     for st in EVOLUTION_LINE:
         unlocked = companion.level >= st.min_level
@@ -1177,8 +1200,8 @@ def _belkins_dex_section(
         evo_cards.append(
             f'<div class="{cls}">'
             f'<div class="bk-stage-head">{svg}<div>'
-            f'<h4>{_esc(st.name)}</h4>'
-            f'<span class="bk-tag">{_esc(tag)} · Lv.{st.min_level}+</span>'
+            f'<h4>#{st.stage} {_esc(st.name)}</h4>'
+            f'<span class="bk-tag">{_esc(tag)} · Lv.{st.min_level}+ · {_esc(st.passive)}</span>'
             "</div></div>"
             f'<p class="note">{_esc(st.lore)}</p>'
             "</div>"
@@ -1199,7 +1222,7 @@ def _belkins_dex_section(
     shop_cards: list[str] = []
     for it in companion.shop_items:
         cls = "bk-badge unlocked" if it.owned else "bk-badge locked"
-        status = "EQUIPPED ✓" if it.equipped else ("OWNED" if it.owned else f"🪙 {it.price:,} Coins")
+        status = "EQUIPPED ✓" if it.equipped else ("OWNED" if it.owned else f"✦ {it.price:,} CR")
         shop_cards.append(
             f'<div class="{cls}">'
             f'<div class="bk-badge-head"><span class="bk-badge-icon">{_esc(it.icon)}</span>'
@@ -1210,11 +1233,12 @@ def _belkins_dex_section(
 
     return (
         hero_html
-        + "<h3>Evolution Lineage</h3>"
+        + boss_html
+        + "<h3>8-Stage Cyber-Form Evolution Lineage</h3>"
         + f'<div class="bk-evo-grid">{"".join(evo_cards)}</div>'
-        + '<h3 style="margin-top:14px">Belkins Trophy Room</h3>'
+        + f'<h3 style="margin-top:14px">Belkins Hall of Fame ({companion.unlocked_badges_count}/{len(companion.badges)} Trophies)</h3>'
         + f'<div class="bk-badge-grid">{"".join(badge_cards)}</div>'
-        + f'<h3 style="margin-top:14px">🛒 Belkins Poké Mart (🪙 {companion.coins_available:,} SparkCoins available — buy/equip in menu bar or via <code>bswap shop</code>)</h3>'
+        + f'<h3 style="margin-top:14px">Belkins Spark Vault (✦ {companion.coins_available:,} CR available — buy/equip in menu bar or via <code>bswap vault</code>)</h3>'
         + f'<div class="bk-badge-grid">{"".join(shop_cards)}</div>'
     )
 
@@ -1256,9 +1280,9 @@ def _style() -> str:
         "--dim:#5d6169;--rule:#e0e0dc;--accent:#b3402f;--ok:#3f8b62;--track:#e8e8e4;"
         + light
         + "}"
-        "@media (prefers-color-scheme: dark){:root{--bg:#16171a;--panel:#1e2024;"
-        "--ink:#e9eaec;--dim:#9aa0a8;--rule:#2c2f35;--accent:#e0715c;--ok:#6fbd92;"
-        "--track:#2c2f35;" + dark + "}}"
+        "@media (prefers-color-scheme: dark){:root{--bg:#0d0e12;--panel:#15171e;"
+        "--ink:#f4f5f7;--dim:#9499a6;--rule:#242733;--accent:#ff6b2c;--ok:#30d175;"
+        "--track:#242733;" + dark + "}}"
         "*{box-sizing:border-box}"
         "body{margin:0;background:var(--bg);color:var(--ink);"
         "font:14px/1.5 -apple-system,BlinkMacSystemFont,'Helvetica Neue',Arial,sans-serif}"
@@ -1267,7 +1291,7 @@ def _style() -> str:
         "h1{font-size:20px;margin:0 0 4px}"
         "h2{font-size:15px;margin:0 0 10px;letter-spacing:.02em;text-transform:uppercase;color:var(--dim)}"
         "h3{font-size:14px;margin:0 0 8px}"
-        "section{background:var(--panel);border:1px solid var(--rule);border-radius:8px;"
+        "section{background:var(--panel);border:1px solid var(--rule);border-radius:10px;"
         "padding:16px 18px;margin:16px 0}"
         ".sub,.note{color:var(--dim);margin:0 0 10px;font-size:12px}"
         ".banner{color:var(--accent);border:1px solid var(--accent);border-radius:6px;"
@@ -1292,7 +1316,7 @@ def _style() -> str:
         "th{color:var(--dim);font-weight:600;font-size:11px;text-transform:uppercase}"
         ".num{text-align:right;font-variant-numeric:tabular-nums}"
         ".accounts{display:flex;flex-wrap:wrap;gap:18px}"
-        ".account{flex:1 1 320px;min-width:0;border:1px solid var(--rule);border-radius:6px;padding:12px}"
+        ".account{flex:1 1 320px;min-width:0;border:1px solid var(--rule);border-radius:8px;padding:12px}"
         ".account h3{display:flex;gap:8px;align-items:baseline}"
         ".vendor,.plan{color:var(--dim);font-weight:400;font-size:11px;text-transform:uppercase}"
         ".window-bar{display:flex;align-items:center;gap:8px;margin:4px 0;font-size:12px}"
@@ -1304,8 +1328,10 @@ def _style() -> str:
         "rect.fill-capped{fill:var(--accent)}rect.fill-expired{fill:var(--dim)}"
         "line.limit{stroke:var(--rule);stroke-width:2}"
         ".empty{padding:28px 0;text-align:center;color:var(--dim)}"
-        ".bk-hero{display:flex;gap:16px;align-items:center;border:1px solid var(--rule);border-radius:8px;padding:14px;margin-bottom:14px}"
-        ".bk-sprite-pad{flex:0 0 92px;height:92px;border-radius:8px;background:#18181b;border:1px solid var(--rule);display:flex;align-items:center;justify-content:center}"
+        ".bk-hero,.bk-boss{display:flex;gap:16px;align-items:center;border:1px solid var(--rule);border-radius:10px;padding:14px;margin-bottom:14px}"
+        ".bk-boss{border-color:var(--accent)}"
+        ".bk-sprite-pad{flex:0 0 92px;height:92px;border-radius:8px;background:#121318;border:1px solid var(--rule);display:flex;align-items:center;justify-content:center}"
+        ".bk-boss-pad{flex:0 0 78px;height:78px;background:#1a1014}"
         ".bk-hero-meta{flex:1;min-width:0}"
         ".bk-hero-top{display:flex;flex-wrap:wrap;gap:8px;align-items:baseline;margin-bottom:4px}"
         ".bk-hero-top strong{font-size:18px}"
@@ -1316,7 +1342,7 @@ def _style() -> str:
         ".bk-xp-fill{height:100%;background:var(--accent);border-radius:4px}"
         ".bk-evo-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px}"
         ".bk-badge-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}"
-        ".bk-stage,.bk-badge{border:1px solid var(--rule);border-radius:6px;padding:10px}"
+        ".bk-stage,.bk-badge{border:1px solid var(--rule);border-radius:8px;padding:10px}"
         ".bk-stage.active,.bk-badge.unlocked{border-color:var(--accent)}"
         ".bk-stage.locked,.bk-badge.locked{opacity:.65}"
         ".bk-stage-head,.bk-badge-head{display:flex;gap:10px;align-items:center;margin-bottom:6px}"

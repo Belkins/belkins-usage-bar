@@ -312,6 +312,7 @@ def _build_belkins_tui_app(switcher: object, *, start: str = "dashboard", detect
                 ("🧬 Morph Companion Form (8 Cyber-Forms)…", "belkins-morph"),
                 ("🏆 Hall of Fame (14 Trophies)…", "belkins-trophies"),
                 ("🌐 Open Belkins HTML Dashboard", "belkins-dashboard"),
+                ("🔄 Update Belkins Usage Bar (git pull + restart)", "belkins-update"),
                 ("Auto-switch view", "auto"),
                 ("Add account…", "add-menu"),
                 ("Disable / enable account…", "disable-menu"),
@@ -467,6 +468,13 @@ def _build_belkins_tui_app(switcher: object, *, start: str = "dashboard", detect
             if action_id == "belkins-dashboard":
                 _cmd_dashboard()
                 self.app.notify("Opened Belkins HTML Dashboard in browser")
+                return
+            if action_id == "belkins-update":
+                rc = _cmd_update([])
+                self.app.notify(
+                    "Belkins Usage Bar updated & restarted!" if rc == 0 else "Update failed — run `bswap update` in terminal",
+                    severity="information" if rc == 0 else "warning",
+                )
                 return
 
             await super()._dispatch(action_id)
@@ -715,8 +723,179 @@ def _cmd_dashboard() -> int:
 
 
 def _cmd_codex(args: list[str]) -> int:
+    if not args or args[0] == "status":
+        args = ["list", *args[1:]]
+    elif args[0] == "switch":
+        if len(args) < 2:
+            print(f"{RED}Usage: bswap codex switch <alias|account-id>{RESET}", file=sys.stderr)
+            return 2
+        target = args[1].strip().lower()
+        from .codex_accounts import CredentialStore, Registry
+        from .contracts import CODEX_ACCOUNTS_DIR, CODEX_ACCOUNTS_REGISTRY_PATH, CODEX_AUTH_PATH
+
+        registry = Registry(CODEX_ACCOUNTS_REGISTRY_PATH)
+        entries = registry.entries()
+        match = None
+        for idx, entry in enumerate(entries):
+            slot_str = str(idx + 1)
+            neg_slot = f"-{idx + 1}"
+            if (
+                entry.alias.lower() == target
+                or entry.account_id.lower() == target
+                or entry.account_id.lower().startswith(target)
+                or target in {slot_str, neg_slot}
+            ):
+                match = entry
+                break
+        if match is None:
+            print(f"{RED}✗ No tracked Codex account matching {args[1]!r}{RESET}", file=sys.stderr)
+            return 1
+        src = CODEX_ACCOUNTS_DIR / match.account_id / "auth.json"
+        if not src.is_file():
+            print(f"{RED}✗ Credential file missing at {src}{RESET}", file=sys.stderr)
+            return 1
+        dst = CODEX_AUTH_PATH
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dst.with_name(f".{dst.name}.bswap.tmp")
+            data = src.read_bytes()
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, data)
+            finally:
+                os.close(fd)
+            os.replace(tmp, dst)
+        except OSError as exc:
+            print(f"{RED}✗ Failed to write {dst}: {exc}{RESET}", file=sys.stderr)
+            return 1
+        label = match.alias or match.account_id[:8]
+        print(f"{GREEN}✓ Switched active Codex account to {BOLD}{label}{RESET}{GREEN} ({match.account_id[:8]}){RESET}")
+        return 0
+
     cmd = [sys.executable, "-m", "cc_usage_widget.codex_accounts", *args]
     return subprocess.run(cmd, cwd=str(WIDGET_DIR)).returncode
+
+
+REPO_GIT_URL = "https://github.com/Belkins/belkins-usage-bar.git"
+REPO_TARBALL_URL = "https://github.com/Belkins/belkins-usage-bar/archive/refs/heads/main.tar.gz"
+
+
+def _cmd_update(args: list[str]) -> int:
+    """Pull the latest Belkins Usage Bar from GitHub, byte-compile, and restart the menu-bar agent."""
+    import tempfile
+
+    force = "--force" in args or "-f" in args
+    print(f"{BOLD}{ORANGE}⚡ Updating Belkins Usage Bar & Cyber-Forge...{RESET}")
+    git_dir = WIDGET_DIR / ".git"
+    updated_ok = False
+
+    if git_dir.is_dir() and shutil.which("git"):
+        remotes = subprocess.run(
+            ["git", "-C", str(WIDGET_DIR), "remote"],
+            capture_output=True,
+            text=True,
+        )
+        remote_names = set((remotes.stdout or "").split())
+        if "origin" not in remote_names:
+            subprocess.run(
+                ["git", "-C", str(WIDGET_DIR), "remote", "add", "origin", REPO_GIT_URL],
+                check=False,
+            )
+        else:
+            subprocess.run(
+                ["git", "-C", str(WIDGET_DIR), "remote", "set-url", "origin", REPO_GIT_URL],
+                check=False,
+            )
+
+        fetch = subprocess.run(
+            ["git", "-C", str(WIDGET_DIR), "fetch", "origin", "main"],
+            capture_output=True,
+            text=True,
+        )
+        if fetch.returncode == 0:
+            if force:
+                pull = subprocess.run(
+                    ["git", "-C", str(WIDGET_DIR), "reset", "--hard", "origin/main"],
+                    capture_output=True,
+                    text=True,
+                )
+            else:
+                pull = subprocess.run(
+                    ["git", "-C", str(WIDGET_DIR), "pull", "--ff-only", "origin", "main"],
+                    capture_output=True,
+                    text=True,
+                )
+                if pull.returncode != 0:
+                    # Fallback if local branch diverged: stash local code changes and reset to origin/main
+                    subprocess.run(["git", "-C", str(WIDGET_DIR), "stash", "--quiet"], check=False)
+                    pull = subprocess.run(
+                        ["git", "-C", str(WIDGET_DIR), "reset", "--hard", "origin/main"],
+                        capture_output=True,
+                        text=True,
+                    )
+            if pull.returncode == 0:
+                updated_ok = True
+                rev = subprocess.run(
+                    ["git", "-C", str(WIDGET_DIR), "rev-parse", "--short", "HEAD"],
+                    capture_output=True,
+                    text=True,
+                )
+                sha = (rev.stdout or "").strip()
+                print(f"  {GREEN}✓ Pulled latest main ({sha}) from {REPO_GIT_URL}{RESET}")
+
+    if not updated_ok:
+        print(f"  {DIM}Fetching latest release archive from GitHub...{RESET}")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tar_path = Path(tmpdir) / "belkins-usage-bar.tar.gz"
+            dl = subprocess.run(
+                ["curl", "-fsSL", REPO_TARBALL_URL, "-o", str(tar_path)],
+                capture_output=True,
+                text=True,
+            )
+            if dl.returncode != 0:
+                print(f"{RED}✗ Could not download update from {REPO_TARBALL_URL}{RESET}", file=sys.stderr)
+                return 1
+            ex = subprocess.run(
+                ["tar", "-xzf", str(tar_path), "-C", tmpdir],
+                capture_output=True,
+                text=True,
+            )
+            if ex.returncode != 0:
+                print(f"{RED}✗ Failed to unpack update archive.{RESET}", file=sys.stderr)
+                return 1
+            extracted_dirs = [p for p in Path(tmpdir).iterdir() if p.is_dir()]
+            if not extracted_dirs:
+                print(f"{RED}✗ Archive was empty.{RESET}", file=sys.stderr)
+                return 1
+            src_root = extracted_dirs[0]
+            for rel in ("cc_usage_widget", "tests", "install.sh", "README.md"):
+                s = src_root / rel
+                d = WIDGET_DIR / rel
+                if s.is_dir():
+                    shutil.copytree(s, d, dirs_exist_ok=True)
+                elif s.is_file():
+                    shutil.copy2(s, d)
+            updated_ok = True
+            print(f"  {GREEN}✓ Synced latest files from GitHub main archive{RESET}")
+
+    # Byte-compile package
+    subprocess.run(
+        [sys.executable, "-m", "compileall", "-q", str(WIDGET_DIR / "cc_usage_widget")],
+        check=False,
+    )
+
+    # Restart launchd service
+    uid = str(os.getuid())
+    res = subprocess.run(
+        ["launchctl", "kickstart", "-k", f"gui/{uid}/com.cc-usage-widget"],
+        capture_output=True,
+        text=True,
+    )
+    if res.returncode == 0:
+        print(f"  {GREEN}✓ Belkins Usage Bar restarted and live in your macOS menu bar!{RESET}")
+    else:
+        print(f"  {GOLD}! Updated files; run `bswap bar restart` to reload the menu bar.{RESET}")
+    return 0
 
 
 def _cmd_help() -> int:
@@ -725,6 +904,7 @@ def _cmd_help() -> int:
     print()
     print(f"{BOLD}Interactive TUI & Companion Commands:{RESET}")
     print(f"  {ORANGE}bswap{RESET} / {ORANGE}bswap tui{RESET}          Launch interactive arrow-key TUI (Switch, Watch, Spark Vault, Boss Raid)")
+    print(f"  {ORANGE}bswap update{RESET}               Pull latest Belkins Usage Bar from GitHub & restart menu bar")
     print(f"  {ORANGE}bswap watch{RESET}                Launch live multi-account Watch monitor in TUI")
     print(f"  {ORANGE}bswap status{RESET}               Print Companion HUD + Claude & Codex fleet status")
     print(f"  {ORANGE}bswap evo{RESET} / {ORANGE}bswap dex{RESET}      Inspect 8-Stage Cyber-Forms, Boss Raid Arena & 14 Hall of Fame Trophies")
@@ -734,7 +914,7 @@ def _cmd_help() -> int:
     print(f"  {ORANGE}bswap buy <item>{RESET}           Buy, equip, or inject a Vault relic (e.g. serum, blade, core, arcade)")
     print(f"  {ORANGE}bswap dashboard{RESET}            Open the interactive Belkins HTML Dashboard in browser")
     print(f"  {ORANGE}bswap bar{RESET} [on|off|restart|status|logs]  Control the Belkins menu-bar app")
-    print(f"  {ORANGE}bswap codex{RESET} [status|switch|add|relogin] Manage Codex accounts")
+    print(f"  {ORANGE}bswap codex{RESET} [list|switch|best|adopt|probe] Manage & switch Codex accounts")
     print()
     print(f"{BOLD}Claude Fleet Commands:{RESET}")
     print(f"  {ORANGE}bswap <slot|alias>{RESET}         Switch active Claude account to slot number or alias")
@@ -808,6 +988,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_dashboard()
     if cmd in {"bar", "widget", "menubar"}:
         return _cmd_bar(args[1:])
+    if cmd in {"update", "upgrade", "self-update"}:
+        return _cmd_update(args[1:])
     if cmd == "codex":
         return _cmd_codex(args[1:])
 
