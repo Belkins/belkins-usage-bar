@@ -52,9 +52,9 @@ _SPRITE_SPARKBIT: Final[tuple[str, ...]] = (
     "..OBBAAAAABO..",
     "..OBBAAAAABO..",
     "...OBBBBBBO...",
-    "....OOOOOO....",
-    "...OO....OO...",
-    "..S..........S",
+    "....OBBBBO....",
+    "...OBO..OBO...",
+    "..SOOC..COOS..",
     "..............",
     "..............",
 )
@@ -70,9 +70,9 @@ _SPRITE_OUTREACHIK: Final[tuple[str, ...]] = (
     "..OBBAAAAABO..",
     "..OBBAAAAABO..",
     ".OOBBBBBBBBOO.",
-    ".OO.OOOOOO.OO.",
-    "....OO..OO....",
-    "...OO....OO...",
+    ".OO.OBBBBO.OO.",
+    "....OBOOBO....",
+    "...OOC..COO...",
     "..............",
 )
 
@@ -87,9 +87,9 @@ _SPRITE_PIPELINEX: Final[tuple[str, ...]] = (
     ".OOBBAAAAABOO.",
     "COOBBAAAAABOOC",
     "COOBBBBBBBBOOC",
-    ".OO.OOOOOO.OO.",
-    "...OO....OO...",
-    "..OOO....OOO..",
+    ".OO.OBBBBO.OO.",
+    "...OBO..OBO...",
+    "..OCOO..OOCO..",
     "..............",
 )
 
@@ -104,9 +104,9 @@ _SPRITE_CONTEXTON: Final[tuple[str, ...]] = (
     ".OBBAAAAAAABO.",
     ".OBBAAAAAAABO.",
     "..OBBBBBBBBO..",
-    ".OO.OOOOOO.OO.",
-    "OO..OO..OO..OO",
-    "...OO....OO...",
+    ".OO.OBBBBO.OO.",
+    "OCO.OBOOBO.OCO",
+    "...OOC..COO...",
     "..............",
 )
 
@@ -122,9 +122,9 @@ _SPRITE_BELKINOSAUR: Final[tuple[str, ...]] = (
     "OOBBAAAAABBBOO",
     "OBBBAAAAABBBBO",
     "OOOBBBBBBBBOOO",
-    ".OOOO.OO.OOOO.",
-    "..OOO....OOO..",
-    "..OOO....OOO..",
+    ".OCOO.OO.OOCO.",
+    "..OBO....OBO..",
+    "..OCO....OCO..",
 )
 
 _SPRITE_CHRONOFLARE: Final[tuple[str, ...]] = (
@@ -138,27 +138,27 @@ _SPRITE_CHRONOFLARE: Final[tuple[str, ...]] = (
     "COOBBAAAAABOOC",
     ".OOBBAAAAABOO.",
     "..OBBBBBBBBO..",
-    "..OO.OOOO.OO..",
-    ".OO..OO..OO...",
-    "S...OO....OO.S",
+    "..OO.OBBO.OO..",
+    ".OCO.OBBO.OCO.",
+    "S...OCO..OCO.S",
     "..............",
 )
 
 _SPRITE_BELKINS_PRIME: Final[tuple[str, ...]] = (
-    ".S..CCCCCC..S.",
-    "..CCCCCCCCCC..",
-    ".CCOOOOOOOOCC.",
-    "COOBBBBBBBBOOC",
-    "OBBBCCCCCCBBBO",
-    "OBBEEEBBEEEBBO",
+    ".S..C.CC.C..S.",
+    "..CCOOOOOOCC..",
+    ".COOBBBBBBOOC.",
+    "COOBBCCCCBBOOC",
+    "OBBBOOOOOOBBBO",
+    "OBBEEEOOEEEBBO",
     "SOBBBBBBBBBBOS",
     "COOBCCCCCCBOOC",
     "COOBBAAAAABOOC",
     ".OOBBAAAAABOO.",
-    "..OBBBBBBBBO..",
-    ".OO.OOOOOO.OO.",
-    "OO..OO..OO..OO",
-    "S...OO..OO...S",
+    "..OBBCCCCBBO..",
+    ".OO.OBBBBO.OO.",
+    ".OCO.OBBO.OCO.",
+    "S..OOC..COO..S",
 )
 
 _SPRITE_OMEGA_BELKION: Final[tuple[str, ...]] = (
@@ -172,10 +172,10 @@ _SPRITE_OMEGA_BELKION: Final[tuple[str, ...]] = (
     "COOBCCCCCCBOOC",
     "COOBAAAAAAAOBC",
     "COOBBAAAAABOOC",
-    ".OOBBBBBBBBOO.",
-    ".OO.OOOOOO.OO.",
-    "OO..OO..OO..OO",
-    "S..OOO..OOO..S",
+    ".OOBBCCCCBBOO.",
+    ".OO.OBBBBO.OO.",
+    "OCO.OBOOBO.OCO",
+    "S..OOC..COO..S",
 )
 
 
