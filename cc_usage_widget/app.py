@@ -5491,9 +5491,7 @@ class CCUsageWidgetApp(rumps.App):
         nothing and counts nothing. *hidden* is the test seam. Returns whether
         the fallback fired on this call.
         """
-        is_live = hidden is None
-        already_compact = self._auto_compact or bool(self.snapshot().settings.get("title_compact", False))
-        if not is_live and already_compact:
+        if self._auto_compact or bool(self.snapshot().settings.get("title_compact", False)):
             return False
         if getattr(self, "_auto_icon_only", False):
             return False
@@ -5502,15 +5500,17 @@ class CCUsageWidgetApp(rumps.App):
             if now - self._title_fit_checked_at < TITLE_FIT_CHECK_SECONDS:
                 return False
             win_num: int | None = None
+            win_obj: Any = None
             try:
                 item = getattr(getattr(self, "_nsapp", None), "nsstatusitem", None)
                 btn = item.button() if item is not None and render._responds(item, "button") else None
-                win = btn.window() if btn is not None and render._responds(btn, "window") else None
-                if win is not None and render._responds(win, "windowNumber"):
-                    win_num = int(win.windowNumber())
+                win_obj = btn.window() if btn is not None and render._responds(btn, "window") else None
+                if win_obj is not None and render._responds(win_obj, "windowNumber"):
+                    win_num = int(win_obj.windowNumber())
             except Exception:
                 win_num = None
-            hidden = lambda wn=win_num: menubar.own_window_hidden(wn)
+                win_obj = None
+            hidden = lambda wn=win_num, wo=win_obj: menubar.own_window_hidden(wn, win=wo)
         self._title_fit_checked_at = now
         verdict = hidden()
         if verdict is None:
@@ -5519,12 +5519,8 @@ class CCUsageWidgetApp(rumps.App):
         if self._title_hidden_streak < 2:
             return False
         self._title_hidden_streak = 0
-        if not already_compact:
-            self._auto_compact = True
-            _log("title: status item hidden by a full menu bar; showing the compact title until restart")
-        else:
-            self._auto_icon_only = True
-            _log("title: compact status item still hidden by menu bar; showing icon-only until restart")
+        self._auto_compact = True
+        _log("title: status item hidden by a full menu bar; showing the compact title until restart")
         self.rebuild_menu()
         return True
 
@@ -5862,6 +5858,26 @@ class CCUsageWidgetApp(rumps.App):
                 # next (nowhere to switch), so it is not dimmed like the rest.
                 room = _claude_room(snapshot)
                 parts.append([(fleet, "warn" if room is not None and room[0] == 0 else "dim")])
+        if getattr(self, "_running", False) and len(render.join_title_tokens(parts)) > 16:
+            slim: list[list[tuple[str, str | None]]] = []
+            for idx, group in enumerate(parts):
+                if len(group) == 1:
+                    txt, knd = group[0]
+                    if knd is None and txt.endswith("/d") and txt.startswith("$"):
+                        slim.append([(txt[:-2], knd)])
+                        continue
+                    if knd == "accent" and txt.startswith("Lv.") and " " in txt:
+                        slim.append([(txt.split(" ", 1)[0].replace("Lv.", "Lv"), knd)])
+                        continue
+                    if knd is None and idx <= 2 and len(txt) > 4 and not txt.startswith("$"):
+                        slim.append([(txt[:4].rstrip("…"), knd)])
+                        continue
+                slim.append(group)
+            if len(slim) > 1 and len(render.join_title_tokens(slim)) > 17:
+                last_txt = "".join(t for t, _k in slim[-1])
+                if last_txt.startswith("⚠") and len(last_txt) <= 3:
+                    slim = slim[:-1]
+            parts = slim
         return parts
 
     def _compact_title(self, snapshot: UiSnapshot) -> str:

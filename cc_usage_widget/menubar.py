@@ -93,20 +93,21 @@ def own_item_hidden() -> bool | None:
     return item_hidden(status_item_windows(), os.getpid())
 
 
-def own_window_hidden(window_number: int | None) -> bool | None:
-    """Detect whether *window_number* (from ``nsstatusitem.button().window().windowNumber()``)
+def own_window_hidden(window_number: int | None, *, win: Any = None) -> bool | None:
+    """Detect whether *window_number* (or *win*, from ``nsstatusitem.button().window()``)
     is hidden by the MacBook camera notch or menu-bar overflow on macOS 15 / 26+.
 
     On macOS 26 (Tahoe), status-item windows on layer 25 report ``Control Centre``
-    as ``kCGWindowOwnerPID`` rather than ``os.getpid()``, and ``CGWindowListCopyWindowInfo``
-    with ``kCGWindowListOptionOnScreenOnly`` (1) lists only the status-item windows
-    actually composited onscreen.
+    as ``kCGWindowOwnerPID`` rather than ``os.getpid()``, and ``win.windowNumber()``
+    returns the out-of-process proxy sentinel ``0x100000000`` (``4294967296``).
+    When *win* is provided, ``win.occlusionState()`` (bit 1 = ``NSWindowOcclusionStateVisible``)
+    and ``win.frame()`` geometry against ``CGWindowListCopyWindowInfo(1, 0)`` give the
+    true composited visibility once the menu bar itself is confirmed visible.
     """
-    if not window_number or window_number <= 0:
-        return own_item_hidden()
     try:
         onscreen_rows = _window_list()(1, 0)  # kCGWindowListOptionOnScreenOnly = 1
         onscreen_nums: set[int] = set()
+        onscreen_bounds: list[tuple[float, float]] = []
         others_onscreen = 0
         for row in onscreen_rows or ():
             if row.get("kCGWindowLayer") != STATUS_ITEM_LAYER:
@@ -116,10 +117,28 @@ def own_window_hidden(window_number: int | None) -> bool | None:
                 continue
             wnum = int(row.get("kCGWindowNumber", 0))
             onscreen_nums.add(wnum)
-            if wnum != window_number:
+            onscreen_bounds.append((float(bounds.get("X", -999)), float(bounds.get("Width", -999))))
+            if not window_number or wnum != window_number:
                 others_onscreen += 1
         if others_onscreen < MIN_OTHERS_ONSCREEN:
             return None
+        if win is not None:
+            try:
+                fr = win.frame()
+                wx = float(fr.origin.x)
+                ww = float(fr.size.width)
+                wh = float(fr.size.height)
+                if ww <= 0 or wh <= 0:
+                    return None
+                for bx, bw in onscreen_bounds:
+                    if abs(bx - wx) <= 2.0 and abs(bw - ww) <= 2.0:
+                        return False
+                occ = int(win.occlusionState())
+                return not bool(occ & 2)
+            except Exception:
+                pass
+        if not window_number or window_number <= 0 or window_number >= 0x100000000:
+            return own_item_hidden()
         return window_number not in onscreen_nums
     except Exception:
         return own_item_hidden()
