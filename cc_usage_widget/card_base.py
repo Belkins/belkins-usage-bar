@@ -345,6 +345,7 @@ _FONTS: dict[tuple, Any] = {}
 _WIDTH_CACHE: dict[tuple, float] = {}
 _FIT_CACHE: dict[tuple, str] = {}
 _SYMBOL_CACHE: dict[tuple, tuple[Any, float, float]] = {}
+LAST_CLICK_Y: float | None = None
 
 
 def _make_font(size: float, weight: Any, *, mono: bool, code: bool, rounded: bool) -> Any:
@@ -957,13 +958,17 @@ if _APPKIT:
             return True
 
         def mouseUp_(self, event: Any) -> None:
+            global LAST_CLICK_Y
             self._last_click_x = None
+            LAST_CLICK_Y = None
             if event is not None:
                 try:
                     pt = self.convertPoint_fromView_(event.locationInWindow(), None)
                     self._last_click_x = float(pt.x)
+                    LAST_CLICK_Y = float(pt.y)
                 except Exception:
                     self._last_click_x = None
+                    LAST_CLICK_Y = None
             self.performAndClose()
 
         def accessibilityPerformPress(self) -> bool:
