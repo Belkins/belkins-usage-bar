@@ -342,6 +342,9 @@ def _role(name: str) -> Any:
 # ---------------------------------------------------------------------------
 
 _FONTS: dict[tuple, Any] = {}
+_WIDTH_CACHE: dict[tuple, float] = {}
+_FIT_CACHE: dict[tuple, str] = {}
+_SYMBOL_CACHE: dict[tuple, tuple[Any, float, float]] = {}
 
 
 def _make_font(size: float, weight: Any, *, mono: bool, code: bool, rounded: bool) -> Any:
@@ -421,8 +424,16 @@ class Pen:
     ) -> float:
         if not s:
             return 0.0
+        w_key = (s, float(size), str(weight), bool(mono), bool(code), kern, bool(rounded))
+        cached = _WIDTH_CACHE.get(w_key)
+        if cached is not None:
+            return cached
         font = self.font(size, weight, mono=mono, code=code, rounded=rounded)
-        return float(self._astr(s, font, NSColor.labelColor(), kern).size().width)
+        val = float(self._astr(s, font, NSColor.labelColor(), kern).size().width)
+        if len(_WIDTH_CACHE) >= 2048:
+            _WIDTH_CACHE.clear()
+        _WIDTH_CACHE[w_key] = val
+        return val
 
     def fit(
         self,
@@ -439,7 +450,14 @@ class Pen:
         """*s* tail-truncated with an ellipsis to at most *maxw* points."""
         if maxw is None or not s:
             return s
+        f_key = (s, float(size), str(weight), round(float(maxw), 1), bool(mono), bool(code), kern, bool(rounded))
+        cached_s = _FIT_CACHE.get(f_key)
+        if cached_s is not None:
+            return cached_s
         if self.width(s, size, weight, mono=mono, code=code, kern=kern, rounded=rounded) <= maxw:
+            if len(_FIT_CACHE) >= 1024:
+                _FIT_CACHE.clear()
+            _FIT_CACHE[f_key] = s
             return s
         lo, hi = 0, len(s)
         while lo < hi:
@@ -449,7 +467,11 @@ class Pen:
                 lo = mid
             else:
                 hi = mid - 1
-        return (s[:lo].rstrip() + "…") if lo else ("…" if maxw >= self.width("…", size, weight) else "")
+        out = (s[:lo].rstrip() + "…") if lo else ("…" if maxw >= self.width("…", size, weight) else "")
+        if len(_FIT_CACHE) >= 1024:
+            _FIT_CACHE.clear()
+        _FIT_CACHE[f_key] = out
+        return out
 
     def text(
         self,
@@ -663,31 +685,41 @@ class Pen:
         ``arrow.*.fill``) draws its glyph white on the colour, like Apple's own
         warnings; everything else is one colour.
         """
-        img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, None)
-        if img is None:
-            return 0.0
-        col = self.color(role)
-        cfg = NSImageSymbolConfiguration.configurationWithPointSize_weight_(size, _weight(weight))
-        two_layer = name.endswith(".fill") and name.split(".")[0] in ("exclamationmark", "xmark", "arrow")
-        colors = [NSColor.whiteColor(), col] if two_layer and not self.hl else [col]
-        cfg = cfg.configurationByApplyingConfiguration_(
-            NSImageSymbolConfiguration.configurationWithPaletteColors_(colors)
-        )
-        img = img.imageWithSymbolConfiguration_(cfg)
-        sz = img.size()
+        dark_now = _is_dark(NSAppearance.currentDrawingAppearance())
+        s_key = (name, round(float(size), 2), str(weight), str(role), bool(self.hl), bool(dark_now))
+        cached = _SYMBOL_CACHE.get(s_key)
+        if cached is not None:
+            img, sw, sh = cached
+        else:
+            img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, None)
+            if img is None:
+                return 0.0
+            col = self.color(role)
+            cfg = NSImageSymbolConfiguration.configurationWithPointSize_weight_(size, _weight(weight))
+            two_layer = name.endswith(".fill") and name.split(".")[0] in ("exclamationmark", "xmark", "arrow")
+            colors = [NSColor.whiteColor(), col] if two_layer and not self.hl else [col]
+            cfg = cfg.configurationByApplyingConfiguration_(
+                NSImageSymbolConfiguration.configurationWithPaletteColors_(colors)
+            )
+            img = img.imageWithSymbolConfiguration_(cfg)
+            sz = img.size()
+            sw, sh = float(sz.width), float(sz.height)
+            if len(_SYMBOL_CACHE) >= 512:
+                _SYMBOL_CACHE.clear()
+            _SYMBOL_CACHE[s_key] = (img, sw, sh)
         if anchor == "center":
-            ox, oy = x - sz.width / 2.0, y - sz.height / 2.0
+            ox, oy = x - sw / 2.0, y - sh / 2.0
         elif anchor == "leftmid":
-            ox, oy = x, y - sz.height / 2.0
+            ox, oy = x, y - sh / 2.0
         elif box:
-            ox, oy = x + (box - sz.width) / 2.0, y + (box - sz.height) / 2.0
+            ox, oy = x + (box - sw) / 2.0, y + (box - sh) / 2.0
         else:
             ox, oy = x, y
         img.drawInRect_fromRect_operation_fraction_respectFlipped_hints_(
-            NSMakeRect(ox, oy, sz.width, sz.height), NSZeroRect,
+            NSMakeRect(ox, oy, sw, sh), NSZeroRect,
             NSCompositingOperationSourceOver, 1.0, True, None,
         )
-        return float(sz.width)
+        return sw
 
     def chip(
         self,
@@ -810,7 +842,7 @@ if _APPKIT:
             return
         try:
             timer = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
-                0.45, _ANIM_TARGET, "onTick:", None, True
+                1.0, _ANIM_TARGET, "onTick:", None, True
             )
             NSRunLoop.mainRunLoop().addTimer_forMode_(timer, NSRunLoopCommonModes)
             _ANIM_TIMER = timer
@@ -982,13 +1014,19 @@ def _sync_menu_visibility(menu: Any) -> None:
     if menu is None:
         return
     try:
+        changed_vis = False
         for mi in menu.itemArray():
             v = mi.view()
             if isinstance(v, BlockView) and v.block is not None:
                 if v.block.is_visible is not None:
-                    mi.setHidden_(not bool(v.block.is_visible()))
-                v.setNeedsDisplay_(True)
-        menu.update()
+                    hide = not bool(v.block.is_visible())
+                    if bool(mi.isHidden()) != hide:
+                        mi.setHidden_(hide)
+                        changed_vis = True
+                if not mi.isHidden():
+                    v.setNeedsDisplay_(True)
+        if changed_vis:
+            menu.update()
     except Exception:
         pass
 

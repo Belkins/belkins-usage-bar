@@ -759,6 +759,7 @@ class _Card:
         self.parts: list[tuple[float, Callable[[Any, float], None], dict[str, Any]]] = []
 
     def add(self, draw: Callable[[Any, float], float], **block_kw: Any) -> None:
+        block_kw.setdefault("no_hover_bg", True)
         height = float(round(draw(_Measure(), 0.0)))
         self.parts.append((height, draw, block_kw))
 

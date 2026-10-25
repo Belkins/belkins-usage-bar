@@ -648,6 +648,8 @@ def _shop_save_path() -> Any:
 
 
 _GAME_SAVE_CACHE: dict[str, dict[str, Any]] = {}
+_GAME_SAVE_REV: int = 0
+_COMPANION_CACHE: dict[tuple[int, int, str], Any] = {}
 
 
 def _clone_game_save(st: dict[str, Any]) -> dict[str, Any]:
@@ -742,7 +744,10 @@ def save_game_state(state: dict[str, Any]) -> bool:
         "streak_days": max(0, int(state.get("streak_days", 0) or 0)),
         "last_daily_claim": str(state.get("last_daily_claim", "") or ""),
     }
+    global _GAME_SAVE_REV
     _GAME_SAVE_CACHE[key] = _clone_game_save(clean)
+    _GAME_SAVE_REV += 1
+    _COMPANION_CACHE.clear()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
@@ -1354,7 +1359,12 @@ def compute_companion(
 
 
 def companion_from_snapshot(snapshot: Any) -> CompanionState:
-    """Build :class:`CompanionState` purely from a :class:`UiSnapshot`."""
+    """Build :class:`CompanionState` purely from a :class:`UiSnapshot` (cached per snapshot & save revision)."""
+    cache_key = (id(snapshot), _GAME_SAVE_REV, str(_shop_save_path()))
+    cached = _COMPANION_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     cost = getattr(snapshot, "cost", None)
     tokens_today = 0
     tokens_30d = 0
@@ -1380,7 +1390,7 @@ def companion_from_snapshot(snapshot: Any) -> CompanionState:
     recent = getattr(snapshot, "recent_switches", ()) or ()
     threshold = float(getattr(snapshot, "autoswitch_threshold_pct", 85.0) or 85.0)
 
-    return compute_companion(
+    res = compute_companion(
         tokens_today=tokens_today,
         tokens_30d=tokens_30d,
         usd_today=usd_today,
@@ -1393,6 +1403,10 @@ def companion_from_snapshot(snapshot: Any) -> CompanionState:
         distinct_models_count=distinct_models,
         threshold_pct=threshold,
     )
+    if len(_COMPANION_CACHE) >= 8:
+        _COMPANION_CACHE.clear()
+    _COMPANION_CACHE[cache_key] = res
+    return res
 
 
 def render_sprite_svg(
