@@ -661,6 +661,9 @@ def _clone_game_save(st: dict[str, Any]) -> dict[str, Any]:
         "bonus_coins": int(st.get("bonus_coins", 0) or 0),
         "bonus_xp": int(st.get("bonus_xp", 0) or 0),
         "selected_stage": int(st.get("selected_stage", 0) or 0),
+        "daily_claims": int(st.get("daily_claims", 0) or 0),
+        "streak_days": int(st.get("streak_days", 0) or 0),
+        "last_daily_claim": str(st.get("last_daily_claim", "") or ""),
     }
 
 
@@ -684,6 +687,9 @@ def load_game_save() -> dict[str, Any]:
         "bonus_coins": 0,
         "bonus_xp": 0,
         "selected_stage": 0,
+        "daily_claims": 0,
+        "streak_days": 0,
+        "last_daily_claim": "",
     }
     try:
         if path.is_file():
@@ -702,6 +708,9 @@ def load_game_save() -> dict[str, Any]:
                     "bonus_coins": int(data.get("bonus_coins", 0) or 0),
                     "bonus_xp": max(0, int(data.get("bonus_xp", 0) or 0)),
                     "selected_stage": max(0, int(data.get("selected_stage", 0) or 0)),
+                    "daily_claims": max(0, int(data.get("daily_claims", 0) or 0)),
+                    "streak_days": max(0, int(data.get("streak_days", 0) or 0)),
+                    "last_daily_claim": str(data.get("last_daily_claim", "") or ""),
                 }
                 _GAME_SAVE_CACHE[key] = _clone_game_save(parsed)
                 return parsed
@@ -729,6 +738,9 @@ def save_game_state(state: dict[str, Any]) -> bool:
         "bonus_coins": int(state.get("bonus_coins", 0) or 0),
         "bonus_xp": max(0, int(state.get("bonus_xp", 0) or 0)),
         "selected_stage": max(0, int(state.get("selected_stage", 0) or 0)),
+        "daily_claims": max(0, int(state.get("daily_claims", 0) or 0)),
+        "streak_days": max(0, int(state.get("streak_days", 0) or 0)),
+        "last_daily_claim": str(state.get("last_daily_claim", "") or ""),
     }
     _GAME_SAVE_CACHE[key] = _clone_game_save(clean)
     try:
@@ -882,6 +894,35 @@ def strike_raid_boss(companion: CompanionState) -> tuple[bool, str]:
     return True, f"{prefix} -{dmg} HP to {boss.spec.name} ({rem}/{boss.hp_max} HP left) · +{hit_coins} 🪙"
 
 
+def claim_daily_supply_drop() -> tuple[bool, str]:
+    """Claim today's Belkins Supply Crate (+150..300 SparkCoins & +15K..45K XP, scaling with active streak)."""
+    import datetime as dt
+
+    st = load_game_save()
+    today_obj = dt.date.today()
+    today_iso = today_obj.isoformat()
+    last_claim = str(st.get("last_daily_claim", "") or "")
+    if last_claim == today_iso:
+        streak = max(1, int(st.get("streak_days", 1) or 1))
+        return False, f"✓ Day {streak} Supply Drop already claimed today — next drop unlocks tomorrow!"
+
+    yesterday_iso = (today_obj - dt.timedelta(days=1)).isoformat()
+    if last_claim == yesterday_iso:
+        streak = max(1, int(st.get("streak_days", 0) or 0)) + 1
+    else:
+        streak = 1
+
+    reward_coins = 150 + min(150, (streak - 1) * 25)
+    reward_xp = 15_000 + min(30_000, (streak - 1) * 5_000)
+    st["streak_days"] = streak
+    st["daily_claims"] = int(st.get("daily_claims", 0) or 0) + 1
+    st["last_daily_claim"] = today_iso
+    st["bonus_coins"] = int(st.get("bonus_coins", 0) or 0) + reward_coins
+    st["bonus_xp"] = int(st.get("bonus_xp", 0) or 0) + reward_xp
+    save_game_state(st)
+    return True, f"🎁 Day {streak} Streak Crate Claimed! +{reward_coins} ✦ CR & +{reward_xp:,} XP!"
+
+
 # ---------------------------------------------------------------------------
 # Companion Snapshot
 # ---------------------------------------------------------------------------
@@ -920,6 +961,8 @@ class CompanionState:
     selected_stage: int = 0
     shop_items: tuple[ShopItemState, ...] = ()
     equipped_items: tuple[str, ...] = ()
+    streak_days: int = 1
+    daily_crate_available: bool = True
 
     @property
     def unlocked_badges_count(self) -> int:
@@ -1268,6 +1311,13 @@ def compute_companion(
         for it in SHOP_CATALOG
     )
 
+    import datetime as _dt
+
+    today_iso = _dt.date.today().isoformat()
+    last_claim_str = str(game_st.get("last_daily_claim", "") or "")
+    streak_days = max(1, int(game_st.get("streak_days", 1) or 1))
+    daily_crate_available = last_claim_str != today_iso
+
     return CompanionState(
         stage=stage,
         highest_stage=highest_stage,
@@ -1298,6 +1348,8 @@ def compute_companion(
         selected_stage=selected_stage_num,
         shop_items=shop_items,
         equipped_items=tuple(sorted(equipped_slugs)),
+        streak_days=streak_days,
+        daily_crate_available=daily_crate_available,
     )
 
 

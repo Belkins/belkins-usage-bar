@@ -307,6 +307,7 @@ def _build_belkins_tui_app(switcher: object, *, start: str = "dashboard", detect
             return [
                 ("Switch account…", "switch"),
                 ("Watch accounts", "watch"),
+                ("🎁 Claim Daily Supply Crate (+150 CR & +15K XP)", "belkins-claim"),
                 ("⚡ Belkins Spark Vault (Buy / Equip Relics)…", "belkins-vault"),
                 ("⚔️ Boss Raid Arena (Strike Raid Boss)…", "belkins-raid"),
                 ("🧬 Morph Companion Form (8 Cyber-Forms)…", "belkins-morph"),
@@ -468,6 +469,11 @@ def _build_belkins_tui_app(switcher: object, *, start: str = "dashboard", detect
             if action_id == "belkins-dashboard":
                 _cmd_dashboard()
                 self.app.notify("Opened Belkins HTML Dashboard in browser")
+                return
+            if action_id == "belkins-claim":
+                ok, msg = belkins_game.claim_daily_supply_drop()
+                self._refresh_hud()
+                self.app.notify(msg, severity="information" if ok else "warning")
                 return
             if action_id == "belkins-update":
                 rc = _cmd_update([])
@@ -908,6 +914,7 @@ def _cmd_help() -> int:
     print(f"  {ORANGE}bswap watch{RESET}                Launch live multi-account Watch monitor in TUI")
     print(f"  {ORANGE}bswap status{RESET}               Print Companion HUD + Claude & Codex fleet status")
     print(f"  {ORANGE}bswap evo{RESET} / {ORANGE}bswap dex{RESET}      Inspect 8-Stage Cyber-Forms, Boss Raid Arena & 14 Hall of Fame Trophies")
+    print(f"  {ORANGE}bswap claim{RESET}                Claim your Daily Supply Crate (+150..300 CR & +15K..45K XP)")
     print(f"  {ORANGE}bswap raid [strikes]{RESET}       Attack the active Raid Boss for SparkCoins & Bonus XP")
     print(f"  {ORANGE}bswap morph <1..8|auto>{RESET}    Morph your active Companion into any unlocked Cyber-Form")
     print(f"  {ORANGE}bswap vault{RESET} / {ORANGE}bswap shop{RESET}   Open the 12-item Belkins Spark Vault (Relics, Serums, Skins & Bots)")
@@ -976,6 +983,11 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_help()
     if cmd in {"evo", "dex", "trophies", "companion", "badges", "pokedex", "forms"}:
         return _cmd_dex()
+    if cmd in {"claim", "daily", "crate", "drop"}:
+        ok, msg = belkins_game.claim_daily_supply_drop()
+        print(f"{GREEN if ok else GOLD}{msg}{RESET}\n")
+        _print_banner()
+        return 0
     if cmd in {"raid", "attack", "strike", "boss", "battle"}:
         return _cmd_raid(args[1:])
     if cmd in {"morph", "evolve", "stage"}:

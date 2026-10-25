@@ -34,6 +34,7 @@ from ..belkins_game import (
     CompanionState,
     EvolutionStage,
     RaidBossSpec,
+    claim_daily_supply_drop,
     companion_from_snapshot,
     load_game_save,
     select_companion_stage,
@@ -1950,10 +1951,11 @@ def _tab_bar_block(claude_count: int, codex_count: int) -> Block:
 
 
 def _standby_strip(spec: dict[str, Any], target_tab: str) -> Callable[[Any, float], float]:
-    """Scalable 1-line standby summary strip at the bottom of a Squad card."""
+    """Scalable 1-line standby summary strip at the bottom of a Squad card with quick-switch pill."""
     rows = spec.get("rows") or []
     total_cnt = int(spec.get("total_count") or (len(rows) + 1))
     top_parts: list[str] = []
+    best_row = rows[0] if rows else None
     for r in rows[:2]:
         slot_prefix = f"{r['slot']} " if r.get("slot") else ""
         nm = r["name"]
@@ -1964,7 +1966,8 @@ def _standby_strip(spec: dict[str, Any], target_tab: str) -> Callable[[Any, floa
     if len(rows) > 2:
         top_parts.append(f"+{len(rows) - 2}")
     summary_s = "  ·  ".join(top_parts)
-    right_lbl = f"All {total_cnt} ▸"
+    can_quick_switch = bool(best_row and callable(best_row.get("action")))
+    right_lbl = f"⚡ Switch → {best_row['name'][:10]}" if can_quick_switch else f"All {total_cnt} ▸"
     del target_tab
 
     def draw(pen: Any, y0: float) -> float:
@@ -1980,7 +1983,19 @@ def _standby_strip(spec: dict[str, Any], target_tab: str) -> Callable[[Any, floa
             bg="belkins_plan_pill",
             weight="semibold",
         )
-        rw_lbl = text(pen, right_lbl, "caption_med", "belkins_flame_text", X1, b, right=True)
+        if can_quick_switch:
+            rw_lbl = _pill_w(pen, right_lbl)
+            pen.pill(
+                right_lbl,
+                X1 - rw_lbl,
+                b - 0.5,
+                F["tag"][0],
+                role="belkins_flame_text",
+                bg="belkins_flame_pill",
+                weight="semibold",
+            )
+        else:
+            rw_lbl = text(pen, right_lbl, "caption_med", "belkins_flame_text", X1, b, right=True)
         sx = X0 + tw_tag + 7.0
         text(pen, summary_s, "caption_med", "secondary", sx, b, maxw=max(40.0, X1 - rw_lbl - 8.0 - sx))
         return b + 7.5
@@ -2019,18 +2034,91 @@ def _party_provider_cards(
                 **ROW_HL,
             )
         if spec.get("rows"):
+            rows = spec["rows"]
+            best_act = rows[0].get("action") if rows else None
+
+            def _on_standby_click(click_x: float, t: str = key, b_act: Any = best_act) -> None:
+                if click_x >= W * 0.62 and callable(b_act):
+                    b_act()
+                else:
+                    set_active_tab(t)
+
             card.add(
                 _standby_strip(spec, key),
                 key=f"belkins-party-{key}-standby",
-                ax=f"{spec['title']} standby accounts. Click to view all {spec.get('total_count', len(spec['rows']))} accounts.",
-                tooltip=f"Click to view and switch all {spec['title']} accounts",
+                ax=f"{spec['title']} standby accounts. Click left to view all {spec.get('total_count', len(rows))} accounts, or right to switch to best standby.",
+                tooltip=f"Click left to open the {spec['title']} fleet tab, or click the right pill to switch to the healthiest standby account immediately.",
                 action=lambda t=key: set_active_tab(t),
+                on_click_x=_on_standby_click,
                 keep_open=True,
                 **ROW_HL,
             )
         card.add(_gap(5.0), key=f"belkins-party-{key}-foot")
         out.append(card)
     return out
+
+
+def _burn_velocity_card(snapshot: Any, actions: ThemeActions) -> _Card | None:
+    """Compact 7-Day Burn Velocity & Model Mix card on the `⚡ Squad` tab."""
+    cost = getattr(snapshot, "cost", None)
+    if cost is None or getattr(cost, "is_partial", False):
+        return None
+    today_w = getattr(cost, "today", None)
+    last7_w = getattr(cost, "last_7d", None)
+    last30_w = getattr(cost, "last_30d", None)
+    if today_w is None or last7_w is None or last30_w is None:
+        return None
+    usd_today = float(getattr(today_w, "usd", 0.0) or 0.0)
+    tok_today = int(getattr(today_w, "total_tokens", 0) or 0)
+    usd_7d = float(getattr(last7_w, "usd", 0.0) or 0.0)
+    usd_30d = float(getattr(last30_w, "usd", 0.0) or 0.0)
+    if usd_30d <= 0.0 and tok_today <= 0:
+        return None
+
+    avg_7d = usd_7d / 7.0
+    if avg_7d > 0.5 and usd_today > avg_7d * 1.35:
+        pace_lbl, pace_role, pace_bg = "PACE: SURGE", "warn_text", "belkins_warn_pill"
+    elif usd_today > 0.0:
+        pace_lbl, pace_role, pace_bg = "PACE: STEADY", "good_text", "belkins_good_pill"
+    else:
+        pace_lbl, pace_role, pace_bg = "PACE: IDLE", "secondary", "belkins_plan_pill"
+
+    by_model = getattr(cost, "by_model", ()) or ()
+    top_model_str = ""
+    if by_model:
+        top_m = by_model[0]
+        m_label = str(getattr(top_m, "label", "") or "")
+        if m_label:
+            top_model_str = f"  ·  Top: {m_label}"
+
+    card = _Card("belkins_card", "belkins_card_edge", rule="belkins_gold_rule")
+    open_dash = getattr(actions, "open_dashboard", None)
+    dash_on = bool(snapshot.settings.get("dashboard_enabled", True))
+    act = open_dash if (callable(open_dash) and dash_on) else None
+
+    def draw_vel(pen: Any, y0: float) -> float:
+        b1 = y0 + 16.5
+        symbol(pen, "chart.bar.xaxis", X0, b1 - 4.0, 10.5, "belkins_xp_fill", "semibold")
+        text(pen, "Burn Velocity & Spend", "title", "label", X0 + 16.5, b1)
+        pw = _pill_w(pen, pace_lbl)
+        pen.pill(pace_lbl, X1 - pw, b1 - 0.5, F["tag"][0], role=pace_role, bg=pace_bg, weight="semibold")
+
+        b2 = b1 + 17.5
+        left_s = f"Today {format_usd(usd_today)}  ·  7d avg {format_usd(avg_7d)}/d"
+        right_s = f"30d {format_usd(usd_30d)}{top_model_str}"
+        rw = text(pen, right_s, "caption_med", "belkins_xp_fill", X1, b2, right=True)
+        text(pen, left_s, "caption_med", "secondary", X0, b2, maxw=max(60.0, W_INNER - rw - 8.0))
+        return b2 + 8.5
+
+    card.add(
+        draw_vel,
+        key="belkins-party-burn-velocity",
+        ax=f"Burn Velocity: Today {format_usd(usd_today)}, 7 day average {format_usd(avg_7d)} per day, 30 day total {format_usd(usd_30d)}.",
+        tooltip="Click to open the full Belkins HTML Usage & Cost Dashboard in your browser.",
+        action=act,
+        **ROW_HL,
+    )
+    return card
 
 
 def _dex_card(snapshot: Any, companion: CompanionState, subtab: str) -> _Card:
@@ -2128,6 +2216,45 @@ def _dex_card(snapshot: Any, companion: CompanionState, subtab: str) -> _Card:
         action=on_strike_boss,
         keep_open=True,
         animated=True,
+        **ROW_HL,
+    )
+
+    # 1b. Daily Streak & Supply Crate Row
+    def draw_daily_crate(pen: Any, y0: float) -> float:
+        live = companion if isinstance(pen, _Measure) else companion_from_snapshot(snapshot)
+        b = y0 + 16.5
+        avail = live.daily_crate_available
+        ic_role = "belkins_xp_fill" if avail else "good_text"
+        symbol(pen, "gift.fill" if avail else "checkmark.seal.fill", X0 + 4.0, b - 4.0, 10.5, ic_role, "semibold")
+        pill_txt = "✦ CLAIM +150 CR" if avail else "✓ CLAIMED TODAY"
+        pill_role = "belkins_xp_fill" if avail else "good_text"
+        pill_bg = "belkins_gold_pill" if avail else "belkins_good_pill"
+        pw = _pill_w(pen, pill_txt)
+        pen.pill(pill_txt, X1 - pw, b - 0.5, F["tag"][0], role=pill_role, bg=pill_bg, weight="semibold")
+        lbl = f"Daily Supply Crate · Day {live.streak_days} Streak"
+        text(
+            pen,
+            lbl,
+            "caption_med",
+            "label" if avail else "secondary",
+            X0 + 19.5,
+            b,
+            maxw=max(60.0, X1 - pw - (X0 + 19.5) - 8.0),
+        )
+        return b + 7.5
+
+    def on_claim_crate() -> None:
+        global _LAST_BOSS_NOTE
+        _ok, msg = claim_daily_supply_drop()
+        _LAST_BOSS_NOTE = msg
+
+    card.add(
+        draw_daily_crate,
+        key=f"belkins-dex-daily-crate-{subtab}",
+        ax="Daily Supply Crate. Click to claim daily SparkCoins and Bonus XP.",
+        tooltip="Claim your daily Belkins Supply Crate (+150..300 CR & +15K..45K XP, scaling with your active daily streak)!",
+        action=on_claim_crate,
+        keep_open=True,
         **ROW_HL,
     )
 
@@ -2442,131 +2569,10 @@ def _shop_card(snapshot: Any, companion: CompanionState, subtab: str) -> _Card:
     return card
 
 
-def _config_card(snapshot: Any, actions: ThemeActions, subtab: str) -> _Card:
-    """`⚙️Cfg` Tab Card: Interactive Menu-Bar Header Studio (Views, Icons & Toggles) + General Engine Settings."""
+def _config_card(snapshot: Any, actions: ThemeActions, subtab: str = "header") -> _Card:
+    """`🎛️ Studio` Tab: Unified, Single-Screen Control Center for Menu-Bar Header, Icon, Thresholds & Engine."""
+    del subtab
     card = _Card("belkins_card", "belkins_card_edge", rule="belkins_flame_rule")
-
-    def draw_cfg_head(pen: Any, y0: float) -> float:
-        base = y0 + HEAD_BASE
-        symbol(pen, "slider.horizontal.3", X0, base - 4.0, 11.5, "belkins_flame_rule", "semibold")
-        text(pen, "Header & General Settings", "title", "label", X0 + 18.0, base)
-        cur_view = str(snapshot.settings.get("title_view", "standard") or "standard")
-        if snapshot.settings.get("title_compact", False) and cur_view == "standard":
-            cur_view = "compact"
-        tag_s = f"VIEW: {cur_view.upper()}"
-        pw = _pill_w(pen, tag_s)
-        pen.pill(tag_s, X1 - pw, base - 0.5, F["tag"][0], role="belkins_flame_text", bg="belkins_flame_pill", weight="semibold")
-        b2 = base + 15.5
-        sub = _LAST_CFG_NOTE or "Click any tile below to customize the macOS menu-bar header or general settings live:"
-        text(pen, sub, "caption", "belkins_flame_text" if _LAST_CFG_NOTE else "secondary", X0, b2, maxw=W_INNER)
-        return b2 + 6.0
-
-    card.add(
-        draw_cfg_head,
-        key=f"belkins-cfg-head-{subtab}",
-        ax="Header and General Settings Studio",
-        tooltip="Customize the menu-bar header icon, header view preset, individual header stats, and general engine settings.",
-    )
-
-    def draw_cfg_subtabs(pen: Any, y0: float) -> float:
-        bar_y = y0 + 2.0
-        bar_h = 25.0
-        half_w = (W_INNER - 6.0) / 2.0
-        pen.rrect(X0, bar_y, W_INNER, bar_h, 6.5, "belkins_subtab_bg")
-        tabs_sub = (
-            ("header", "slider.horizontal.3", "Header & Icon Studio"),
-            ("general", "gearshape.fill", "General & Engine"),
-        )
-        for idx, (sid, ic_name, slabel) in enumerate(tabs_sub):
-            sx = X0 + 2.5 + idx * (half_w + 1.0)
-            is_on = _CFG_SUBTAB == sid
-            if is_on:
-                pen.rrect(sx, bar_y + 2.0, half_w, bar_h - 4.0, 5.0, "belkins_tab_active_fill")
-            txt_role = "belkins_tab_active_text" if is_on else "belkins_tab_inactive_text"
-            tw_lbl = text_w(pen, slabel, "caption_med")
-            ic_sz = 9.0
-            tot_w = ic_sz + 4.5 + tw_lbl
-            start_x = sx + (half_w - tot_w) / 2.0
-            symbol(pen, ic_name, start_x, bar_y + 12.5, ic_sz, txt_role, "semibold")
-            text(
-                pen,
-                slabel,
-                "caption_med",
-                txt_role,
-                start_x + ic_sz + 4.5,
-                bar_y + 16.2,
-                maxw=half_w - ic_sz - 10.0,
-            )
-        return bar_y + bar_h + 5.0
-
-    def on_cfg_subtab_click(click_x: float) -> None:
-        if click_x < W / 2.0:
-            set_cfg_subtab("header")
-        else:
-            set_cfg_subtab("general")
-
-    card.add(
-        draw_cfg_subtabs,
-        key=f"belkins-cfg-subtabs-{subtab}",
-        ax="Switch between Header Studio and General Settings",
-        tooltip="",
-        action=lambda: set_cfg_subtab("general" if _CFG_SUBTAB == "header" else "header"),
-        on_click_x=on_cfg_subtab_click,
-        keep_open=True,
-        no_hover_bg=True,
-    )
-    card.add(_hair(), key=f"belkins-cfg-rule-{subtab}")
-
-    col_gap = 8.0
-    col_w = (W_INNER - col_gap) / 2.0
-
-    def _add_pair_row(
-        row_key: str,
-        left_spec: tuple[str, str, Callable[[], bool], Callable[[], None], str],
-        right_spec: tuple[str, str, Callable[[], bool], Callable[[], None], str] | None,
-    ) -> None:
-        specs = [left_spec] + ([right_spec] if right_spec is not None else [])
-
-        def draw_pair(pen: Any, y0: float, pair_specs: list = specs) -> float:
-            box_y = y0 + 2.0
-            box_h = 28.0
-            b1 = box_y + 18.0
-            for c_idx, (title_s, sub_s, is_on_fn, _act_fn, _tip_s) in enumerate(pair_specs):
-                cx = X0 + c_idx * (col_w + col_gap)
-                active = bool(is_on_fn())
-                bg_role = "belkins_badge_on" if active else "belkins_badge_off"
-                edge_role = "belkins_badge_on_edge" if active else "belkins_badge_off_edge"
-                pen.rrect(cx, box_y, col_w, box_h, 6.0, bg_role, stroke=edge_role)
-                badge_txt = sub_s if sub_s else ("ON ✓" if active else "OFF")
-                badge_role = "good_text" if active else "secondary"
-                mw = text(pen, badge_txt, "tag", badge_role, cx + col_w - 7.0, b1, right=True)
-                text(
-                    pen,
-                    title_s,
-                    "caption_med",
-                    "label" if active else "secondary",
-                    cx + 7.5,
-                    b1,
-                    maxw=col_w - mw - 16.0,
-                )
-            return box_y + box_h + 3.0
-
-        def on_pair_click(click_x: float, pair_specs: list = specs) -> None:
-            idx = 0 if (click_x < W / 2.0 or len(pair_specs) == 1) else 1
-            pair_specs[idx][3]()
-
-        tips = "\n".join(s[4] for s in specs if s[4])
-        axs = " · ".join(s[0] for s in specs)
-        card.add(
-            draw_pair,
-            key=row_key,
-            ax=axs,
-            tooltip=tips,
-            action=lambda pair_specs=specs: pair_specs[0][3](),
-            on_click_x=on_pair_click,
-            keep_open=True,
-            no_hover_bg=True,
-        )
 
     def _cur_view() -> str:
         v = str(snapshot.settings.get("title_view", "standard") or "standard")
@@ -2582,12 +2588,12 @@ def _config_card(snapshot: Any, actions: ThemeActions, subtab: str) -> _Card:
     def _set_view(v: str, label: str) -> None:
         global _LAST_CFG_NOTE
         actions.set_setting("title_view", v)
-        _LAST_CFG_NOTE = f"Header View → {label}"
+        _LAST_CFG_NOTE = f"Layout → {label}"
 
     def _set_icon(st: str, label: str) -> None:
         global _LAST_CFG_NOTE
         actions.set_setting("title_icon_style", st)
-        _LAST_CFG_NOTE = f"Header Icon → {label}"
+        _LAST_CFG_NOTE = f"Icon → {label}"
 
     def _toggle_key(k: str, label: str, default: bool = True) -> None:
         global _LAST_CFG_NOTE
@@ -2595,126 +2601,330 @@ def _config_card(snapshot: Any, actions: ThemeActions, subtab: str) -> _Card:
         actions.set_setting(k, not cur)
         _LAST_CFG_NOTE = f"{label}: {'ON ✓' if not cur else 'OFF'}"
 
-    if subtab == "header":
-        # Section 1: Header View Presets
-        card.add(
-            lambda pen, y0: text(pen, "HEADER VIEW PRESET", "tag", "belkins_flame_text", X0, y0 + 13.0) and (y0 + 16.0),
-            key="belkins-cfg-sec-views",
-        )
-        view_pairs = [
-            (
-                ("📊 Full Info", "ACTIVE" if _cur_view() == "full" else "SET", lambda: _cur_view() == "full", lambda: _set_view("full", "Full Info"), "Show Alias + 5h% + 7d% + Codex% + Cost in header"),
-                ("🎛️ Standard", "ACTIVE" if _cur_view() == "standard" else "SET", lambda: _cur_view() == "standard", lambda: _set_view("standard", "Standard Custom"), "Use custom individual header toggles below"),
-            ),
-            (
-                ("🐾 Companion", "ACTIVE" if _cur_view() == "companion" else "SET", lambda: _cur_view() == "companion", lambda: _set_view("companion", "Companion HUD"), "Show Companion Lv/Form + 5h% + SparkCoins"),
-                ("⚔️ Raid HUD", "ACTIVE" if _cur_view() == "raid" else "SET", lambda: _cur_view() == "raid", lambda: _set_view("raid", "Boss Raid HUD"), "Show Raid Boss HP% + Companion Lv + 5h%"),
-            ),
-            (
-                ("💰 Cost/Burn", "ACTIVE" if _cur_view() == "cost" else "SET", lambda: _cur_view() == "cost", lambda: _set_view("cost", "Cost & Burn HUD"), "Show Today's Cost ($/d) + Tokens + 5h%"),
-                ("🤏 Compact", "ACTIVE" if _cur_view() == "compact" else "SET", lambda: _cur_view() == "compact", lambda: _set_view("compact", "Compact V·C"), "Ultra-narrow V·C 100/100 menu-bar view"),
-            ),
-        ]
-        for idx, (l_sp, r_sp) in enumerate(view_pairs):
-            _add_pair_row(f"belkins-cfg-view-row-{idx}", l_sp, r_sp)
+    def _set_val(k: str, val: Any, label: str) -> None:
+        global _LAST_CFG_NOTE
+        actions.set_setting(k, val)
+        _LAST_CFG_NOTE = label
 
-        # Section 2: Header Icon Styles
-        card.add(
-            lambda pen, y0: text(pen, "HEADER ICON STYLE", "tag", "belkins_flame_text", X0, y0 + 14.0) and (y0 + 17.0),
-            key="belkins-cfg-sec-icons",
-        )
-        icon_pairs = [
-            (
-                ("⚡ Lightning", "", lambda: _cur_icon() == "bolt", lambda: _set_icon("bolt", "Belkins Lightning"), "Belkins Lightning Bolt icon"),
-                ("🐾 Pixel Sprite", "", lambda: _cur_icon() == "companion", lambda: _set_icon("companion", "Companion Pixel Sprite"), "Live 12x12 color pixel sprite of your active Companion!"),
-            ),
-            (
-                ("👑 Crown", "", lambda: _cur_icon() == "crown", lambda: _set_icon("crown", "Sovereign Crown"), "Sovereign Crown icon"),
-                ("🔥 Cyber Flame", "", lambda: _cur_icon() == "flame", lambda: _set_icon("flame", "Cyber Flame"), "Cyber Flame icon"),
-            ),
-            (
-                ("🧠 Neural CPU", "", lambda: _cur_icon() == "cpu", lambda: _set_icon("cpu", "Neural CPU"), "Neural CPU icon"),
-                ("📊 Usage Bars", "", lambda: _cur_icon() == "bars", lambda: _set_icon("bars", "Usage Bars"), "Usage Bars icon"),
-            ),
-            (
-                ("🛡️ Cyber Shield", "", lambda: _cur_icon() == "shield", lambda: _set_icon("shield", "Cyber Shield"), "Cyber Shield icon"),
-                ("🚫 No Icon", "", lambda: _cur_icon() == "none", lambda: _set_icon("none", "No Icon (Text Only)"), "Hide icon and show text only"),
-            ),
-        ]
-        for idx, (l_sp, r_sp) in enumerate(icon_pairs):
-            _add_pair_row(f"belkins-cfg-icon-row-{idx}", l_sp, r_sp)
+    _ICON_SF_MAP: dict[str, str] = {
+        "bolt": "bolt.fill",
+        "companion": "sparkles",
+        "crown": "crown.fill",
+        "flame": "flame.fill",
+        "cpu": "cpu",
+        "bars": "chart.bar.fill",
+        "shield": "bolt.shield.fill",
+    }
 
-        # Section 3: Individual Header Info Toggles
-        card.add(
-            lambda pen, y0: text(pen, "HEADER INFO COMPONENTS (CLICK TO TOGGLE)", "tag", "belkins_flame_text", X0, y0 + 14.0) and (y0 + 17.0),
-            key="belkins-cfg-sec-toggles",
-        )
-        toggle_pairs = [
-            (
-                ("👤 Account Alias", "", lambda: bool(snapshot.settings.get("title_show_alias", True)), lambda: _toggle_key("title_show_alias", "Account Alias", True), "Show active Claude account alias in header"),
-                ("⚡ 5h Quota %", "", lambda: bool(snapshot.settings.get("title_show_five_hour_pct", True)), lambda: _toggle_key("title_show_five_hour_pct", "5h Quota %", True), "Show active 5-hour usage percentage in header"),
-            ),
-            (
-                ("📅 7d Weekly %", "", lambda: bool(snapshot.settings.get("title_show_seven_day_pct", False)), lambda: _toggle_key("title_show_seven_day_pct", "7d Weekly %", False), "Show 7-day weekly percentage (7d7%) in header"),
-                ("💻 Codex %", "", lambda: bool(snapshot.settings.get("title_show_codex_pct", False)), lambda: _toggle_key("title_show_codex_pct", "Active Codex %", False), "Show active Codex account percentage (C12%) in header"),
-            ),
-            (
-                ("💰 Today Cost", "", lambda: bool(snapshot.settings.get("title_show_cost", True)), lambda: _toggle_key("title_show_cost", "Today's Cost", True), "Show today's notional USD burn ($/d) in header"),
-                ("🔢 Today Tokens", "", lambda: bool(snapshot.settings.get("title_show_tokens", False)), lambda: _toggle_key("title_show_tokens", "Today's Tokens", False), "Show today's token burn (e.g. 262.9M) in header"),
-            ),
-            (
-                ("🐾 Companion Lv", "", lambda: bool(snapshot.settings.get("title_show_companion", False)), lambda: _toggle_key("title_show_companion", "Companion Lv & Form", False), "Show Companion Level & Stage name in header"),
-                ("🪙 SparkCoins", "", lambda: bool(snapshot.settings.get("title_show_coins", False)), lambda: _toggle_key("title_show_coins", "SparkCoins Wallet", False), "Show SparkCoins wallet balance in header"),
-            ),
-            (
-                ("🐉 Raid Boss HP", "", lambda: bool(snapshot.settings.get("title_show_boss", False)), lambda: _toggle_key("title_show_boss", "Raid Boss HP", False), "Show active Raid Boss HP% in header"),
-                ("⚠️ Merge Alerts", "", lambda: bool(snapshot.settings.get("title_merge_alerts", False)), lambda: _toggle_key("title_merge_alerts", "Merge Alerts (⚠N)", False), "Fold alerts into a single ⚠N counter"),
-            ),
-        ]
-        for idx, (l_sp, r_sp) in enumerate(toggle_pairs):
-            _add_pair_row(f"belkins-cfg-tog-row-{idx}", l_sp, r_sp)
-    else:
-        # General & Engine Settings sub-tab
-        card.add(
-            lambda pen, y0: text(pen, "GENERAL, ENGINE & PRIVACY SETTINGS", "tag", "belkins_flame_text", X0, y0 + 13.0) and (y0 + 16.0),
-            key="belkins-cfg-sec-gen",
+    # 1. Header + Live Menu-Bar Preview Strip
+    def draw_cfg_head(pen: Any, y0: float) -> float:
+        base = y0 + HEAD_BASE
+        symbol(pen, "slider.horizontal.3", X0, base - 4.0, 11.5, "belkins_flame_rule", "semibold")
+        text(pen, "Settings & Control Studio", "title", "label", X0 + 18.0, base)
+        note_tag = _LAST_CFG_NOTE if _LAST_CFG_NOTE else f"PRESET: {_cur_view().upper()}"
+        pw = _pill_w(pen, note_tag)
+        pen.pill(
+            note_tag,
+            X1 - pw,
+            base - 0.5,
+            F["tag"][0],
+            role="good_text" if _LAST_CFG_NOTE else "belkins_flame_text",
+            bg="belkins_good_pill" if _LAST_CFG_NOTE else "belkins_flame_pill",
+            weight="semibold",
         )
 
-        def _toggle_autosw() -> None:
-            global _LAST_CFG_NOTE
-            actions.toggle_autoswitch()
-            _LAST_CFG_NOTE = "Toggled Auto-Switch engine"
+        # Recessed Live Menu-Bar Preview Strip
+        strip_y = base + 8.0
+        strip_h = 26.0
+        pen.rrect(
+            X0,
+            strip_y,
+            W_INNER,
+            strip_h,
+            6.5,
+            "belkins_inner_panel",
+            stroke="belkins_inner_edge",
+            stroke_width=0.75,
+        )
+        sb = strip_y + 17.0
+        text(pen, "LIVE MENU BAR", "tag", "secondary", X0 + 9.0, sb)
 
-        gen_pairs = [
-            (
-                ("⚡ Auto-Switch", "", lambda: bool(snapshot.autoswitch_enabled), _toggle_autosw, "Automatically switch Claude slots at threshold"),
-                ("💰 Cost Tracking", "", lambda: bool(snapshot.settings.get("cost_tracking_enabled", True)), lambda: _toggle_key("cost_tracking_enabled", "Cost Tracking", True), "Track notional USD & token burn from transcripts"),
-            ),
-            (
-                ("📡 Codex Live", "", lambda: bool(snapshot.settings.get("codex_live_quota_enabled", False)), lambda: _toggle_key("codex_live_quota_enabled", "Codex Live Quota", False), "Poll live per-account Codex OAuth quotas"),
-                ("🔄 Auto-Refresh", "", lambda: bool(snapshot.settings.get("codex_refresh_enabled", True)), lambda: _toggle_key("codex_refresh_enabled", "Codex Token Auto-Refresh", True), "Automatically refresh Codex OAuth tokens"),
-            ),
-            (
-                ("📈 Pace Forecast", "", lambda: bool(snapshot.settings.get("codex_pace_forecast_enabled", True)), lambda: _toggle_key("codex_pace_forecast_enabled", "Codex Pace Forecast", True), "Show 'at this pace: wall in Xh' forecast on Codex rows"),
-                ("📊 Codex Fleet", "", lambda: bool(snapshot.settings.get("codex_fleet_line_enabled", True)), lambda: _toggle_key("codex_fleet_line_enabled", "Codex Fleet Summary", True), "Show Codex fleet room & banked resets summary"),
-            ),
-            (
-                ("✨ Pixel Anim", "", lambda: bool(snapshot.settings.get("belkins_animations_enabled", True)), lambda: _toggle_key("belkins_animations_enabled", "Idle Pixel Animations", True), "Toggle lightweight retro breathing/bobbing animations"),
-                ("🔔 Notifications", "", lambda: bool(snapshot.settings.get("notifications_enabled", True)), lambda: _toggle_key("notifications_enabled", "Desktop Notifications", True), "Send macOS notifications when quota crosses alert threshold"),
-            ),
-            (
-                ("📁 Project Cost", "", lambda: bool(snapshot.settings.get("cost_by_project_enabled", True)), lambda: _toggle_key("cost_by_project_enabled", "Cost by Project", True), "Attribute daily token spend by project directory"),
-                ("📜 History DB", "", lambda: bool(snapshot.settings.get("history_enabled", True)), lambda: _toggle_key("history_enabled", "SQLite History Mirror", True), "Persist daily rollups beyond lookback window for CSV/JSON export"),
-            ),
-            (
-                ("🛡️ Self-Audit", "", lambda: bool(snapshot.settings.get("self_audit_enabled", True)), lambda: _toggle_key("self_audit_enabled", "Daily Rollup Self-Audit", True), "Verify rollup store integrity once per day"),
-                ("🌐 HTML Dash", "", lambda: bool(snapshot.settings.get("dashboard_enabled", True)), lambda: _toggle_key("dashboard_enabled", "Local HTML Dashboard", True), "Enable clicking Companion card to open local HTML usage dashboard"),
-            ),
-        ]
-        for idx, (l_sp, r_sp) in enumerate(gen_pairs):
-            _add_pair_row(f"belkins-cfg-gen-row-{idx}", l_sp, r_sp)
+        live_fn = getattr(actions, "render_live_title", None)
+        live_str = str(live_fn() or "").strip() if callable(live_fn) else ""
+        if not live_str:
+            act_row = getattr(snapshot, "active", None)
+            alias_s = str(getattr(act_row, "alias", "main") or "main")[:8]
+            pct_s = f"{int(round(getattr(act_row, 'five_hour_pct', 0) or 0))}%" if act_row else "0%"
+            live_str = f"{alias_s} {pct_s}"
+        # Strip leading fallback glyph if icon is rendered as SF Symbol
+        if live_str.startswith("⚡"):
+            live_str = live_str.lstrip("⚡").strip()
 
-    card.add(_gap(8.0), key=f"belkins-cfg-foot-{subtab}")
+        ic_style = _cur_icon()
+        ic_sf = _ICON_SF_MAP.get(ic_style)
+        tw_live = text_w(pen, live_str, "caption_med")
+        ic_w = 13.5 if ic_sf else 0.0
+        pill_pad = 16.0
+        mock_w = min(W_INNER - 115.0, max(54.0, tw_live + ic_w + pill_pad))
+        mock_x = X1 - mock_w - 6.0
+        pen.rrect(mock_x, strip_y + 3.0, mock_w, strip_h - 6.0, 5.0, "belkins_badge_off", stroke="belkins_badge_on_edge")
+        tx = mock_x + 8.0
+        if ic_sf:
+            symbol(pen, ic_sf, tx, strip_y + 13.0, 9.5, "belkins_flame_text", "semibold")
+            tx += 13.5
+        text(pen, live_str or "Icon Only", "caption_med", "label", tx, sb, maxw=mock_x + mock_w - tx - 6.0)
+        return strip_y + strip_h + 4.0
+
+    card.add(
+        draw_cfg_head,
+        key="belkins-cfg-head",
+        ax="Settings and Control Studio with Live Menu-Bar Preview",
+        tooltip="Every change below updates your macOS menu-bar status item immediately.",
+    )
+
+    # Helper: Horizontal Segmented Control Bar
+    def _add_segmented_bar(
+        row_key: str,
+        sec_label: str,
+        items: list[tuple[str, str | None, Callable[[], bool], Callable[[], None], str]],
+    ) -> None:
+        n = len(items)
+        gap_s = 4.0
+        seg_w = (W_INNER - gap_s * (n - 1)) / float(n)
+
+        def draw_seg(pen: Any, y0: float, seg_items: list = items) -> float:
+            lbl_b = y0 + 12.5
+            text(pen, sec_label, "tag", "belkins_flame_text", X0, lbl_b)
+            bar_y = lbl_b + 4.5
+            bar_h = 26.0
+            b_txt = bar_y + 17.0
+            for idx, (lbl, sf_ic, is_on_fn, _act_fn, _tip) in enumerate(seg_items):
+                sx = X0 + idx * (seg_w + gap_s)
+                on = bool(is_on_fn())
+                bg = "belkins_tab_active_fill" if on else "belkins_badge_off"
+                edge = "belkins_flame_rule" if on else "belkins_badge_off_edge"
+                pen.rrect(sx, bar_y, seg_w, bar_h, 5.5, bg, stroke=edge)
+                txt_r = "belkins_tab_active_text" if on else "secondary"
+                if sf_ic:
+                    tw = text_w(pen, lbl, "caption_med")
+                    ic_s = 8.0
+                    tot = ic_s + 2.5 + tw
+                    st_x = sx + max(2.5, (seg_w - tot) / 2.0)
+                    symbol(pen, sf_ic, st_x, bar_y + 13.0, ic_s, txt_r, "semibold")
+                    text(pen, lbl, "caption_med", txt_r, st_x + ic_s + 2.5, b_txt, maxw=seg_w - ic_s - 3.5)
+                else:
+                    text(pen, lbl, "caption_med", txt_r, sx + seg_w / 2.0, b_txt, center=True, maxw=seg_w - 4.0)
+            return bar_y + bar_h + 3.0
+
+        def on_seg_click(click_x: float, seg_items: list = items) -> None:
+            rel = max(0.0, min(W_INNER - 1.0, click_x - X0))
+            idx = min(len(seg_items) - 1, max(0, int(rel // (seg_w + gap_s))))
+            seg_items[idx][3]()
+
+        card.add(
+            draw_seg,
+            key=row_key,
+            ax=f"{sec_label}: " + ", ".join(i[0] for i in items),
+            tooltip="\n".join(i[4] for i in items if i[4]),
+            action=lambda seg_items=items: seg_items[0][3](),
+            on_click_x=on_seg_click,
+            keep_open=True,
+            no_hover_bg=True,
+        )
+
+    # 2. Menu-Bar Icon (6-Segment Horizontal Picker)
+    _add_segmented_bar(
+        "belkins-cfg-icon-bar",
+        "1. MENU-BAR ICON STYLE",
+        [
+            ("Bolt", "bolt.fill", lambda: _cur_icon() == "bolt", lambda: _set_icon("bolt", "Belkins Bolt"), "Belkins Lightning Bolt icon"),
+            ("Sprite", "sparkles", lambda: _cur_icon() == "companion", lambda: _set_icon("companion", "Companion Sprite"), "Live 12x12 color pixel sprite of your active Companion"),
+            ("Crown", "crown.fill", lambda: _cur_icon() == "crown", lambda: _set_icon("crown", "Crown"), "Sovereign Crown icon"),
+            ("Flame", "flame.fill", lambda: _cur_icon() == "flame", lambda: _set_icon("flame", "Flame"), "Cyber Flame icon"),
+            ("Bars", "chart.bar.fill", lambda: _cur_icon() == "bars", lambda: _set_icon("bars", "Bars"), "Classic Usage Bars icon"),
+            ("None", "nosign", lambda: _cur_icon() == "none", lambda: _set_icon("none", "No Icon"), "Text only (hide menu-bar icon)"),
+        ],
+    )
+
+    # 3. Menu-Bar View Preset (4-Segment Horizontal Picker)
+    _add_segmented_bar(
+        "belkins-cfg-view-bar",
+        "2. MENU-BAR LAYOUT PRESET",
+        [
+            ("Custom", "slider.horizontal.3", lambda: _cur_view() == "standard", lambda: _set_view("standard", "Custom Chips"), "Show the exact stats toggled in Section 3 below"),
+            ("Full Info", "chart.bar.fill", lambda: _cur_view() == "full", lambda: _set_view("full", "Full Info"), "Show Account + 5h% + 7d% + Codex% + Today Cost"),
+            ("Companion", "sparkles", lambda: _cur_view() == "companion", lambda: _set_view("companion", "Companion HUD"), "Show Companion Level/Form + 5h% + SparkCoins"),
+            ("Compact", "rectangle.compress.vertical", lambda: _cur_view() == "compact", lambda: _set_view("compact", "Compact V·C"), "Ultra-narrow V·C 100/100 view for crowded menu bars"),
+        ],
+    )
+
+    # 4. Visible Menu-Bar Stats (Compact 4-Column × 2-Row Chip Grid)
+    card.add(
+        lambda pen, y0: text(pen, "3. VISIBLE MENU-BAR DATA CHIPS (CLICK TO TOGGLE)", "tag", "belkins_flame_text", X0, y0 + 12.5) and (y0 + 15.5),
+        key="belkins-cfg-chips-hdr",
+    )
+    chip_rows = [
+        [
+            ("Alias", "person.fill", lambda: bool(snapshot.settings.get("title_show_alias", True)), lambda: _toggle_key("title_show_alias", "Account Alias", True), "Show active Claude account alias"),
+            ("5h %", "bolt.fill", lambda: bool(snapshot.settings.get("title_show_five_hour_pct", True)), lambda: _toggle_key("title_show_five_hour_pct", "5h Quota %", True), "Show active 5-hour quota %"),
+            ("7d %", "calendar", lambda: bool(snapshot.settings.get("title_show_seven_day_pct", False)), lambda: _toggle_key("title_show_seven_day_pct", "7d Weekly %", False), "Show 7-day weekly quota %"),
+            ("Codex", "terminal.fill", lambda: bool(snapshot.settings.get("title_show_codex_pct", False)), lambda: _toggle_key("title_show_codex_pct", "Codex %", False), "Show active Codex weekly %"),
+        ],
+        [
+            ("$ Cost", "dollarsign.circle.fill", lambda: bool(snapshot.settings.get("title_show_cost", True)), lambda: _toggle_key("title_show_cost", "Today Cost", True), "Show today's notional USD spend ($/d)"),
+            ("Tokens", "number.square.fill", lambda: bool(snapshot.settings.get("title_show_tokens", False)), lambda: _toggle_key("title_show_tokens", "Today Tokens", False), "Show today's token burn (e.g. 42M)"),
+            ("Lv/Form", "sparkles", lambda: bool(snapshot.settings.get("title_show_companion", False)), lambda: _toggle_key("title_show_companion", "Companion Lv", False), "Show Companion Level & Stage in header"),
+            ("Boss HP", "flame.fill", lambda: bool(snapshot.settings.get("title_show_boss", False)), lambda: _toggle_key("title_show_boss", "Raid Boss HP", False), "Show active Raid Boss HP% in header"),
+        ],
+    ]
+    chip_gap = 5.0
+    chip_w = (W_INNER - chip_gap * 3.0) / 4.0
+    for r_idx, c_row in enumerate(chip_rows):
+        def draw_chip_row(pen: Any, y0: float, row_items: list = c_row) -> float:
+            by = y0 + 2.0
+            bh = 26.0
+            bt = by + 17.0
+            for c_i, (clbl, c_sf, on_fn, _act, _tip) in enumerate(row_items):
+                cx = X0 + c_i * (chip_w + chip_gap)
+                on = bool(on_fn())
+                bg = "belkins_badge_on" if on else "belkins_badge_off"
+                edge = "belkins_badge_on_edge" if on else "belkins_badge_off_edge"
+                pen.rrect(cx, by, chip_w, bh, 5.5, bg, stroke=edge)
+                ic_r = "good_text" if on else "secondary"
+                txt_r = "label" if on else "secondary"
+                symbol(pen, c_sf, cx + 6.5, by + 13.0, 8.5, ic_r, "semibold")
+                dot_s = "✓" if on else ""
+                if dot_s:
+                    text(pen, dot_s, "tag", "good_text", cx + chip_w - 6.0, bt, right=True)
+                text(pen, clbl, "caption_med", txt_r, cx + 17.5, bt, maxw=chip_w - (29.0 if on else 20.0))
+            return by + bh + 3.0
+
+        def on_chip_row_click(click_x: float, row_items: list = c_row) -> None:
+            rel = max(0.0, min(W_INNER - 1.0, click_x - X0))
+            idx = min(3, max(0, int(rel // (chip_w + chip_gap))))
+            row_items[idx][3]()
+
+        card.add(
+            draw_chip_row,
+            key=f"belkins-cfg-chip-row-{r_idx}",
+            ax="Menu-bar data chips: " + ", ".join(c[0] for c in c_row),
+            tooltip="\n".join(c[4] for c in c_row),
+            action=lambda row_items=c_row: row_items[0][3](),
+            on_click_x=on_chip_row_click,
+            keep_open=True,
+            no_hover_bg=True,
+        )
+
+    # 5. Auto-Switch & Quota Alert Threshold (5-Segment Bar)
+    def _cur_thresh() -> int:
+        return int(snapshot.settings.get("notification_threshold_pct", 85) or 85)
+
+    def _toggle_autosw() -> None:
+        global _LAST_CFG_NOTE
+        actions.toggle_autoswitch()
+        _LAST_CFG_NOTE = f"Auto-Switch → {'OFF' if snapshot.autoswitch_enabled else 'ON ✓'}"
+
+    _add_segmented_bar(
+        "belkins-cfg-thresh-bar",
+        "4. AUTO-SWITCH & QUOTA ALERT THRESHOLD",
+        [
+            (
+                "Auto ON" if snapshot.autoswitch_enabled else "Auto OFF",
+                "bolt.fill",
+                lambda: bool(snapshot.autoswitch_enabled),
+                _toggle_autosw,
+                "Toggle automatic Claude account rotation before hitting the wall",
+            ),
+            ("80%", None, lambda: _cur_thresh() == 80, lambda: _set_val("notification_threshold_pct", 80, "Alert Threshold → 80%"), "Warn at 80% quota utilization"),
+            ("85%", None, lambda: _cur_thresh() == 85, lambda: _set_val("notification_threshold_pct", 85, "Alert Threshold → 85%"), "Warn at 85% quota utilization (default)"),
+            ("90%", None, lambda: _cur_thresh() == 90, lambda: _set_val("notification_threshold_pct", 90, "Alert Threshold → 90%"), "Warn at 90% quota utilization"),
+            ("95%", None, lambda: _cur_thresh() == 95, lambda: _set_val("notification_threshold_pct", 95, "Alert Threshold → 95%"), "Warn at 95% quota utilization"),
+        ],
+    )
+
+    # 6. Desktop Alerts & Codex Poll Speed (5-Segment Bar)
+    def _cur_poll() -> int:
+        return int(snapshot.settings.get("codex_quota_interval_seconds", 300) or 300)
+
+    _add_segmented_bar(
+        "belkins-cfg-poll-bar",
+        "5. DESKTOP NOTIFICATIONS & CODEX POLL INTERVAL",
+        [
+            (
+                "Bell ON" if snapshot.settings.get("notifications_enabled", True) else "Bell OFF",
+                "bell.fill",
+                lambda: bool(snapshot.settings.get("notifications_enabled", True)),
+                lambda: _toggle_key("notifications_enabled", "Desktop Alerts", True),
+                "Toggle macOS Notification Center quota alerts",
+            ),
+            ("1m", None, lambda: _cur_poll() == 60, lambda: _set_val("codex_quota_interval_seconds", 60, "Codex Poll → 1 min"), "Poll live Codex quotas every 1 minute"),
+            ("5m", None, lambda: _cur_poll() == 300, lambda: _set_val("codex_quota_interval_seconds", 300, "Codex Poll → 5 min"), "Poll live Codex quotas every 5 minutes (recommended)"),
+            ("10m", None, lambda: _cur_poll() == 600, lambda: _set_val("codex_quota_interval_seconds", 600, "Codex Poll → 10 min"), "Poll live Codex quotas every 10 minutes"),
+            ("15m", None, lambda: _cur_poll() == 900, lambda: _set_val("codex_quota_interval_seconds", 900, "Codex Poll → 15 min"), "Poll live Codex quotas every 15 minutes"),
+        ],
+    )
+
+    # 7. Core Engine Switches & Quick Actions (2 Rows of 3 Pills)
+    def _trig_update() -> None:
+        global _LAST_CFG_NOTE
+        fn = getattr(actions, "update_app", None)
+        if callable(fn):
+            fn()
+        _LAST_CFG_NOTE = "Running bswap update in background…"
+
+    def _trig_dash() -> None:
+        global _LAST_CFG_NOTE
+        fn = getattr(actions, "open_dashboard", None)
+        if callable(fn):
+            fn()
+        _LAST_CFG_NOTE = "Opened HTML Dashboard in browser"
+
+    def _trig_csv() -> None:
+        global _LAST_CFG_NOTE
+        fn = getattr(actions, "export_csv", None)
+        if callable(fn):
+            fn()
+        _LAST_CFG_NOTE = "Exported Usage CSV to ~/Downloads"
+
+    _add_segmented_bar(
+        "belkins-cfg-engine-bar",
+        "6. ENGINE MODULES & QUICK ACTIONS",
+        [
+            (
+                "Codex Live",
+                "antenna.radiowaves.left.and.right",
+                lambda: bool(snapshot.settings.get("codex_live_quota_enabled", False)),
+                lambda: _toggle_key("codex_live_quota_enabled", "Codex Live Quota", False),
+                "Enable live per-account Codex OAuth quota polling",
+            ),
+            (
+                "Cost Track",
+                "dollarsign.circle.fill",
+                lambda: bool(snapshot.settings.get("cost_tracking_enabled", True)),
+                lambda: _toggle_key("cost_tracking_enabled", "Cost Tracking", True),
+                "Track local transcript token & USD spend",
+            ),
+            (
+                "Idle Anim",
+                "sparkles",
+                lambda: bool(snapshot.settings.get("belkins_animations_enabled", True)),
+                lambda: _toggle_key("belkins_animations_enabled", "Idle Animations", True),
+                "Toggle retro pixel breathing/bobbing animations while menu is open",
+            ),
+        ],
+    )
+
+    _add_segmented_bar(
+        "belkins-cfg-actions-bar",
+        "QUICK TOOLS",
+        [
+            ("Update App", "arrow.triangle.2.circlepath", lambda: False, _trig_update, "Pull latest Belkins Usage Bar from GitHub & restart (`bswap update`)"),
+            ("Web Dashboard", "safari.fill", lambda: False, _trig_dash, "Open the local Belkins HTML Usage & Companion Dashboard"),
+            ("Export CSV", "square.and.arrow.down.fill", lambda: False, _trig_csv, "Export daily token & USD history to ~/Downloads"),
+        ],
+    )
+
+    card.add(_gap(6.0), key="belkins-cfg-foot")
     return card
 
 
@@ -2744,7 +2954,7 @@ def build(snapshot: Any, now: float, actions: ThemeActions | None = None) -> lis
     acts = actions or ThemeActions()
     companion = companion_from_snapshot(snapshot)
 
-    # 1. Always-visible Companion Hero + Segmented 5-Tab Bar
+    # 1. Always-visible Companion Hero + Segmented 6-Tab Bar
     hero_card = _companion_card(snapshot, companion, acts)
     blocks: list[Block] = hero_card.blocks(TOP_GAP, 2.0)
 
@@ -2754,9 +2964,12 @@ def build(snapshot: Any, now: float, actions: ThemeActions | None = None) -> lis
     codex_cnt = len([r for r in A._visible_quota_rows_of(snapshot) if r.vendor != A.VENDOR_CLAUDE and r.slot < 0])
     blocks.append(_tab_bar_block(claude_cnt, codex_cnt))
 
-    # 2. Tab "party": Separate Luxury Claude & Codex Cards FIRST + Compact Grouped Needs-Attention below
+    # 2. Tab "party": Separate Luxury Claude & Codex Cards FIRST + Burn Velocity + Compact Grouped Needs-Attention below
     attn = _attention_spec(A, snapshot, acts)
-    party_cards: list[_Card] = _party_provider_cards(claude_sp, codex_sp)
+    party_cards: list[_Card] = _party_provider_cards(claude_sp, codex_spec=codex_sp)
+    vel_card = _burn_velocity_card(snapshot, acts)
+    if vel_card is not None:
+        party_cards.append(vel_card)
     if attn:
         party_cards.append(_attention_card(attn))
     for i, c in enumerate(party_cards):
@@ -2775,7 +2988,7 @@ def build(snapshot: Any, now: float, actions: ThemeActions | None = None) -> lis
         codex_attn = [it for it in (attn["items"] if attn else ()) if it["provider"] == "Codex"]
         blocks += _tag_blocks(_provider_card(codex_sp, codex_attn).blocks(2.0, TAIL_GAP), "codex")
 
-    # 5. Tab "dex": Interactive Boss Raid Arena + 8-Stage Pokedex / 10-Trophy Bento Grid
+    # 5. Tab "dex": Interactive Boss Raid Arena + Daily Crate + 8-Stage Pokedex / 14-Trophy Bento Grid
     blocks += _tag_blocks(
         _dex_card(snapshot, companion, "pokedex").blocks(2.0, TAIL_GAP),
         "dex",
@@ -2787,7 +3000,7 @@ def build(snapshot: Any, now: float, actions: ThemeActions | None = None) -> lis
         extra_pred=lambda: _DEX_SUBTAB == "trophies",
     )
 
-    # 6. Tab "shop": 12-Item Belkins Poké Mart ("gear" sub-tab & "style" sub-tab)
+    # 6. Tab "shop": 12-Item Belkins Spark Vault ("gear" sub-tab & "style" sub-tab)
     blocks += _tag_blocks(
         _shop_card(snapshot, companion, "gear").blocks(2.0, TAIL_GAP),
         "shop",
@@ -2799,16 +3012,10 @@ def build(snapshot: Any, now: float, actions: ThemeActions | None = None) -> lis
         extra_pred=lambda: _SHOP_SUBTAB == "style",
     )
 
-    # 7. Tab "config": Header & Icon Studio ("header" sub-tab) + General Settings ("general" sub-tab)
+    # 7. Tab "config": Unified Single-Screen Settings & Control Studio
     blocks += _tag_blocks(
-        _config_card(snapshot, acts, "header").blocks(2.0, TAIL_GAP),
+        _config_card(snapshot, acts).blocks(2.0, TAIL_GAP),
         "config",
-        extra_pred=lambda: _CFG_SUBTAB == "header",
-    )
-    blocks += _tag_blocks(
-        _config_card(snapshot, acts, "general").blocks(2.0, TAIL_GAP),
-        "config",
-        extra_pred=lambda: _CFG_SUBTAB == "general",
     )
 
     return blocks

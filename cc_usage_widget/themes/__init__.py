@@ -95,6 +95,9 @@ class ThemeActions:
     open_dashboard: Callable[[], Any] = _noop
     set_setting: Callable[[str, Any], Any] = _noop
     toggle_autoswitch: Callable[[], Any] = _noop
+    export_csv: Callable[[], Any] = _noop
+    update_app: Callable[[], Any] = _noop
+    render_live_title: Callable[[], str] = lambda: ""
     attention_extras: tuple[str, ...] = field(default_factory=tuple)
 
 

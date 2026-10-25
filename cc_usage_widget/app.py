@@ -6472,6 +6472,19 @@ class CCUsageWidgetApp(rumps.App):
             if target:
                 self._worker.submit(_CMD_SWITCH_CODEX, str(target))
 
+        def update_app() -> None:
+            bswap_bin = Path.home() / ".local" / "bin" / "bswap"
+            if bswap_bin.is_file():
+                try:
+                    subprocess.Popen(
+                        [str(bswap_bin), "update"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                except OSError:
+                    pass
+
         return _themes.ThemeActions(
             switch_to=switch_to,
             switch_best=lambda: self._on_switch_best(None),
@@ -6483,6 +6496,9 @@ class CCUsageWidgetApp(rumps.App):
             open_dashboard=lambda: self._on_open_dashboard(None),
             set_setting=self._set_setting_from_theme,
             toggle_autoswitch=lambda: self._on_toggle_autoswitch(None),
+            export_csv=lambda: self._on_export_csv(None),
+            update_app=update_app,
+            render_live_title=lambda: self.render_title(self.snapshot()),
             attention_extras=extras,
         )
 
