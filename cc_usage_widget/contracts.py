@@ -2883,12 +2883,19 @@ SETTINGS_DEFAULTS: dict[str, Any] = {
     "cost_interval_seconds": 300,
     "codex_quota_interval_seconds": 300,
     # --- title components (SPEC 4.1: "<icon> podol 17% F3% $12/d") --------
+    "title_view": "standard",
+    "title_icon_style": "bolt",
     "title_show_icon": True,
     "title_show_alias": True,
     "title_show_five_hour_pct": True,
+    "title_show_seven_day_pct": False,
     "title_show_scoped_pct": True,
     "title_show_cost": True,
+    "title_show_tokens": False,
     "title_show_codex_pct": False,
+    "title_show_companion": False,
+    "title_show_coins": False,
+    "title_show_boss": False,
     "title_show_fleet": True,
     "title_compact": False,
     # --- menu design (wave 2, 2026-09-25) ---------------------------------
@@ -2897,6 +2904,7 @@ SETTINGS_DEFAULTS: dict[str, Any] = {
     "menu_layout_classic": False,
     # --- menu themes (design 3, 2026-09-25; belkins default) -------------
     "menu_theme": "belkins",
+    "belkins_animations_enabled": True,
 }
 """Full ``settings.json`` schema with defaults.
 
@@ -3083,6 +3091,20 @@ would defeat the whole design.
 SETTINGS_CHOICES: dict[str, tuple[str, ...]] = {
     "codex_pricing_tier": ("standard", "fast", "batch"),
     "menu_theme": ("belkins", "apple", "dense", "cards", "glance", "classic"),
+    "title_view": ("standard", "full", "companion", "raid", "cost", "compact", "icon_only"),
+    "title_icon_style": (
+        "bolt",
+        "companion",
+        "companion_mono",
+        "bars",
+        "flame",
+        "cpu",
+        "crown",
+        "shield",
+        "sparkles",
+        "arrows",
+        "none",
+    ),
 }
 """Allowed values for the string settings, first entry = the default.
 

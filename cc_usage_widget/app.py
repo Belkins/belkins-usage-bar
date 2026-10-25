@@ -232,6 +232,8 @@ _LOOKBACK_CHOICES = (7, 14, 30, 60, 90)
 _UI_INTERVAL_CHOICES = (30, 60, 120, 300)
 _COST_INTERVAL_CHOICES = (60, 300, 600, 1800)
 _CODEX_QUOTA_INTERVAL_CHOICES = (60, 120, 300, 600, 1800)
+_NOTIFICATION_THRESHOLD_CHOICES = (50, 60, 70, 75, 80, 85, 90, 95, 100)
+_UNPRICED_ALERT_CHOICES = (1_000, 5_000, 10_000, 50_000, 100_000)
 """Per-account poll periods offered for the live Codex quota (SPEC-CODEX 6).
 
 Every value is inside ``SETTINGS_BOUNDS["codex_quota_interval_seconds"]``
@@ -243,19 +245,48 @@ _TITLE_TOGGLES = (
     ("title_show_icon", "Icon"),
     ("title_show_alias", "Account alias"),
     ("title_show_five_hour_pct", "5h percentage"),
+    ("title_show_seven_day_pct", "7d weekly percentage"),
     ("title_show_scoped_pct", "Weekly scoped percentage"),
     ("title_show_cost", "Today's cost"),
+    ("title_show_tokens", "Today's tokens"),
     # Relabelled with SPEC-CODEX 6: the component now renders the ACTIVE Codex
     # account's figure only (the login ~/.codex holds), never a sum or a pick
     # across the four tracked accounts - so the old "weekly percentage" would
     # have named a number the title no longer shows.
     ("title_show_codex_pct", "Active Codex account %"),
+    ("title_show_companion", "Companion Lv & Form"),
+    ("title_show_coins", "SparkCoins wallet (🪙)"),
+    ("title_show_boss", "Raid Boss HP"),
     ("title_show_fleet", "Fleet headroom (when at limit)"),
     # Design wave 2. The merge NARROWS the title (C⚠ + ⚠ -> one ⚠N); the
     # credit marker is listed only where Codex exists (see `_settings_submenu`).
     ("title_merge_alerts", "Merge alerts into ⚠N"),
     ("title_show_reset_credit", "Reset-credit marker (↺now)"),
 )
+
+_HEADER_VIEW_LABELS: dict[str, str] = {
+    "standard": "🎛️ Standard (Custom toggles)",
+    "full": "📊 Full Detailed (Alias + 5h/7d + Codex + Cost)",
+    "companion": "🐾 Companion HUD (Lv + Form + 5h% + Coins)",
+    "raid": "⚔️ Boss Raid HUD (Boss HP + Lv + 5h%)",
+    "cost": "💰 Cost & Burn ($/d + Tokens + 5h%)",
+    "compact": "🤏 Compact (V·C 100/100)",
+    "icon_only": "🔩 Icon Only",
+}
+
+_HEADER_ICON_LABELS: dict[str, str] = {
+    "bolt": "⚡ Belkins Lightning",
+    "companion": "🐾 Companion Pixel Sprite (Color)",
+    "companion_mono": "🐾 Companion Silhouette (Mono)",
+    "bars": "📊 Usage Bars",
+    "flame": "🔥 Cyber Flame",
+    "cpu": "🧠 Neural CPU",
+    "crown": "👑 Sovereign Crown",
+    "shield": "🛡️ Cyber Shield",
+    "sparkles": "✨ Sparkles",
+    "arrows": "⇄ Swap Arrows",
+    "none": "🚫 No Icon (Text only)",
+}
 
 _VENDOR_TITLE_TOGGLES = ("title_show_codex_pct", "title_show_reset_credit")
 """Title toggles that only mean something where a Codex source exists."""
@@ -5561,18 +5592,89 @@ class CCUsageWidgetApp(rumps.App):
         """
         snapshot = snapshot or self.snapshot()
         settings = snapshot.settings
-        if getattr(self, "_auto_icon_only", False):
+        view = str(settings.get("title_view", "standard") or "standard")
+        if getattr(self, "_auto_icon_only", False) or view == "icon_only":
             return []
-        if settings.get("title_compact", False) or getattr(self, "_auto_compact", False):
+        if (
+            settings.get("title_compact", False)
+            or getattr(self, "_auto_compact", False)
+            or view == "compact"
+        ):
             return self._compact_tokens(snapshot)
         merge = bool(settings.get("title_merge_alerts", False))
+        show_alias = bool(settings.get("title_show_alias", True))
+        show_5h = bool(settings.get("title_show_five_hour_pct", True))
+        show_7d = bool(settings.get("title_show_seven_day_pct", False))
+        show_scoped = bool(settings.get("title_show_scoped_pct", True))
+        show_codex = bool(settings.get("title_show_codex_pct", False))
+        show_cost = bool(settings.get("title_show_cost", True))
+        show_tokens = bool(settings.get("title_show_tokens", False))
+        show_companion = bool(settings.get("title_show_companion", False))
+        show_coins = bool(settings.get("title_show_coins", False))
+        show_boss = bool(settings.get("title_show_boss", False))
+
+        if view == "full":
+            show_alias = True
+            show_5h = True
+            show_7d = True
+            show_scoped = True
+            show_codex = True
+            show_cost = True
+        elif view == "companion":
+            show_companion = True
+            show_alias = False
+            show_5h = True
+            show_7d = False
+            show_scoped = False
+            show_codex = False
+            show_cost = False
+            show_tokens = False
+            show_coins = True
+            show_boss = False
+        elif view == "raid":
+            show_boss = True
+            show_companion = True
+            show_alias = False
+            show_5h = True
+            show_7d = False
+            show_scoped = False
+            show_codex = False
+            show_cost = False
+            show_tokens = False
+            show_coins = False
+        elif view == "cost":
+            show_alias = True
+            show_5h = True
+            show_7d = False
+            show_scoped = False
+            show_codex = False
+            show_cost = True
+            show_tokens = True
+            show_companion = False
+            show_coins = False
+            show_boss = False
+
+        comp = None
+        if show_companion or show_coins or show_boss:
+            try:
+                from .belkins_game import companion_from_snapshot
+
+                comp = companion_from_snapshot(snapshot)
+            except Exception:
+                comp = None
+
         parts: list[list[tuple[str, str | None]]] = []
-        if settings.get("title_show_icon", True):
+        if settings.get("title_show_icon", True) and not getattr(self, "_icon_image_set", False):
             parts.append([(TITLE_ICON, None)])
+        if show_companion and comp is not None:
+            short_stage = comp.stage.name.split()[-1]
+            parts.append([(f"Lv.{comp.level} {short_stage}", "accent")])
+        if show_boss and comp is not None:
+            parts.append([(f"{comp.boss.spec.icon}{int(round(comp.boss.hp_pct))}%", "crit")])
         active = snapshot.active
         notes = snapshot.account_notes
         if active is not None:
-            if settings.get("title_show_alias", True):
+            if show_alias:
                 parts.append([(_title_alias(_display_name(active)), None)])
             note = notes.get(active.slot)
             binding = _binding_window(active, tuple(snapshot.autoswitch_models or ()))
@@ -5598,25 +5700,44 @@ class CCUsageWidgetApp(rumps.App):
                 label, pct_text = _binding_token(active, walled)
                 parts.append([(label, None), (pct_text, render.severity(walled[1]))])
             else:
-                if settings.get("title_show_five_hour_pct", True) and active.five_hour_pct is not None:
+                if show_5h and active.five_hour_pct is not None:
                     parts.append(
                         [(_title_pct(active.five_hour_pct), render.severity(active.five_hour_pct))]
                     )
-                if settings.get("title_show_scoped_pct", True):
+                if show_7d and active.seven_day_pct is not None:
+                    parts.append(
+                        [("7d", None), (_title_pct(active.seven_day_pct), render.severity(active.seven_day_pct))]
+                    )
+                if show_scoped:
                     window = active.primary_scoped_window
                     if window is not None:
                         name, pct = window
                         parts.append(
                             [(f"{active.scoped_abbrev(name)}{_title_pct(pct)}", render.severity(pct))]
                         )
-        if settings.get("title_show_codex_pct", False):
+        if show_codex:
             codex = self._title_vendor_tokens(snapshot, merge=merge)
             if codex:
                 parts.append(codex)
-        if settings.get("title_show_cost", True) and settings.get("cost_tracking_enabled", True):
+        if show_cost and settings.get("cost_tracking_enabled", True):
             cost_part = self._title_cost(snapshot)
             if cost_part:
                 parts.append([(cost_part, None)])
+        if (
+            show_tokens
+            and snapshot.cost is not None
+            and not snapshot.cost.is_partial
+            and snapshot.cost.today.total_tokens > 0
+        ):
+            parts.append([(format_tokens(snapshot.cost.today.total_tokens), "accent")])
+        if show_coins and comp is not None:
+            coins_val = int(comp.coins_available)
+            coins_str = (
+                f"{coins_val / 1000.0:.1f}K"
+                if coins_val >= 10_000
+                else f"{coins_val:,}"
+            )
+            parts.append([(f"🪙{coins_str}", "warn")])
         # Standing problems always reach the bar, whatever the toggles say:
         # the engine's verdict first, else a bare "⚠" when a slot other than
         # the active one needs the operator (its note is in the menu).
@@ -6157,8 +6278,8 @@ class CCUsageWidgetApp(rumps.App):
         is pure over the snapshot - no I/O on this thread (SPEC 2.3).
         """
         snapshot = snapshot or self.snapshot()
+        self._sync_status_icon(snapshot)
         self.title = self.render_title(snapshot)
-        self._install_icon_once()
         layout = self._menu_layout(snapshot)
         items = None
         if layout == "classic":
@@ -6291,6 +6412,8 @@ class CCUsageWidgetApp(rumps.App):
             open_url=_open_web_url,
             refresh=lambda: self._on_refresh_now(None),
             open_dashboard=lambda: self._on_open_dashboard(None),
+            set_setting=self._set_setting_from_theme,
+            toggle_autoswitch=lambda: self._on_toggle_autoswitch(None),
             attention_extras=extras,
         )
 
@@ -7100,32 +7223,55 @@ class CCUsageWidgetApp(rumps.App):
         checkmark, so it reads correctly at a glance."""
         return f"{name + ':':<18}{'ON' if on else 'OFF'}"
 
-    def _install_icon_once(self) -> None:
-        """Put an SF Symbol template image on the status item (once).
+    def _sync_status_icon(self, snapshot: UiSnapshot | None = None) -> None:
+        """Keep the status item's NSImage in sync with ``title_show_icon`` and ``title_icon_style``.
 
-        Deferred to the first repaint because rumps only creates the
-        NSStatusItem in ``applicationDidFinishLaunching_``; before that there is
-        nothing to set an image on. Purely cosmetic — any failure leaves the
-        text title in place, so this can never stop the widget from working.
+        Deferred until ``applicationDidFinishLaunching_`` creates ``nsstatusitem``.
+        Supports SF Symbol styles (``bolt``, ``flame``, ``crown``, ``bars``, etc.),
+        the live 12x12 pixel-art Companion sprite (``companion`` in color or
+        ``companion_mono`` template), or hiding the icon (``none`` / ``title_show_icon=False``).
         """
-        if getattr(self, "_icon_installed", False):
-            return
-        self._icon_installed = True  # one attempt, whatever happens
+        snapshot = snapshot or self.snapshot()
+        settings = snapshot.settings
+        show_icon = bool(settings.get("title_show_icon", True))
+        style = str(settings.get("title_icon_style", "bolt") or "bolt")
+        stage_num = 1
+        if show_icon and style in ("companion", "companion_mono"):
+            try:
+                from .belkins_game import companion_from_snapshot
+
+                stage_num = companion_from_snapshot(snapshot).stage.stage
+            except Exception:
+                stage_num = 1
+        target_key = ("none", 0) if (not show_icon or style == "none") else (style, stage_num)
         try:
             item = getattr(getattr(self, "_nsapp", None), "nsstatusitem", None)
             if item is None:
-                self._icon_installed = False  # retry on the next repaint
+                self._icon_installed = False
                 return
-            image = render.status_icon()
+            self._icon_installed = True
+            if getattr(self, "_last_icon_key", None) == target_key:
+                return
+            if target_key[0] == "none":
+                item.setImage_(None)
+                self._icon_image_set = False
+                self._last_icon_key = target_key
+                return
+            image = render.status_icon_for_style(style, stage_num=stage_num)
             if image is not None:
                 item.setImage_(image)
                 self._icon_image_set = True
-                # The title may have been rendered before the image existed;
-                # re-render so the ⇄ fallback drops off an icon-only item.
-                self.title = self.render_title()
-                self._apply_title_attributes()
+                self._last_icon_key = target_key
+            else:
+                item.setImage_(None)
+                self._icon_image_set = False
+                self._last_icon_key = ("none", 0)
         except Exception:
             pass
+
+    def _install_icon_once(self) -> None:
+        """Backwards-compatible alias for :meth:`_sync_status_icon`."""
+        self._sync_status_icon()
 
     def _account_items(
         self, snapshot: UiSnapshot, *, reset_style: str = "classic"
@@ -7824,6 +7970,8 @@ class CCUsageWidgetApp(rumps.App):
                 ),
                 compact_on,
             ),
+            self._header_view_submenu(settings, label="Header View"),
+            self._header_icon_submenu(settings, label="Header Icon"),
             None,
         ]
         title_children += [
@@ -7960,6 +8108,21 @@ class CCUsageWidgetApp(rumps.App):
                     pace_on,
                 )
             )
+            extra_limits_on = bool(
+                settings.get(
+                    "codex_show_extra_limits",
+                    SETTINGS_DEFAULTS["codex_show_extra_limits"],
+                )
+            )
+            codex_children.append(
+                _check(
+                    rumps.MenuItem(
+                        self._switch_label("Codex extra rate limits", extra_limits_on),
+                        callback=self._make_setting_toggle("codex_show_extra_limits"),
+                    ),
+                    extra_limits_on,
+                )
+            )
             codex_children.append(self._codex_accounts_submenu(snapshot))
         # The Accounts block's per-model fleet line (F4) had only a hand-edit of
         # settings.json as its off switch. Drawn only while some claude-swap
@@ -7993,6 +8156,29 @@ class CCUsageWidgetApp(rumps.App):
         # the menu look" control, and it replaces design wave 2's classic
         # toggle (Classic is one of its five choices).
         children.insert(1, self._theme_submenu(settings))
+        children.insert(2, self._header_view_submenu(settings))
+        children.insert(3, self._header_icon_submenu(settings))
+        children.insert(4, self._belkins_submenu(snapshot))
+        autoswitch_on = bool(snapshot.autoswitch_enabled)
+        children.append(
+            _check(
+                rumps.MenuItem(
+                    self._switch_label("Auto-switch", autoswitch_on),
+                    callback=self._on_toggle_autoswitch,
+                ),
+                autoswitch_on,
+            )
+        )
+        cost_on = bool(settings.get("cost_tracking_enabled", True))
+        children.append(
+            _check(
+                rumps.MenuItem(
+                    self._switch_label("Cost tracking", cost_on),
+                    callback=self._on_toggle_cost_tracking,
+                ),
+                cost_on,
+            )
+        )
         audit_on = bool(
             settings.get("self_audit_enabled", SETTINGS_DEFAULTS["self_audit_enabled"])
         )
@@ -8047,6 +8233,37 @@ class CCUsageWidgetApp(rumps.App):
                     history_on,
                 )
             )
+        dash_on = bool(settings.get("dashboard_enabled", SETTINGS_DEFAULTS["dashboard_enabled"]))
+        children.append(
+            _check(
+                rumps.MenuItem(
+                    self._switch_label("HTML dashboard", dash_on),
+                    callback=self._make_setting_toggle("dashboard_enabled"),
+                ),
+                dash_on,
+            )
+        )
+        unpriced_min = int(
+            settings.get(
+                "unpriced_alert_min_tokens",
+                SETTINGS_DEFAULTS["unpriced_alert_min_tokens"],
+            )
+        )
+        children.append(
+            _submenu(
+                f"Unpriced alert min: {format_tokens(unpriced_min)} tok",
+                [
+                    _check(
+                        rumps.MenuItem(
+                            f"{tok:,} tokens",
+                            callback=self._make_setting_value("unpriced_alert_min_tokens", tok),
+                        ),
+                        unpriced_min == tok,
+                    )
+                    for tok in _UNPRICED_ALERT_CHOICES
+                ],
+            )
+        )
         children.append(self._notifications_submenu(snapshot))
         if self._worker.supports_index_rebuild():
             children.append(rumps.MenuItem("Rebuild cost index", callback=self._on_rebuild_index))
@@ -8062,6 +8279,250 @@ class CCUsageWidgetApp(rumps.App):
         children.append(None)
         children.extend(self._diagnostic_items(snapshot))
         return _submenu("Settings", children)
+
+    def _header_view_submenu(
+        self, settings: dict[str, Any], *, label: str = "Header View"
+    ) -> rumps.MenuItem:
+        """``Header View ▸`` — choose a rich menu-bar preset or custom toggles."""
+        compact_on = bool(settings.get("title_compact", False))
+        current = str(settings.get("title_view", "standard") or "standard")
+        if compact_on and current == "standard":
+            current = "compact"
+        return _submenu(
+            label,
+            [
+                _check(
+                    rumps.MenuItem(
+                        _HEADER_VIEW_LABELS.get(view, view),
+                        callback=self._make_header_view_choice(view),
+                    ),
+                    current == view,
+                )
+                for view in SETTINGS_CHOICES["title_view"]
+            ],
+        )
+
+    def _make_header_view_choice(self, view: str) -> Callable[[Any], None]:
+        """Switch ``title_view`` preset and sync matching ``title_show_*`` flags."""
+
+        def callback(_sender: Any) -> None:
+            self._apply_header_view_choice(view, rebuild=True)
+
+        return callback
+
+    def _apply_header_view_choice(self, view: str, *, rebuild: bool = True) -> None:
+        self._auto_compact = False
+        self._auto_icon_only = False
+        self._title_hidden_streak = 0
+        snapshot = self.snapshot()
+        updates: dict[str, Any] = {
+            "title_view": view,
+            "title_compact": (view == "compact"),
+        }
+        if view == "full":
+            updates.update(
+                {
+                    "title_show_alias": True,
+                    "title_show_five_hour_pct": True,
+                    "title_show_seven_day_pct": True,
+                    "title_show_scoped_pct": True,
+                    "title_show_codex_pct": True,
+                    "title_show_cost": True,
+                    "title_show_tokens": False,
+                    "title_show_companion": False,
+                    "title_show_coins": False,
+                    "title_show_boss": False,
+                }
+            )
+        elif view == "companion":
+            updates.update(
+                {
+                    "title_show_alias": False,
+                    "title_show_five_hour_pct": True,
+                    "title_show_seven_day_pct": False,
+                    "title_show_scoped_pct": False,
+                    "title_show_codex_pct": False,
+                    "title_show_cost": False,
+                    "title_show_tokens": False,
+                    "title_show_companion": True,
+                    "title_show_coins": True,
+                    "title_show_boss": False,
+                }
+            )
+        elif view == "raid":
+            updates.update(
+                {
+                    "title_show_alias": False,
+                    "title_show_five_hour_pct": True,
+                    "title_show_seven_day_pct": False,
+                    "title_show_scoped_pct": False,
+                    "title_show_codex_pct": False,
+                    "title_show_cost": False,
+                    "title_show_tokens": False,
+                    "title_show_companion": True,
+                    "title_show_coins": False,
+                    "title_show_boss": True,
+                }
+            )
+        elif view == "cost":
+            updates.update(
+                {
+                    "title_show_alias": True,
+                    "title_show_five_hour_pct": True,
+                    "title_show_seven_day_pct": False,
+                    "title_show_scoped_pct": False,
+                    "title_show_codex_pct": False,
+                    "title_show_cost": True,
+                    "title_show_tokens": True,
+                    "title_show_companion": False,
+                    "title_show_coins": False,
+                    "title_show_boss": False,
+                }
+            )
+        new_settings = normalize_settings({**snapshot.settings, **updates})
+        if rebuild:
+            self._optimistic(settings=new_settings)
+        else:
+            snapshot.settings.update(new_settings)
+            with self._lock:
+                self._snapshot = replace(self._snapshot, settings=new_settings)
+            self._sync_status_icon(self._snapshot)
+            self.title = self.render_title(self._snapshot)
+            self._apply_title_attributes(self._snapshot)
+        for k, v in updates.items():
+            self._worker.submit(_CMD_SET_SETTING, (k, v))
+
+    def _header_icon_submenu(
+        self, settings: dict[str, Any], *, label: str = "Header Icon"
+    ) -> rumps.MenuItem:
+        """``Header Icon ▸`` — pick menu-bar icon (Lightning, Companion Sprite, Crown, etc.)."""
+        show_icon = bool(settings.get("title_show_icon", True))
+        current = str(settings.get("title_icon_style", "bolt") or "bolt")
+        if not show_icon:
+            current = "none"
+        return _submenu(
+            label,
+            [
+                _check(
+                    rumps.MenuItem(
+                        _HEADER_ICON_LABELS.get(style, style),
+                        callback=self._make_header_icon_choice(style),
+                    ),
+                    current == style,
+                )
+                for style in SETTINGS_CHOICES["title_icon_style"]
+            ],
+        )
+
+    def _make_header_icon_choice(self, style: str) -> Callable[[Any], None]:
+        def callback(_sender: Any) -> None:
+            self._apply_header_icon_choice(style, rebuild=True)
+
+        return callback
+
+    def _apply_header_icon_choice(self, style: str, *, rebuild: bool = True) -> None:
+        snapshot = self.snapshot()
+        show_icon = style != "none"
+        updates: dict[str, Any] = {
+            "title_icon_style": style,
+            "title_show_icon": show_icon,
+        }
+        new_settings = normalize_settings({**snapshot.settings, **updates})
+        if rebuild:
+            self._optimistic(settings=new_settings)
+        else:
+            snapshot.settings.update(new_settings)
+            with self._lock:
+                self._snapshot = replace(self._snapshot, settings=new_settings)
+            self._sync_status_icon(self._snapshot)
+            self.title = self.render_title(self._snapshot)
+            self._apply_title_attributes(self._snapshot)
+        for k, v in updates.items():
+            self._worker.submit(_CMD_SET_SETTING, (k, v))
+
+    def _belkins_submenu(self, snapshot: UiSnapshot) -> rumps.MenuItem:
+        """``Belkins Cyber-Forge ▸`` — Companion animations, stage morphing, Vault relics, and Boss strike."""
+        settings = snapshot.settings
+        anim_on = bool(
+            settings.get("belkins_animations_enabled", SETTINGS_DEFAULTS["belkins_animations_enabled"])
+        )
+        children: list[Any] = [
+            _check(
+                rumps.MenuItem(
+                    self._switch_label("Idle animations", anim_on),
+                    callback=self._make_setting_toggle("belkins_animations_enabled"),
+                ),
+                anim_on,
+            ),
+        ]
+        try:
+            from .belkins_game import (
+                EVOLUTION_LINE,
+                SHOP_CATALOG,
+                companion_from_snapshot,
+                select_companion_stage,
+                strike_raid_boss,
+                toggle_or_buy_shop_item,
+            )
+
+            comp = companion_from_snapshot(snapshot)
+            stage_items: list[Any] = []
+            for st in EVOLUTION_LINE:
+                unlocked = comp.level >= st.min_level
+                active_st = comp.stage.stage == st.stage
+                lbl = f"Stage {st.stage}: {st.name} ({st.passive})"
+                if not unlocked:
+                    lbl += f" — unlocks Lv.{st.min_level}"
+
+                def _morph_cb(_sender: Any, s_num: int = st.stage, lvl: int = comp.level) -> None:
+                    select_companion_stage(s_num, lvl)
+                    self.rebuild_menu()
+
+                stage_items.append(
+                    _check(
+                        rumps.MenuItem(lbl, callback=_morph_cb if unlocked else None),
+                        active_st,
+                    )
+                )
+            children.append(_submenu(f"Companion Form: {comp.stage.name}", stage_items))
+
+            vault_items: list[Any] = []
+            owned_slugs = {it.slug for it in comp.shop_items if it.owned}
+            eq_slugs = set(comp.equipped_items)
+            for item_spec in SHOP_CATALOG:
+                is_eq = item_spec.slug in eq_slugs
+                is_own = item_spec.slug in owned_slugs
+                status_tag = "EQUIPPED" if is_eq else ("OWNED" if is_own else f"🪙 {item_spec.price}")
+
+                def _vault_cb(_sender: Any, slug: str = item_spec.slug, earned: int = comp.coins_earned) -> None:
+                    toggle_or_buy_shop_item(slug, earned)
+                    self.rebuild_menu()
+
+                vault_items.append(
+                    _check(
+                        rumps.MenuItem(
+                            f"{item_spec.icon} {item_spec.name} ({status_tag})",
+                            callback=_vault_cb,
+                        ),
+                        is_eq,
+                    )
+                )
+            children.append(_submenu(f"Spark Vault (🪙 {comp.coins_available:,})", vault_items))
+
+            def _strike_cb(_sender: Any) -> None:
+                live = companion_from_snapshot(self.snapshot())
+                strike_raid_boss(live)
+                self.rebuild_menu()
+
+            children.append(
+                rumps.MenuItem(
+                    f"⚔️ Strike Boss: {comp.boss.spec.name} ({comp.boss.hp_current:,}/{comp.boss.hp_max:,} HP)",
+                    callback=_strike_cb,
+                )
+            )
+        except Exception:
+            pass
+        return _submenu("Belkins Cyber-Forge", children)
 
     def _theme_submenu(self, settings: dict[str, Any]) -> rumps.MenuItem:
         """``Theme ▸ Apple / Dense / Cards / Glance (text) / Classic (text)``.
@@ -8163,8 +8624,26 @@ class CCUsageWidgetApp(rumps.App):
             )
         else:
             children.append(_info("Telegram: run `notify setup` (no notify.json)"))
+        thresh = int(
+            settings.get(
+                "notification_threshold_pct",
+                SETTINGS_DEFAULTS["notification_threshold_pct"],
+            )
+        )
         children.append(
-            _info(f"  alert at {int(settings.get('notification_threshold_pct', 85))}%")
+            _submenu(
+                f"Alert threshold: {thresh}%",
+                [
+                    _check(
+                        rumps.MenuItem(
+                            f"{pct}%",
+                            callback=self._make_setting_value("notification_threshold_pct", pct),
+                        ),
+                        thresh == pct,
+                    )
+                    for pct in _NOTIFICATION_THRESHOLD_CHOICES
+                ],
+            )
         )
         return _submenu("Notifications", children)
 
@@ -8299,9 +8778,30 @@ class CCUsageWidgetApp(rumps.App):
     def _make_setting_toggle(self, key: str) -> Callable[[Any], None]:
         def callback(_sender: Any) -> None:
             snapshot = self.snapshot()
-            target = not bool(snapshot.settings.get(key, True))
-            self._optimistic(settings=normalize_settings({**snapshot.settings, key: target}))
-            self._worker.submit(_CMD_SET_SETTING, (key, target))
+            default_val = bool(SETTINGS_DEFAULTS.get(key, True))
+            target = not bool(snapshot.settings.get(key, default_val))
+            updates: dict[str, Any] = {key: target}
+            if key.startswith("title_"):
+                self._auto_compact = False
+                self._auto_icon_only = False
+                self._title_hidden_streak = 0
+            if key != "title_compact" and key in dict(_TITLE_TOGGLES):
+                if bool(snapshot.settings.get("title_compact", False)):
+                    updates["title_compact"] = False
+                if str(snapshot.settings.get("title_view", "standard") or "standard") != "standard":
+                    updates["title_view"] = "standard"
+                if (
+                    key == "title_show_icon"
+                    and target
+                    and snapshot.settings.get("title_icon_style") == "none"
+                ):
+                    updates["title_icon_style"] = "bolt"
+            elif key == "title_compact":
+                if str(snapshot.settings.get("title_view", "standard") or "standard") != "standard":
+                    updates["title_view"] = "compact" if target else "standard"
+            self._optimistic(settings=normalize_settings({**snapshot.settings, **updates}))
+            for k, v in updates.items():
+                self._worker.submit(_CMD_SET_SETTING, (k, v))
 
         return callback
 
@@ -8312,6 +8812,41 @@ class CCUsageWidgetApp(rumps.App):
             self._worker.submit(_CMD_SET_SETTING, (key, value))
 
         return callback
+
+    def _set_setting_from_theme(self, key: str, value: Any) -> None:
+        """Apply a setting change triggered from an in-card theme control (``keep_open=True``)."""
+        if key == "title_view":
+            self._apply_header_view_choice(str(value), rebuild=False)
+            return
+        if key == "title_icon_style":
+            self._apply_header_icon_choice(str(value), rebuild=False)
+            return
+        snapshot = self.snapshot()
+        updates: dict[str, Any] = {key: value}
+        if key.startswith("title_"):
+            self._auto_compact = False
+            self._auto_icon_only = False
+            self._title_hidden_streak = 0
+        if key != "title_compact" and key in dict(_TITLE_TOGGLES):
+            if bool(snapshot.settings.get("title_compact", False)):
+                updates["title_compact"] = False
+            if str(snapshot.settings.get("title_view", "standard") or "standard") != "standard":
+                updates["title_view"] = "standard"
+            if (
+                key == "title_show_icon"
+                and value
+                and snapshot.settings.get("title_icon_style") == "none"
+            ):
+                updates["title_icon_style"] = "bolt"
+        new_settings = normalize_settings({**snapshot.settings, **updates})
+        snapshot.settings.update(new_settings)
+        with self._lock:
+            self._snapshot = replace(self._snapshot, settings=new_settings)
+        self._sync_status_icon(self._snapshot)
+        self.title = self.render_title(self._snapshot)
+        self._apply_title_attributes(self._snapshot)
+        for k, v in updates.items():
+            self._worker.submit(_CMD_SET_SETTING, (k, v))
 
     def _make_codex_account_toggle(
         self, account_id: str, enabled: bool

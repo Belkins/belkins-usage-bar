@@ -92,6 +92,8 @@ class ThemeActions:
     open_url: Callable[[str], bool] = lambda _url: False
     refresh: Callable[[], Any] = _noop
     open_dashboard: Callable[[], Any] = _noop
+    set_setting: Callable[[str, Any], Any] = _noop
+    toggle_autoswitch: Callable[[], Any] = _noop
     attention_extras: tuple[str, ...] = field(default_factory=tuple)
 
 

@@ -647,11 +647,33 @@ def _shop_save_path() -> Any:
     return Path.home() / ".claude" / "cc-usage-widget" / "belkins_shop.json"
 
 
+_GAME_SAVE_CACHE: dict[str, dict[str, Any]] = {}
+
+
+def _clone_game_save(st: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "owned": set(st.get("owned") or ()),
+        "equipped": set(st.get("equipped") or ()),
+        "candies_fed": int(st.get("candies_fed", 0) or 0),
+        "boss_tier": int(st.get("boss_tier", 1) or 1),
+        "boss_damage": int(st.get("boss_damage", 0) or 0),
+        "bosses_slain": int(st.get("bosses_slain", 0) or 0),
+        "bonus_coins": int(st.get("bonus_coins", 0) or 0),
+        "bonus_xp": int(st.get("bonus_xp", 0) or 0),
+        "selected_stage": int(st.get("selected_stage", 0) or 0),
+    }
+
+
 def load_game_save() -> dict[str, Any]:
-    """Return full persistent game state from ``belkins_shop.json``."""
+    """Return full persistent game state from ``belkins_shop.json`` (cached in memory for zero-I/O menu rebuilds)."""
     import json
 
     path = _shop_save_path()
+    key = str(path)
+    cached = _GAME_SAVE_CACHE.get(key)
+    if cached is not None:
+        return _clone_game_save(cached)
+
     default: dict[str, Any] = {
         "owned": set(),
         "equipped": set(),
@@ -670,7 +692,7 @@ def load_game_save() -> dict[str, Any]:
                 valid = {it.slug for it in SHOP_CATALOG}
                 owned = {str(s) for s in (data.get("owned") or ()) if str(s) in valid}
                 equipped = {str(s) for s in (data.get("equipped") or ()) if str(s) in owned}
-                return {
+                parsed = {
                     "owned": owned,
                     "equipped": equipped,
                     "candies_fed": max(0, int(data.get("candies_fed", 0) or 0)),
@@ -681,8 +703,11 @@ def load_game_save() -> dict[str, Any]:
                     "bonus_xp": max(0, int(data.get("bonus_xp", 0) or 0)),
                     "selected_stage": max(0, int(data.get("selected_stage", 0) or 0)),
                 }
+                _GAME_SAVE_CACHE[key] = _clone_game_save(parsed)
+                return parsed
     except Exception:
         pass
+    _GAME_SAVE_CACHE[key] = _clone_game_save(default)
     return default
 
 
@@ -691,21 +716,28 @@ def save_game_state(state: dict[str, Any]) -> bool:
     import json
 
     path = _shop_save_path()
+    key = str(path)
+    owned = set(state.get("owned") or ())
+    equipped = set(state.get("equipped") or ()) & owned
+    clean = {
+        "owned": owned,
+        "equipped": equipped,
+        "candies_fed": max(0, int(state.get("candies_fed", 0) or 0)),
+        "boss_tier": max(1, int(state.get("boss_tier", 1) or 1)),
+        "boss_damage": max(0, int(state.get("boss_damage", 0) or 0)),
+        "bosses_slain": max(0, int(state.get("bosses_slain", 0) or 0)),
+        "bonus_coins": int(state.get("bonus_coins", 0) or 0),
+        "bonus_xp": max(0, int(state.get("bonus_xp", 0) or 0)),
+        "selected_stage": max(0, int(state.get("selected_stage", 0) or 0)),
+    }
+    _GAME_SAVE_CACHE[key] = _clone_game_save(clean)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
-        owned = set(state.get("owned") or ())
-        equipped = set(state.get("equipped") or ()) & owned
         payload = {
+            **clean,
             "owned": sorted(owned),
             "equipped": sorted(equipped),
-            "candies_fed": max(0, int(state.get("candies_fed", 0) or 0)),
-            "boss_tier": max(1, int(state.get("boss_tier", 1) or 1)),
-            "boss_damage": max(0, int(state.get("boss_damage", 0) or 0)),
-            "bosses_slain": max(0, int(state.get("bosses_slain", 0) or 0)),
-            "bonus_coins": int(state.get("bonus_coins", 0) or 0),
-            "bonus_xp": max(0, int(state.get("bonus_xp", 0) or 0)),
-            "selected_stage": max(0, int(state.get("selected_stage", 0) or 0)),
         }
         tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         tmp.replace(path)

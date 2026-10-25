@@ -349,6 +349,82 @@ def _appkit() -> Any | None:
     return AppKit
 
 
+ICON_STYLE_SYMBOLS: dict[str, tuple[str, ...]] = {
+    "bolt": ("bolt.fill", "bolt.horizontal.fill"),
+    "bars": ("chart.bar.fill", "chart.bar"),
+    "flame": ("flame.fill", "flame"),
+    "cpu": ("cpu.fill", "cpu", "memorychip.fill"),
+    "crown": ("crown.fill", "crown", "star.fill"),
+    "shield": ("shield.lefthalf.filled", "bolt.shield.fill", "shield.fill"),
+    "sparkles": ("sparkles", "wand.and.stars", "star.fill"),
+    "arrows": ("arrow.left.arrow.right", "arrow.triangle.2.circlepath"),
+}
+
+
+def companion_sprite_icon(stage_num: int = 1, *, mono: bool = False) -> Any | None:
+    """Render the active Belkins Companion 12x12 pixel sprite as a menu-bar NSImage."""
+    AppKit = _appkit()
+    if AppKit is None:
+        return None
+    try:
+        from .themes.belkins import _SPRITES, _STAGE_COLORS
+    except Exception:
+        return status_icon()
+
+    grid = _SPRITES.get(stage_num) or _SPRITES.get(1)
+    if not grid:
+        return status_icon()
+    body_rgb, acc_rgb, glow_rgb = _STAGE_COLORS.get(stage_num, _STAGE_COLORS[1])
+
+    size = 15.0
+    px = 1.15
+    ox = (size - 12 * px) / 2.0
+    oy = (size - 12 * px) / 2.0
+    try:
+        image = AppKit.NSImage.alloc().initWithSize_(AppKit.NSMakeSize(size, size))
+        image.lockFocus()
+        try:
+            for r_idx, row_str in enumerate(reversed(grid)):
+                for c_idx, ch in enumerate(row_str):
+                    if ch == ".":
+                        continue
+                    if mono:
+                        if ch == "E":
+                            continue
+                        col = AppKit.NSColor.blackColor()
+                    elif ch == "O":
+                        col = AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(*body_rgb, 1.0)
+                    elif ch == "A":
+                        col = AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(*acc_rgb, 1.0)
+                    elif ch == "W":
+                        col = AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(*glow_rgb, 1.0)
+                    elif ch == "E":
+                        col = AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(0.08, 0.09, 0.12, 1.0)
+                    else:
+                        continue
+                    col.setFill()
+                    rect = AppKit.NSMakeRect(ox + c_idx * px, oy + r_idx * px, px + 0.15, px + 0.15)
+                    AppKit.NSBezierPath.fillRect_(rect)
+        finally:
+            image.unlockFocus()
+        image.setTemplate_(bool(mono))
+        return image
+    except Exception:
+        return status_icon()
+
+
+def status_icon_for_style(style: str = "bolt", *, stage_num: int = 1) -> Any | None:
+    """Resolve the status-bar NSImage for the chosen ``title_icon_style``."""
+    if style == "none":
+        return None
+    if style == "companion":
+        return companion_sprite_icon(stage_num, mono=False)
+    if style == "companion_mono":
+        return companion_sprite_icon(stage_num, mono=True)
+    symbols = ICON_STYLE_SYMBOLS.get(style, ICON_STYLE_SYMBOLS["bolt"])
+    return status_icon(symbols)
+
+
 def status_icon(symbols: Sequence[str] = ()) -> Any | None:
     """A template NSImage for the status item, or ``None`` to keep text.
 
