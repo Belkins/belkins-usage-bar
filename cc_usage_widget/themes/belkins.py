@@ -1396,12 +1396,28 @@ def _claude_tip(A: Any, row: Any, now: float, note: str = "", accounts: tuple = 
     return "\n".join(parts)
 
 
+def _nice_plan_label(raw_plan: str | None, fallback: str = "") -> str:
+    raw = str(raw_plan or "").strip()
+    low = raw.lower().replace("_", "").replace("-", "").replace(" ", "")
+    mapped = {
+        "promax": "Pro Max",
+        "pro": "Pro",
+        "plus": "Plus",
+        "max": "Max",
+        "team": "Team",
+        "business": "Business",
+        "enterprise": "Enterprise",
+        "free": "Free",
+    }.get(low)
+    return mapped or fallback or raw
+
+
 def _claude_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) -> dict[str, Any] | None:
     if not snap.accounts:
         return None
     models = tuple(snap.autoswitch_models or ())
     notes = snap.account_notes
-    active = snap.active
+    active = snap.active or next((r for r in snap.accounts if getattr(r, "is_active", False)), None)
     room = A._claude_room(snap)
     right = []
     if room:
@@ -1435,10 +1451,11 @@ def _claude_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) -
                     R.severity(sp) if sp else "dim",
                 )
             )
+        raw_plan = A._claude_plan_text(accounts, active) or A.plan_label(active.plan_type)
         hero = {
             "name": A._display_name(active),
             "slot": active.slot,
-            "plan": A._claude_plan_text(accounts, active) or A.plan_label(active.plan_type),
+            "plan": _nice_plan_label(active.plan_type, raw_plan),
             "sub": active.email,
             "raw_pct": binding[1] if binding else None,
             "big": (format_pct(binding[1]), binding[0], R.severity(binding[1])) if binding else None,
@@ -1460,6 +1477,7 @@ def _claude_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) -
     targets = [r for r in A._switch_targets(snap.accounts) if r.slot not in notes]
     nxt = next((r for r in targets if not r.disabled), None)
     rows = []
+    toggle_fn = getattr(actions, "toggle_slot_disabled", None)
     for r in targets:
         binding = A._binding_window(r, models)
         caps = []
@@ -1472,12 +1490,30 @@ def _claude_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) -
             caps.append(("disabled · bswap enable", "dim"))
         if r.usage_is_stale:
             caps.append((f"{A._age_label(r.usage_age_seconds)} old", "dim"))
+        if r.five_hour_pct is not None and r.seven_day_pct is not None:
+            dual_win = f"5h {format_pct(r.five_hour_pct)}  ·  7d {format_pct(r.seven_day_pct)}"
+        elif binding and binding[1] is not None:
+            dual_win = f"{binding[0]} {format_pct(binding[1])}"
+        else:
+            dual_win = r.email or ""
+        free_pct = (
+            max(0, 100 - int(round(float(binding[1]))))
+            if (binding and binding[1] is not None)
+            else None
+        )
         rows.append(
             {
                 "key": f"belkins-claude-{r.slot}",
                 "slot": f"#{r.slot}",
+                "slot_num": r.slot,
                 "name": A._display_name(r),
-                "plan": A.plan_label(r.plan_type),
+                "plan": _nice_plan_label(r.plan_type, A.plan_label(r.plan_type)),
+                "email": r.email or "",
+                "dual_win": dual_win,
+                "free_pct": free_pct,
+                "disabled": bool(r.disabled),
+                "is_next": bool(r is nxt),
+                "needs_relogin": False,
                 "label": binding[0] if binding else "",
                 "pct": binding[1] if binding else None,
                 "sev": R.severity(binding[1]) if binding else "dim",
@@ -1486,14 +1522,45 @@ def _claude_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) -
                 "captions": caps,
                 "tip": _claude_tip(A, r, now, accounts=accounts),
                 "action": (lambda slot=r.slot: actions.switch_to(slot)),
+                "toggle_disable_action": (
+                    (lambda slot=r.slot: toggle_fn(slot)) if callable(toggle_fn) else None
+                ),
             }
         )
+
+    thr = getattr(snap, "autoswitch_threshold", 85.0)
+    thr_int = int(round(float(thr if thr is not None else 85.0)))
+    auto_on = bool(getattr(snap, "autoswitch_enabled", True))
+    header_pills: list[tuple[str, str, str, Callable[[], Any]]] = [
+        (
+            f"⚡ Auto {thr_int}%" if auto_on else "Auto OFF",
+            "good_text" if auto_on else "belkins_cmm_sub",
+            "belkins_good_pill" if auto_on else "belkins_plan_pill",
+            actions.toggle_autoswitch,
+        ),
+    ]
+    if nxt is not None and callable(actions.switch_best):
+        header_pills.append(
+            ("⚡ Best", "belkins_cmm_aqua", "belkins_tab_active_glass", actions.switch_best)
+        )
+    relogin_fn = getattr(actions, "claude_relogin", None)
+    header_pills.append(
+        (
+            "+ Add",
+            "belkins_flame_text",
+            "belkins_flame_pill",
+            relogin_fn if callable(relogin_fn) else (lambda: _copy_cmd_to_pasteboard("bswap add")),
+        )
+    )
     return {
-        "title": "Claude",
+        "title": "Claude Party",
         "icon": "sparkles",
         "rule": "belkins_claude_rule",
         "right": " · ".join(right),
         "right_parts": right,
+        "room_badge": f"{room[0]}/{len(accounts)} ready" if room else f"{len(accounts)} slots",
+        "header_pills": header_pills,
+        "relogin_action": relogin_fn if callable(relogin_fn) else (lambda: _copy_cmd_to_pasteboard("bswap add")),
         "hero": hero,
         "rows": rows,
         "total_count": len(accounts),
@@ -1566,7 +1633,7 @@ def _codex_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) ->
             caps_compact.append(("Log in again…", "accent"))
         hero = {
             "name": A._quota_alias(active),
-            "plan": A.plan_label(active.plan_type),
+            "plan": _nice_plan_label(active.plan_type, A.plan_label(active.plan_type)),
             "slot": None,
             "sub": active.email,
             "raw_pct": win[1] if known else None,
@@ -1585,21 +1652,36 @@ def _codex_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) ->
         if r is active or A._quota_alarm(r):
             continue
         win = A._plan_window(r)
-        act = actions.codex_login_for(r)
+        relogin_act = actions.codex_login_for(r)
+        act = relogin_act
         row_alias = A._quota_alias(r)
         if act is None and row_alias:
             act = (lambda target=row_alias: actions.switch_codex(target))
         caps = _codex_caps(A, r, compact=True)
         if r is best:
             caps.insert(0, ("BEST", "tag"))
-        if actions.codex_login_for(r) is not None:
+        if relogin_act is not None:
             caps.append(("Log in again…", "accent"))
+        plan_nice = _nice_plan_label(r.plan_type, A.plan_label(r.plan_type))
+        sub_parts = [p for p in (plan_nice, r.email) if p]
+        free_pct = (
+            max(0, 100 - int(round(float(win[1]))))
+            if (win and win[1] is not None and not win[2])
+            else None
+        )
         rows.append(
             {
                 "key": f"belkins-codex-{r.slot}",
                 "slot": "",
+                "slot_num": r.slot,
                 "name": row_alias,
-                "plan": A.plan_label(r.plan_type),
+                "plan": plan_nice,
+                "email": r.email or "",
+                "dual_win": " · ".join(sub_parts),
+                "free_pct": free_pct,
+                "disabled": bool(r.disabled),
+                "is_next": bool(r is best),
+                "needs_relogin": bool(relogin_act is not None),
                 "label": "",
                 "pct": win[1] if win else None,
                 "sev": "dim" if (not win or win[2]) else R.severity(win[1]),
@@ -1608,14 +1690,34 @@ def _codex_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) ->
                 "captions": caps,
                 "tip": _codex_tip(A, r, now),
                 "action": act,
+                "toggle_disable_action": None,
             }
         )
+
+    header_pills: list[tuple[str, str, str, Callable[[], Any]]] = []
+    best_alias = A._quota_alias(best) if (best is not None and not best.is_active) else ""
+    if best_alias and callable(actions.switch_codex):
+        header_pills.append(
+            (
+                "⚡ Best",
+                "belkins_cmm_aqua",
+                "belkins_tab_active_glass",
+                lambda target=best_alias: actions.switch_codex(target),
+            )
+        )
+    new_login_fn = getattr(actions, "codex_new_login", None)
+    if callable(new_login_fn):
+        header_pills.append(
+            ("+ Login", "good_text", "belkins_good_pill", new_login_fn)
+        )
     return {
-        "title": "Codex",
+        "title": "Codex Party",
         "icon": "terminal.fill",
         "rule": "belkins_codex_rule",
         "right": " · ".join(right),
         "right_parts": right,
+        "room_badge": f"{parts.room}/{parts.total} ready" if parts else "",
+        "header_pills": header_pills,
         "hero": hero,
         "rows": rows,
         "total_count": len(live),
@@ -1760,6 +1862,26 @@ def _card_head(spec: dict[str, Any], *, one_line: bool = False, show_chevron: bo
         if show_chevron:
             symbol(pen, "chevron.right", X1 - 7.0, base - 3.8, 8.5, "belkins_cmm_sub", "semibold")
             right_edge = X1 - 12.0
+
+        pills = spec.get("header_pills") or []
+        if pills:
+            cur_r = right_edge
+            for lbl, role, bg, _fn in reversed(pills):
+                pw = _pill_w(pen, lbl)
+                if cur_r - pw < tx + tw + 8.0:
+                    break
+                pen.pill(lbl, cur_r - pw, base - 0.5, F["tag"][0], role=role, bg=bg, weight="semibold")
+                cur_r -= pw + 4.5
+            room_badge = spec.get("room_badge") or ""
+            if room_badge and (tx + tw + 7.0 + text_w(pen, room_badge, "caption_med") <= cur_r - 4.0):
+                text(pen, room_badge, "caption_med", "belkins_cmm_sub", tx + tw + 7.0, base - 0.5)
+            parts = spec.get("right_parts") or []
+            if not one_line and len(parts) >= 2:
+                cap = base + 14.5
+                text(pen, " · ".join(parts), "caption", "belkins_cmm_sub", tx, cap, maxw=X1 - tx)
+                return cap + HEAD_AFTER
+            return base + HEAD_AFTER
+
         room = right_edge - (tx + tw + 10.0)
         parts = spec.get("right_parts") or []
         full = spec["right"]
@@ -1773,6 +1895,26 @@ def _card_head(spec: dict[str, Any], *, one_line: bool = False, show_chevron: bo
         return cap + HEAD_AFTER
 
     return draw
+
+
+def _card_head_click_x(spec: dict[str, Any]) -> Callable[[float], None] | None:
+    pills = spec.get("header_pills") or []
+    if not pills:
+        return None
+
+    def on_click_x(click_x: float) -> None:
+        m = _Measure()
+        cur_r = X1
+        for lbl, _role, _bg, fn in reversed(pills):
+            pw = _pill_w(m, lbl)
+            x_start = cur_r - pw - 2.0
+            x_end = cur_r + 2.0
+            if x_start <= click_x <= x_end and callable(fn):
+                fn()
+                return
+            cur_r -= pw + 4.5
+
+    return on_click_x
 
 
 def _hero(hero: dict[str, Any], *, compact: bool = False) -> Callable[[Any, float], float]:
@@ -1882,7 +2024,16 @@ def _hero(hero: dict[str, Any], *, compact: bool = False) -> Callable[[Any, floa
             )
             pct_role = "belkins_cmm_sub" if expired else (SEV_TEXT[sev] if sev != "ok" else "label")
             text(pen, format_pct(pct), "num_bar", pct_role, COL_PCT_R, b, right=True)
-            text(pen, "↺ ended" if expired else mark, "num_small", "belkins_cmm_sub", px1, b, right=True)
+            text(
+                pen,
+                "↺ ended" if expired else mark,
+                "num_small",
+                "belkins_cmm_sub",
+                px1,
+                b,
+                right=True,
+                maxw=max(32.0, px1 - COL_PCT_R - 6.0),
+            )
             ink = b + INK
 
         caps_source = hero.get("captions_compact") if compact and "captions_compact" in hero else hero["captions"]
@@ -1937,33 +2088,117 @@ def _hero(hero: dict[str, Any], *, compact: bool = False) -> Callable[[Any, floa
 
 def _row(r: dict[str, Any]) -> Callable[[Any, float], float]:
     def draw(pen: Any, y0: float) -> float:
-        x = X0 + 18.0 if r["slot"] else X0 + 4.0
-        label_w = text_w(pen, r["label"], "caption") if r["label"] else 0.0
-        row_end_x = (COL_LABEL_R - label_w - 6.0) if r["label"] else (COL_BAR_X - 6.0)
-        avail_w = max(48.0, row_end_x - x)
+        x = X0 + 20.0 if r["slot"] else X0 + 4.0
+        b1 = y0 + 15.0
+        b2 = b1 + 15.0
 
-        tag_cap = next((c[0] for c in r["captions"] if c[1] == "tag"), "")
-        tag_w = (_pill_w(pen, tag_cap) + 5.0) if tag_cap else 0.0
+        # 1. Right-side interactive action pills on Line 1 (`b1`)
+        right_edge = X1
+        disabled = bool(r.get("disabled", False))
+        needs_relogin = bool(r.get("needs_relogin", False))
+        has_toggle = callable(r.get("toggle_disable_action"))
+        free_pct = r.get("free_pct")
 
-        b = y0 + ROW_BASE
-        if r["slot"]:
-            text(pen, r["slot"], "slot", "belkins_flame_text", X0 + 14.0, b, right=True)
-        nw = text(pen, r["name"], "primary_med", "label", x, b, maxw=max(40.0, avail_w - tag_w))
-        if tag_cap and (nw + tag_w <= avail_w + 2.0):
+        if disabled:
+            btn_lbl = "▶ ENABLE"
+            btn_w = _pill_w(pen, btn_lbl)
             pen.pill(
-                tag_cap,
-                x + nw + 5.0,
-                b - 0.5,
+                btn_lbl,
+                right_edge - btn_w,
+                b1 - 0.5,
+                F["tag"][0],
+                role="warn_text",
+                bg="belkins_warn_pill",
+                weight="semibold",
+            )
+            right_edge -= btn_w + 6.0
+        elif needs_relogin:
+            btn_lbl = "🔑 RE-LOGIN"
+            btn_w = _pill_w(pen, btn_lbl)
+            pen.pill(
+                btn_lbl,
+                right_edge - btn_w,
+                b1 - 0.5,
                 F["tag"][0],
                 role="belkins_flame_text",
                 bg="belkins_flame_pill",
+                weight="semibold",
+            )
+            right_edge -= btn_w + 6.0
+        else:
+            if has_toggle:
+                pause_lbl = "⏸"
+                pw_pause = _pill_w(pen, pause_lbl)
+                pen.pill(
+                    pause_lbl,
+                    right_edge - pw_pause,
+                    b1 - 0.5,
+                    F["tag"][0],
+                    role="belkins_cmm_sub",
+                    bg="belkins_plan_pill",
+                    weight="semibold",
+                )
+                right_edge -= pw_pause + 4.5
+            if free_pct is not None:
+                if free_pct <= 0:
+                    sw_lbl = "CAPPED"
+                    sw_role, sw_bg = "crit_text", "belkins_crit_pill"
+                elif free_pct <= 35:
+                    sw_lbl = f"⚡ {free_pct}% FREE"
+                    sw_role, sw_bg = "warn_text", "belkins_warn_pill"
+                else:
+                    sw_lbl = f"⚡ {free_pct}% FREE"
+                    sw_role, sw_bg = "good_text", "belkins_good_pill"
+                sw_w = _pill_w(pen, sw_lbl)
+                pen.pill(
+                    sw_lbl,
+                    right_edge - sw_w,
+                    b1 - 0.5,
+                    F["tag"][0],
+                    role=sw_role,
+                    bg=sw_bg,
+                    weight="semibold",
+                )
+                right_edge -= sw_w + 6.0
+
+        # 2. Left-side Account Identity on Line 1 (`b1`): `#slot` + `name` + `NEXT`/`BEST`/`PAUSED` + `PLAN`
+        if r["slot"]:
+            text(pen, r["slot"], "slot", "belkins_flame_text", X0 + 16.0, b1, right=True)
+
+        tag_cap = "PAUSED" if disabled else next((c[0] for c in r["captions"] if c[1] == "tag"), "")
+        tag_w = (_pill_w(pen, tag_cap) + 5.0) if tag_cap else 0.0
+        avail_w = max(48.0, right_edge - x)
+        name_role = "belkins_cmm_sub" if disabled else "label"
+        nw = text(pen, r["name"], "primary_med", name_role, x, b1, maxw=max(42.0, avail_w - tag_w))
+        cur_x = x + nw
+        if tag_cap and (cur_x + tag_w <= right_edge + 2.0):
+            t_role = "warn_text" if disabled else "belkins_flame_text"
+            t_bg = "belkins_warn_pill" if disabled else "belkins_flame_pill"
+            pen.pill(
+                tag_cap,
+                cur_x + 5.0,
+                b1 - 0.5,
+                F["tag"][0],
+                role=t_role,
+                bg=t_bg,
                 weight=F["tag"][1],
             )
-        elif r["plan"] and not tag_cap:
-            plan_s = r["plan"].split("·")[0].strip()
-            if nw + 5.5 + text_w(pen, plan_s, "caption") <= avail_w:
-                text(pen, plan_s, "caption", "belkins_cmm_sub", x + nw + 5.5, b)
+            cur_x += tag_w
+        if r.get("plan") and r["slot"]:
+            plan_tag = r["plan"].split("·")[0].strip().upper()
+            pw_plan = _pill_w(pen, plan_tag) + 5.0
+            if plan_tag and (cur_x + pw_plan <= right_edge):
+                pen.pill(
+                    plan_tag,
+                    cur_x + 5.0,
+                    b1 - 0.5,
+                    F["tag"][0],
+                    role="belkins_plan_text",
+                    bg="belkins_plan_pill",
+                    weight="semibold",
+                )
 
+        # 3. Line 2 (`b2`): Dual-window (`5h 0% · 7d 0%`) or Codex (`Pro · email`) on Left + Stamina Bar & Reset on Right
         if r.get("withheld"):
             note, kind = r["withheld"]
             text(
@@ -1971,34 +2206,106 @@ def _row(r: dict[str, Any]) -> Callable[[Any, float], float]:
                 "⚠ " + note,
                 "secondary_med",
                 "crit_text" if kind == "crit" else "warn_text",
-                X1,
-                b,
-                right=True,
-                maxw=X1 - COL_BAR_X,
+                x,
+                b2,
+                maxw=X1 - x,
             )
+        elif r["slot"]:
+            # Claude row: `5h 0% · 7d 0%` already shows both percentages on the left; draw stamina bar + reset mark on the right
+            dual_s = r.get("dual_win") or r.get("email") or ""
+            bar_x = 176.0
+            bar_w = 70.0
+            if dual_s:
+                text(pen, dual_s, "caption_med", "belkins_cmm_sub", x, b2, maxw=max(40.0, bar_x - 8.0 - x))
+            luxury_bar(
+                pen,
+                bar_x,
+                b2 - 3.8,
+                bar_w,
+                r["pct"],
+                "dim" if disabled else r["sev"],
+                h=4.6,
+                expired=disabled,
+            )
+            if r["reset"]:
+                text(
+                    pen,
+                    r["reset"],
+                    "num_small",
+                    "belkins_cmm_sub",
+                    X1,
+                    b2,
+                    right=True,
+                    maxw=max(32.0, X1 - (bar_x + bar_w) - 6.0),
+                )
         else:
-            if r["label"]:
-                text(pen, r["label"], "caption", "belkins_cmm_sub", COL_LABEL_R, b, right=True)
-            luxury_bar(pen, COL_BAR_X, b - 3.8, COL_BAR_W, r["pct"], r["sev"], h=5.0)
+            # Codex row: `Pro · email` on the left, stamina bar + `%` + reset mark on the right
+            dual_s = r.get("dual_win") or r.get("email") or ""
+            bar_x = 176.0
+            bar_w = 50.0
+            pct_r = 260.0
+            if dual_s:
+                text(pen, dual_s, "caption_med", "belkins_cmm_sub", x, b2, maxw=max(40.0, bar_x - 8.0 - x))
+            luxury_bar(
+                pen,
+                bar_x,
+                b2 - 3.8,
+                bar_w,
+                r["pct"],
+                "dim" if disabled else r["sev"],
+                h=4.6,
+                expired=disabled,
+            )
             if r["pct"] is not None:
+                pct_role = (
+                    "belkins_cmm_sub"
+                    if disabled
+                    else (SEV_TEXT[r["sev"]] if r["sev"] != "ok" else "label")
+                )
                 text(
                     pen,
                     format_pct(r["pct"]),
                     "num",
-                    SEV_TEXT[r["sev"]] if r["sev"] != "ok" else "label",
-                    COL_PCT_R,
-                    b,
+                    pct_role,
+                    pct_r,
+                    b2,
                     right=True,
                 )
-            text(pen, r["reset"], "num_small", "belkins_cmm_sub", X1, b, right=True)
+            if r["reset"]:
+                text(
+                    pen,
+                    r["reset"],
+                    "num_small",
+                    "belkins_cmm_sub",
+                    X1,
+                    b2,
+                    right=True,
+                    maxw=max(32.0, X1 - pct_r - 6.0),
+                )
 
-        urgent_caps = [c for c in r["captions"] if c[1] in ("crit", "accent")]
-        if not urgent_caps:
-            return b + ROW_END
-        lines = flow(pen, urgent_caps, x, b + ROW_CAP, X1 - x)
-        return b + ROW_CAP + CAP_STEP * (lines - 1) + ROW_END
+        return b2 + ROW_END
 
     return draw
+
+
+def _row_click_x(r: dict[str, Any]) -> Callable[[float], None] | None:
+    toggle_fn = r.get("toggle_disable_action")
+    act_fn = r.get("action")
+    if not callable(toggle_fn):
+        return None
+    disabled = bool(r.get("disabled", False))
+
+    def on_click_x(click_x: float) -> None:
+        if disabled and click_x >= (X1 - 70.0):
+            toggle_fn()
+            return
+        if (not disabled) and click_x >= (X1 - 26.0):
+            toggle_fn()
+            return
+        if callable(act_fn):
+            act_fn()
+
+    return on_click_x
 
 
 def _ax(tip: str) -> str:
@@ -2017,61 +2324,152 @@ def _copy_cmd_to_pasteboard(cmd: str = "bswap add") -> None:
         pass
 
 
-def _provider_card(spec: dict[str, Any], attn_items: list[dict[str, Any]] | None = None) -> _Card:
+def _provider_card(
+    spec: dict[str, Any],
+    attn_items: list[dict[str, Any]] | None = None,
+    *,
+    key_prefix: str = "belkins",
+    expand_attn: bool = False,
+) -> _Card:
     card = _Card("belkins_card", "belkins_card_edge", rule=spec.get("rule"))
     key = spec["key"]
+    head_click_x = _card_head_click_x(spec)
+    relogin_fn = spec.get("relogin_action") or (lambda: _copy_cmd_to_pasteboard("bswap add"))
     card.add(
-        _card_head(spec, one_line=True),
-        key=f"belkins-{key}-head",
+        _card_head(spec, one_line=(not expand_attn)),
+        key=f"{key_prefix}-{key}-head",
         ax=f"{spec['title']}. {spec['right']}".strip(". "),
-        tooltip=spec["right"],
+        tooltip=spec["right"] or spec["title"],
+        action=spec.get("header_pills", ((None, None, None, None),))[0][3] if spec.get("header_pills") else None,
+        on_click_x=head_click_x,
+        keep_open=True,
+        no_hover_bg=True,
     )
     hero = spec["hero"]
     if hero:
         card.add(
-            _hero(hero, compact=True),
-            key=f"belkins-{key}-active",
+            _hero(hero, compact=(not expand_attn)),
+            key=f"{key_prefix}-{key}-active",
             tooltip=hero["tip"],
             ax=_ax(hero["tip"]),
             action=hero["action"],
             **ROW_HL,
         )
     if spec["rows"]:
-        card.add(_hair(), key=f"belkins-{key}-rule")
+        card.add(_hair(), key=f"{key_prefix}-{key}-rule")
         for r in spec["rows"]:
+            row_key = r["key"] if key_prefix == "belkins" else r["key"].replace("belkins-", f"{key_prefix}-", 1)
+            row_cx = _row_click_x(r)
             card.add(
                 _row(r),
-                key=r["key"],
+                key=row_key,
                 tooltip=r["tip"],
                 ax=_ax(r["tip"]),
                 action=r["action"],
+                on_click_x=row_cx,
                 **ROW_HL,
             )
     if attn_items:
-        card.add(_hair(), key=f"belkins-{key}-attn-rule")
-        if len(attn_items) >= 2:
-            tips = "\n".join(it["tip"] for it in attn_items) + "\nClick to copy `bswap add` to clipboard"
+        card.add(_hair(), key=f"{key_prefix}-{key}-attn-rule")
+
+        def _trigger_relogin() -> None:
+            _copy_cmd_to_pasteboard("bswap add")
+            if callable(relogin_fn):
+                relogin_fn()
+
+        if len(attn_items) >= 2 and not expand_attn:
+            tips = "\n".join(it["tip"] for it in attn_items) + "\nClick to launch `claude login && bswap add` in Terminal (and copy `bswap add`)"
             card.add(
                 _attn_grouped_item(attn_items, show_tab_hint=False),
-                key=f"belkins-{key}-attn-grouped",
+                key=f"{key_prefix}-{key}-attn-grouped",
                 tooltip=tips,
                 ax=_ax(tips),
-                action=lambda: _copy_cmd_to_pasteboard("bswap add"),
-                keep_open=True,
+                action=_trigger_relogin,
+                keep_open=False,
                 **ROW_HL,
             )
         else:
-            it = attn_items[0]
-            act = it["action"] or (lambda: _copy_cmd_to_pasteboard("bswap add"))
-            card.add(
-                _attn_item(it),
-                key=f"belkins-{key}-attn-single",
-                tooltip=it["tip"],
-                ax=_ax(it["tip"]),
-                action=act,
-                **ROW_HL,
-            )
-    card.add(_gap(6), key=f"belkins-{key}-foot")
+            for idx, it in enumerate(attn_items):
+                act = it["action"] or _trigger_relogin
+                it_key = (
+                    f"{key_prefix}-{key}-attn-single"
+                    if len(attn_items) == 1
+                    else f"{key_prefix}-{key}-attn-item-{idx}"
+                )
+                card.add(
+                    _attn_item(it),
+                    key=it_key,
+                    tooltip=it["tip"],
+                    ax=_ax(it["tip"]),
+                    action=act,
+                    **ROW_HL,
+                )
+    card.add(_gap(6), key=f"{key_prefix}-{key}-foot")
+    return card
+
+
+def _claude_sessions_card(snapshot: Any) -> _Card | None:
+    """Render an Active Claude CLI Sessions card on the dedicated `✨ Claude` tab when CLI sessions are running."""
+    sessions = getattr(snapshot, "sessions", ()) or ()
+    if not sessions:
+        return None
+    card = _Card("belkins_card", "belkins_card_edge", rule="belkins_claude_rule")
+    total_sess = len(sessions)
+
+    # Group sessions by workspace directory basename for crisp display
+    by_dir: dict[str, list[Any]] = {}
+    for s in sessions:
+        cwd = str(getattr(s, "cwd", "") or "").strip()
+        short_dir = cwd.rstrip("/").split("/")[-1] if cwd else "(unknown workspace)"
+        by_dir.setdefault(short_dir, []).append((cwd, s))
+
+    def draw_head(pen: Any, y0: float) -> float:
+        base = y0 + HEAD_BASE
+        symbol(pen, "terminal.fill", X0, base - 4.0, 11.5, "belkins_claude_rule", "semibold")
+        text(pen, "Active Claude CLI Sessions", "title", "label", X0 + 18.0, base)
+        badge = f"{total_sess} running"
+        bw = _pill_w(pen, badge)
+        pen.pill(badge, X1 - bw, base - 0.5, F["tag"][0], role="good_text", bg="belkins_good_pill", weight="semibold")
+        return base + HEAD_AFTER
+
+    card.add(
+        draw_head,
+        key="belkins-claude-sessions-head",
+        ax=f"Active Claude CLI Sessions: {total_sess} running",
+        tooltip=f"{total_sess} active Claude Code CLI processes detected across {len(by_dir)} workspaces",
+    )
+    card.add(_hair(), key="belkins-claude-sessions-rule")
+
+    for idx, (short_dir, items) in enumerate(by_dir.items()):
+        full_cwd = items[0][0] or short_dir
+        cnt = len(items)
+
+        def draw_sess_row(
+            pen: Any,
+            y0: float,
+            name_s: str = short_dir,
+            path_s: str = full_cwd,
+            n_cnt: int = cnt,
+        ) -> float:
+            b = y0 + 15.5
+            pen.circle(X0 + 2.0, b - 6.8, 6.0, "belkins_good_fill")
+            pill_s = f"{n_cnt} {'session' if n_cnt == 1 else 'sessions'}"
+            pw = _pill_w(pen, pill_s)
+            pen.pill(pill_s, X1 - pw, b - 0.5, F["tag"][0], role="belkins_plan_text", bg="belkins_plan_pill", weight="semibold")
+            nw = text(pen, name_s, "primary_med", "label", X0 + 13.0, b, maxw=135.0)
+            short_path = path_s.replace("/Users/vladislavpodolyako", "~")
+            rem_w = max(30.0, (X1 - pw - 8.0) - (X0 + 13.0 + nw + 8.0))
+            text(pen, short_path, "caption", "belkins_cmm_sub", X0 + 13.0 + nw + 8.0, b, maxw=rem_w)
+            return b + 7.5
+
+        card.add(
+            draw_sess_row,
+            key=f"belkins-claude-session-dir-{idx}",
+            ax=f"{short_dir}: {cnt} active Claude sessions ({full_cwd})",
+            tooltip=f"{full_cwd}\n{cnt} active Claude Code CLI session(s)",
+        )
+
+    card.add(_gap(6.0), key="belkins-claude-sessions-foot")
     return card
 
 
@@ -2411,174 +2809,46 @@ def _hub_bento_blocks(
     attn: dict[str, Any] | None,
     actions: ThemeActions,
 ) -> list[Block]:
-    """Build Game Party / Raid & Auto-Switch Banner + 2x2 Bento Grid (`Claude | Codex` and `Today Burn | 30d Spend`)."""
-    from .. import card_base as _cb
-
+    """Build Unified Dual-Party Command Center (`Claude Party Card` + `Codex Party Card` + `Today Burn | 30d Spend & Sessions`)."""
     out: list[Block] = []
     tile_gap = 8.0
     tile_w = (W - 2 * CARD_X - tile_gap) / 2.0
     lx0 = CARD_X
     rx0 = CARD_X + tile_w + tile_gap
     companion = companion_from_snapshot(snapshot)
-    boss = companion.boss
 
-    # 1. Full-Width Game Party / Raid & Auto-Switch Banner
-    auto_on = bool(getattr(snapshot, "autoswitch_enabled", True))
-    thr = getattr(snapshot, "autoswitch_threshold", 85.0)
-    thr_int = int(round(float(thr if thr is not None else 85.0)))
     items = (attn.get("items") or []) if attn else []
     extras = (attn.get("extras") or []) if attn else []
-    claude_n = sum(1 for it in items if it.get("provider") == "Claude")
-    codex_n = sum(1 for it in items if it.get("provider") == "Codex")
+    claude_attn = [it for it in items if it.get("provider") == "Claude"]
+    codex_attn = [it for it in items if it.get("provider") == "Codex"]
 
-    if claude_n:
-        mid_line = f"⚠ {claude_n} Claude slot{'s' if claude_n != 1 else ''} {'need' if claude_n != 1 else 'needs'} re-login · Run bswap add"
-        mid_role = "belkins_cmm_coral"
-        target_banner_tab = "claude"
-    elif codex_n:
-        mid_line = f"⚠ {codex_n} Codex account{'s' if codex_n != 1 else ''} {'need' if codex_n != 1 else 'needs'} attention"
-        mid_role = "belkins_cmm_coral"
-        target_banner_tab = "codex"
-    elif extras:
-        clean_extra = str(extras[0]).lstrip("⚠ ").strip()
-        mid_line = f"⚠ {clean_extra}"
-        mid_role = "belkins_cmm_coral"
-        target_banner_tab = "claude"
-    else:
-        boss_hp_int = max(1, min(100, int(round(float(boss.hp_pct)))))
-        mid_line = f"⚔ Boss: {boss.spec.name} (HP {boss_hp_int}%) · Click to Raid"
-        mid_role = "label"
-        target_banner_tab = "dex"
+    # 1. Extra non-account engine verdicts / external-switch alerts (if any)
+    if extras:
+        extra_card = _Card("belkins_card", "belkins_card_edge", rule="belkins_attn_rule")
+        for i, line in enumerate(extras):
+            extra_card.add(_attn_extra(line), key=f"belkins-hub-attn-extra-{i}", tooltip=line, ax=line)
+        extra_card.add(_gap(4.0), key="belkins-hub-attn-extra-foot")
+        out += extra_card.blocks(2.0, 2.0)
 
-    c_hero = claude_spec.get("hero") if claude_spec else None
-    if c_hero:
-        c_nm = str(c_hero.get("name") or "none")
-        c_pct = c_hero.get("raw_pct")
-        c_tag = f"Claude {format_pct(c_pct)}" if (c_pct is not None and not c_hero.get("status")) else "Claude"
-        c_party = f"{c_nm} ({c_tag})"
-    else:
-        c_party = "none (Claude)"
+    # 2. Full Interactive Claude Party Card (Active Champion + All Switchable Slots + 1-Click Re-Login Bar)
+    if claude_spec:
+        out += _provider_card(
+            claude_spec,
+            claude_attn,
+            key_prefix="belkins-hub",
+            expand_attn=False,
+        ).blocks(2.0, 2.0)
 
-    x_hero = codex_spec.get("hero") if codex_spec else None
-    if x_hero:
-        x_nm = str(x_hero.get("name") or "none")
-        x_pct = x_hero.get("raw_pct")
-        x_tag = f"Codex {format_pct(x_pct)}" if (x_pct is not None and not x_hero.get("status")) else "Codex"
-        x_party = f"{x_nm} ({x_tag})"
-    else:
-        x_party = "none (Codex)"
+    # 3. Full Interactive Codex Party Card (Active Codex Champion + All Standby Accounts with Email, Plan & 1-Click Switch)
+    if codex_spec:
+        out += _provider_card(
+            codex_spec,
+            codex_attn,
+            key_prefix="belkins-hub",
+            expand_attn=False,
+        ).blocks(2.0, 2.0)
 
-    party_line = f"Active Party: {c_party} · {x_party}"
-
-    all_tips = [it.get("tip", "") for it in items if it.get("tip")] + list(extras)
-    full_tip = "\n".join(all_tips) if all_tips else f"{mid_line}\n{party_line}"
-    full_ax = ". ".join([mid_line, party_line] + list(extras))
-
-    def paint_protection_banner(pen: Pen, w: float, h: float) -> None:
-        _draw_cmm_backdrop(pen, w, h)
-        ty = 4.0
-        th = 74.0
-        fill, edge, _ = _card_surface_roles("belkins_card", "belkins_card_edge", None)
-        draw_glass_tile(pen, CARD_X, ty, w - 2 * CARD_X, th, 12.0, fill, edge)
-
-        ix0 = CARD_X + 14.0
-        ix1 = w - CARD_X - 14.0
-        b1 = ty + 21.5
-        sh_role = "belkins_cmm_aqua" if auto_on else "belkins_cmm_sub"
-        symbol(pen, "bolt.shield.fill", ix0, b1 - 4.0, 12.5, sh_role, "semibold")
-        text(pen, "Party Auto-Switch", "primary_med", "label", ix0 + 19.5, b1)
-        status_right = f"✓ Armed at {thr_int}%" if auto_on else "Paused"
-        text(pen, status_right, "caption_med", sh_role, ix1, b1, right=True)
-
-        b2 = ty + 42.5
-        text(pen, mid_line, "primary_med", mid_role, ix0, b2, maxw=ix1 - ix0)
-
-        b3 = ty + 62.0
-        text(pen, party_line, "secondary", "belkins_cmm_sub", ix0, b3, maxw=ix1 - ix0)
-
-    out.append(
-        Block(
-            82.0,
-            paint_protection_banner,
-            key="belkins-hub-alert-pill",
-            ax=full_ax,
-            tooltip=full_tip,
-            action=lambda t=target_banner_tab: set_active_tab(t),
-            keep_open=True,
-            no_hover_bg=True,
-        )
-    )
-
-    # 2. Bento Row 1: Side-by-Side Claude & Codex Tiles
-    if claude_spec or codex_spec:
-        row1_h = 94.0
-
-        def paint_providers(pen: Pen, w: float, h: float) -> None:
-            _draw_cmm_backdrop(pen, w, h)
-            _draw_provider_bento_tile(
-                pen,
-                claude_spec,
-                lx0,
-                3.0,
-                tile_w,
-                88.0,
-                "belkins_tile_claude",
-                "belkins_card_edge",
-                "Claude",
-                "sparkles",
-                "belkins_claude_rule",
-            )
-            _draw_provider_bento_tile(
-                pen,
-                codex_spec,
-                rx0,
-                3.0,
-                tile_w,
-                88.0,
-                "belkins_tile_codex",
-                "belkins_card_edge",
-                "Codex",
-                "terminal.fill",
-                "belkins_codex_rule",
-            )
-
-        def on_provider_bento_click(click_x: float) -> None:
-            is_right = click_x >= (W / 2.0)
-            target_sp = codex_spec if is_right else claude_spec
-            target_tab = "codex" if is_right else "claude"
-            if target_sp is None:
-                target_sp = claude_spec or codex_spec
-                target_tab = "claude" if claude_spec else "codex"
-            click_y = getattr(_cb, "LAST_CLICK_Y", None)
-            if click_y is not None and click_y >= 56.0 and target_sp:
-                best_r = _best_bento_switch_row(target_sp)
-                if best_r and callable(best_r.get("action")):
-                    best_r["action"]()
-                    return
-            set_active_tab(target_tab)
-
-        c_tip = claude_spec["hero"]["tip"] if (claude_spec and claude_spec.get("hero")) else "Claude Fleet"
-        x_tip = codex_spec["hero"]["tip"] if (codex_spec and codex_spec.get("hero")) else "Codex Fleet"
-        bento_ax_parts = []
-        if claude_spec:
-            bento_ax_parts.append(f"Claude {claude_spec.get('right', '').replace(' room', ' ok')}")
-        if codex_spec:
-            bento_ax_parts.append(f"Codex {codex_spec.get('right', '').replace(' room', ' ok')}")
-        out.append(
-            Block(
-                row1_h,
-                paint_providers,
-                key="belkins-hub-providers-bento",
-                ax=". ".join(bento_ax_parts) or "Claude and Codex Bento Tiles",
-                tooltip=f"{c_tip}\n\n{x_tip}",
-                action=lambda: set_active_tab("claude" if claude_spec else "codex"),
-                on_click_x=on_provider_bento_click,
-                keep_open=True,
-                no_hover_bg=True,
-            )
-        )
-
-    # 3. Bento Row 2: Side-by-Side Today Burn (+XP) & 30d Spend Tiles
+    # 4. Compact Side-by-Side Today Burn (+XP) & 30d Spend / CLI Sessions Strip
     cost = getattr(snapshot, "cost", None)
     if cost is not None and not getattr(cost, "is_partial", False):
         today_w = getattr(cost, "today", None)
@@ -2609,42 +2879,42 @@ def _hub_bento_blocks(
                 def paint_telemetry(pen: Pen, w: float, h: float) -> None:
                     _draw_cmm_backdrop(pen, w, h)
                     ty = 2.0
-                    th = 62.0
+                    th = 56.0
                     fill, edge, _ = _card_surface_roles("belkins_card", "belkins_card_edge", None)
 
                     # Left Tile: Today Burn (`$1,128` / `2.4B tok · +102K XP`)
-                    draw_glass_tile(pen, lx0, ty, tile_w, th, 12.0, fill, edge)
-                    b1 = ty + 23.5
-                    b2 = ty + 43.5
-                    symbol(pen, "bolt.horizontal.fill", lx0 + 13.0, b1 - 2.0, 14.0, "belkins_cmm_icon", "medium")
-                    text(pen, "Today Burn", "hero_name", "label", lx0 + 35.0, b1)
-                    text(pen, _compact_usd_str(usd_today), "primary_med", "label", lx0 + tile_w - 13.0, b1, right=True)
+                    draw_glass_tile(pen, lx0, ty, tile_w, th, 11.0, fill, edge)
+                    b1 = ty + 21.0
+                    b2 = ty + 40.0
+                    symbol(pen, "bolt.horizontal.fill", lx0 + 12.0, b1 - 2.0, 13.0, "belkins_cmm_icon", "medium")
+                    text(pen, "Today Burn", "hero_name", "label", lx0 + 32.0, b1)
+                    text(pen, _compact_usd_str(usd_today), "primary_med", "label", lx0 + tile_w - 12.0, b1, right=True)
                     if tok_today > 0:
                         tok_prefix = f"{format_tokens(tok_today)} tok · "
-                        w_tok = text(pen, tok_prefix, "caption", "belkins_cmm_sub", lx0 + 35.0, b2)
+                        w_tok = text(pen, tok_prefix, "caption", "belkins_cmm_sub", lx0 + 32.0, b2)
                         text(
                             pen,
                             xp_str,
                             "caption_med",
                             "belkins_cmm_aqua",
-                            lx0 + 35.0 + w_tok,
+                            lx0 + 32.0 + w_tok,
                             b2,
-                            maxw=max(24.0, tile_w - 46.0 - w_tok),
+                            maxw=max(24.0, tile_w - 44.0 - w_tok),
                         )
                     else:
-                        text(pen, f"Idle · {xp_str}", "caption", "belkins_cmm_sub", lx0 + 35.0, b2, maxw=tile_w - 46.0)
+                        text(pen, f"Idle · {xp_str}", "caption", "belkins_cmm_sub", lx0 + 32.0, b2, maxw=tile_w - 44.0)
 
-                    # Right Tile: 30d Spend (`$58.1K` / `$2,145/d · 5 sess`)
-                    draw_glass_tile(pen, rx0, ty, tile_w, th, 12.0, fill, edge)
-                    symbol(pen, "cpu", rx0 + 13.0, b1 - 2.0, 14.0, "belkins_cmm_icon", "medium")
-                    text(pen, "30d Spend", "hero_name", "label", rx0 + 35.0, b1)
-                    text(pen, _compact_usd_str(usd_30d), "primary_med", "belkins_cmm_coral", rx0 + tile_w - 13.0, b1, right=True)
-                    sub_30 = f"{_compact_usd_str(avg_7d)}/d · {sess_cnt} sess" if sess_cnt > 0 else f"{_compact_usd_str(avg_7d)}/d avg"
-                    text(pen, sub_30, "caption", "belkins_cmm_sub", rx0 + 35.0, b2, maxw=tile_w - 46.0)
+                    # Right Tile: 30d Spend (`$58.1K` / `$2,145/d · 6 CLI sess`)
+                    draw_glass_tile(pen, rx0, ty, tile_w, th, 11.0, fill, edge)
+                    symbol(pen, "cpu", rx0 + 12.0, b1 - 2.0, 13.0, "belkins_cmm_icon", "medium")
+                    text(pen, "30d Spend", "hero_name", "label", rx0 + 32.0, b1)
+                    text(pen, _compact_usd_str(usd_30d), "primary_med", "belkins_cmm_coral", rx0 + tile_w - 12.0, b1, right=True)
+                    sub_30 = f"{_compact_usd_str(avg_7d)}/d · {sess_cnt} CLI sess" if sess_cnt > 0 else f"{_compact_usd_str(avg_7d)}/d avg"
+                    text(pen, sub_30, "caption", "belkins_cmm_sub", rx0 + 32.0, b2, maxw=tile_w - 44.0)
 
                 out.append(
                     Block(
-                        68.0,
+                        62.0,
                         paint_telemetry,
                         key="belkins-party-burn-velocity",
                         ax=f"Today Burn {format_usd(usd_today)} ({xp_str}), 30d Spend {format_usd(usd_30d)}, 7d average {format_usd(avg_7d)} per day.",
@@ -3624,15 +3894,24 @@ def build(snapshot: Any, now: float, actions: ThemeActions | None = None) -> lis
         "party",
     )
 
-    # 3. Tab "claude": Full Claude Fleet + Compact Claude Attention Summary
+    # 3. Tab "claude": Full Claude Party Manager + Individual Re-Login Slots + Active Claude CLI Sessions
     if claude_sp:
         claude_attn = [it for it in (attn["items"] if attn else ()) if it["provider"] == "Claude"]
-        blocks += _tag_blocks(_provider_card(claude_sp, claude_attn).blocks(2.0, TAIL_GAP), "claude")
+        blocks += _tag_blocks(
+            _provider_card(claude_sp, claude_attn, key_prefix="belkins", expand_attn=True).blocks(2.0, 2.0),
+            "claude",
+        )
+        sess_card = _claude_sessions_card(snapshot)
+        if sess_card is not None:
+            blocks += _tag_blocks(sess_card.blocks(2.0, TAIL_GAP), "claude")
 
-    # 4. Tab "codex": Full Codex Fleet + Compact Codex Attention Summary
+    # 4. Tab "codex": Full Codex Party Manager + Detailed Fleet Line
     if codex_sp:
         codex_attn = [it for it in (attn["items"] if attn else ()) if it["provider"] == "Codex"]
-        blocks += _tag_blocks(_provider_card(codex_sp, codex_attn).blocks(2.0, TAIL_GAP), "codex")
+        blocks += _tag_blocks(
+            _provider_card(codex_sp, codex_attn, key_prefix="belkins", expand_attn=True).blocks(2.0, TAIL_GAP),
+            "codex",
+        )
 
     # 5. Tab "dex": Interactive Boss Raid Arena + Daily Crate + 8-Stage Pokedex / 14-Trophy Bento Grid
     blocks += _tag_blocks(

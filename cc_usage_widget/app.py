@@ -6488,6 +6488,61 @@ class CCUsageWidgetApp(rumps.App):
             if target:
                 self._worker.submit(_CMD_SWITCH_CODEX, str(target))
 
+        def toggle_slot_disabled(slot: int) -> None:
+            live_rows = {r.slot: r for r in self.snapshot().accounts}
+            row = live_rows.get(slot) or by_slot.get(slot)
+            subcmd = "enable" if (row is not None and getattr(row, "disabled", False)) else "disable"
+            if os.environ.get(_NO_REVEAL_ENV):
+                self._worker.submit(_CMD_REFRESH, None)
+                return
+
+            def _run_toggle() -> None:
+                bswap_bin = Path.home() / ".local" / "bin" / "bswap"
+                cli = str(bswap_bin) if bswap_bin.is_file() else (shutil.which("bswap") or shutil.which("cswap") or "bswap")
+                try:
+                    subprocess.run(
+                        [cli, subcmd, str(slot)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=10,
+                        check=False,
+                    )
+                except Exception:
+                    pass
+                self._worker.submit(_CMD_REFRESH, None)
+
+            threading.Thread(target=_run_toggle, daemon=True).start()
+
+        def claude_relogin() -> None:
+            if self.snapshot().unmanaged_login:
+                self._worker.submit(_CMD_ADD_LOGIN, None)
+            if os.environ.get(_NO_REVEAL_ENV):
+                return
+            try:
+                cmd_dir = Path.home() / ".claude" / "cc-usage-widget"
+                cmd_dir.mkdir(parents=True, exist_ok=True)
+                cmd_file = cmd_dir / "belkins_claude_relogin.command"
+                script = (
+                    "#!/bin/zsh\n"
+                    "clear\n"
+                    "echo '=== Belkins Party · Claude Account Login & Pool Sync ==='\n"
+                    "echo '1. Signing in with Claude Code (claude login)...'\n"
+                    "claude login || true\n"
+                    "echo ''\n"
+                    "echo '2. Adding / refreshing slot in Belkins Party (bswap add)...'\n"
+                    "~/.local/bin/bswap add || bswap add || cswap add || true\n"
+                    "echo ''\n"
+                    "echo '✓ Done! You can close this window.'\n"
+                )
+                cmd_file.write_text(script, encoding="utf-8")
+                cmd_file.chmod(0o755)
+                _open_in_browser(cmd_file)
+            except Exception as exc:
+                _log(f"claude_relogin launcher failed: {exc!r}")
+
+        def codex_new_login() -> None:
+            self._worker.submit(_CMD_CODEX_LOGIN, None)
+
         def update_app() -> None:
             bswap_bin = Path.home() / ".local" / "bin" / "bswap"
             if bswap_bin.is_file():
@@ -6505,6 +6560,9 @@ class CCUsageWidgetApp(rumps.App):
             switch_to=switch_to,
             switch_best=lambda: self._on_switch_best(None),
             switch_codex=switch_codex,
+            toggle_slot_disabled=toggle_slot_disabled,
+            claude_relogin=claude_relogin,
+            codex_new_login=codex_new_login,
             codex_login=codex_login,
             codex_login_for=codex_login_for,
             open_url=_open_web_url,

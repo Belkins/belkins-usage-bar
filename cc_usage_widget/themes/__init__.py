@@ -88,6 +88,9 @@ class ThemeActions:
     switch_to: Callable[[int], Any] = _noop
     switch_best: Callable[[], Any] = _noop
     switch_codex: Callable[[str], Any] = _noop
+    toggle_slot_disabled: Callable[[int], Any] = _noop
+    claude_relogin: Callable[[], Any] = _noop
+    codex_new_login: Callable[[], Any] = _noop
     codex_login: Callable[[Any], bool] = lambda _row: False
     codex_login_for: Callable[[Any], Callable[[], Any] | None] = _no_login
     open_url: Callable[[str], bool] = lambda _url: False
