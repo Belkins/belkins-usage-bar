@@ -6514,6 +6514,7 @@ class CCUsageWidgetApp(rumps.App):
             toggle_autoswitch=lambda: self._on_toggle_autoswitch(None),
             export_csv=lambda: self._on_export_csv(None),
             update_app=update_app,
+            quit_app=lambda: self._on_quit(None),
             render_live_title=lambda: self.render_title(self.snapshot()),
             attention_extras=extras,
         )

@@ -232,6 +232,12 @@ def test_a_card_theme_renders_views_then_the_common_native_tail() -> None:
             snap = _snapshot(theme)
             app.rebuild_menu(snap)
             items = _top(app)
+            expected = [row and row["title"] for row in themes.tail_rows(snap)]
+            if not expected:
+                views = [_view(item) for item in items]
+                assert views and all(isinstance(v, card_base.BlockView) for v in views), (theme, views)
+                assert all(v.frame().size.width == card_base.W for v in views)
+                continue
             first_native = next(i for i, item in enumerate(items) if item is None)
             views = [_view(item) for item in items[:first_native]]
             assert views and all(isinstance(v, card_base.BlockView) for v in views), (theme, views)

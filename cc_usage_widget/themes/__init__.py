@@ -97,6 +97,7 @@ class ThemeActions:
     toggle_autoswitch: Callable[[], Any] = _noop
     export_csv: Callable[[], Any] = _noop
     update_app: Callable[[], Any] = _noop
+    quit_app: Callable[[], Any] = _noop
     render_live_title: Callable[[], str] = lambda: ""
     attention_extras: tuple[str, ...] = field(default_factory=tuple)
 
@@ -141,20 +142,12 @@ def tail_rows(snapshot: Any, *, problems: Sequence[str] = ()) -> list[dict[str, 
         snapshot.settings.get("menu_theme", "belkins") == "belkins"
         and not bool(snapshot.settings.get("menu_layout_classic", False))
     )
+    if is_belkins and not getattr(snapshot, "unmanaged_login", None):
+        return [r for r in rows if r is not None]
     rows.append({"id": "cost", "title": f"Cost ({A.NOTIONAL_LABEL})", "submenu": True})
     if snapshot.sessions or snapshot.fleet_notes:
         rows.append({"id": "sessions", "title": "Sessions", "submenu": True,
                      "detail": str(len(snapshot.sessions)) if snapshot.sessions else ""})
-    if is_belkins:
-        unmanaged = getattr(snapshot, "unmanaged_login", None)
-        if unmanaged:
-            text = f"Add to pool: {unmanaged}"
-            rows.append({"id": "add_login", "title": fit_menu_title(text), "tooltip": text})
-        rows.append(None)
-        rows.append({"id": "refresh", "title": "Refresh", "key_eq": "⌘R"})
-        rows.append({"id": "settings", "title": "Settings", "submenu": True})
-        rows.append({"id": "quit", "title": "Quit", "key_eq": "⌘Q"})
-        return rows
     if snapshot.recent_events:
         newest = A._localize_instants(str(tuple(snapshot.recent_events)[-1]))
         match = _LEADING_TIME.match(newest)

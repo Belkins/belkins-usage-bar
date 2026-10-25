@@ -910,26 +910,25 @@ def _companion_card(snapshot: Any, companion: CompanionState, actions: ThemeActi
         badge_icon = "crown.fill" if is_royal else ("gamecontroller.fill" if "arcade_skin" in eq_live else "sparkles")
         badge_icon_role = "belkins_gold_text" if is_royal else "belkins_flame_text"
         symbol(pen, badge_icon, rx, b1 - 4.0, 10.0, badge_icon_role, "semibold")
-        nx = rx + 15.5
+        nx = rx + 18.0
         lvl_s = f"LV.{live.level}"
         lvl_w = _pill_w(pen, lvl_s)
-        name_role = "belkins_gold_text" if "shiny_core" in eq_live else "label"
         nw = text(
             pen,
             live.stage.name,
             "hero_name",
-            name_role,
+            "label",
             nx,
             b1,
             maxw=max(40.0, X1 - cw - lvl_w - nx - 12.0),
         )
         pen.pill(
             lvl_s,
-            nx + nw + 6.0,
+            nx + nw + 6.5,
             b1 - 0.5,
             F["tag"][0],
-            role="belkins_gold_text" if "shiny_core" in eq_live else "belkins_flame_text",
-            bg="belkins_gold_pill" if "shiny_core" in eq_live else "belkins_flame_pill",
+            role="belkins_flame_text",
+            bg="belkins_plan_pill",
             weight="semibold",
         )
 
@@ -949,14 +948,14 @@ def _companion_card(snapshot: Any, companion: CompanionState, actions: ThemeActi
         for idx, (_ic, val_s, _rl) in enumerate(stat_items):
             if idx:
                 total_stat_w += sep_w
-            total_stat_w += 11.5 + text_w(pen, val_s, "num_small")
+            total_stat_w += 13.5 + text_w(pen, val_s, "num_small")
 
         sx_cur = X1 - total_stat_w
         for idx, (ic_name, val_s, rl_name) in enumerate(stat_items):
             if idx:
                 sx_cur += text(pen, sep_dot, "num_small", "tertiary", sx_cur, b2)
-            symbol(pen, ic_name, sx_cur, b2 - 3.6, 9.0, rl_name, "semibold")
-            sx_cur += 11.5
+            symbol(pen, ic_name, sx_cur, b2 - 3.6, 8.8, rl_name, "semibold")
+            sx_cur += 13.5
             sx_cur += text(pen, val_s, "num_small", "label", sx_cur, b2)
 
         xp_fill_role = "belkins_xp_fill"
@@ -1933,8 +1932,9 @@ def _tab_bar_block(claude_count: int, codex_count: int) -> Block:
             ic_role = acc_role if is_act else "belkins_tab_inactive_text"
             ic_name = _TAB_ICONS.get(tab_id, "sparkles")
             tw_lbl = text_w(pen, label, "caption_med")
-            ic_sz = 8.5
-            tot_w = ic_sz + 3.0 + tw_lbl
+            ic_sz = 8.0
+            ic_adv = 12.2
+            tot_w = ic_adv + tw_lbl
             start_x = tx + (seg_w - tot_w) / 2.0
             symbol(pen, ic_name, start_x, y + 15.0, ic_sz, ic_role, "semibold")
             text(
@@ -1942,9 +1942,9 @@ def _tab_bar_block(claude_count: int, codex_count: int) -> Block:
                 label,
                 "caption_med",
                 txt_role,
-                start_x + ic_sz + 3.0,
+                start_x + ic_adv,
                 y + 19.0,
-                maxw=seg_w - ic_sz - 4.0,
+                maxw=seg_w - ic_adv - 2.0,
             )
 
     def on_click_x(click_x: float) -> None:
@@ -2002,11 +2002,11 @@ def _draw_provider_bento_tile(
     ix1 = tx + tw - 10.5
     iw = ix1 - ix0
 
-    b1 = ty + 18.0
+    b1 = ty + 18.5
     title = spec["title"] if spec else fallback_title
     icon_name = spec["icon"] if spec else fallback_icon
-    symbol(pen, icon_name, ix0, b1 - 4.0, 10.5, accent_role, "semibold")
-    text(pen, title, "title", "label", ix0 + 14.5, b1)
+    symbol(pen, icon_name, ix0, b1 - 4.0, 10.0, accent_role, "semibold")
+    text(pen, title, "title", "label", ix0 + 16.5, b1)
     symbol(pen, "chevron.right", ix1 - 6.0, b1 - 3.6, 8.0, "secondary", "semibold")
 
     if not spec:
@@ -2030,9 +2030,15 @@ def _draw_provider_bento_tile(
 
         plan_w = 0.0
         if hero.get("plan"):
-            plan_s = str(hero["plan"]).upper()
-            if len(plan_s) > 8:
-                plan_s = plan_s[:8]
+            plan_s = (
+                str(hero["plan"])
+                .upper()
+                .replace("MAX ", "")
+                .replace("MAX_", "")
+                .replace("PROMAX", "PRO")
+            )
+            if len(plan_s) > 6:
+                plan_s = plan_s[:6]
             plan_w = _pill_w(pen, plan_s)
             pen.pill(
                 plan_s,
@@ -2043,14 +2049,16 @@ def _draw_provider_bento_tile(
                 bg="belkins_plan_pill",
                 weight="semibold",
             )
+        hero_nm = str(hero.get("name") or "")
+        nm_font = "secondary_med" if len(hero_nm) > 10 else "primary_med"
         text(
             pen,
-            hero["name"],
-            "primary_med",
+            hero_nm,
+            nm_font,
             "label",
-            ix0 + 10.0,
+            ix0 + 9.5,
             b2,
-            maxw=max(36.0, iw - plan_w - 14.0),
+            maxw=max(40.0, iw - plan_w - 12.5),
         )
 
         b3 = ty + 55.5
@@ -2084,24 +2092,32 @@ def _draw_provider_bento_tile(
         text(pen, "No active session", "caption_med", "secondary", ix0, b2, maxw=iw)
         luxury_bar(pen, ix0, ty + 65.5, iw, 0.0, "dim", h=5.2, expired=True)
 
-    # Bottom 1-click frosted glass switch button
+    # Bottom 1-click frosted glass switch button (split Left/Right so quota % NEVER truncates)
     btn_y = ty + 76.5
     btn_h = 19.5
     pen.rrect(ix0, btn_y, iw, btn_h, 6.0, "belkins_glass_btn", stroke="belkins_glass_btn_edge", stroke_width=0.65)
     rows = spec.get("rows") or []
     best_r = rows[0] if rows else None
     if best_r and callable(best_r.get("action")):
-        nm = best_r["name"]
-        if len(nm) > 9:
-            nm = nm[:8] + "…"
-        pct_s = f" ({format_pct(best_r['pct'])})" if best_r.get("pct") is not None else ""
-        btn_txt = f"⚡ Switch → {nm}{pct_s}"
         btn_role = "belkins_flame_text" if spec["key"] == "claude" else "good_text"
+        pct_r_str = f"{format_pct(best_r['pct'])} ▸" if best_r.get("pct") is not None else "▸"
+        pct_rw = text(pen, pct_r_str, "num_small", btn_role, ix1 - 6.5, btn_y + 13.5, right=True)
+        symbol(pen, "bolt.fill", ix0 + 6.5, btn_y + 9.8, 8.2, btn_role, "semibold")
+        nm = str(best_r.get("name") or "")
+        lhs_lbl = f"Next · {nm}"
+        text(
+            pen,
+            lhs_lbl,
+            "caption_med",
+            btn_role,
+            ix0 + 16.5,
+            btn_y + 13.5,
+            maxw=max(32.0, iw - pct_rw - 23.0),
+        )
     else:
         total_c = int(spec.get("total_count") or 1)
-        btn_txt = f"Fleet ({total_c}) ▸"
-        btn_role = "secondary"
-    text(pen, btn_txt, "caption_med", btn_role, ix0 + iw / 2.0, btn_y + 13.5, center=True, maxw=iw - 6.0)
+        btn_txt = f"View Fleet ({total_c}) ▸"
+        text(pen, btn_txt, "caption_med", "secondary", ix0 + iw / 2.0, btn_y + 13.5, center=True, maxw=iw - 6.0)
 
 
 def _hub_bento_blocks(
@@ -2134,7 +2150,7 @@ def _hub_bento_blocks(
                 tile_w,
                 102.0,
                 "belkins_tile_claude",
-                "belkins_tile_claude_edge",
+                "belkins_card_edge",
                 "Claude",
                 "sparkles",
                 "belkins_claude_rule",
@@ -2147,7 +2163,7 @@ def _hub_bento_blocks(
                 tile_w,
                 102.0,
                 "belkins_tile_codex",
-                "belkins_tile_codex_edge",
+                "belkins_card_edge",
                 "Codex",
                 "terminal.fill",
                 "belkins_codex_rule",
@@ -3144,6 +3160,63 @@ def _tag_blocks(
     return blocks
 
 
+def _footer_dock_block(snapshot: Any, actions: ThemeActions) -> Block:
+    """Always-visible 4-pill Liquid Glass Utility Dock (`Refresh | Dashboard | Auto | Quit`) replacing the raw NSMenu tail."""
+    auto_on = bool(getattr(snapshot, "autoswitch_enabled", True))
+    thr = getattr(snapshot, "autoswitch_threshold", 85.0)
+    thr_int = int(round(float(thr if thr is not None else 85.0)))
+    auto_lbl = f"Auto {thr_int}%" if auto_on else "Auto OFF"
+
+    pills: list[tuple[str, str, str, Callable[[], Any] | None]] = [
+        ("arrow.clockwise", "Refresh", "secondary", actions.refresh),
+        ("chart.bar.xaxis", "Analytics", "belkins_gold_text", actions.open_dashboard),
+        ("bolt.fill", auto_lbl, "good_text" if auto_on else "secondary", actions.toggle_autoswitch),
+        ("power", "Quit", "crit_text", actions.quit_app),
+    ]
+    gap = 6.0
+    tot_w = W - 2 * CARD_X
+    pw = (tot_w - gap * (len(pills) - 1)) / float(len(pills))
+    ph = 26.0
+
+    def paint(pen: Pen, w: float, h: float) -> None:
+        del w, h
+        y = 3.0
+        fill, edge, _ = _card_surface_roles("belkins_card", "belkins_card_edge", None)
+        for idx, (ic_name, lbl, role_nm, _act) in enumerate(pills):
+            px = CARD_X + idx * (pw + gap)
+            draw_glass_tile(pen, px, y, pw, ph, 8.0, fill, edge)
+            tw = text_w(pen, lbl, "caption_med")
+            ic_adv = 13.5
+            start_x = px + (pw - (ic_adv + tw)) / 2.0
+            symbol(pen, ic_name, start_x, y + 13.0, 8.2, role_nm, "semibold")
+            text(
+                pen,
+                lbl,
+                "caption_med",
+                "label" if idx < 3 else "secondary",
+                start_x + ic_adv,
+                y + 17.0,
+                maxw=pw - ic_adv - 4.0,
+            )
+
+    def on_click_x(click_x: float) -> None:
+        rel = max(0.0, min(tot_w - 1.0, click_x - CARD_X))
+        idx = min(len(pills) - 1, max(0, int(rel // (pw + gap))))
+        fn = pills[idx][3]
+        if callable(fn):
+            fn()
+
+    return Block(
+        35.0,
+        paint,
+        key="belkins-footer-dock",
+        ax=f"Utility Dock: Refresh, Analytics Dashboard, {auto_lbl}, Quit",
+        action=actions.refresh,
+        on_click_x=on_click_x,
+        no_hover_bg=True,
+    )
+
+
 # ------------------------------------------------------------------ build ---
 
 
@@ -3209,8 +3282,10 @@ def build(snapshot: Any, now: float, actions: ThemeActions | None = None) -> lis
 
     # 7. Tab "config": Unified Single-Screen Settings & Control Studio
     blocks += _tag_blocks(
-        _config_card(snapshot, acts).blocks(2.0, TAIL_GAP),
+        _config_card(snapshot, acts).blocks(2.0, 2.0),
         "config",
     )
 
+    # 8. Always-visible Liquid Glass Utility Dock (replaces clunky native NSMenuItem tail)
+    blocks.append(_footer_dock_block(snapshot, acts))
     return blocks
