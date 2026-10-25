@@ -353,7 +353,8 @@ ICON_STYLE_SYMBOLS: dict[str, tuple[str, ...]] = {
     "bolt": ("bolt.fill", "bolt.horizontal.fill"),
     "bars": ("chart.bar.fill", "chart.bar"),
     "flame": ("flame.fill", "flame"),
-    "cpu": ("display", "laptopcomputer", "cpu.fill"),
+    "cpu": ("gamecontroller.fill", "arcade.stick.console.fill", "shield.lefthalf.filled"),
+    "game": ("gamecontroller.fill", "arcade.stick.console.fill", "crown.fill"),
     "crown": ("crown.fill", "crown", "star.fill"),
     "shield": ("shield.lefthalf.filled", "bolt.shield.fill", "shield.fill"),
     "sparkles": ("sparkles", "wand.and.stars", "star.fill"),
@@ -413,13 +414,13 @@ def companion_sprite_icon(stage_num: int = 1, *, mono: bool = False) -> Any | No
         return status_icon()
 
 
-def clean_mac_status_icon() -> Any | None:
-    """Render a CleanMyMac-style vector iMac/Display silhouette with a diagonal lightning sweep (template NSImage)."""
+def game_crest_status_icon() -> Any | None:
+    """Render a 16x16pt luxury Game Controller + Sovereign Crown Crest template NSImage."""
     AppKit = _appkit()
     if AppKit is None:
         return None
     try:
-        w, h = 16.0, 15.0
+        w, h = 16.0, 16.0
         image = AppKit.NSImage.alloc().initWithSize_(AppKit.NSMakeSize(w, h))
         image.lockFocus()
         try:
@@ -427,48 +428,92 @@ def clean_mac_status_icon() -> Any | None:
             col.setFill()
             col.setStroke()
 
-            # 1. Monitor screen frame (rounded rect x=1.5, y=4.2, w=13.0, h=9.5)
-            scr = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-                AppKit.NSMakeRect(1.5, 4.2, 13.0, 9.5), 2.0, 2.0
-            )
-            scr.fill()
+            # 1. Sovereign Crown / Mecha Crest along top ridge (y: 11.0 -> 14.8)
+            crown = AppKit.NSBezierPath.bezierPath()
+            crown.moveToPoint_(AppKit.NSMakePoint(3.4, 10.6))
+            crown.lineToPoint_(AppKit.NSMakePoint(2.6, 13.8))
+            crown.lineToPoint_(AppKit.NSMakePoint(5.6, 11.9))
+            crown.lineToPoint_(AppKit.NSMakePoint(8.0, 14.9))
+            crown.lineToPoint_(AppKit.NSMakePoint(10.4, 11.9))
+            crown.lineToPoint_(AppKit.NSMakePoint(13.4, 13.8))
+            crown.lineToPoint_(AppKit.NSMakePoint(12.6, 10.6))
+            crown.closePath()
+            crown.fill()
 
-            # 2. Diagonal CleanMyMac-style sweep cutout across the screen using DestinationOut
+            # 2. Sleek Gamepad Body + Ergonomic Grips (y: 1.6 -> 11.0)
+            body = AppKit.NSBezierPath.bezierPath()
+            body.moveToPoint_(AppKit.NSMakePoint(3.6, 10.8))
+            body.lineToPoint_(AppKit.NSMakePoint(12.4, 10.8))
+            # Right shoulder & grip
+            body.curveToPoint_controlPoint1_controlPoint2_(
+                AppKit.NSMakePoint(14.9, 4.2),
+                AppKit.NSMakePoint(14.5, 10.8),
+                AppKit.NSMakePoint(15.3, 7.2),
+            )
+            body.curveToPoint_controlPoint1_controlPoint2_(
+                AppKit.NSMakePoint(11.4, 2.0),
+                AppKit.NSMakePoint(14.6, 2.0),
+                AppKit.NSMakePoint(12.5, 1.4),
+            )
+            # Bottom arch between grips
+            body.lineToPoint_(AppKit.NSMakePoint(10.0, 4.6))
+            body.lineToPoint_(AppKit.NSMakePoint(6.0, 4.6))
+            # Left grip & shoulder
+            body.lineToPoint_(AppKit.NSMakePoint(4.6, 2.0))
+            body.curveToPoint_controlPoint1_controlPoint2_(
+                AppKit.NSMakePoint(1.1, 4.2),
+                AppKit.NSMakePoint(3.5, 1.4),
+                AppKit.NSMakePoint(1.4, 2.0),
+            )
+            body.curveToPoint_controlPoint1_controlPoint2_(
+                AppKit.NSMakePoint(3.6, 10.8),
+                AppKit.NSMakePoint(0.7, 7.2),
+                AppKit.NSMakePoint(1.5, 10.8),
+            )
+            body.closePath()
+            body.fill()
+
+            # 3. Crisp Negative-Space Cutouts (D-Pad + Action Buttons + Crown Seam)
             ctx = AppKit.NSGraphicsContext.currentContext()
             old_op = ctx.compositingOperation()
             ctx.setCompositingOperation_(AppKit.NSCompositingOperationDestinationOut)
-            slash = AppKit.NSBezierPath.bezierPath()
-            slash.moveToPoint_(AppKit.NSMakePoint(4.5, 4.0))
-            slash.lineToPoint_(AppKit.NSMakePoint(7.2, 4.0))
-            slash.lineToPoint_(AppKit.NSMakePoint(11.5, 13.9))
-            slash.lineToPoint_(AppKit.NSMakePoint(8.8, 13.9))
-            slash.closePath()
-            slash.fill()
-            # Bottom chin bezel line cutout
-            AppKit.NSBezierPath.fillRect_(AppKit.NSMakeRect(2.5, 5.4, 11.0, 0.85))
-            ctx.setCompositingOperation_(old_op)
 
-            # 3. Monitor stand neck & base foot
-            col.setFill()
-            AppKit.NSBezierPath.fillRect_(AppKit.NSMakeRect(6.6, 2.0, 2.8, 2.2))
-            foot = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-                AppKit.NSMakeRect(4.5, 1.1, 7.0, 1.2), 0.6, 0.6
+            # Crown separator seam
+            AppKit.NSBezierPath.fillRect_(AppKit.NSMakeRect(4.0, 10.55, 8.0, 0.85))
+
+            # Left D-Pad cross cutout
+            AppKit.NSBezierPath.fillRect_(AppKit.NSMakeRect(2.7, 7.1, 3.3, 1.15))
+            AppKit.NSBezierPath.fillRect_(AppKit.NSMakeRect(3.78, 6.02, 1.15, 3.3))
+
+            # Right A/B action button cutouts
+            btn_a = AppKit.NSBezierPath.bezierPathWithOvalInRect_(
+                AppKit.NSMakeRect(11.2, 7.8, 1.45, 1.45)
             )
-            foot.fill()
+            btn_a.fill()
+            btn_b = AppKit.NSBezierPath.bezierPathWithOvalInRect_(
+                AppKit.NSMakeRect(9.5, 6.2, 1.45, 1.45)
+            )
+            btn_b.fill()
+
+            ctx.setCompositingOperation_(old_op)
         finally:
             image.unlockFocus()
         image.setTemplate_(True)
         return image
     except Exception:
-        return status_icon(("display", "laptopcomputer"))
+        return status_icon(("gamecontroller.fill", "crown.fill"))
+
+
+# Keep backwards-compatible alias if any caller imports clean_mac_status_icon
+clean_mac_status_icon = game_crest_status_icon
 
 
 def status_icon_for_style(style: str = "bolt", *, stage_num: int = 1) -> Any | None:
     """Resolve the status-bar NSImage for the chosen ``title_icon_style``."""
     if style == "none":
         return None
-    if style == "cpu":
-        return clean_mac_status_icon()
+    if style in ("cpu", "game"):
+        return game_crest_status_icon()
     if style == "companion":
         return companion_sprite_icon(stage_num, mono=False)
     if style == "companion_mono":

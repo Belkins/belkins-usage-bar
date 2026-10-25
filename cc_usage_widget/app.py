@@ -280,7 +280,7 @@ _HEADER_ICON_LABELS: dict[str, str] = {
     "companion_mono": "🐾 Companion Silhouette (Mono)",
     "bars": "📊 Usage Bars",
     "flame": "🔥 Cyber Flame",
-    "cpu": "🧠 Neural CPU",
+    "cpu": "🎮 Game Crest",
     "crown": "👑 Sovereign Crown",
     "shield": "🛡️ Cyber Shield",
     "sparkles": "✨ Sparkles",
