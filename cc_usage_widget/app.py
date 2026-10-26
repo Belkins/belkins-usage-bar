@@ -6577,7 +6577,7 @@ class CCUsageWidgetApp(rumps.App):
             open_url=_open_web_url,
             refresh=lambda: self._on_refresh_now(None),
             open_dashboard=lambda: self._on_open_dashboard(None),
-            set_setting=self._set_setting_from_theme,
+            set_setting=lambda k, v: self._set_setting_from_theme(k, v),
             toggle_autoswitch=toggle_autoswitch_from_theme,
             export_csv=lambda: self._on_export_csv(None),
             update_app=update_app,

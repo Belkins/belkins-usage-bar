@@ -92,35 +92,36 @@ You can also trigger **🔄 Update Belkins Usage Bar** directly inside the inter
 Start manually in foreground: `./run.sh`
 Remove everything: `./uninstall.sh`
 
-## Belkins ⚡ Luxury 6-Tab Menu Bar UI, Cyber-Forge & `bswap` CLI
+## Belkins ⚡ Minimalist Luxury 6-Tab Menu Bar UI, Cyber-Forge & `bswap` CLI
 
-`./install.sh` installs the unified **`bswap`** and **`belkins`** CLI commands into `~/.local/bin` and enables the default **`Belkins ⚡ (Companion & Party)`** luxury glassmorphic theme (`#121318` Obsidian panels, `#FF6B2C` Belkins Flame accents, `#D97757` Claude Terracotta, `#10A37F` Codex Emerald, and crisp vector SF Symbols):
+`./install.sh` installs the unified **`bswap`** and **`belkins`** CLI commands into `~/.local/bin` and enables the default **`Belkins ⚡ (Companion & Party)`** Minimalist Luxury theme (adaptive Obsidian Dark `#111622` & Pearl Alabaster Light `#F5F6FA` surfaces, `#FF6B2C` Belkins Flame accents, `#D97757` Claude Terracotta, `#00C49A` Emerald Aqua, and crisp vector SF Symbols):
 
 ### Interactive 6-Tab Menu Bar Architecture
-- **`⚡ Squad` (Command Deck & Burn Velocity)**:
-  - **Belkins Companion Hero**: Double-bezel studio medallion with vector SF Symbol HUD pills (`shield.fill` ATK, `trophy.fill` Trophies, `flame.fill` Slain, `sparkles` SparkCoins `✦ CR`) and a smooth luxury XP track.
-  - **Claude & Codex Squad Cards**: Active account recessed glass panel with `56% FREE` headroom pill, `luxury_bar` quota gauges, and a **1-Click Standby Quick-Switch (`⚡ Switch → <alias>`)** pill right on the standby strip.
-  - **Burn Velocity & Spend Card**: Shows today's spend vs 7-day average (`Today $41.98 · 7d avg $44.31/d`), 30-day total, top active model (`Top: Opus 4.6`), and a live `PACE: STEADY` / `PACE: SURGE` indicator.
-  - **Needs Attention Banner**: Compact glass alert card below the Command Deck — click the `bswap add` row to copy `bswap add` to your clipboard or click a Codex relogin row to launch `codex login`.
-- **`Claude` & `Codex` Full Fleet Tabs**:
-  - **Recessed Active Account Panel**: Shows `● ACTIVE`, plan badge, email, and individual `luxury_bar` tracks for `5h`, `7d`, and `Fable` / `weekly` windows.
-  - **Standby Fleet Rows**: Click **any** standby Claude or Codex account row to switch your active login immediately!
-- **`✨ Evo` Tab (Boss Raid Arena, Daily Supply Crate, 8 Cyber-Forms & 14 Trophies)**:
+- **`Hub` (Minimalist Party Showcase & Telemetry)**:
+  - **Belkins Companion Hero**: Calm, minimalist companion showcase (`Belkins Prime  Lv.89`, `Apex Sovereign · ✦ 12.7K`, and an uninterrupted `178pt` gold XP bar) paired with a glowing hexagonal game medallion and controller badge.
+  - **Claude & Codex Party Cards**: Single-line header (`✦ Claude · 3/9` + `[⚡ Auto 85%]`), recessed active account showcase (`● podol` + `45% free` + `5.5pt` stamina gauge + concise window summary), up to 2 ready standby accounts (`● callowayrupert NEXT  100% free`), and a 1-line summary footer (`4 need re-login · +2 more  All ▸`).
+  - **Sleek Telemetry Strip**: Two single-line glass pills at the bottom of the Hub (`⚡ Today  $388` and `✦ 30d  $58.1K`).
+  - **4 Switchable Hub View Styles**: Switch anytime in `Settings` between **`Luxury`** (Minimalist Party Showcase, default), **`Detailed`** (Full Party Roster), **`Bento`** (2-Column Game Deck), and **`Studio`** (Clean Gauge Rings).
+- **`Claude` & `Codex` Full Party Tabs**:
+  - **Recessed Active Account Panel**: Shows `● active`, plan badge, `45% free`, and individual `luxury_bar` tracks for `5h`, `7d`, and `Fable` / `Weekly` windows with concise reset times (`↺ 10:20`, `↺ Sat`).
+  - **Single-Line `30pt` Standby Rows**: Click **any** standby Claude or Codex account row to switch your active login immediately, or click the right-aligned `⏸` / `▶ Enable` control to pause or resume a slot in auto-switch rotation.
+  - **Collapsed Re-Login Banner**: Multiple expired slots collapse into a single actionable line (`4 need re-login · main, dmitry, sm +1  [bswap add]`).
+  - **Active Sessions Card (`Claude` tab)**: Displays running Claude Code CLI processes grouped cleanly by workspace name (`● Rightmark  5`).
+- **`Evo` Tab (Boss Raid Arena, Daily Supply Crate, 8 Cyber-Forms & 14 Trophies)**:
   - **Boss Raid Arena**: Recessed glass inner panel with a `luxury_bar` Boss HP gauge. Click directly in the menu to strike Raid Bosses (`HTTP-429 Golem`, `Context Leviathan`, `Latency Archlich`, `Quota Behemoth`, `Null Singularity`) using your Companion's **ATK & Crit** to loot **SparkCoins (`✦ CR`)** and **Bonus XP**!
-  - **Daily Supply Crate (`🎁 Daily Supply Crate · Day N Streak`)**: Claimable once per calendar day directly inside `✨ Evo` (or via `bswap claim`) for `+150..300 ✦ CR` and `+15,000..45,000 XP` scaling with your consecutive daily streak!
+  - **Daily Supply Crate (`🎁 Daily Supply Crate · Day N Streak`)**: Claimable once per calendar day directly inside `Evo` (or via `bswap claim`) for `+150..300 ✦ CR` and `+15,000..45,000 XP` scaling with your consecutive daily streak!
   - **8-Stage Cyber-Forms**: `Sparkbit` (Lv.1) → `Outreachik` (Lv.8) → `Pipelinex` (Lv.18) → `Contexton` (Lv.30) → `Belkinosaur` (Lv.45) → `Chronoflare` (Lv.62) → `Belkins Prime` (Lv.80) → `Omega Belkion` (Lv.95). Click any unlocked form to morph your active Companion and activate its passive buff!
   - **14 Hall of Fame Trophies**: `7×2` Bento Grid tracking mid-to-endgame milestones (`Kilowatt Day` \$1.5K/day, `Quarter-Trillion` 250B tokens, `Fleet Admiral` 8+ healthy accounts, `Flawless Rotator` 15+ rotations with 0 alerts, `Leviathan Hunter` 10+ Bosses, `Raid Godslayer` 50+ Bosses, `Serum Alchemist` 25+ Serums, `Vault Tycoon` 12/12 Vault relics, `Prismatic Triad`, `Omega Ascendant` Lv.95, and `Lv.99 Immortal`).
-- **`🛡️ Vault` Tab (12-Item Belkins Spark Vault)**:
+- **`Vault` Tab (12-Item Belkins Spark Vault)**:
   - **`⚔️ Relics & Lab`**: `Cool-Down Cell`, repeatable `Overclock Serum` (`+60K XP & +20 ATK` per serum), `Deal Closer Visor`, `Plasma Token Blade`, `Sovereign Crown`, and `Prismatic Core` (mutates your Companion into its ★ Prismatic gold/violet/cyan palette!).
   - **`🎨 Skins & Bots`**: `Solar Forge Pad`, `Emerald Grove Pad`, `Void Nebula Pad`, `Cyber Halo Aura`, `Mini-Drone Sidekick`, and `Cyber Arcade UI Skin` (reskins all menu cards into a Gold Arcade Console!).
-- **`🎛️ Studio` Tab (Unified Single-Screen Settings & Control Studio)**:
-  - **Live Menu-Bar Preview Strip**: Shows a real-time preview of your macOS menu-bar status item (`LIVE MENU BAR` + active icon + live rendered title text) that updates as you click any control below.
-  - **1. Menu-Bar Icon Style**: 6-segment horizontal picker (`Bolt`, `Sprite`, `Crown`, `Flame`, `Bars`, `None`).
-  - **2. Menu-Bar Layout Preset**: 4-segment horizontal picker (`Custom`, `Full Info`, `Companion`, `Compact`).
-  - **3. Visible Menu-Bar Data Chips**: `4×2` one-click chip grid (`Alias`, `5h %`, `7d %`, `Codex`, `$ Cost`, `Tokens`, `Lv/Form`, `Boss HP`).
-  - **4. Auto-Switch & Quota Alert Threshold**: 5-segment horizontal bar (`Auto ON/OFF` + `80%`, `85%`, `90%`, `95%`).
-  - **5. Desktop Notifications & Codex Poll Interval**: 5-segment horizontal bar (`Bell ON/OFF` + `1m`, `5m`, `10m`, `15m`).
-  - **6. Engine Modules & Quick Tools**: One-click switches for `Codex Live`, `Cost Track`, `Idle Anim`, plus instant action buttons for `Update App` (`bswap update`), `Web Dashboard`, and `Export CSV`.
+- **`Settings` Tab (Minimalist Control Studio with `✓` Active State Pills)**:
+  - **Live Menu-Bar Preview Strip**: Shows a real-time preview of your macOS menu-bar status item (`LIVE MENU BAR` + active icon + live rendered title text) and confirms every setting toggle immediately in the header.
+  - **`HUB VIEW`**: 4-segment picker (`Luxury ✓`, `Detailed`, `Bento`, `Studio`).
+  - **`THEME`**: 5-segment picker (`Belkins ⚡ ✓`, `Cards`, `Apple`, `Dense`, `Classic`).
+  - **`HEADER ICON`**: 6-segment picker (`Game` controller default, `Bolt`, `Crown`, `Flame`, `Bars`, `None`).
+  - **`HEADER PRESET` & `HEADER STATS`**: 4 layout presets (`Custom`, `Full Info`, `Companion`, `Compact`) + `4×2` toggle grid (`Alias`, `5h %`, `7d %`, `Codex`, `$ Cost`, `Tokens`, `Lv/Form`, `Boss HP`) with explicit `✓` active indicators and `ON` / `OFF` badges.
+  - **`AUTO-SWITCH`, `ALERTS & POLLING`, `MODULES`, `TOOLS`**: One-click controls for Auto-Switch (`ON ✓` / `OFF` + `80%`..`95%`), Desktop Notifications (`Bell ON ✓` + `1m`..`15m`), `Codex Live`, `Cost Track`, `Idle Anim`, `Update App`, `Web Dashboard`, and `Export CSV`.
 
 ### `bswap` / `belkins` Interactive TUI & CLI Reference
 ```bash
@@ -165,7 +166,7 @@ tools. Every reset reads the same way everywhere: `↺ 14:50` today, `↺ Thu
 bars are one submenu away (**All Claude bars ▸**, **All Codex bars ▸**).
 
 **Settings ▸ Theme** (`menu_theme`) picks how the dropdown is drawn:
-**Belkins ⚡ (Companion & Party)** (default: features your Belkins Companion Medallion, Side-by-Side Squad Command Deck, Boss Raid Arena, 14-Trophy Hall of Fame, Spark Vault `✦ CR`, and **6 interactive in-menu tabs** — `⚡ Squad`, `Claude`, `Codex`, `✨ Evo`, `🛡️ Vault`, and `🎛️ Studio`), **Cards** (one rounded panel per provider, the active account large,
+**Belkins ⚡ (Companion & Party)** (default: Minimalist Luxury Companion Hero, Claude & Codex Party Showcase with 4 switchable Hub views, Boss Raid Arena, 14-Trophy Hall of Fame, Spark Vault `✦ CR`, and **6 interactive in-menu tabs** — `Hub`, `Claude`, `Codex`, `Evo`, `Vault`, and `Settings`), **Cards** (one rounded panel per provider, the active account large,
 the others one line each), **Apple** (the
 language of Control Center: hero lines, section headers, symbols, two-line
 rows), **Dense** (every account on one aligned line; the shortest menu), or the

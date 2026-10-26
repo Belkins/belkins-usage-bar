@@ -72,7 +72,6 @@ _TAB_ACCENTS: dict[str, str] = {
 _ACTIVE_TAB: str = "party"
 _DEX_SUBTAB: str = "pokedex"     # "pokedex" | "trophies"
 _SHOP_SUBTAB: str = "gear"       # "gear" | "style"
-_CFG_SUBTAB: str = "header"      # "header" | "general"
 _LAST_SHOP_NOTE: str = ""
 _LAST_BOSS_NOTE: str = ""
 _LAST_CFG_NOTE: str = ""
@@ -117,23 +116,6 @@ def set_shop_subtab(sub: str) -> None:
     global _SHOP_SUBTAB
     if sub in ("gear", "style"):
         _SHOP_SUBTAB = sub
-
-
-def set_cfg_subtab(sub: str) -> None:
-    global _CFG_SUBTAB
-    if sub in ("header", "general"):
-        _CFG_SUBTAB = sub
-
-
-def _fmt_num(n: int) -> str:
-    val = int(n)
-    if abs(val) >= 1_000_000:
-        m = val / 1_000_000.0
-        return f"{m:.1f}M" if abs(m) >= 10.0 else f"{m:.2f}M"
-    if abs(val) >= 10_000:
-        k = val / 1_000.0
-        return f"{k:.0f}K" if abs(k) >= 100.0 else f"{k:.1f}K"
-    return f"{val:,}"
 
 
 def _fmt_compact_coins(n: int) -> str:
@@ -421,19 +403,6 @@ def text_w(pen: Any, s: str, fk: str) -> float:
     return pen.width(s, size, weight, mono=mono, code=code, rounded=rounded)
 
 
-def segments(pen: Any, segs: list[tuple], x: float, baseline: float, maxw: float) -> float:
-    cur, end = x, x + maxw
-    for s, fk, role, *style in segs:
-        room = end - cur
-        if room <= 6:
-            break
-        if style and style[0] == "code":
-            cur += pen.chip(s, cur, baseline, F[fk][0], role=role, maxw=room, weight=F[fk][1])
-        else:
-            cur += text(pen, s, fk, role, cur, baseline, maxw=room)
-    return cur - x
-
-
 def luxury_bar(
     pen: Any,
     x: float,
@@ -483,24 +452,6 @@ def luxury_bar(
             if 0.03 < frac < 0.995 and fill_w >= h + 1.5:
                 NSColor.colorWithSRGBRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.72).setFill()
                 NSBezierPath.fillRect_(NSMakeRect(x + fill_w - 2.4, y + 0.8, 1.6, max(1.0, h - 1.6)))
-
-
-def segmented_bar(
-    pen: Any,
-    x: float,
-    mid_y: float,
-    w: float,
-    pct: float | None,
-    sev: str,
-    *,
-    h: float = 5.5,
-    cells: int = 8,
-    expired: bool = False,
-    fill_override: str | None = None,
-) -> None:
-    """Delegates to ``luxury_bar`` for a unified, sleek precision gauge experience."""
-    del cells
-    luxury_bar(pen, x, mid_y, w, pct, sev, h=h, expired=expired, fill_override=fill_override)
 
 
 def draw_pixel_companion(
@@ -729,48 +680,6 @@ def hairline(pen: Any, x0: float, x1: float, y: float) -> None:
 
 def _pill_w(pen: Any, s: str) -> float:
     return text_w(pen, s, "tag") + 10.0
-
-
-def flow(pen: Any, caps: list[tuple[str, str]], x: float, baseline: float, maxw: float) -> int:
-    lines, cur = 1, x
-    sep = "  ·  "
-    sep_w = text_w(pen, sep, "caption")
-    prev_tag = False
-    for i, (cap, kind) in enumerate(caps):
-        tag = kind == "tag"
-        fk = "caption_med" if kind in ("accent", "good", "crit", "warn") else "caption"
-        w = _pill_w(pen, cap) if tag else text_w(pen, cap, fk)
-        gap = 6.0 if (tag or prev_tag) else sep_w
-        if i and cur + gap + w > x + maxw:
-            lines += 1
-            baseline += CAP_STEP
-            cur = x
-        elif i:
-            if not (tag or prev_tag):
-                text(pen, sep, "caption", "tertiary", cur, baseline)
-            cur += gap
-        if tag:
-            cur += pen.pill(
-                cap,
-                cur,
-                baseline - 0.5,
-                F["tag"][0],
-                role="belkins_flame_text",
-                bg="belkins_flame_pill",
-                weight=F["tag"][1],
-            )
-        else:
-            cur += text(
-                pen,
-                cap,
-                fk,
-                CAP_ROLE.get(kind, SEV_TEXT.get(kind, "secondary")),
-                cur,
-                baseline,
-                maxw=x + maxw - cur,
-            )
-        prev_tag = tag
-    return lines
 
 
 def _clip_to(w: float, h: float, draw: Callable[[], None]) -> None:
@@ -1737,18 +1646,6 @@ def _codex_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) ->
 # ---------------------------------------------------------------- painters ---
 
 
-def _attn_head(count: int) -> Callable[[Any, float], float]:
-    def draw(pen: Any, y0: float) -> float:
-        base = y0 + HEAD_BASE
-        symbol(pen, "exclamationmark.triangle.fill", X0, base - 4.5, 11.5, "belkins_warn_fill")
-        text(pen, "Needs attention", "title", "label", X0 + 18, base)
-        cnt_s = str(count)
-        pw = _pill_w(pen, cnt_s)
-        pen.pill(cnt_s, X1 - pw, base - 0.5, F["tag"][0], role="warn_text", bg="belkins_warn_pill", weight="semibold")
-        return base + 8
-    return draw
-
-
 def _short_reset_mark(mark: str, *, ultra_short: bool = False) -> str:
     """Trim redundant trailing ` HH:MM` from multi-day calendar reset marks (`↺ Nov 2 00:59` -> `↺ Nov 2`) so reset labels never truncate."""
     s = str(mark or "").strip()
@@ -1793,80 +1690,6 @@ def _attn_item(it: dict[str, Any]) -> Callable[[Any, float], float]:
         st_s = f"· {it['state']}" + (f" ({it['age']})" if it.get("age") else "")
         text(pen, st_s, "caption_med", it["state_role"], sx, b1, maxw=max(40.0, right_lim - sx))
         return b1 + 8.0
-
-    return draw
-
-
-def _attn_grouped_item(group: list[dict[str, Any]], *, show_tab_hint: bool = True) -> Callable[[Any, float], float]:
-    """Compact 2-line summary for multiple accounts sharing the same alert state — guarantees `bswap add` is never truncated."""
-    first = group[0]
-    n = len(group)
-    provider = first["provider"]
-    state = first["state"]
-    state_role = first["state_role"]
-
-    def _short_alias(s: str) -> str:
-        return (s[:10] + "…") if len(s) > 11 else s
-
-    names = [_short_alias(g["name"]) for g in group]
-    if len(names) <= 3:
-        names_s = ", ".join(names)
-    else:
-        names_s = f"{', '.join(names[:3])} +{len(names) - 3} more"
-
-    cmd_chip = next(
-        (seg[0] for seg in (first.get("action_segs") or ()) if len(seg) >= 4 and seg[3] == "code"),
-        "bswap add",
-    )
-
-    def draw(pen: Any, y0: float) -> float:
-        b1 = y0 + 16.0
-        head_s = f"{n} {provider} slots"
-        whead = text(pen, head_s, "primary_med", "label", X0, b1)
-        hint_w = 54.0 if show_tab_hint else 0.0
-        text(pen, state, "primary", state_role, X0 + whead + 7.0, b1, maxw=X1 - (X0 + whead + 7.0 + hint_w))
-        if show_tab_hint:
-            text(pen, f"{provider} ▸", "caption_med", "secondary", X1, b1, right=True)
-
-        b2 = b1 + 17.5
-        # Draw right-aligned `Run [bswap add]` FIRST so the command chip is 100% immune to clipping!
-        chip_w = text_w(pen, cmd_chip, "code") + 6.0
-        run_lbl = "Run "
-        run_w = text_w(pen, run_lbl, "caption_med")
-        pen.chip(cmd_chip, X1 - chip_w, b2, F["code"][0], role="belkins_flame_text", bg="belkins_flame_pill", weight=F["code"][1])
-        text(pen, run_lbl, "caption_med", "secondary", X1 - chip_w - run_w - 2.0, b2)
-
-        left_maxw = max(40.0, X1 - chip_w - run_w - 10.0 - X0)
-        text(pen, names_s, "caption", "secondary", X0, b2, maxw=left_maxw)
-        return b2 + ROW_END
-
-    return draw
-
-
-def _word_lines(pen: Any, s: str, fk: str, maxw: float, most: int) -> list[str]:
-    if most <= 1:
-        return [s]
-    words, lines, cur = s.split(), [], ""
-    for i, word in enumerate(words):
-        trial = f"{cur} {word}" if cur else word
-        if cur and text_w(pen, trial, fk) > maxw:
-            lines.append(cur)
-            if len(lines) == most - 1:
-                return lines + [" ".join(words[i:])]
-            cur = word
-        else:
-            cur = trial
-    return lines + [cur] if cur else lines
-
-
-def _attn_extra(line: str) -> Callable[[Any, float], float]:
-    def draw(pen: Any, y0: float) -> float:
-        b = y0 + 16
-        for i, part in enumerate(_word_lines(pen, line.split("\n")[0], "primary", W_INNER, 3)):
-            if i:
-                b += 16.0
-            text(pen, part, "primary", "label", X0, b, maxw=W_INNER)
-        return b + ROW_END
 
     return draw
 
@@ -2511,87 +2334,6 @@ def _claude_sessions_card(snapshot: Any) -> _Card | None:
         )
 
     card.add(_gap(8.0), key="belkins-claude-sessions-foot")
-    return card
-
-
-def _attention_card(spec: dict[str, Any]) -> _Card:
-    """Smart Needs-Attention card: collapses 2+ identical re-login slots into one clean summary row."""
-    card = _Card("belkins_card", "belkins_card_edge", rule="belkins_attn_rule")
-    count = len(spec["items"]) + len(spec["extras"])
-    card.add(_attn_head(count), key="belkins-attn-head", ax=f"Needs attention: {count}")
-
-    items = spec["items"]
-    if len(items) > 1:
-        grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
-        standalone: list[dict[str, Any]] = []
-        for it in items:
-            if it["action"] is None:
-                grouped.setdefault((it["provider"], it["state"]), []).append(it)
-            else:
-                standalone.append(it)
-
-        for (prov, st_name), grp in grouped.items():
-            if len(grp) >= 2:
-                combined_tip = "\n".join(g["tip"] for g in grp)
-                combined_ax = " ".join(f"{g['provider']} {g['name']}: {g['state']}." for g in grp)
-                target_tab = "claude" if prov.lower() == "claude" else "codex"
-                card.add(
-                    _attn_grouped_item(grp),
-                    key=f"belkins-attn-grouped-{prov.lower()}-{st_name[:12]}",
-                    tooltip=combined_tip,
-                    ax=combined_ax,
-                    action=lambda t=target_tab: set_active_tab(t),
-                    keep_open=True,
-                    **ROW_HL,
-                )
-            else:
-                standalone.extend(grp)
-
-        for it in standalone:
-            opens = "Logs in again." if it["action"] is not None else ""
-            label = " ".join(
-                x
-                for x in (
-                    f"{it['provider']} {it['name']}: {it['state']}.",
-                    f"{it['cause']}." if it["cause"] else "",
-                    f"Last seen {it['age']}." if it["age"] else "",
-                    opens,
-                )
-                if x
-            )
-            card.add(
-                _attn_item(it),
-                key=it["key"],
-                tooltip=it["tip"],
-                ax=label,
-                action=it["action"],
-                **ROW_HL,
-            )
-    else:
-        for it in items:
-            opens = "Logs in again." if it["action"] is not None else ""
-            label = " ".join(
-                x
-                for x in (
-                    f"{it['provider']} {it['name']}: {it['state']}.",
-                    f"{it['cause']}." if it["cause"] else "",
-                    f"Last seen {it['age']}." if it["age"] else "",
-                    opens,
-                )
-                if x
-            )
-            card.add(
-                _attn_item(it),
-                key=it["key"],
-                tooltip=it["tip"],
-                ax=label,
-                action=it["action"],
-                **ROW_HL,
-            )
-
-    for i, line in enumerate(spec["extras"]):
-        card.add(_attn_extra(line), key=f"belkins-attn-extra-{i}", tooltip=line, ax=line)
-    card.add(_gap(6), key="belkins-attn-foot")
     return card
 
 

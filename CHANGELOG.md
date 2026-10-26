@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-10-26 — Belkins Minimalist Luxury v7, 4 Hub Views, Game Icon & Interactive Settings
+
+- **Minimalist Luxury UI (`cc_usage_widget/themes/belkins.py`):**
+  - Expanded card margins (`12pt`), corner radii (`14pt`), and inter-card vertical spacing (`8pt`) with adaptive **Obsidian Dark** (`#111622`) and **Pearl Alabaster Light** (`#F5F6FA` canvas / `#FFFFFF` cards) palettes.
+  - Simplified the Companion Hero header to three calm elements (`Belkins Prime  Lv.89`, `Apex Sovereign · ✦ 12.7K`, and a `178pt` gold XP bar) alongside a hexagonal game medallion and controller badge.
+  - Streamlined the `Hub` tab into a minimalist Party Showcase: 1-line headers (`✦ Claude · 3/9` + `[⚡ Auto 85%]`), recessed active account panel (`45% free` + `5.5pt` stamina bar + concise window summary), top 2 ready standby accounts (`● callowayrupert NEXT  100% free`), and a 2-pill bottom telemetry strip (`⚡ Today  $388` and `✦ 30d  $58.1K`).
+  - Redesigned `Claude` and `Codex` party tabs with single-line `30pt` standby rows, inline `⏸` / `▶ Enable` slot controls, a collapsed 1-line re-login summary (`4 need re-login · main, dmitry, sm +1  [bswap add]`), and a clean workspace-only `Active Sessions` card.
+- **4 Switchable Hub Views & Interactive Settings (`Settings` tab):**
+  - Added `belkins_hub_view` (`Luxury`, `Detailed`, `Bento`, `Studio`) and `menu_theme` (`Belkins ⚡`, `Cards`, `Apple`, `Dense`, `Classic`) pickers directly inside the `Settings` tab and bottom dock.
+  - Added immediate optimistic UI state updates (`_LIVE_SETTINGS`, `_LIVE_AUTOSWITCH`), explicit `✓` active indicators on all segmented bars, and `ON` / `OFF` badges on all toggle chips.
+- **Game Controller Menu-Bar Icon (`cc_usage_widget/menubar.py`):**
+  - Added vector `gamecontroller.fill` (`"sprite"`) as the default menu-bar status icon (`16×16pt` template image).
+
 ## 2026-09-30 — Switching: a new login is never lost, a click lands on its slot
 
 A `/login` into an account the pool did not hold (a new Team seat) left
