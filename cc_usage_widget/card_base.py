@@ -1030,6 +1030,8 @@ def _sync_menu_visibility(menu: Any) -> None:
                         changed_vis = True
                 if not mi.isHidden():
                     v.setNeedsDisplay_(True)
+                    if v.window() is not None:
+                        v.displayIfNeeded()
         if changed_vis:
             menu.update()
     except Exception:

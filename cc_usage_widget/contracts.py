@@ -2905,6 +2905,8 @@ SETTINGS_DEFAULTS: dict[str, Any] = {
     # --- menu themes (design 3, 2026-09-25; belkins default) -------------
     "menu_theme": "belkins",
     "belkins_animations_enabled": True,
+    "belkins_hub_view": "luxury",
+    "belkins_native_tail": False,
 }
 """Full ``settings.json`` schema with defaults.
 
@@ -3091,6 +3093,7 @@ would defeat the whole design.
 SETTINGS_CHOICES: dict[str, tuple[str, ...]] = {
     "codex_pricing_tier": ("standard", "fast", "batch"),
     "menu_theme": ("belkins", "apple", "dense", "cards", "glance", "classic"),
+    "belkins_hub_view": ("luxury", "detailed", "bento", "cleanmymac"),
     "title_view": ("standard", "full", "companion", "raid", "cost", "compact", "icon_only"),
     "title_icon_style": (
         "bolt",

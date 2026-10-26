@@ -144,6 +144,7 @@ def tail_rows(snapshot: Any, *, problems: Sequence[str] = ()) -> list[dict[str, 
     is_belkins = (
         snapshot.settings.get("menu_theme", "belkins") == "belkins"
         and not bool(snapshot.settings.get("menu_layout_classic", False))
+        and not bool(snapshot.settings.get("belkins_native_tail", False))
     )
     if is_belkins and not getattr(snapshot, "unmanaged_login", None):
         return [r for r in rows if r is not None]

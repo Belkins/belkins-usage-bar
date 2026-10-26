@@ -51,7 +51,7 @@ TABS: tuple[tuple[str, str], ...] = (
     ("codex", "Codex"),
     ("dex", "Evo"),
     ("shop", "Vault"),
-    ("config", "Studio"),
+    ("config", "Settings"),
 )
 _TAB_ICONS: dict[str, str] = {
     "party": "square.grid.2x2.fill",
@@ -59,7 +59,7 @@ _TAB_ICONS: dict[str, str] = {
     "codex": "terminal.fill",
     "dex": "trophy.fill",
     "shop": "shield.lefthalf.filled",
-    "config": "slider.horizontal.3",
+    "config": "gearshape.fill",
 }
 _TAB_ACCENTS: dict[str, str] = {
     "party": "belkins_flame_rule",
@@ -76,6 +76,25 @@ _CFG_SUBTAB: str = "header"      # "header" | "general"
 _LAST_SHOP_NOTE: str = ""
 _LAST_BOSS_NOTE: str = ""
 _LAST_CFG_NOTE: str = ""
+_LIVE_SETTINGS: dict[str, Any] = {}
+_LIVE_AUTOSWITCH: bool = True
+_HUB_VIEWS: tuple[str, ...] = ("luxury", "detailed", "bento", "cleanmymac")
+
+
+def _cur_hub_view(snapshot: Any = None) -> str:
+    v = _LIVE_SETTINGS.get("belkins_hub_view")
+    if not v and snapshot is not None:
+        v = snapshot.settings.get("belkins_hub_view", "luxury")
+    v_str = str(v or "luxury")
+    return v_str if v_str in _HUB_VIEWS else "luxury"
+
+
+def _toggle_autoswitch_ui(actions: ThemeActions) -> None:
+    global _LIVE_AUTOSWITCH, _LAST_CFG_NOTE
+    _LIVE_AUTOSWITCH = not _LIVE_AUTOSWITCH
+    _LAST_CFG_NOTE = f"Auto-Switch: {'ON ✓' if _LIVE_AUTOSWITCH else 'OFF'}"
+    if callable(actions.toggle_autoswitch):
+        actions.toggle_autoswitch()
 
 
 def get_active_tab() -> str:
@@ -1533,12 +1552,16 @@ def _claude_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) -
     thr = getattr(snap, "autoswitch_threshold", 85.0)
     thr_int = int(round(float(thr if thr is not None else 85.0)))
     auto_on = bool(getattr(snap, "autoswitch_enabled", True))
-    header_pills: list[tuple[str, str, str, Callable[[], Any]]] = [
+    header_pills: list[tuple[Any, Any, Any, Callable[[], Any]]] = [
         (
-            f"⚡ Auto {thr_int}%" if auto_on else "Auto OFF",
-            "good_text" if auto_on else "belkins_cmm_sub",
-            "belkins_good_pill" if auto_on else "belkins_plan_pill",
-            actions.toggle_autoswitch,
+            lambda t_default=thr_int: (
+                f"⚡ Auto {int(_LIVE_SETTINGS.get('notification_threshold_pct', t_default) or t_default)}%"
+                if _LIVE_AUTOSWITCH
+                else "Auto OFF"
+            ),
+            lambda: "good_text" if _LIVE_AUTOSWITCH else "belkins_cmm_sub",
+            lambda: "belkins_good_pill" if _LIVE_AUTOSWITCH else "belkins_plan_pill",
+            lambda: _toggle_autoswitch_ui(actions),
         ),
     ]
     if nxt is not None and callable(actions.switch_best):
@@ -1893,7 +1916,10 @@ def _card_head(spec: dict[str, Any], *, one_line: bool = False, show_chevron: bo
         pills = all_pills[:1] if one_line else all_pills
         if pills:
             cur_r = right_edge
-            for lbl, role, bg, _fn in reversed(pills):
+            for raw_lbl, raw_role, raw_bg, _fn in reversed(pills):
+                lbl = str(raw_lbl() if callable(raw_lbl) else raw_lbl)
+                role = str(raw_role() if callable(raw_role) else raw_role)
+                bg = str(raw_bg() if callable(raw_bg) else raw_bg)
                 pw = _pill_w(pen, lbl)
                 if cur_r - pw < tx + tw + 8.0:
                     break
@@ -1933,7 +1959,8 @@ def _card_head_click_x(spec: dict[str, Any], *, one_line: bool = False) -> Calla
     def on_click_x(click_x: float) -> None:
         m = _Measure()
         cur_r = X1
-        for lbl, _role, _bg, fn in reversed(pills):
+        for raw_lbl, _role, _bg, fn in reversed(pills):
+            lbl = str(raw_lbl() if callable(raw_lbl) else raw_lbl)
             pw = _pill_w(m, lbl)
             x_start = cur_r - pw - 2.0
             x_end = cur_r + 2.0
@@ -2759,14 +2786,14 @@ def _tab_bar_block(claude_count: int, codex_count: int) -> Block:
             ic_name = _TAB_ICONS.get(tab_id, game_icons.get(tab_id, "sparkles"))
             fk_lbl = "tag"
             tw_lbl = text_w(pen, label, fk_lbl)
-            ic_sz = 7.6
-            ic_adv = 11.8
+            ic_sz = 7.2
+            ic_adv = 10.2
             tot_w = ic_adv + tw_lbl
-            start_x = tx + max(3.5, (seg_w - tot_w) / 2.0)
+            start_x = tx + max(2.2, (seg_w - tot_w) / 2.0)
             mid_y = y + 13.8
             sw = symbol(pen, ic_name, start_x, mid_y, ic_sz, ic_role, "semibold")
-            txt_x = start_x + max(ic_adv, (sw + 3.0) if sw > 0 else ic_adv)
-            avail_w = max(10.0, (tx + seg_w - 3.0) - txt_x)
+            txt_x = start_x + max(ic_adv - 0.5, (sw + 1.8) if sw > 0 else ic_adv)
+            avail_w = max(10.0, (tx + seg_w - 1.5) - txt_x)
             text(
                 pen,
                 label,
@@ -2849,12 +2876,13 @@ def _draw_provider_bento_tile(
 
     # 1. Top-Left: Provider vector icon (warm ember for Claude, cyber-emerald for Codex) + bold title
     b1 = ty + 21.0
-    title = spec["title"] if spec else fallback_title
+    raw_title = spec["title"] if spec else fallback_title
+    title = raw_title.replace(" Party", "").replace(" Quota", "") if tw < 190.0 else raw_title
     icon_name = spec["icon"] if spec else fallback_icon
     icon_role = (spec.get("rule") if spec else None) or accent_role or "belkins_cmm_icon"
     symbol(pen, icon_name, ix_left, b1 - 4.0, 13.0, icon_role, "semibold")
     ix_title = ix_left + 18.5
-    text(pen, title, "hero_name", "label", ix_title, b1, maxw=70.0)
+    text(pen, title, "hero_name", "label", ix_title, b1, maxw=78.0)
 
     if not spec:
         text(pen, "No accounts linked", "caption", "belkins_cmm_sub", ix_left, ty + 42.0, maxw=inner_w)
@@ -2939,8 +2967,11 @@ def _hub_bento_blocks(
     snapshot: Any,
     attn: dict[str, Any] | None,
     actions: ThemeActions,
+    *,
+    view_mode: str = "luxury",
+    key_prefix: str = "belkins-hub",
 ) -> list[Block]:
-    """Build Unified Dual-Party Command Center (`Claude Party Card` + `Codex Party Card` + `Today Burn | 30d Spend & Sessions`)."""
+    """Build Unified Dual-Party Command Center supporting all 4 Hub View Styles (`luxury`, `detailed`, `bento`, `cleanmymac`)."""
     out: list[Block] = []
     tile_gap = 8.0
     tile_w = (W - 2 * CARD_X - tile_gap) / 2.0
@@ -2955,33 +2986,224 @@ def _hub_bento_blocks(
 
     urgent_extras = [e for e in extras if not str(e).lower().startswith("last switch")]
 
-    # 1. Extra non-account engine verdicts / external-switch alerts (only when urgent, never for routine "last switch")
-    if urgent_extras and not claude_spec and not codex_spec:
-        extra_card = _Card("belkins_card", "belkins_card_edge", rule="belkins_attn_rule")
-        for i, line in enumerate(urgent_extras):
-            extra_card.add(_attn_extra(line), key=f"belkins-hub-attn-extra-{i}", tooltip=line, ax=line)
-        extra_card.add(_gap(4.0), key="belkins-hub-attn-extra-foot")
-        out += extra_card.blocks(2.0, 2.0)
+    if view_mode == "bento":
+        # Mode 3 (`bento`): Side-by-side 2×2 Game Bento Tiles + compact Quest Alert Banner
+        if claude_spec or codex_spec:
+            best_c = _best_bento_switch_row(claude_spec)
+            best_x = _best_bento_switch_row(codex_spec)
 
-    # 2. Full Interactive Claude Party Card (Sculptural Master Hero + 1-Line Ready Roster + Quiet Summary Footer)
-    if claude_spec:
-        out += _provider_card(
-            claude_spec,
-            claude_attn,
-            key_prefix="belkins-hub",
-            expand_attn=False,
-            extra_notes=list(extras),
-        ).blocks(2.0, 2.0)
+            def paint_bento_pair(pen: Pen, w: float, h: float) -> None:
+                _draw_cmm_backdrop(pen, w, h)
+                _draw_provider_bento_tile(
+                    pen,
+                    claude_spec,
+                    lx0,
+                    2.0,
+                    tile_w,
+                    88.0,
+                    "belkins_tile_claude",
+                    "belkins_tile_claude_edge",
+                    "Claude Party",
+                    "sparkles",
+                    "belkins_claude_rule",
+                )
+                _draw_provider_bento_tile(
+                    pen,
+                    codex_spec,
+                    rx0,
+                    2.0,
+                    tile_w,
+                    88.0,
+                    "belkins_tile_codex",
+                    "belkins_tile_codex_edge",
+                    "Codex Party",
+                    "terminal.fill",
+                    "belkins_codex_rule",
+                )
 
-    # 3. Full Interactive Codex Party Card (Sculptural Master Hero + 1-Line Ready Roster)
-    if codex_spec:
-        out += _provider_card(
-            codex_spec,
-            codex_attn,
-            key_prefix="belkins-hub",
-            expand_attn=False,
-            extra_notes=list(extras) if not claude_spec else None,
-        ).blocks(2.0, 2.0)
+            bento_blk: Block | None = None
+
+            def on_bento_click(click_x: float) -> None:
+                if click_x < W / 2.0:
+                    if best_c and callable(best_c.get("action")):
+                        if bento_blk is not None:
+                            bento_blk.keep_open = False
+                        best_c["action"]()
+                    else:
+                        if bento_blk is not None:
+                            bento_blk.keep_open = True
+                        set_active_tab("claude")
+                else:
+                    if best_x and callable(best_x.get("action")):
+                        if bento_blk is not None:
+                            bento_blk.keep_open = False
+                        best_x["action"]()
+                    else:
+                        if bento_blk is not None:
+                            bento_blk.keep_open = True
+                        set_active_tab("codex")
+
+            ax_parts = []
+            if claude_spec:
+                ax_parts.append(claude_spec["title"])
+            if codex_spec:
+                ax_parts.append(f"{codex_spec['title']}: {codex_spec['right']}".strip(": "))
+            ax_parts += list(extras)
+            bento_blk = Block(
+                92.0,
+                paint_bento_pair,
+                key=f"{key_prefix}-bento-providers",
+                ax=". ".join(p for p in ax_parts if p),
+                tooltip="\n".join(p for p in ax_parts if p),
+                action=lambda: on_bento_click(lx0 + 10.0),
+                on_click_x=on_bento_click,
+                keep_open=True,
+                no_hover_bg=True,
+            )
+            out.append(bento_blk)
+
+        if items or urgent_extras:
+            q_cnt = len(items)
+            q_txt = f"{q_cnt} {'account needs' if q_cnt == 1 else 'accounts need'} re-login" if q_cnt else str(urgent_extras[0])
+            q_tips = [it["tip"] for it in items] + list(urgent_extras)
+
+            def paint_quest_banner(pen: Pen, w: float, h: float, msg: str = q_txt) -> None:
+                _draw_cmm_backdrop(pen, w, h)
+                fill, edge, _ = _card_surface_roles("belkins_card", "belkins_card_edge", None)
+                draw_glass_tile(pen, CARD_X, 2.0, W - 2 * CARD_X, 32.0, 9.0, fill, edge)
+                b = 22.0
+                symbol(pen, "exclamationmark.triangle.fill", X0, b - 4.0, 11.0, "belkins_warn_fill", "semibold")
+                text(pen, msg, "caption_med", "warn_text", X0 + 16.5, b, maxw=W_INNER - 64.0)
+                text(pen, "Fix ▸", "caption_med", "belkins_cmm_aqua", X1, b, right=True)
+
+            out.append(
+                Block(
+                    36.0,
+                    paint_quest_banner,
+                    key=f"{key_prefix}-bento-quest",
+                    ax=f"Quest Alert: {q_txt}. Click to fix.",
+                    tooltip="\n".join(q_tips),
+                    action=lambda: set_active_tab("claude" if claude_attn else "codex"),
+                    keep_open=True,
+                    no_hover_bg=True,
+                )
+            )
+    elif view_mode == "cleanmymac":
+        # Mode 4 (`cleanmymac`): CleanMyMac Indigo Glass Protection Banner + Side-by-Side Cyan Action Tiles
+        q_cnt = len(items)
+        q_tips = [it["tip"] for it in items] + list(extras)
+
+        def paint_cmm_banner(pen: Pen, w: float, h: float) -> None:
+            _draw_cmm_backdrop(pen, w, h)
+            fill, edge, _ = _card_surface_roles("belkins_card", "belkins_card_edge", None)
+            draw_glass_tile(pen, CARD_X, 2.0, W - 2 * CARD_X, 44.0, 11.0, fill, edge)
+            b1 = 20.0
+            b2 = 35.0
+            if q_cnt > 0:
+                ic_nm, ic_rl = "exclamationmark.shield.fill", "belkins_cmm_coral"
+                hdr_s = f"Action Needed: {q_cnt} {'Account' if q_cnt == 1 else 'Accounts'}"
+                sub_s = "Expired or capped credentials in party pool"
+                pill_s, pill_r, pill_bg = "Fix Now ▸", "crit_text", "belkins_crit_pill"
+            else:
+                ic_nm, ic_rl = "checkmark.shield.fill", "belkins_cmm_aqua"
+                hdr_s = "Fleet Protected & Ready"
+                sub_s = "Auto-Switch active · All active quotas healthy"
+                pill_s, pill_r, pill_bg = "Protected ✓", "good_text", "belkins_good_pill"
+            symbol(pen, ic_nm, X0, b1 + 3.0, 16.0, ic_rl, "semibold")
+            pw = _pill_w(pen, pill_s)
+            pen.pill(pill_s, X1 - pw, b1 + 4.5, F["tag"][0], role=pill_r, bg=pill_bg, weight="semibold")
+            max_tx = max(60.0, (X1 - pw - 8.0) - (X0 + 24.0))
+            text(pen, hdr_s, "primary_med", "label", X0 + 24.0, b1, maxw=max_tx)
+            text(pen, sub_s, "caption", "belkins_cmm_sub", X0 + 24.0, b2, maxw=max_tx)
+
+        out.append(
+            Block(
+                48.0,
+                paint_cmm_banner,
+                key=f"{key_prefix}-cmm-banner",
+                ax="Fleet Protection Status. " + (" ".join(q_tips) if q_tips else "All active quotas healthy."),
+                tooltip="\n".join(q_tips) if q_tips else "Fleet Protected & Ready",
+                action=lambda: set_active_tab("claude" if claude_attn else "codex"),
+                keep_open=True,
+                no_hover_bg=True,
+            )
+        )
+
+        if claude_spec or codex_spec:
+            def paint_cmm_pair(pen: Pen, w: float, h: float) -> None:
+                _draw_cmm_backdrop(pen, w, h)
+                _draw_provider_bento_tile(
+                    pen,
+                    claude_spec,
+                    lx0,
+                    2.0,
+                    tile_w,
+                    88.0,
+                    "belkins_tile_claude",
+                    "belkins_tile_claude_edge",
+                    "Claude Quota",
+                    "sparkles",
+                    "belkins_cmm_aqua",
+                )
+                _draw_provider_bento_tile(
+                    pen,
+                    codex_spec,
+                    rx0,
+                    2.0,
+                    tile_w,
+                    88.0,
+                    "belkins_tile_codex",
+                    "belkins_tile_codex_edge",
+                    "Codex Quota",
+                    "terminal.fill",
+                    "belkins_cmm_aqua",
+                )
+
+            ax_cmm = []
+            if claude_spec:
+                ax_cmm.append(claude_spec["title"])
+            if codex_spec:
+                ax_cmm.append(f"{codex_spec['title']}: {codex_spec['right']}".strip(": "))
+            out.append(
+                Block(
+                    92.0,
+                    paint_cmm_pair,
+                    key=f"{key_prefix}-cmm-providers",
+                    ax=". ".join(p for p in ax_cmm if p),
+                    tooltip="\n".join(p for p in ax_cmm if p),
+                    action=lambda: set_active_tab("claude"),
+                    on_click_x=lambda cx: set_active_tab("claude" if cx < W / 2.0 else "codex"),
+                    keep_open=True,
+                    no_hover_bg=True,
+                )
+            )
+    else:
+        # Mode 1 (`luxury`, Default) & Mode 2 (`detailed`, Expanded 2-Line Party Command Center)
+        expand_all = view_mode == "detailed"
+        if urgent_extras and not claude_spec and not codex_spec:
+            extra_card = _Card("belkins_card", "belkins_card_edge", rule="belkins_attn_rule")
+            for i, line in enumerate(urgent_extras):
+                extra_card.add(_attn_extra(line), key=f"{key_prefix}-attn-extra-{i}", tooltip=line, ax=line)
+            extra_card.add(_gap(4.0), key=f"{key_prefix}-attn-extra-foot")
+            out += extra_card.blocks(2.0, 2.0)
+
+        if claude_spec:
+            out += _provider_card(
+                claude_spec,
+                claude_attn,
+                key_prefix=key_prefix,
+                expand_attn=expand_all,
+                extra_notes=list(extras),
+            ).blocks(2.0, 2.0)
+
+        if codex_spec:
+            out += _provider_card(
+                codex_spec,
+                codex_attn,
+                key_prefix=key_prefix,
+                expand_attn=expand_all,
+                extra_notes=list(extras) if not claude_spec else None,
+            ).blocks(2.0, 2.0)
 
     # 4. Compact Side-by-Side Today Burn (+XP) & 30d Spend / CLI Sessions Strip
     cost = getattr(snapshot, "cost", None)
@@ -3047,11 +3269,12 @@ def _hub_bento_blocks(
                     sub_30 = f"{_compact_usd_str(avg_7d)}/d · {sess_cnt} CLI sess" if sess_cnt > 0 else f"{_compact_usd_str(avg_7d)}/d avg"
                     text(pen, sub_30, "caption", "belkins_cmm_sub", rx0 + 32.0, b2, maxw=tile_w - 44.0)
 
+                burn_key = "belkins-party-burn-velocity" if key_prefix == "belkins-hub" else f"{key_prefix}-burn-velocity"
                 out.append(
                     Block(
                         62.0,
                         paint_telemetry,
-                        key="belkins-party-burn-velocity",
+                        key=burn_key,
                         ax=f"Today Burn {format_usd(usd_today)} ({xp_str}), 30d Spend {format_usd(usd_30d)}, 7d average {format_usd(avg_7d)} per day.",
                         tooltip="Click to open the full interactive HTML Usage & Cost Dashboard.",
                         action=dash_act,
@@ -3531,39 +3754,105 @@ def _shop_card(snapshot: Any, companion: CompanionState, subtab: str) -> _Card:
 
 
 def _config_card(snapshot: Any, actions: ThemeActions, subtab: str = "header") -> _Card:
-    """`🎛️ Studio` Tab: Unified, Single-Screen Control Center for Menu-Bar Header, Icon, Thresholds & Engine."""
+    """`⚙️ Settings` Tab: Unified, Single-Screen Control Center for Views, Themes, Menu-Bar Header, Icon, Thresholds & Engine."""
     del subtab
     card = _Card("belkins_card", "belkins_card_edge", rule="belkins_flame_rule")
 
+    def _get_s(k: str, default: Any = None) -> Any:
+        if k in _LIVE_SETTINGS:
+            return _LIVE_SETTINGS[k]
+        return snapshot.settings.get(k, default)
+
+    def _put_s(k: str, val: Any) -> None:
+        _LIVE_SETTINGS[k] = val
+        if isinstance(getattr(snapshot, "settings", None), dict):
+            snapshot.settings[k] = val
+
     def _cur_view() -> str:
-        v = str(snapshot.settings.get("title_view", "standard") or "standard")
-        if snapshot.settings.get("title_compact", False) and v == "standard":
+        v = str(_get_s("title_view", "standard") or "standard")
+        if bool(_get_s("title_compact", False)) and v == "standard":
             return "compact"
         return v
 
     def _cur_icon() -> str:
-        if not snapshot.settings.get("title_show_icon", True):
+        if not bool(_get_s("title_show_icon", True)):
             return "none"
-        return str(snapshot.settings.get("title_icon_style", "bolt") or "bolt")
+        return str(_get_s("title_icon_style", "bolt") or "bolt")
+
+    def _cur_theme() -> str:
+        if bool(_get_s("menu_layout_classic", False)):
+            return "classic"
+        return str(_get_s("menu_theme", "belkins") or "belkins")
+
+    def _set_hub_view(mode: str, label: str) -> None:
+        global _LAST_CFG_NOTE
+        _put_s("belkins_hub_view", mode)
+        actions.set_setting("belkins_hub_view", mode)
+        _LAST_CFG_NOTE = f"Hub View → {label} ✓"
+
+    def _set_theme(th: str, label: str) -> None:
+        global _LAST_CFG_NOTE
+        _put_s("menu_theme", th)
+        _put_s("menu_layout_classic", th == "classic")
+        _LAST_CFG_NOTE = f"Theme → {label} ✓"
+        actions.set_setting("menu_theme", th)
 
     def _set_view(v: str, label: str) -> None:
         global _LAST_CFG_NOTE
+        _put_s("title_view", v)
+        _put_s("title_compact", v == "compact")
+        if v == "full":
+            for ck, cv in (
+                ("title_show_alias", True),
+                ("title_show_five_hour_pct", True),
+                ("title_show_seven_day_pct", True),
+                ("title_show_scoped_pct", True),
+                ("title_show_codex_pct", True),
+                ("title_show_cost", True),
+                ("title_show_tokens", False),
+                ("title_show_companion", False),
+                ("title_show_coins", False),
+                ("title_show_boss", False),
+            ):
+                _put_s(ck, cv)
+        elif v == "companion":
+            for ck, cv in (
+                ("title_show_alias", False),
+                ("title_show_five_hour_pct", True),
+                ("title_show_seven_day_pct", False),
+                ("title_show_scoped_pct", False),
+                ("title_show_codex_pct", False),
+                ("title_show_cost", False),
+                ("title_show_tokens", False),
+                ("title_show_companion", True),
+                ("title_show_coins", True),
+                ("title_show_boss", False),
+            ):
+                _put_s(ck, cv)
         actions.set_setting("title_view", v)
-        _LAST_CFG_NOTE = f"Layout → {label}"
+        _LAST_CFG_NOTE = f"Layout → {label} ✓"
 
     def _set_icon(st: str, label: str) -> None:
         global _LAST_CFG_NOTE
+        _put_s("title_icon_style", st)
+        _put_s("title_show_icon", st != "none")
         actions.set_setting("title_icon_style", st)
-        _LAST_CFG_NOTE = f"Icon → {label}"
+        _LAST_CFG_NOTE = f"Icon → {label} ✓"
 
     def _toggle_key(k: str, label: str, default: bool = True) -> None:
         global _LAST_CFG_NOTE
-        cur = bool(snapshot.settings.get(k, default))
-        actions.set_setting(k, not cur)
-        _LAST_CFG_NOTE = f"{label}: {'ON ✓' if not cur else 'OFF'}"
+        cur = bool(_get_s(k, default))
+        new_val = not cur
+        _put_s(k, new_val)
+        if k.startswith("title_show_"):
+            _put_s("title_view", "standard")
+            _put_s("title_compact", False)
+        actions.set_setting(k, new_val)
+        _LAST_CFG_NOTE = f"{label}: {'ON ✓' if new_val else 'OFF'}"
 
     def _set_val(k: str, val: Any, label: str) -> None:
         global _LAST_CFG_NOTE
+        _put_s(k, val)
         actions.set_setting(k, val)
         _LAST_CFG_NOTE = label
 
@@ -3580,9 +3869,9 @@ def _config_card(snapshot: Any, actions: ThemeActions, subtab: str = "header") -
     # 1. Header + Live Menu-Bar Preview Strip
     def draw_cfg_head(pen: Any, y0: float) -> float:
         base = y0 + HEAD_BASE
-        symbol(pen, "slider.horizontal.3", X0, base - 4.0, 11.5, "belkins_flame_rule", "semibold")
-        text(pen, "Settings & Control Studio", "title", "label", X0 + 18.0, base)
-        note_tag = _LAST_CFG_NOTE if _LAST_CFG_NOTE else f"PRESET: {_cur_view().upper()}"
+        symbol(pen, "gearshape.fill", X0, base - 4.0, 11.5, "belkins_flame_rule", "semibold")
+        text(pen, "Settings & View Studio", "title", "label", X0 + 18.0, base)
+        note_tag = _LAST_CFG_NOTE if _LAST_CFG_NOTE else f"VIEW: {_cur_hub_view(snapshot).upper()}"
         pw = _pill_w(pen, note_tag)
         pen.pill(
             note_tag,
@@ -3617,7 +3906,6 @@ def _config_card(snapshot: Any, actions: ThemeActions, subtab: str = "header") -
             alias_s = str(getattr(act_row, "alias", "main") or "main")[:8]
             pct_s = f"{int(round(getattr(act_row, 'five_hour_pct', 0) or 0))}%" if act_row else "0%"
             live_str = f"{alias_s} {pct_s}"
-        # Strip leading fallback glyph if icon is rendered as SF Symbol
         if live_str.startswith("⚡"):
             live_str = live_str.lstrip("⚡").strip()
 
@@ -3639,27 +3927,28 @@ def _config_card(snapshot: Any, actions: ThemeActions, subtab: str = "header") -
     card.add(
         draw_cfg_head,
         key="belkins-cfg-head",
-        ax="Settings and Control Studio with Live Menu-Bar Preview",
-        tooltip="Every change below updates your macOS menu-bar status item immediately.",
+        ax="Settings and View Studio with Live Menu-Bar Preview",
+        tooltip="Every change below updates your macOS menu-bar status item and Hub view immediately.",
     )
 
-    # Helper: Horizontal Segmented Control Bar
+    # Helper: Horizontal Segmented Control Bar (supports dynamic callable labels for ON/OFF state!)
     def _add_segmented_bar(
         row_key: str,
         sec_label: str,
-        items: list[tuple[str, str | None, Callable[[], bool], Callable[[], None], str]],
+        items: list[tuple[Any, str | None, Callable[[], bool], Callable[[], None], str]],
     ) -> None:
         n = len(items)
         gap_s = 4.0
         seg_w = (W_INNER - gap_s * (n - 1)) / float(n)
 
         def draw_seg(pen: Any, y0: float, seg_items: list = items) -> float:
-            lbl_b = y0 + 12.5
+            lbl_b = y0 + 12.0
             text(pen, sec_label, "tag", "belkins_flame_text", X0, lbl_b)
-            bar_y = lbl_b + 4.5
-            bar_h = 26.0
-            b_txt = bar_y + 17.0
-            for idx, (lbl, sf_ic, is_on_fn, _act_fn, _tip) in enumerate(seg_items):
+            bar_y = lbl_b + 4.0
+            bar_h = 25.0
+            b_txt = bar_y + 16.5
+            for idx, (raw_lbl, sf_ic, is_on_fn, _act_fn, _tip) in enumerate(seg_items):
+                lbl = str(raw_lbl() if callable(raw_lbl) else raw_lbl)
                 sx = X0 + idx * (seg_w + gap_s)
                 on = bool(is_on_fn())
                 bg = "belkins_tab_active_fill" if on else "belkins_badge_off"
@@ -3669,27 +3958,28 @@ def _config_card(snapshot: Any, actions: ThemeActions, subtab: str = "header") -
                 if sf_ic:
                     fk_seg = "tag" if len(seg_items) >= 4 else "caption_med"
                     tw = text_w(pen, lbl, fk_seg)
-                    ic_s = 7.0 if len(seg_items) >= 6 else (7.4 if len(seg_items) == 5 else 7.8)
-                    ic_adv = 10.8 if len(seg_items) >= 6 else (10.5 if len(seg_items) == 5 else 11.2)
+                    ic_s = 6.6 if len(seg_items) >= 6 else (7.2 if len(seg_items) == 5 else 7.8)
+                    ic_adv = 9.0 if len(seg_items) >= 6 else (10.0 if len(seg_items) == 5 else 11.0)
                     tot = ic_adv + tw
-                    st_x = sx + max(2.2, (seg_w - tot) / 2.0)
-                    sw = symbol(pen, sf_ic, st_x, bar_y + 13.0, ic_s, txt_r, "semibold")
-                    gap_ic = 1.6 if len(seg_items) >= 5 else 2.2
+                    st_x = sx + max(1.5, (seg_w - tot) / 2.0)
+                    sw = symbol(pen, sf_ic, st_x, bar_y + 12.5, ic_s, txt_r, "semibold")
+                    gap_ic = 1.2 if len(seg_items) >= 5 else 2.0
                     txt_x = st_x + max(ic_adv - 1.0, (sw + gap_ic) if sw > 0 else ic_adv)
-                    text(pen, lbl, fk_seg, txt_r, txt_x, b_txt)
+                    text(pen, lbl, fk_seg, txt_r, txt_x, b_txt, maxw=max(12.0, (sx + seg_w - 1.2) - txt_x))
                 else:
                     text(pen, lbl, "caption_med", txt_r, sx + seg_w / 2.0, b_txt, center=True, maxw=seg_w - 4.0)
-            return bar_y + bar_h + 3.0
+            return bar_y + bar_h + 2.5
 
         def on_seg_click(click_x: float, seg_items: list = items) -> None:
             rel = max(0.0, min(W_INNER - 1.0, click_x - X0))
             idx = min(len(seg_items) - 1, max(0, int(rel // (seg_w + gap_s))))
             seg_items[idx][3]()
 
+        ax_labels = [str(i[0]() if callable(i[0]) else i[0]) for i in items]
         card.add(
             draw_seg,
             key=row_key,
-            ax=f"{sec_label}: " + ", ".join(i[0] for i in items),
+            ax=f"{sec_label}: " + ", ".join(ax_labels),
             tooltip="\n".join(i[4] for i in items if i[4]),
             action=lambda seg_items=items: seg_items[0][3](),
             on_click_x=on_seg_click,
@@ -3697,10 +3987,36 @@ def _config_card(snapshot: Any, actions: ThemeActions, subtab: str = "header") -
             no_hover_bg=True,
         )
 
-    # 2. Menu-Bar Icon (6-Segment Horizontal Picker)
+    # 1. Hub View Style (Switch between New Luxury View & Previous Views!)
+    _add_segmented_bar(
+        "belkins-cfg-hub-view-bar",
+        "1. HUB VIEW STYLE (NEW & PREVIOUS DESIGNS)",
+        [
+            ("Luxury", "sparkles", lambda: _cur_hub_view(snapshot) == "luxury", lambda: _set_hub_view("luxury", "Luxury Minimal"), "Sculptural Master Stamina Hero + 1-line ready standby rows (Default)"),
+            ("Full Party", "bolt.fill", lambda: _cur_hub_view(snapshot) == "detailed", lambda: _set_hub_view("detailed", "Full Party"), "Expanded 2-line standby slots with Switch/Pause pills & multi-bar hero"),
+            ("2×2 Bento", "square.grid.2x2.fill", lambda: _cur_hub_view(snapshot) == "bento", lambda: _set_hub_view("bento", "2×2 Bento Tiles"), "Compact side-by-side 2×2 Game Bento tiles + 1-line Quest Banner"),
+            ("CleanMac", "shield.fill", lambda: _cur_hub_view(snapshot) == "cleanmymac", lambda: _set_hub_view("cleanmymac", "CleanMyMac Glass"), "CleanMyMac Fleet Protection Banner + cyan quota tiles"),
+        ],
+    )
+
+    # 2. App Theme (Switch between Belkins & Classic / Legacy Themes!)
+    _add_segmented_bar(
+        "belkins-cfg-theme-bar",
+        "2. APP THEME (BELKINS & LEGACY MENU VIEWS)",
+        [
+            ("Belkins", "bolt.fill", lambda: _cur_theme() == "belkins", lambda: _set_theme("belkins", "Belkins ⚡"), "Belkins Companion, Boss Raid & Party Command Center"),
+            ("Cards", "rectangle.stack.fill", lambda: _cur_theme() == "cards", lambda: _set_theme("cards", "Cards"), "Classic native Cards theme"),
+            ("Apple", "apple.logo", lambda: _cur_theme() == "apple", lambda: _set_theme("apple", "Apple"), "Classic Apple native bars theme"),
+            ("Dense", "list.bullet", lambda: _cur_theme() == "dense", lambda: _set_theme("dense", "Dense"), "Compact Dense card theme"),
+            ("Glance", "doc.text", lambda: _cur_theme() == "glance", lambda: _set_theme("glance", "Glance"), "Glance text menu layout"),
+            ("Classic", "list.dash", lambda: _cur_theme() == "classic", lambda: _set_theme("classic", "Classic"), "Original Classic text menu layout"),
+        ],
+    )
+
+    # 3. Menu-Bar Icon (6-Segment Horizontal Picker)
     _add_segmented_bar(
         "belkins-cfg-icon-bar",
-        "1. MENU-BAR ICON STYLE",
+        "3. MENU-BAR ICON STYLE",
         [
             ("Game", "gamecontroller.fill", lambda: _cur_icon() == "cpu", lambda: _set_icon("cpu", "Game Crest"), "Crowned Cyber-Gamepad menu-bar icon"),
             ("Sprite", "sparkles", lambda: _cur_icon() == "companion", lambda: _set_icon("companion", "Companion Sprite"), "Live 12x12 color pixel sprite of your active Companion"),
@@ -3711,35 +4027,35 @@ def _config_card(snapshot: Any, actions: ThemeActions, subtab: str = "header") -
         ],
     )
 
-    # 3. Menu-Bar View Preset (4-Segment Horizontal Picker)
+    # 4. Menu-Bar View Preset (4-Segment Horizontal Picker)
     _add_segmented_bar(
         "belkins-cfg-view-bar",
-        "2. MENU-BAR LAYOUT PRESET",
+        "4. MENU-BAR LAYOUT PRESET",
         [
-            ("Custom", "slider.horizontal.3", lambda: _cur_view() == "standard", lambda: _set_view("standard", "Custom Chips"), "Show the exact stats toggled in Section 3 below"),
+            ("Custom", "slider.horizontal.3", lambda: _cur_view() == "standard", lambda: _set_view("standard", "Custom Chips"), "Show the exact stats toggled in Section 5 below"),
             ("Full Info", "chart.bar.fill", lambda: _cur_view() == "full", lambda: _set_view("full", "Full Info"), "Show Account + 5h% + 7d% + Codex% + Today Cost"),
             ("Companion", "sparkles", lambda: _cur_view() == "companion", lambda: _set_view("companion", "Companion HUD"), "Show Companion Level/Form + 5h% + SparkCoins"),
             ("Compact", "rectangle.compress.vertical", lambda: _cur_view() == "compact", lambda: _set_view("compact", "Compact V·C"), "Ultra-narrow V·C 100/100 view for crowded menu bars"),
         ],
     )
 
-    # 4. Visible Menu-Bar Stats (Compact 4-Column × 2-Row Chip Grid)
+    # 5. Visible Menu-Bar Stats (Compact 4-Column × 2-Row Chip Grid with explicit ON / OFF state!)
     card.add(
-        lambda pen, y0: text(pen, "3. VISIBLE MENU-BAR DATA CHIPS (CLICK TO TOGGLE)", "tag", "belkins_flame_text", X0, y0 + 12.5) and (y0 + 15.5),
+        lambda pen, y0: text(pen, "5. VISIBLE MENU-BAR DATA CHIPS (CLICK TO TOGGLE ON / OFF)", "tag", "belkins_flame_text", X0, y0 + 12.0) and (y0 + 15.0),
         key="belkins-cfg-chips-hdr",
     )
     chip_rows = [
         [
-            ("Alias", "person.fill", lambda: bool(snapshot.settings.get("title_show_alias", True)), lambda: _toggle_key("title_show_alias", "Account Alias", True), "Show active Claude account alias"),
-            ("5h %", "bolt.fill", lambda: bool(snapshot.settings.get("title_show_five_hour_pct", True)), lambda: _toggle_key("title_show_five_hour_pct", "5h Quota %", True), "Show active 5-hour quota %"),
-            ("7d %", "calendar", lambda: bool(snapshot.settings.get("title_show_seven_day_pct", False)), lambda: _toggle_key("title_show_seven_day_pct", "7d Weekly %", False), "Show 7-day weekly quota %"),
-            ("Codex", "terminal.fill", lambda: bool(snapshot.settings.get("title_show_codex_pct", False)), lambda: _toggle_key("title_show_codex_pct", "Codex %", False), "Show active Codex weekly %"),
+            ("Alias", "person.fill", lambda: bool(_get_s("title_show_alias", True)), lambda: _toggle_key("title_show_alias", "Account Alias", True), "Show active Claude account alias"),
+            ("5h %", "bolt.fill", lambda: bool(_get_s("title_show_five_hour_pct", True)), lambda: _toggle_key("title_show_five_hour_pct", "5h Quota %", True), "Show active 5-hour quota %"),
+            ("7d %", "calendar", lambda: bool(_get_s("title_show_seven_day_pct", False)), lambda: _toggle_key("title_show_seven_day_pct", "7d Weekly %", False), "Show 7-day weekly quota %"),
+            ("Codex", "terminal.fill", lambda: bool(_get_s("title_show_codex_pct", False)), lambda: _toggle_key("title_show_codex_pct", "Codex %", False), "Show active Codex weekly %"),
         ],
         [
-            ("$ Cost", "dollarsign.circle.fill", lambda: bool(snapshot.settings.get("title_show_cost", True)), lambda: _toggle_key("title_show_cost", "Today Cost", True), "Show today's notional USD spend ($/d)"),
-            ("Tokens", "number.square.fill", lambda: bool(snapshot.settings.get("title_show_tokens", False)), lambda: _toggle_key("title_show_tokens", "Today Tokens", False), "Show today's token burn (e.g. 42M)"),
-            ("Lv/Form", "sparkles", lambda: bool(snapshot.settings.get("title_show_companion", False)), lambda: _toggle_key("title_show_companion", "Companion Lv", False), "Show Companion Level & Stage in header"),
-            ("Boss HP", "flame.fill", lambda: bool(snapshot.settings.get("title_show_boss", False)), lambda: _toggle_key("title_show_boss", "Raid Boss HP", False), "Show active Raid Boss HP% in header"),
+            ("$ Cost", "dollarsign.circle.fill", lambda: bool(_get_s("title_show_cost", True)), lambda: _toggle_key("title_show_cost", "Today Cost", True), "Show today's notional USD spend ($/d)"),
+            ("Tokens", "number.square.fill", lambda: bool(_get_s("title_show_tokens", False)), lambda: _toggle_key("title_show_tokens", "Today Tokens", False), "Show today's token burn (e.g. 42M)"),
+            ("Level", "sparkles", lambda: bool(_get_s("title_show_companion", False)), lambda: _toggle_key("title_show_companion", "Companion Lv", False), "Show Companion Level & Stage in header"),
+            ("Boss", "flame.fill", lambda: bool(_get_s("title_show_boss", False)), lambda: _toggle_key("title_show_boss", "Raid Boss HP", False), "Show active Raid Boss HP% in header"),
         ],
     ]
     chip_gap = 5.0
@@ -3747,23 +4063,23 @@ def _config_card(snapshot: Any, actions: ThemeActions, subtab: str = "header") -
     for r_idx, c_row in enumerate(chip_rows):
         def draw_chip_row(pen: Any, y0: float, row_items: list = c_row) -> float:
             by = y0 + 2.0
-            bh = 26.0
-            bt = by + 17.0
-            for c_i, (clbl, c_sf, on_fn, _act, _tip) in enumerate(row_items):
+            bh = 25.0
+            bt = by + 16.5
+            for c_i, (clbl, _c_sf, on_fn, _act, _tip) in enumerate(row_items):
                 cx = X0 + c_i * (chip_w + chip_gap)
                 on = bool(on_fn())
-                bg = "belkins_badge_on" if on else "belkins_badge_off"
-                edge = "belkins_badge_on_edge" if on else "belkins_badge_off_edge"
+                bg = "belkins_good_pill" if on else "belkins_badge_off"
+                edge = "belkins_emerald_edge" if on else "belkins_badge_off_edge"
                 pen.rrect(cx, by, chip_w, bh, 5.5, bg, stroke=edge)
-                ic_r = "good_text" if on else "secondary"
+                dot_role = "belkins_good_fill" if on else "dead_fill"
+                pen.circle(cx + 5.5, by + 9.8, 5.4, dot_role)
+                state_s = "ON" if on else "OFF"
+                state_r = "good_text" if on else "secondary"
+                text(pen, state_s, "tag", state_r, cx + chip_w - 5.0, bt, right=True)
                 txt_r = "label" if on else "belkins_tab_inactive_text"
-                sw_c = symbol(pen, c_sf, cx + 6.5, by + 13.0, 8.2, ic_r, "semibold")
-                dot_s = "✓" if on else ""
-                if dot_s:
-                    text(pen, dot_s, "tag", "good_text", cx + chip_w - 6.0, bt, right=True)
-                tx_c = cx + max(19.5, 6.5 + sw_c + 3.0)
-                text(pen, clbl, "caption_med", txt_r, tx_c, bt, maxw=max(16.0, (cx + chip_w - (16.0 if on else 5.0)) - tx_c))
-            return by + bh + 3.0
+                tx_c = cx + 13.5
+                text(pen, clbl, "tag", txt_r, tx_c, bt, maxw=max(18.0, (cx + chip_w - 23.0) - tx_c))
+            return by + bh + 2.5
 
         def on_chip_row_click(click_x: float, row_items: list = c_row) -> None:
             rel = max(0.0, min(W_INNER - 1.0, click_x - X0))
@@ -3781,56 +4097,51 @@ def _config_card(snapshot: Any, actions: ThemeActions, subtab: str = "header") -
             no_hover_bg=True,
         )
 
-    # 5. Auto-Switch & Quota Alert Threshold (5-Segment Bar)
+    # 6. Auto-Switch & Quota Alert Threshold (5-Segment Bar)
     def _cur_thresh() -> int:
-        return int(snapshot.settings.get("notification_threshold_pct", 85) or 85)
-
-    def _toggle_autosw() -> None:
-        global _LAST_CFG_NOTE
-        actions.toggle_autoswitch()
-        _LAST_CFG_NOTE = f"Auto-Switch → {'OFF' if snapshot.autoswitch_enabled else 'ON ✓'}"
+        return int(_get_s("notification_threshold_pct", 85) or 85)
 
     _add_segmented_bar(
         "belkins-cfg-thresh-bar",
-        "4. AUTO-SWITCH & QUOTA ALERT THRESHOLD",
+        "6. AUTO-SWITCH & QUOTA ALERT THRESHOLD",
         [
             (
-                "Auto ON" if snapshot.autoswitch_enabled else "Auto OFF",
+                lambda: "Auto: ON" if _LIVE_AUTOSWITCH else "Auto: OFF",
                 "bolt.fill",
-                lambda: bool(snapshot.autoswitch_enabled),
-                _toggle_autosw,
+                lambda: bool(_LIVE_AUTOSWITCH),
+                lambda: _toggle_autoswitch_ui(actions),
                 "Toggle automatic Claude account rotation before hitting the wall",
             ),
-            ("80%", None, lambda: _cur_thresh() == 80, lambda: _set_val("notification_threshold_pct", 80, "Alert Threshold → 80%"), "Warn at 80% quota utilization"),
-            ("85%", None, lambda: _cur_thresh() == 85, lambda: _set_val("notification_threshold_pct", 85, "Alert Threshold → 85%"), "Warn at 85% quota utilization (default)"),
-            ("90%", None, lambda: _cur_thresh() == 90, lambda: _set_val("notification_threshold_pct", 90, "Alert Threshold → 90%"), "Warn at 90% quota utilization"),
-            ("95%", None, lambda: _cur_thresh() == 95, lambda: _set_val("notification_threshold_pct", 95, "Alert Threshold → 95%"), "Warn at 95% quota utilization"),
+            ("80%", None, lambda: _cur_thresh() == 80, lambda: _set_val("notification_threshold_pct", 80, "Alert Threshold → 80% ✓"), "Warn at 80% quota utilization"),
+            ("85%", None, lambda: _cur_thresh() == 85, lambda: _set_val("notification_threshold_pct", 85, "Alert Threshold → 85% ✓"), "Warn at 85% quota utilization (default)"),
+            ("90%", None, lambda: _cur_thresh() == 90, lambda: _set_val("notification_threshold_pct", 90, "Alert Threshold → 90% ✓"), "Warn at 90% quota utilization"),
+            ("95%", None, lambda: _cur_thresh() == 95, lambda: _set_val("notification_threshold_pct", 95, "Alert Threshold → 95% ✓"), "Warn at 95% quota utilization"),
         ],
     )
 
-    # 6. Desktop Alerts & Codex Poll Speed (5-Segment Bar)
+    # 7. Desktop Alerts & Codex Poll Speed (5-Segment Bar)
     def _cur_poll() -> int:
-        return int(snapshot.settings.get("codex_quota_interval_seconds", 300) or 300)
+        return int(_get_s("codex_quota_interval_seconds", 300) or 300)
 
     _add_segmented_bar(
         "belkins-cfg-poll-bar",
-        "5. DESKTOP NOTIFICATIONS & CODEX POLL INTERVAL",
+        "7. DESKTOP NOTIFICATIONS & CODEX POLL INTERVAL",
         [
             (
-                "Bell ON" if snapshot.settings.get("notifications_enabled", True) else "Bell OFF",
+                lambda: "Bell: ON" if bool(_get_s("notifications_enabled", True)) else "Bell: OFF",
                 "bell.fill",
-                lambda: bool(snapshot.settings.get("notifications_enabled", True)),
+                lambda: bool(_get_s("notifications_enabled", True)),
                 lambda: _toggle_key("notifications_enabled", "Desktop Alerts", True),
                 "Toggle macOS Notification Center quota alerts",
             ),
-            ("1m", None, lambda: _cur_poll() == 60, lambda: _set_val("codex_quota_interval_seconds", 60, "Codex Poll → 1 min"), "Poll live Codex quotas every 1 minute"),
-            ("5m", None, lambda: _cur_poll() == 300, lambda: _set_val("codex_quota_interval_seconds", 300, "Codex Poll → 5 min"), "Poll live Codex quotas every 5 minutes (recommended)"),
-            ("10m", None, lambda: _cur_poll() == 600, lambda: _set_val("codex_quota_interval_seconds", 600, "Codex Poll → 10 min"), "Poll live Codex quotas every 10 minutes"),
-            ("15m", None, lambda: _cur_poll() == 900, lambda: _set_val("codex_quota_interval_seconds", 900, "Codex Poll → 15 min"), "Poll live Codex quotas every 15 minutes"),
+            ("1m", None, lambda: _cur_poll() == 60, lambda: _set_val("codex_quota_interval_seconds", 60, "Codex Poll → 1 min ✓"), "Poll live Codex quotas every 1 minute"),
+            ("5m", None, lambda: _cur_poll() == 300, lambda: _set_val("codex_quota_interval_seconds", 300, "Codex Poll → 5 min ✓"), "Poll live Codex quotas every 5 minutes (recommended)"),
+            ("10m", None, lambda: _cur_poll() == 600, lambda: _set_val("codex_quota_interval_seconds", 600, "Codex Poll → 10 min ✓"), "Poll live Codex quotas every 10 minutes"),
+            ("15m", None, lambda: _cur_poll() == 900, lambda: _set_val("codex_quota_interval_seconds", 900, "Codex Poll → 15 min ✓"), "Poll live Codex quotas every 15 minutes"),
         ],
     )
 
-    # 7. Core Engine Switches & Quick Actions (2 Rows of 3 Pills)
+    # 8. Core Engine Switches & Classic Menu Tail (4-Segment Bar with explicit :ON / :OFF labels!)
     def _trig_update() -> None:
         global _LAST_CFG_NOTE
         fn = getattr(actions, "update_app", None)
@@ -3854,28 +4165,35 @@ def _config_card(snapshot: Any, actions: ThemeActions, subtab: str = "header") -
 
     _add_segmented_bar(
         "belkins-cfg-engine-bar",
-        "6. ENGINE MODULES & QUICK ACTIONS",
+        "8. ENGINE MODULES & CLASSIC MENU TAIL",
         [
             (
-                "Codex Live",
+                lambda: f"Codex: {'ON' if bool(_get_s('codex_live_quota_enabled', False)) else 'OFF'}",
                 "antenna.radiowaves.left.and.right",
-                lambda: bool(snapshot.settings.get("codex_live_quota_enabled", False)),
+                lambda: bool(_get_s("codex_live_quota_enabled", False)),
                 lambda: _toggle_key("codex_live_quota_enabled", "Codex Live Quota", False),
                 "Enable live per-account Codex OAuth quota polling",
             ),
             (
-                "Cost Track",
+                lambda: f"Cost: {'ON' if bool(_get_s('cost_tracking_enabled', True)) else 'OFF'}",
                 "dollarsign.circle.fill",
-                lambda: bool(snapshot.settings.get("cost_tracking_enabled", True)),
+                lambda: bool(_get_s("cost_tracking_enabled", True)),
                 lambda: _toggle_key("cost_tracking_enabled", "Cost Tracking", True),
                 "Track local transcript token & USD spend",
             ),
             (
-                "Idle Anim",
+                lambda: f"Anim: {'ON' if bool(_get_s('belkins_animations_enabled', True)) else 'OFF'}",
                 "sparkles",
-                lambda: bool(snapshot.settings.get("belkins_animations_enabled", True)),
+                lambda: bool(_get_s("belkins_animations_enabled", True)),
                 lambda: _toggle_key("belkins_animations_enabled", "Idle Animations", True),
                 "Toggle retro pixel breathing/bobbing animations while menu is open",
+            ),
+            (
+                lambda: f"Tail: {'ON' if bool(_get_s('belkins_native_tail', False)) else 'OFF'}",
+                "list.bullet.rectangle",
+                lambda: bool(_get_s("belkins_native_tail", False)),
+                lambda: _toggle_key("belkins_native_tail", "Classic Menu Tail", False),
+                "Show classic macOS menu tail (Cost, Sessions, Resets, Settings) at bottom of dropdown",
             ),
         ],
     )
@@ -3909,10 +4227,10 @@ def _tag_blocks(
 
 
 def _footer_dock_block(snapshot: Any, actions: ThemeActions) -> Block:
-    """CleanMyMac-style bottom utility dock (`[🎮]   Open Command Center   [↻] [⚙️] [⏻]`)."""
-    del snapshot
+    """CleanMyMac-style bottom utility dock (`[🎮]   Open Command Center   [⊞] [↻] [⚙️] [⏻]`)."""
     btn_sz = 26.0
-    btn_gap = 5.0
+    btn_gap = 4.5
+    dock_blk: Block | None = None
 
     def paint(pen: Pen, w: float, h: float) -> None:
         _draw_cmm_backdrop(pen, w, h)
@@ -3944,8 +4262,9 @@ def _footer_dock_block(snapshot: Any, actions: ThemeActions) -> Block:
                 anchor="center",
             )
 
-        # Right square icon buttons (`Refresh`, `Studio`, `Quit`)
+        # Right square icon buttons (`Cycle View`, `Refresh`, `Settings`, `Quit`)
         right_icons = [
+            ("square.grid.2x2.fill", "belkins_cmm_aqua" if _cur_hub_view(snapshot) != "luxury" else "belkins_cmm_sub"),
             ("arrow.clockwise", "belkins_cmm_sub"),
             ("gearshape.fill", "belkins_cmm_aqua" if _ACTIVE_TAB == "config" else "belkins_cmm_sub"),
             ("power", "belkins_cmm_coral"),
@@ -3954,7 +4273,7 @@ def _footer_dock_block(snapshot: Any, actions: ThemeActions) -> Block:
         for idx, (ic_nm, ic_rl) in enumerate(right_icons):
             rx = r_start + idx * (btn_sz + btn_gap)
             draw_glass_tile(pen, rx, y, btn_sz, btn_sz, 6.5, fill, edge)
-            pen.symbol(ic_nm, rx + btn_sz / 2.0, mid_y, 10.5, ic_rl, "semibold", anchor="center")
+            pen.symbol(ic_nm, rx + btn_sz / 2.0, mid_y, 10.2, ic_rl, "semibold", anchor="center")
 
         # Center action text (`Open Command Center`) symmetrically centered between left & right docks
         left_end = lx + btn_sz
@@ -3967,37 +4286,58 @@ def _footer_dock_block(snapshot: Any, actions: ThemeActions) -> Block:
             center_x,
             y + 17.5,
             center=True,
-            maxw=max(60.0, r_start - left_end - 12.0),
+            maxw=max(60.0, r_start - left_end - 10.0),
         )
 
     def on_click_x(click_x: float) -> None:
-        r_start = W - CARD_X - 3 * btn_sz - 2 * btn_gap
+        global _LAST_CFG_NOTE
+        r_start = W - CARD_X - 4 * btn_sz - 3 * btn_gap
         if click_x >= r_start:
             rel = click_x - r_start
             slot = int(rel // (btn_sz + btn_gap))
             if slot <= 0:
+                if dock_blk is not None:
+                    dock_blk.keep_open = True
+                cur_v = _cur_hub_view(snapshot)
+                nxt_v = _HUB_VIEWS[(_HUB_VIEWS.index(cur_v) + 1) % len(_HUB_VIEWS)]
+                _LIVE_SETTINGS["belkins_hub_view"] = nxt_v
+                if isinstance(getattr(snapshot, "settings", None), dict):
+                    snapshot.settings["belkins_hub_view"] = nxt_v
+                actions.set_setting("belkins_hub_view", nxt_v)
+                _LAST_CFG_NOTE = f"Hub View → {nxt_v.title()} ✓"
+                set_active_tab("party")
+            elif slot == 1:
+                if dock_blk is not None:
+                    dock_blk.keep_open = True
                 if callable(actions.refresh):
                     actions.refresh()
-            elif slot == 1:
-                set_active_tab("config")
+            elif slot == 2:
+                if dock_blk is not None:
+                    dock_blk.keep_open = True
+                set_active_tab("party" if _ACTIVE_TAB == "config" else "config")
             else:
+                if dock_blk is not None:
+                    dock_blk.keep_open = False
                 if callable(actions.quit_app):
                     actions.quit_app()
             return
+        if dock_blk is not None:
+            dock_blk.keep_open = False
         if callable(actions.open_dashboard):
             actions.open_dashboard()
 
-    return Block(
+    dock_blk = Block(
         40.0,
         paint,
         key="belkins-footer-dock",
-        tooltip="Open Belkins Command Center Dashboard, Refresh Quotas, Open Studio, or Quit",
-        ax="Open Command Center, Refresh, Studio Settings, Quit",
+        tooltip="Open Command Center Dashboard, Cycle Hub View (Luxury / Full Party / 2×2 Bento / CleanMyMac), Refresh, Settings, or Quit",
+        ax="Open Command Center, Cycle Hub View, Refresh, Settings, Quit",
         action=actions.open_dashboard,
         on_click_x=on_click_x,
         keep_open=False,
         no_hover_bg=True,
     )
+    return dock_blk
 
 
 # ------------------------------------------------------------------ build ---
@@ -4008,8 +4348,13 @@ def build(snapshot: Any, now: float, actions: ThemeActions | None = None) -> lis
     from .. import app as A
     from .. import render as R
 
+    global _LIVE_AUTOSWITCH
     _ensure_roles()
     acts = actions or ThemeActions()
+    _LIVE_SETTINGS.clear()
+    if isinstance(getattr(snapshot, "settings", None), dict):
+        _LIVE_SETTINGS.update(snapshot.settings)
+    _LIVE_AUTOSWITCH = bool(getattr(snapshot, "autoswitch_enabled", False))
     companion = companion_from_snapshot(snapshot)
 
     # 1. Always-visible Companion Hero + Segmented 6-Tab Bar
@@ -4022,12 +4367,24 @@ def build(snapshot: Any, now: float, actions: ThemeActions | None = None) -> lis
     codex_cnt = len([r for r in A._visible_quota_rows_of(snapshot) if r.vendor != A.VENDOR_CLAUDE and r.slot < 0])
     blocks.append(_tab_bar_block(claude_cnt, codex_cnt))
 
-    # 2. Tab "party" ("Hub"): 2×2 Liquid Glass Bento Grid (Claude + Codex tiles, Burn + 30d tiles, Alert capsule)
+    # 2. Tab "party" ("Hub"): Pre-build all 4 Hub View Styles (`luxury`, `detailed`, `bento`, `cleanmymac`) for instant in-menu switching!
     attn = _attention_spec(A, snapshot, acts)
-    blocks += _tag_blocks(
-        _hub_bento_blocks(claude_sp, codex_sp, snapshot, attn, acts),
-        "party",
-    )
+    initial_hub = _cur_hub_view(snapshot)
+    for hub_mode in _HUB_VIEWS:
+        kp = "belkins-hub" if hub_mode == initial_hub else f"belkins-hub-{hub_mode}"
+        blocks += _tag_blocks(
+            _hub_bento_blocks(
+                claude_sp,
+                codex_sp,
+                snapshot,
+                attn,
+                acts,
+                view_mode=hub_mode,
+                key_prefix=kp,
+            ),
+            "party",
+            extra_pred=lambda m=hub_mode: _cur_hub_view(snapshot) == m,
+        )
 
     # 3. Tab "claude": Full Claude Party Manager + Individual Re-Login Slots + Active Claude CLI Sessions
     if claude_sp:
@@ -4072,12 +4429,12 @@ def build(snapshot: Any, now: float, actions: ThemeActions | None = None) -> lis
         extra_pred=lambda: _SHOP_SUBTAB == "style",
     )
 
-    # 7. Tab "config": Unified Single-Screen Settings & Control Studio
+    # 7. Tab "config": Unified Single-Screen Settings & View Studio
     blocks += _tag_blocks(
         _config_card(snapshot, acts).blocks(2.0, 2.0),
         "config",
     )
 
-    # 8. Always-visible Liquid Glass Utility Dock (replaces clunky native NSMenuItem tail)
+    # 8. Always-visible Liquid Glass Utility Dock
     blocks.append(_footer_dock_block(snapshot, acts))
     return blocks

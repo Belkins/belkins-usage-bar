@@ -6556,6 +6556,15 @@ class CCUsageWidgetApp(rumps.App):
                 except OSError:
                     pass
 
+        def toggle_autoswitch_from_theme() -> None:
+            target = not bool(self.snapshot().autoswitch_enabled)
+            with self._lock:
+                self._snapshot = replace(self._snapshot, autoswitch_enabled=target)
+            self._sync_status_icon(self._snapshot)
+            self.title = self.render_title(self._snapshot)
+            self._apply_title_attributes(self._snapshot)
+            self._worker.submit(_CMD_SET_AUTOSWITCH, target)
+
         return _themes.ThemeActions(
             switch_to=switch_to,
             switch_best=lambda: self._on_switch_best(None),
@@ -6569,7 +6578,7 @@ class CCUsageWidgetApp(rumps.App):
             refresh=lambda: self._on_refresh_now(None),
             open_dashboard=lambda: self._on_open_dashboard(None),
             set_setting=self._set_setting_from_theme,
-            toggle_autoswitch=lambda: self._on_toggle_autoswitch(None),
+            toggle_autoswitch=toggle_autoswitch_from_theme,
             export_csv=lambda: self._on_export_csv(None),
             update_app=update_app,
             quit_app=lambda: self._on_quit(None),
@@ -8545,7 +8554,7 @@ class CCUsageWidgetApp(rumps.App):
         else:
             snapshot.settings.update(new_settings)
             with self._lock:
-                self._snapshot = replace(self._snapshot, settings=new_settings)
+                self._snapshot = replace(self._snapshot, settings=snapshot.settings)
             self._sync_status_icon(self._snapshot)
             self.title = self.render_title(self._snapshot)
             self._apply_title_attributes(self._snapshot)
@@ -8596,7 +8605,7 @@ class CCUsageWidgetApp(rumps.App):
         else:
             snapshot.settings.update(new_settings)
             with self._lock:
-                self._snapshot = replace(self._snapshot, settings=new_settings)
+                self._snapshot = replace(self._snapshot, settings=snapshot.settings)
             self._sync_status_icon(self._snapshot)
             self.title = self.render_title(self._snapshot)
             self._apply_title_attributes(self._snapshot)
@@ -8604,12 +8613,40 @@ class CCUsageWidgetApp(rumps.App):
             self._worker.submit(_CMD_SET_SETTING, (k, v))
 
     def _belkins_submenu(self, snapshot: UiSnapshot) -> rumps.MenuItem:
-        """``Belkins Cyber-Forge ▸`` — Companion animations, stage morphing, Vault relics, and Boss strike."""
+        """``Belkins Cyber-Forge ▸`` — Hub View Style, Companion animations, stage morphing, Vault relics, and Boss strike."""
         settings = snapshot.settings
+        cur_hub = str(settings.get("belkins_hub_view", "luxury") or "luxury")
+        hub_labels = {
+            "luxury": "✨ Luxury Minimal (Default)",
+            "detailed": "⚡ Full Party (Detailed 2-Line)",
+            "bento": "⊞ 2×2 Bento Tiles (Compact)",
+            "cleanmymac": "🛡️ CleanMyMac Indigo Glass",
+        }
+        hub_items = [
+            _check(
+                rumps.MenuItem(
+                    hub_labels.get(mode, mode),
+                    callback=self._make_setting_value("belkins_hub_view", mode),
+                ),
+                cur_hub == mode,
+            )
+            for mode in SETTINGS_CHOICES.get("belkins_hub_view", ("luxury", "detailed", "bento", "cleanmymac"))
+        ]
         anim_on = bool(
             settings.get("belkins_animations_enabled", SETTINGS_DEFAULTS["belkins_animations_enabled"])
         )
+        tail_on = bool(
+            settings.get("belkins_native_tail", SETTINGS_DEFAULTS["belkins_native_tail"])
+        )
         children: list[Any] = [
+            _submenu(f"Hub View: {hub_labels.get(cur_hub, cur_hub)}", hub_items),
+            _check(
+                rumps.MenuItem(
+                    self._switch_label("Classic menu tail", tail_on),
+                    callback=self._make_setting_toggle("belkins_native_tail"),
+                ),
+                tail_on,
+            ),
             _check(
                 rumps.MenuItem(
                     self._switch_label("Idle animations", anim_on),
@@ -8978,6 +9015,9 @@ class CCUsageWidgetApp(rumps.App):
 
     def _set_setting_from_theme(self, key: str, value: Any) -> None:
         """Apply a setting change triggered from an in-card theme control (``keep_open=True``)."""
+        if key == "menu_theme":
+            self._make_theme_choice(str(value))(None)
+            return
         if key == "title_view":
             self._apply_header_view_choice(str(value), rebuild=False)
             return
@@ -9002,9 +9042,14 @@ class CCUsageWidgetApp(rumps.App):
             ):
                 updates["title_icon_style"] = "bolt"
         new_settings = normalize_settings({**snapshot.settings, **updates})
+        if key == "belkins_native_tail":
+            self._optimistic(settings=new_settings)
+            for k, v in updates.items():
+                self._worker.submit(_CMD_SET_SETTING, (k, v))
+            return
         snapshot.settings.update(new_settings)
         with self._lock:
-            self._snapshot = replace(self._snapshot, settings=new_settings)
+            self._snapshot = replace(self._snapshot, settings=snapshot.settings)
         self._sync_status_icon(self._snapshot)
         self.title = self.render_title(self._snapshot)
         self._apply_title_attributes(self._snapshot)
