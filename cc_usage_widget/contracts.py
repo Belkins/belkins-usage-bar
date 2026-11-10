@@ -2906,6 +2906,7 @@ SETTINGS_DEFAULTS: dict[str, Any] = {
     "menu_theme": "belkins",
     "belkins_animations_enabled": True,
     "belkins_hub_view": "luxury",
+    "belkins_thinking_guard": True,
     "belkins_native_tail": False,
 }
 """Full ``settings.json`` schema with defaults.

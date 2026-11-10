@@ -106,7 +106,7 @@ Remove everything: `./uninstall.sh`
   - **Recessed Active Account Panel**: Shows `● active`, plan badge, `45% free`, and individual `luxury_bar` tracks for `5h`, `7d`, and `Fable` / `Weekly` windows with concise reset times (`↺ 10:20`, `↺ Sat`).
   - **Single-Line `30pt` Standby Rows**: Click **any** standby Claude or Codex account row to switch your active login immediately, or click the right-aligned `⏸` / `▶ Enable` control to pause or resume a slot in auto-switch rotation.
   - **Collapsed Re-Login Banner**: Multiple expired slots collapse into a single actionable line (`4 need re-login · main, dmitry, sm +1  [bswap add]`).
-  - **Active Sessions Card (`Claude` tab)**: Displays running Claude Code CLI processes grouped cleanly by workspace name (`● Rightmark  5`).
+  - **Active Sessions Card (`Claude` tab)**: Displays running Claude Code CLI processes grouped cleanly by workspace name (`● Rightmark  5`), `PINNED` badges, and a one-click **`[🛡️ Guard ON]`** Preserved-Thinking Guard toggle that holds mid-turn proactive switches while sessions are busy.
 - **`Evo` Tab (Boss Raid Arena, Daily Supply Crate, 8 Cyber-Forms & 14 Trophies)**:
   - **Boss Raid Arena**: Recessed glass inner panel with a `luxury_bar` Boss HP gauge. Click directly in the menu to strike Raid Bosses (`HTTP-429 Golem`, `Context Leviathan`, `Latency Archlich`, `Quota Behemoth`, `Null Singularity`) using your Companion's **ATK & Crit** to loot **SparkCoins (`✦ CR`)** and **Bonus XP**!
   - **Daily Supply Crate (`🎁 Daily Supply Crate · Day N Streak`)**: Claimable once per calendar day directly inside `Evo` (or via `bswap claim`) for `+150..300 ✦ CR` and `+15,000..45,000 XP` scaling with your consecutive daily streak!
@@ -137,6 +137,9 @@ bswap vault                 # Open the 12-item Belkins Spark Vault in terminal (
 bswap buy <item>            # Buy, equip, or inject a relic (e.g. bswap buy serum, blade, core, arcade)
 bswap <slot|alias>          # Switch active Claude account to slot number or alias
 bswap best                  # Switch to the healthiest Claude account with the most headroom
+bswap claude [slot] [args]  # Launch Claude Code pinned to its owning slot (prevents cross-org thinking drops)
+bswap sessions              # Inspect active Claude Code sessions, org owners & Preserved-Thinking health
+bswap fix-thinking          # Auto-align active account to session org owners, pin workspaces & tune thresholds
 bswap codex switch <alias>  # Switch active Codex account in ~/.codex/auth.json
 bswap codex list            # List tracked Codex accounts and active login
 bswap dashboard             # Open the local Belkins HTML Usage & Companion Dashboard

@@ -2091,8 +2091,8 @@ def _claude_room(snapshot: UiSnapshot) -> tuple[int, int] | None:
     Extracted from ``_title_fleet`` (design wave 2) so the title suffix, the
     Claude card and the Claude section header count the same way. ``M`` =
     switchable, not ``cswap disable``d; ``N`` = of those, no derived-usage
-    note, a KNOWN 5-hour figure, and a binding window (:func:`_binding_window`)
-    below the autoswitch threshold. ``None`` when ``M`` is 0.
+    note and a KNOWN binding window (:func:`_binding_window`) below the
+    autoswitch threshold. ``None`` when ``M`` is 0.
     """
     threshold = snapshot.autoswitch_threshold
     if threshold is None:
@@ -2108,7 +2108,7 @@ def _claude_room(snapshot: UiSnapshot) -> tuple[int, int] | None:
     notes = snapshot.account_notes
 
     def _room(row: AccountRow) -> bool:
-        if row.slot in notes or row.five_hour_pct is None:
+        if row.slot in notes:
             return False
         window = _binding_window(row, models)
         return window is not None and window[1] < threshold
@@ -5764,6 +5764,9 @@ class CCUsageWidgetApp(rumps.App):
                     parts.append(
                         [(_title_pct(active.five_hour_pct), render.severity(active.five_hour_pct))]
                     )
+                elif show_5h and not show_7d and binding is not None and binding[0] == "7d":
+                    label, pct_text = _binding_token(active, binding)
+                    parts.append([(label, None), (pct_text, render.severity(binding[1]))])
                 if show_7d and active.seven_day_pct is not None:
                     parts.append(
                         [("7d", None), (_title_pct(active.seven_day_pct), render.severity(active.seven_day_pct))]
@@ -5931,6 +5934,14 @@ class CCUsageWidgetApp(rumps.App):
                 figures.append(
                     (initial, _compact_pct(active.five_hour_pct), render.severity(active.five_hour_pct))
                 )
+            else:
+                binding = _binding_window(
+                    active, tuple(snapshot.autoswitch_models or ())
+                ) or _binding_window(active, ("all",))
+                if binding is not None:
+                    figures.append(
+                        (initial, _compact_pct(binding[1]), render.severity(binding[1]))
+                    )
         identified = self._active_quota_row(snapshot)
         row = identified or self._transcript_quota_row(snapshot)
         credit = False

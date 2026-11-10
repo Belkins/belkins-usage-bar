@@ -98,13 +98,18 @@ def _load_companion_state() -> belkins_game.CompanionState:
 
     claude_rows: list[AccountRow] = []
     for swap_state in (
+        Path.home() / ".claude-swap-backup" / "sequence.json",
         Path.home() / ".claude" / "claude-swap" / "state.json",
         Path.home() / ".claude-swap" / "state.json",
     ):
         if swap_state.is_file():
             try:
                 st = json.loads(swap_state.read_text(encoding="utf-8"))
-                active_slot = st.get("active_account") or st.get("active")
+                active_slot = (
+                    st.get("activeAccountNumber")
+                    or st.get("active_account")
+                    or st.get("active")
+                )
                 for k, v in (st.get("accounts", {}) or {}).items():
                     slot_num = int(k)
                     usage = v.get("usage") or {}
@@ -127,26 +132,65 @@ def _load_companion_state() -> belkins_game.CompanionState:
                 pass
 
     codex_rows: list[AccountRow] = []
-    codex_dir = Path.home() / ".codex-accounts"
-    if codex_dir.is_dir():
+    codex_reg_path = WIDGET_DIR / "codex_accounts.json"
+    codex_snap_path = WIDGET_DIR / "codex_quota_snapshots.json"
+    if codex_reg_path.is_file():
         try:
-            idx = -1
-            for p in sorted(codex_dir.glob("*.json")):
-                if p.name.startswith(".") or p.name == "state.json":
+            reg_data = json.loads(codex_reg_path.read_text(encoding="utf-8"))
+            snap_accounts: dict[str, object] = {}
+            if codex_snap_path.is_file():
+                try:
+                    snap_data = json.loads(codex_snap_path.read_text(encoding="utf-8"))
+                    snap_accounts = snap_data.get("accounts", {}) or {}
+                except Exception:
+                    snap_accounts = {}
+            for i, entry in enumerate(reg_data.get("accounts", []) or []):
+                if not isinstance(entry, dict) or not entry.get("enabled", True):
                     continue
+                acc_id = str(entry.get("account_id") or "")
+                alias = str(entry.get("alias") or acc_id[:8] or f"codex-{i + 1}")
+                sd_pct: float | None = None
+                snap_entry = snap_accounts.get(acc_id)
+                if isinstance(snap_entry, dict):
+                    quota = snap_entry.get("quota")
+                    if isinstance(quota, dict):
+                        sd_obj = quota.get("seven_day")
+                        if isinstance(sd_obj, dict) and sd_obj.get("used_percent") is not None:
+                            sd_pct = float(sd_obj["used_percent"])
                 codex_rows.append(
                     AccountRow(
-                        slot=idx,
-                        alias=p.stem,
+                        slot=-(i + 1),
+                        alias=alias,
                         email="",
-                        is_active=(idx == -1),
+                        is_active=(i == 0),
+                        seven_day_pct=sd_pct,
                         vendor=VENDOR_CODEX,
                         switchable=False,
                     )
                 )
-                idx -= 1
         except Exception:
             pass
+    if not codex_rows:
+        codex_dir = Path.home() / ".codex-accounts"
+        if codex_dir.is_dir():
+            try:
+                idx = -1
+                for p in sorted(codex_dir.glob("*.json")):
+                    if p.name.startswith(".") or p.name == "state.json":
+                        continue
+                    codex_rows.append(
+                        AccountRow(
+                            slot=idx,
+                            alias=p.stem,
+                            email="",
+                            is_active=(idx == -1),
+                            vendor=VENDOR_CODEX,
+                            switchable=False,
+                        )
+                    )
+                    idx -= 1
+            except Exception:
+                pass
 
     return belkins_game.compute_companion(
         tokens_today=tokens_today,
@@ -904,6 +948,230 @@ def _cmd_update(args: list[str]) -> int:
     return 0
 
 
+def _detect_workspace_owner_slot(cwd: Path, identities: dict[int, tuple[str, str]]) -> int | None:
+    """Inspect the newest Claude transcript for *cwd* and return the slot whose ``organizationUuid`` owns its thinking blocks."""
+    org_to_slot = {org: slot for slot, (_email, org) in identities.items() if org}
+    if not org_to_slot:
+        return None
+    slug = str(cwd).replace("/", "-").replace(" ", "-")
+    pdir = Path.home() / ".claude" / "projects" / slug
+    if not pdir.is_dir():
+        return None
+    try:
+        jsonls = sorted(pdir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return None
+    if not jsonls:
+        return None
+    try:
+        lines = jsonls[0].read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    # Check first 60 lines for initial session-owner / credential_org
+    for line in lines[:60]:
+        if "session-owner" in line or "credential_org" in line:
+            try:
+                obj = json.loads(line)
+                org = obj.get("organizationUuid") or (obj.get("attachment") or {}).get("organizationUuid")
+                if org and org in org_to_slot:
+                    return org_to_slot[org]
+            except Exception:
+                pass
+    return None
+
+
+def _ensure_optimal_autoswitch_policy(backup_dir: Path) -> bool:
+    """Ensure claude-swap's settings.json sets weeklyThreshold=98.0 and hysteresisPct>=12.0 to prevent premature cross-org switches."""
+    s_path = backup_dir / "settings.json"
+    try:
+        raw = json.loads(s_path.read_text(encoding="utf-8")) if s_path.is_file() else {}
+    except Exception:
+        return False
+    if not isinstance(raw, dict):
+        return False
+    auto = dict(raw.get("autoswitch") or {})
+    changed = False
+    if auto.get("weeklyThreshold") is None or float(auto.get("weeklyThreshold", 0) or 0) < 95.0:
+        auto["weeklyThreshold"] = 98.0
+        changed = True
+    if float(auto.get("hysteresisPct", 10.0) or 10.0) < 12.0:
+        auto["hysteresisPct"] = 12.0
+        changed = True
+    if changed:
+        raw["autoswitch"] = auto
+        raw.setdefault("schemaVersion", 1)
+        try:
+            from claude_swap.settings import atomic_write_json
+
+            atomic_write_json(s_path, raw)
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def _cmd_sessions(args: list[str]) -> int:
+    """Inspect active Claude Code sessions, their Preserved-Thinking organization owner, and optionally auto-fix/pin."""
+    from . import accounts, fleet
+
+    do_fix = "--fix" in args or "fix" in args
+    try:
+        from claude_swap import paths
+
+        bdir = Path(paths.get_backup_root())
+    except Exception:
+        bdir = Path.home() / ".claude-swap-backup"
+
+    policy_updated = _ensure_optimal_autoswitch_policy(bdir)
+    identities = fleet.account_identities(bdir)
+    src = accounts.create_account_source()
+    src.refresh(force=False)
+    rows = {r.slot: r for r in src.rows()}
+    active = src.active()
+    active_slot = active.slot if active else None
+
+    snap = fleet.collect(backup_dir=bdir, active_slot=active_slot)
+    _print_banner()
+    print(f"  {BOLD}{ORANGE}🛡️  BELKINS PRESERVED-THINKING & SESSION QUALITY DIAGNOSTIC{RESET}")
+    if policy_updated:
+        print(f"  {GREEN}✓ Upgraded autoswitch policy: weeklyThreshold → 98.0%, hysteresisPct → 12.0%{RESET}")
+    else:
+        print(f"  {GREEN}✓ Thinking Guard: ACTIVE (holds busy turns to 96% 5h / 98% weekly){RESET}")
+    print()
+
+    if not snap.sessions:
+        print(f"  {DIM}No live interactive Claude Code sessions detected.{RESET}")
+        return 0
+
+    owner_counts: dict[int, int] = {}
+    pinned_workspaces: set[str] = set()
+    for s in snap.sessions:
+        cwd_p = Path(s.cwd) if s.cwd else Path.cwd()
+        short_w = cwd_p.name or s.cwd
+        owner_slot = s.slot if s.pinned else _detect_workspace_owner_slot(cwd_p, identities)
+        owner_row = rows.get(owner_slot) if owner_slot is not None else None
+        owner_lbl = f"#{owner_slot} ({owner_row.alias})" if owner_row else (f"#{owner_slot}" if owner_slot else "unknown")
+        cur_row = rows.get(s.slot) if s.slot is not None else None
+        cur_lbl = f"#{s.slot} ({cur_row.alias})" if cur_row else f"#{s.slot}"
+        mismatch = (not s.pinned) and (owner_slot is not None) and (owner_slot != s.slot)
+        if mismatch and owner_slot is not None:
+            owner_counts[owner_slot] = owner_counts.get(owner_slot, 0) + 1
+
+        mode_badge = f"{CYAN}📌 PINNED{RESET}" if s.pinned else (f"{GOLD}⚠ ORG SHIFTED{RESET}" if mismatch else f"{GREEN}● MATCHED{RESET}")
+        print(f"  PID {s.pid:<6} {BOLD}{short_w:<18}{RESET} [{s.status or 'idle':<7}] {mode_badge}  cur={cur_lbl}  thinking_org={owner_lbl}")
+
+        if do_fix and (not s.pinned) and owner_slot is not None and s.cwd and "/private/tmp/" not in s.cwd:
+            ident = identities.get(owner_slot)
+            if ident and s.cwd not in pinned_workspaces:
+                try:
+                    fleet.set_mapping(bdir, s.cwd, ident[0], ident[1])
+                    pinned_workspaces.add(s.cwd)
+                except Exception:
+                    pass
+
+    if pinned_workspaces:
+        print(f"\n  {GREEN}✓ Pinned {len(pinned_workspaces)} workspace(s) to their original thinking organization for future `bswap claude` launches.{RESET}")
+
+    if owner_counts:
+        # Find dominant healthy owner slot
+        best_owner = None
+        for cand_slot, _cnt in sorted(owner_counts.items(), key=lambda kv: kv[1], reverse=True):
+            r = rows.get(cand_slot)
+            if r and not r.disabled and not r.attention_note and (r.five_hour_pct or 0.0) < 90.0 and (r.seven_day_pct or 0.0) < 95.0:
+                best_owner = r
+                break
+        print()
+        if best_owner is not None and do_fix:
+            src.switch_to(str(best_owner.slot))
+            print(
+                f"  {GREEN}✓ Restored global login to Slot #{best_owner.slot} ({best_owner.alias}) "
+                f"so your active sessions regain their Preserved Thinking & Prompt Cache!{RESET}"
+            )
+        elif best_owner is not None:
+            print(
+                f"  {GOLD}💡 Tip:{RESET} Run {ORANGE}bswap fix-thinking{RESET} to restore Slot #{best_owner.slot} ({best_owner.alias}) "
+                f"and pin workspaces, or launch future terminals with {ORANGE}bswap claude{RESET} for 100% org isolation."
+            )
+    else:
+        print(f"\n  {GREEN}✓ All active sessions match their thinking organization!{RESET}")
+    return 0
+
+
+def _cmd_claude_session(args: list[str]) -> int:
+    """Launch Claude Code inside an isolated per-account profile (`cswap run --share-history`) locked to the workspace's thinking org."""
+    from . import accounts, fleet
+
+    cswap_bin = _find_cswap()
+    if cswap_bin is None:
+        print(f"{RED}cswap backend not found.{RESET}", file=sys.stderr)
+        return 1
+
+    try:
+        from claude_swap import paths
+
+        bdir = Path(paths.get_backup_root())
+    except Exception:
+        bdir = Path.home() / ".claude-swap-backup"
+
+    _ensure_optimal_autoswitch_policy(bdir)
+    identities = fleet.account_identities(bdir)
+    src = accounts.create_account_source()
+    src.refresh(force=False)
+    rows = {r.slot: r for r in src.rows()}
+
+    target_slot: str | None = None
+    claude_args = list(args)
+    if claude_args and not claude_args[0].startswith("-"):
+        first = claude_args[0]
+        if first.isdigit() or any(r.alias.lower() == first.lower() for r in rows.values()):
+            target_slot = first
+            claude_args = claude_args[1:]
+            if claude_args and claude_args[0] == "--":
+                claude_args = claude_args[1:]
+
+    cwd = Path.cwd()
+    if target_slot is None:
+        # 1. Check if current workspace has an existing transcript owner slot with headroom
+        owner_slot = _detect_workspace_owner_slot(cwd, identities)
+        if owner_slot is not None:
+            r = rows.get(owner_slot)
+            if r and not r.disabled and not r.attention_note and (r.five_hour_pct or 0.0) < 92.0 and (r.seven_day_pct or 0.0) < 96.0:
+                target_slot = str(owner_slot)
+                print(
+                    f"{GREEN}🛡️  Locked to Slot #{owner_slot} ({r.alias}){RESET} "
+                    f"{DIM}(matches this workspace's Preserved Thinking organization){RESET}"
+                )
+
+    if target_slot is None:
+        # 2. Pick healthiest slot with most headroom
+        healthy = [
+            r
+            for r in rows.values()
+            if not r.disabled and not r.attention_note and (r.five_hour_pct or 0.0) < 90.0 and (r.seven_day_pct or 0.0) < 95.0
+        ]
+        if healthy:
+            healthy.sort(
+                key=lambda r: max(
+                    float(r.five_hour_pct or 0.0),
+                    float(r.seven_day_pct or 0.0),
+                )
+            )
+            chosen = healthy[0]
+            target_slot = str(chosen.slot)
+            print(
+                f"{GREEN}🛡️  Launching isolated session on Slot #{chosen.slot} ({chosen.alias}){RESET} "
+                f"{DIM}(immune to background account switches){RESET}"
+            )
+        else:
+            active = src.active()
+            target_slot = str(active.slot if active else 1)
+
+    run_cmd = [str(cswap_bin), "run", target_slot, "--share-history"]
+    if claude_args:
+        run_cmd.extend(["--", *claude_args])
+    return subprocess.run(run_cmd).returncode
+
+
 def _cmd_help() -> int:
     _print_banner()
     print(f"{BOLD}Usage:{RESET} {ORANGE}bswap{RESET} [command]   (or {ORANGE}belkins{RESET} [command])")
@@ -923,7 +1191,10 @@ def _cmd_help() -> int:
     print(f"  {ORANGE}bswap bar{RESET} [on|off|restart|status|logs]  Control the Belkins menu-bar app")
     print(f"  {ORANGE}bswap codex{RESET} [list|switch|best|adopt|probe] Manage & switch Codex accounts")
     print()
-    print(f"{BOLD}Claude Fleet Commands:{RESET}")
+    print(f"{BOLD}Claude Fleet & Preserved-Thinking Commands:{RESET}")
+    print(f"  {ORANGE}bswap claude [slot] [args]{RESET} Launch Claude Code in an org-locked profile (never drops thinking!)")
+    print(f"  {ORANGE}bswap fix-thinking{RESET}         Diagnose & restore session orgs + set 98% weekly switch guard")
+    print(f"  {ORANGE}bswap sessions{RESET}             Inspect live Claude sessions & their Preserved-Thinking org owners")
     print(f"  {ORANGE}bswap <slot|alias>{RESET}         Switch active Claude account to slot number or alias")
     print(f"  {ORANGE}bswap best{RESET}                 Switch to the healthiest Claude account with most room")
     print(f"  {ORANGE}bswap list{RESET}                 List all registered Claude accounts")
@@ -1004,6 +1275,12 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_update(args[1:])
     if cmd == "codex":
         return _cmd_codex(args[1:])
+    if cmd in {"claude", "isolate", "locked"}:
+        return _cmd_claude_session(args[1:])
+    if cmd in {"sessions", "session", "thinking"}:
+        return _cmd_sessions(args[1:])
+    if cmd in {"fix-thinking", "sync-org", "restore-org"}:
+        return _cmd_sessions(["--fix", *args[1:]])
 
     return _run_cswap(args, show_banner=False)
 

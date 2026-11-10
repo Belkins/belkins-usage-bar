@@ -7533,5 +7533,36 @@ def test_extra_usage_line_under_a_claude_account() -> None:
         app._worker.stop(timeout=2.0)
 
 
+def test_seven_day_only_claude_accounts_render_in_title_and_room_count() -> None:
+    """Accounts whose API response omits ``five_hour`` (``five_hour_pct=None``)
+    and reports ``seven_day`` + ``scoped`` must still appear in the compact and
+    standard menu-bar titles and count as available rooms in ``_claude_room``."""
+    vlad = _ux_row(2, "vlad", five=None, seven=24.0, scoped=(("Fable", 2.0),), active=True)
+    podol = _ux_row(3, "podol", five=None, seven=13.0, scoped=(("Fable", 2.0),))
+    anastasiia = _ux_row(9, "sm.anastasiia.g", five=7.0, seven=5.0)
+    codex = replace(_scanned_codex_row(), seven_day_pct=51.0)
+    app = app_mod.CCUsageWidgetApp()
+    try:
+        compact_snap = UiSnapshot(
+            settings=_fleet_settings(title_compact=True),
+            accounts=(vlad, podol, anastasiia),
+            active=vlad,
+            quota_rows=(codex,),
+            autoswitch_threshold=85.0,
+        )
+        assert app.render_title(compact_snap) == "V·C 24/51"
+        assert app_mod._claude_room(compact_snap) == (3, 3)
+
+        std_snap = replace(compact_snap, settings=_fleet_settings(title_compact=False))
+        assert app.render_title(std_snap) == "vlad 7d24% F2%"
+        with_codex = replace(
+            compact_snap, settings=_fleet_settings(title_compact=False, title_show_codex_pct=True)
+        )
+        assert app.render_title(with_codex) == "vlad 7d24% F2% C51%"
+    finally:
+        app._running = False
+        app._worker.stop(timeout=2.0)
+
+
 if __name__ == "__main__":
     raise SystemExit(main())

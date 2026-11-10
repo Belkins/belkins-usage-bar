@@ -1272,7 +1272,11 @@ class SwapAccountSource:
             if derived is None:
                 # swap-1: no upstream word for it, so the refusal is named here.
                 derived = self._fetch_failure_note(account)
-            if derived is None and row.five_hour_pct is not None:
+            if derived is None and (
+                row.five_hour_pct is not None
+                or row.seven_day_pct is not None
+                or bool(row.scoped_windows)
+            ):
                 self._healthy_slots.add(row.slot)
                 self._no_cred_streak.pop(row.slot, None)
             elif (
@@ -2375,17 +2379,85 @@ class SwapAccountSource:
                 self._alert = None
 
         outcome: Any = None
+        orig_policy = getattr(engine, "settings", None)
+        guarded_policy = self._thinking_guard_policy(engine, orig_policy)
         try:
+            if guarded_policy is not None:
+                engine.settings = guarded_policy
             # tick() documents that it never raises; wrapped anyway, because a
             # raising tick must not kill the widget's worker thread.
             outcome = engine.tick()
         except Exception as exc:
             self._record_error("autoswitch tick failed", exc)
+        finally:
+            if guarded_policy is not None and orig_policy is not None:
+                try:
+                    engine.settings = orig_policy
+                except Exception:
+                    pass
 
         delay = self._tick_delay(engine, outcome)
         with self._lock:
             self._next_tick_at = time.monotonic() + delay
         return self._drain_events()
+
+    def _thinking_guard_policy(self, engine: Any, orig_policy: Any) -> Any | None:
+        """Return a temporary ``AutoSwitchSettings`` override when Preserved-Thinking Guard is active.
+
+        1. Separates weekly ceiling (``weekly_threshold = 98.0`` when unset) so 7-day / ``Fable``
+           windows are not abandoned prematurely at 85% across organizations.
+        2. Holds proactive mid-turn switches up to ``96.0%`` (5h) while any unpinned default-profile
+           Claude Code session has ``status == 'busy'``, preventing mid-turn ``thinking_drop`` and
+           1-hour prompt-cache invalidation.
+        """
+        import dataclasses
+        import os
+
+        if orig_policy is None or not dataclasses.is_dataclass(orig_policy):
+            return None
+        mod = type(engine).__module__
+        if not mod.startswith("claude_swap") and not os.environ.get("CC_USAGE_WIDGET_SESSIONS_DIR"):
+            return None
+        settings_map = _as_mapping(self._settings_obj) or {}
+        if not settings_map.get("belkins_thinking_guard", True):
+            return None
+
+        try:
+            cur_thresh = float(getattr(orig_policy, "threshold", 90.0) or 90.0)
+            cur_weekly = getattr(orig_policy, "weekly_threshold", None)
+            new_weekly = float(cur_weekly) if cur_weekly is not None else max(cur_thresh, 98.0)
+            new_thresh = cur_thresh
+
+            with self._lock:
+                active = self._active
+            if active is not None and not active.attention_note:
+                fh = float(active.five_hour_pct or 0.0)
+                sd = float(active.seven_day_pct or 0.0)
+                scoped_max = max((float(pct) for _n, pct in (active.scoped_windows or ())), default=0.0)
+                if fh < 96.0 and sd < 98.0 and scoped_max < 98.0:
+                    from . import fleet
+
+                    records, _unreadable = fleet.read_registry(fleet.sessions_dir())
+                    busy_count = sum(1 for r in records if str(r.get("status") or "") == "busy")
+                    if busy_count > 0 and cur_thresh < 96.0:
+                        new_thresh = 96.0
+                        if fh >= cur_thresh:
+                            self._log.info(
+                                "accounts: thinking guard holding %s (5h %.0f%% < 96%%) for %d busy Claude session(s)",
+                                active.alias,
+                                fh,
+                                busy_count,
+                            )
+
+            if new_thresh != cur_thresh or cur_weekly is None:
+                return dataclasses.replace(
+                    orig_policy,
+                    threshold=new_thresh,
+                    weekly_threshold=new_weekly,
+                )
+        except Exception as exc:
+            self._log.debug("accounts: thinking guard check skipped: %r", exc)
+        return None
 
     def _ensure_engine(self) -> Any | None:
         """The live engine, (re)built when policy changed. ``None`` on failure.

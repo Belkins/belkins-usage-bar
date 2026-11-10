@@ -673,11 +673,19 @@ CLAUDE_PRICE_ROWS: Final[tuple[PriceRow, ...]] = (
     # loop of this setup since 2026-09-22.
     _row("claude-opus-5-5", "4.00", "20.00", cache_read_usd="0.20"),
     _row("claude-opus-4-8", "5.00", "25.00"),
+    # Sonnet 5.5: $2 in / $10 out; cache write 5m $2.50 / 1h $4.00 (1.25x / 2x);
+    # cache read $0.10 (0.05x input, matching Opus 5.5 in cacheReadExceptions).
+    # Source: platform.claude.com/docs/en/about-claude/pricing, read 2026-11-08.
+    _row("claude-sonnet-5-5", "2.00", "10.00", cache_read_usd="0.10"),
     # Sonnet 5: introductory rate, then standard. Inclusive bounds, adjacent
     # days - no gap, no overlap. This pair is the reason resolution is dated.
     _row("claude-sonnet-5", "2.00", "10.00", effective_until="2026-08-31"),
     _row("claude-sonnet-5", "3.00", "15.00", effective_from="2026-09-01"),
     _row("claude-sonnet-4-6", "3.00", "15.00"),
+    # Haiku 5.5: $0.10 in / $0.50 out (short-context standard tier); cache write
+    # 5m $0.125 / 1h $0.20 (1.25x / 2x); cache read $0.01 (standard 0.1x).
+    # Source: platform.claude.com/docs/en/about-claude/pricing, read 2026-11-08.
+    _row("claude-haiku-5-5", "0.10", "0.50"),
     _row("claude-haiku-4-5", "1.00", "5.00"),
 )
 """Anthropic rows, USD per million tokens (SPEC 3.4).
@@ -706,6 +714,7 @@ OPENAI_PRICE_ROWS: Final[tuple[PriceRow, ...]] = (
     # 2026-09-09 vs 404 for Sol). Standard tier; Fast/Batch/Flex tiers are
     # not represented because a rollout does not say which tier ran.
     _openai_row("gpt-6-astra", "10.00", "1.00", "50.00", cache_write_usd="12.50"),
+    _openai_row("gpt-6.1-sol", "2.00", "0.20", "10.00", cache_write_usd="2.50"),
     # gpt-6-sol / gpt-6-luna: first listed 2026-09-25 (luna was already in use
     # and pricing at $0). "gpt-6-sol" is its own key; it never folds into
     # "gpt-5.6-sol", whose name it is not a prefix of.
@@ -783,12 +792,15 @@ MODEL_DISPLAY_NAMES: Final[Mapping[VendorModelKey, str]] = {
     "claude-opus-5": "Opus 5",
     "claude-opus-5-5": "Opus 5.5",
     "claude-opus-4-8": "Opus 4.8",
+    "claude-sonnet-5-5": "Sonnet 5.5",
     "claude-sonnet-5": "Sonnet 5",
     "claude-sonnet-4-6": "Sonnet 4.6",
+    "claude-haiku-5-5": "Haiku 5.5",
     "claude-haiku-4-5": "Haiku 4.5",
     # OpenAI keys are vendor-qualified, so a future Anthropic model that
     # happened to share a name could not overwrite one of these.
     "codex:gpt-6-astra": "gpt-6-astra",
+    "codex:gpt-6.1-sol": "gpt-6.1-sol",
     "codex:gpt-6-sol": "gpt-6-sol",
     "codex:gpt-6-luna": "gpt-6-luna",
     "codex:gpt-5.6-sol": "gpt-5.6-sol",

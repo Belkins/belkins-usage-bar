@@ -1809,10 +1809,12 @@ def _hero(hero: dict[str, Any], *, compact: bool = False) -> Callable[[Any, floa
             bw = text_w(pen, badge_txt, "primary_med")
             text(pen, badge_txt, "primary_med", badge_role, px1, b1, right=True)
 
-        # Live status dot + Account Name (Plan label shown only in expanded tab view)
+        # Live status dot + Account Name + ACTIVE badge (Plan label shown in expanded tab view)
         pen.circle(px0, b1 - 7.5, 6.4, sev_dot)
         nx = px0 + 11.5
         name_max = max(60.0, px1 - bw - 12.0 - nx)
+        act_lbl = "ACTIVE"
+        act_w = _pill_w(pen, act_lbl) + 6.5
         plan_raw = (hero.get("plan") or "").split("·")[0].strip() if not compact else ""
         nw = text(
             pen,
@@ -1821,12 +1823,34 @@ def _hero(hero: dict[str, Any], *, compact: bool = False) -> Callable[[Any, floa
             "label",
             nx,
             b1,
-            maxw=name_max * (0.68 if plan_raw else 1.0),
+            maxw=max(48.0, (name_max - act_w) * (0.72 if plan_raw else 1.0)),
         )
+        cur_x = nx + nw
+        if nw + act_w <= name_max + 4.0:
+            act_role = (
+                "crit_text"
+                if master_sev == "crit"
+                else ("warn_text" if master_sev == "warn" else "good_text")
+            )
+            act_bg = (
+                "belkins_crit_pill"
+                if master_sev == "crit"
+                else ("belkins_warn_pill" if master_sev == "warn" else "belkins_good_pill")
+            )
+            pen.pill(
+                act_lbl,
+                cur_x + 6.5,
+                b1 - 0.5,
+                F["tag"][0],
+                role=act_role,
+                bg=act_bg,
+                weight="semibold",
+            )
+            cur_x += act_w
         if plan_raw:
             plan_lbl = f"·  {plan_raw}"
-            if nw + 7.5 + text_w(pen, plan_lbl, "caption_med") <= name_max:
-                text(pen, plan_lbl, "caption_med", "belkins_cmm_sub", nx + nw + 7.0, b1 - 0.5)
+            if (cur_x - nx) + 7.5 + text_w(pen, plan_lbl, "caption_med") <= name_max:
+                text(pen, plan_lbl, "caption_med", "belkins_cmm_sub", cur_x + 7.0, b1 - 0.5)
 
         # Sculptural Minimalist Mode for `Hub`: 1 Master Stamina Bar + 1 Whisper-Clean Telemetry Line
         if compact and not hero["status"]:
@@ -2278,8 +2302,8 @@ def _provider_card(
     return card
 
 
-def _claude_sessions_card(snapshot: Any) -> _Card | None:
-    """Minimalist Active CLI Sessions card on the dedicated `✨ Claude` tab (workspace name + count, no path clutter)."""
+def _claude_sessions_card(snapshot: Any, actions: ThemeActions | None = None) -> _Card | None:
+    """Minimalist Active CLI Sessions card on the dedicated `✨ Claude` tab with Preserved-Thinking Guard toggle."""
     sessions = getattr(snapshot, "sessions", ()) or ()
     if not sessions:
         return None
@@ -2292,45 +2316,88 @@ def _claude_sessions_card(snapshot: Any) -> _Card | None:
         short_dir = cwd.rstrip("/").split("/")[-1] if cwd else "Workspace"
         by_dir.setdefault(short_dir, []).append((cwd, s))
 
+    def _guard_on() -> bool:
+        if "belkins_thinking_guard" in _LIVE_SETTINGS:
+            return bool(_LIVE_SETTINGS["belkins_thinking_guard"])
+        return bool(snapshot.settings.get("belkins_thinking_guard", True))
+
+    def _toggle_guard() -> None:
+        global _LAST_CFG_NOTE
+        nxt = not _guard_on()
+        _LIVE_SETTINGS["belkins_thinking_guard"] = nxt
+        _LAST_CFG_NOTE = f"Thinking Guard: {'ON ✓ (holds busy turns to 96%)' if nxt else 'OFF'}"
+        if actions is not None and callable(getattr(actions, "set_setting", None)):
+            actions.set_setting("belkins_thinking_guard", nxt)
+
     def draw_head(pen: Any, y0: float) -> float:
         base = y0 + HEAD_BASE
         symbol(pen, "terminal.fill", X0, base - 4.0, 11.5, "belkins_claude_rule", "semibold")
-        text(pen, "Active Sessions", "title", "label", X0 + 18.0, base)
-        badge = f"{total_sess} active"
+        tw = text(pen, "Active Sessions", "title", "label", X0 + 18.0, base)
+        text(pen, f"·  {total_sess}", "caption_med", "belkins_cmm_sub", X0 + 18.0 + tw + 7.0, base - 0.5)
+        g_on = _guard_on()
+        badge = "🛡️ Guard ON" if g_on else "🛡️ Guard OFF"
         bw = _pill_w(pen, badge)
-        pen.pill(badge, X1 - bw, base - 0.5, F["tag"][0], role="good_text", bg="belkins_good_pill", weight="semibold")
+        pen.pill(
+            badge,
+            X1 - bw,
+            base - 0.5,
+            F["tag"][0],
+            role="good_text" if g_on else "belkins_cmm_sub",
+            bg="belkins_good_pill" if g_on else "belkins_badge_off",
+            weight="semibold",
+        )
         return base + HEAD_AFTER
 
     card.add(
         draw_head,
         key="belkins-claude-sessions-head",
-        ax=f"Active Claude CLI Sessions: {total_sess} running",
-        tooltip=f"{total_sess} active Claude Code CLI processes detected across {len(by_dir)} workspaces",
+        ax=f"Active Claude CLI Sessions: {total_sess} running. Preserved-Thinking Guard {'ON' if _guard_on() else 'OFF'}",
+        tooltip=(
+            f"{total_sess} active Claude Code CLI processes across {len(by_dir)} workspaces.\n"
+            "Click [🛡️ Guard ON/OFF] to toggle Preserved-Thinking Guard (holds proactive switches up to 96% 5h / 98% weekly while sessions are busy).\n"
+            "Tip: Run `bswap claude` in a project to launch an org-locked session that never loses thinking!"
+        ),
+        action=_toggle_guard,
+        keep_open=True,
     )
     card.add(_hair(), key="belkins-claude-sessions-rule")
 
     for idx, (short_dir, items) in enumerate(by_dir.items()):
         full_cwd = items[0][0] or short_dir
         cnt = len(items)
+        any_pinned = any(bool(getattr(s_obj, "pinned", False)) for _c, s_obj in items)
+        busy_cnt = sum(1 for _c, s_obj in items if str(getattr(s_obj, "status", "") or "") == "busy")
 
         def draw_sess_row(
             pen: Any,
             y0: float,
             name_s: str = short_dir,
             n_cnt: int = cnt,
+            is_pin: bool = any_pinned,
         ) -> float:
             b = y0 + 17.5
-            pen.circle(X0 + 4.0, b - 6.8, 5.6, "belkins_good_fill")
+            pen.circle(X0 + 4.0, b - 6.8, 5.6, "belkins_cmm_aqua" if is_pin else "belkins_good_fill")
             cnt_s = f"{n_cnt}" if n_cnt > 1 else "1"
             text(pen, cnt_s, "caption_med", "belkins_cmm_sub", X1 - 2.0, b, right=True)
-            text(pen, name_s, "primary_med", "label", X0 + 16.0, b, maxw=W_INNER - 48.0)
+            nw = text(pen, name_s, "primary_med", "label", X0 + 16.0, b, maxw=W_INNER - 95.0)
+            if is_pin:
+                pen.pill(
+                    "PINNED",
+                    X0 + 16.0 + nw + 6.0,
+                    b - 0.5,
+                    F["tag"][0],
+                    role="belkins_cmm_aqua",
+                    bg="belkins_tab_active_glass",
+                    weight="semibold",
+                )
             return b + 9.5
 
+        mode_str = "Org-Pinned profile (immune to global switches)" if any_pinned else "Shared ~/.claude profile (protected by Thinking Guard while busy)"
         card.add(
             draw_sess_row,
             key=f"belkins-claude-session-dir-{idx}",
             ax=f"{short_dir}: {cnt} active Claude sessions ({full_cwd})",
-            tooltip=f"{full_cwd}\n{cnt} active Claude Code CLI session(s)",
+            tooltip=f"{full_cwd}\n{cnt} session(s) ({busy_cnt} busy) · {mode_str}\nTip: Run `bswap claude` in this folder to lock it to its own organization.",
         )
 
     card.add(_gap(8.0), key="belkins-claude-sessions-foot")
@@ -3512,7 +3579,10 @@ def _config_card(snapshot: Any, actions: ThemeActions, subtab: str = "header") -
         if not live_str:
             act_row = getattr(snapshot, "active", None)
             alias_s = str(getattr(act_row, "alias", "main") or "main")[:8]
-            pct_s = f"{int(round(getattr(act_row, 'five_hour_pct', 0) or 0))}%" if act_row else "0%"
+            raw_pct = getattr(act_row, "five_hour_pct", None)
+            if raw_pct is None:
+                raw_pct = getattr(act_row, "seven_day_pct", None)
+            pct_s = f"{int(round(raw_pct or 0))}%" if act_row else "0%"
             live_str = f"{alias_s} {pct_s}"
         if live_str.startswith("⚡"):
             live_str = live_str.lstrip("⚡").strip()
@@ -3776,6 +3846,13 @@ def _config_card(snapshot: Any, actions: ThemeActions, subtab: str = "header") -
         "MODULES",
         [
             (
+                lambda: f"Guard: {'ON' if bool(_get_s('belkins_thinking_guard', True)) else 'OFF'}",
+                "shield.lefthalf.filled",
+                lambda: bool(_get_s("belkins_thinking_guard", True)),
+                lambda: _toggle_key("belkins_thinking_guard", "Thinking Guard (busy hold & 98% wk)", True),
+                "Hold mid-turn auto-switches up to 96% (5h) / 98% (weekly) while Claude sessions are busy to preserve Extended Thinking & Prompt Cache",
+            ),
+            (
                 lambda: f"Codex: {'ON' if bool(_get_s('codex_live_quota_enabled', False)) else 'OFF'}",
                 "antenna.radiowaves.left.and.right",
                 lambda: bool(_get_s("codex_live_quota_enabled", False)),
@@ -4001,7 +4078,7 @@ def build(snapshot: Any, now: float, actions: ThemeActions | None = None) -> lis
             _provider_card(claude_sp, claude_attn, key_prefix="belkins", expand_attn=True).blocks(4.0, 4.0),
             "claude",
         )
-        sess_card = _claude_sessions_card(snapshot)
+        sess_card = _claude_sessions_card(snapshot, acts)
         if sess_card is not None:
             blocks += _tag_blocks(sess_card.blocks(4.0, TAIL_GAP), "claude")
 

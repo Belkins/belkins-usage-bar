@@ -987,6 +987,8 @@ _NEW_ROW_DAY = dt.date(2026, 9, 23)
 _NEW_ROW_RATES: dict[str, tuple[float, float, float, float, float]] = {
     "claude-opus-5-5": (4.00, 20.00, 5.00, 8.00, 0.20),
     "claude-fable-5-1": (10.00, 50.00, 12.50, 20.00, 0.25),
+    "claude-sonnet-5-5": (2.00, 10.00, 2.50, 4.00, 0.10),
+    "claude-haiku-5-5": (0.10, 0.50, 0.125, 0.20, 0.01),
 }
 _USAGE_FIELDS = ("input", "output", "cache_write_5m", "cache_write_1h", "cache_read")
 
@@ -1027,6 +1029,17 @@ def test_fable_5_1_prices_each_token_kind_at_its_published_rate() -> None:
     _check_each_rate("claude-fable-5-1")
     full = ModelUsage(**{f: _ONE_MTOK for f in _USAGE_FIELDS})
     assert abs(DEFAULT_PRICING.cost_usd("claude-fable-5-1", full, _NEW_ROW_DAY) - 92.75) < 1e-9
+
+
+def test_sonnet_5_5_and_haiku_5_5_price_each_token_kind_at_published_rate() -> None:
+    """Sonnet 5.5 ($2/$10, $0.10 read = $18.60) and Haiku 5.5 ($0.10/$0.50, $0.01 read = $0.935)."""
+    _check_each_rate("claude-sonnet-5-5")
+    _check_each_rate("claude-haiku-5-5")
+    full = ModelUsage(**{f: _ONE_MTOK for f in _USAGE_FIELDS})
+    assert abs(DEFAULT_PRICING.cost_usd("claude-sonnet-5-5", full, _NEW_ROW_DAY) - 18.60) < 1e-9
+    assert abs(DEFAULT_PRICING.cost_usd("claude-haiku-5-5", full, _NEW_ROW_DAY) - 0.935) < 1e-9
+    assert DEFAULT_PRICING.display_name("claude-sonnet-5-5[1m]") == "Sonnet 5.5"
+    assert DEFAULT_PRICING.display_name("claude-haiku-5-5") == "Haiku 5.5"
 
 
 def test_opus_5_5_and_fable_5_1_spellings_resolve_to_their_own_rows() -> None:
@@ -1132,7 +1145,15 @@ def test_the_cache_read_override_moves_no_pre_existing_rate() -> None:
     # The only rows added are the two point releases and (2026-09-25) the two
     # GPT-6 models OpenAI's page lists beside Astra.
     added = sorted(k[1] for k in rows if k not in _PRE_EXISTING_RATES)
-    assert added == ["claude-fable-5-1", "claude-opus-5-5", "gpt-6-luna", "gpt-6-sol"], added
+    assert added == [
+        "claude-fable-5-1",
+        "claude-haiku-5-5",
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "gpt-6-luna",
+        "gpt-6-sol",
+        "gpt-6.1-sol",
+    ], added
 
 
 # ---------------------------------------------------------------------------
