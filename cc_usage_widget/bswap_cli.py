@@ -934,6 +934,16 @@ def _cmd_update(args: list[str]) -> int:
         check=False,
     )
 
+    # Ensure optimal Preserved-Thinking autoswitch policy on update
+    try:
+        from claude_swap import paths as _cswap_paths
+
+        _bdir = Path(_cswap_paths.get_backup_root())
+    except Exception:
+        _bdir = Path.home() / ".claude-swap-backup"
+    _ensure_optimal_autoswitch_policy(_bdir)
+    print(f"  {GREEN}✓ Preserved-Thinking Guard active (busy-turn hold 96% · weekly ceiling 98%){RESET}")
+
     # Restart launchd service
     uid = str(os.getuid())
     res = subprocess.run(
@@ -948,8 +958,45 @@ def _cmd_update(args: list[str]) -> int:
     return 0
 
 
-def _detect_workspace_owner_slot(cwd: Path, identities: dict[int, tuple[str, str]]) -> int | None:
-    """Inspect the newest Claude transcript for *cwd* and return the slot whose ``organizationUuid`` owns its thinking blocks."""
+def _detect_jsonl_owner_slot(jsonl_path: Path, org_to_slot: dict[str, int]) -> int | None:
+    """Return the slot whose ``organizationUuid`` signed the most recent turns in *jsonl_path*."""
+    try:
+        with jsonl_path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - 262_144), os.SEEK_SET)
+            tail_lines = fh.read().decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    # Scan from newest to oldest: prefer credential_org (actual API token org), then session-owner
+    fallback_slot: int | None = None
+    for line in reversed(tail_lines):
+        if "credential_org" in line:
+            try:
+                obj = json.loads(line)
+                org = (obj.get("attachment") or {}).get("organizationUuid")
+                if org and org in org_to_slot:
+                    return org_to_slot[org]
+            except Exception:
+                pass
+        elif fallback_slot is None and "session-owner" in line:
+            try:
+                obj = json.loads(line)
+                org = obj.get("organizationUuid")
+                if org and org in org_to_slot:
+                    fallback_slot = org_to_slot[org]
+            except Exception:
+                pass
+    return fallback_slot
+
+
+def _detect_workspace_owner_slot(
+    cwd: Path,
+    identities: dict[int, tuple[str, str]],
+    *,
+    pid: int | None = None,
+) -> int | None:
+    """Inspect the Claude transcript for *pid* (or newest in *cwd*) and return the slot owning its latest thinking blocks."""
     org_to_slot = {org: slot for slot, (_email, org) in identities.items() if org}
     if not org_to_slot:
         return None
@@ -957,27 +1004,26 @@ def _detect_workspace_owner_slot(cwd: Path, identities: dict[int, tuple[str, str
     pdir = Path.home() / ".claude" / "projects" / slug
     if not pdir.is_dir():
         return None
+    if pid is not None:
+        reg_file = Path.home() / ".claude" / "sessions" / f"{pid}.json"
+        if reg_file.is_file():
+            try:
+                sid = json.loads(reg_file.read_text(encoding="utf-8", errors="replace")).get("sessionId")
+                if sid:
+                    cand = pdir / f"{sid}.jsonl"
+                    if cand.is_file():
+                        slot = _detect_jsonl_owner_slot(cand, org_to_slot)
+                        if slot is not None:
+                            return slot
+            except Exception:
+                pass
     try:
         jsonls = sorted(pdir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
     except OSError:
         return None
     if not jsonls:
         return None
-    try:
-        lines = jsonls[0].read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return None
-    # Check first 60 lines for initial session-owner / credential_org
-    for line in lines[:60]:
-        if "session-owner" in line or "credential_org" in line:
-            try:
-                obj = json.loads(line)
-                org = obj.get("organizationUuid") or (obj.get("attachment") or {}).get("organizationUuid")
-                if org and org in org_to_slot:
-                    return org_to_slot[org]
-            except Exception:
-                pass
-    return None
+    return _detect_jsonl_owner_slot(jsonls[0], org_to_slot)
 
 
 def _ensure_optimal_autoswitch_policy(backup_dir: Path) -> bool:
@@ -1044,18 +1090,22 @@ def _cmd_sessions(args: list[str]) -> int:
         return 0
 
     owner_counts: dict[int, int] = {}
+    mismatch_count = 0
     pinned_workspaces: set[str] = set()
     for s in snap.sessions:
         cwd_p = Path(s.cwd) if s.cwd else Path.cwd()
         short_w = cwd_p.name or s.cwd
-        owner_slot = s.slot if s.pinned else _detect_workspace_owner_slot(cwd_p, identities)
+        owner_slot = s.slot if s.pinned else _detect_workspace_owner_slot(cwd_p, identities, pid=s.pid)
         owner_row = rows.get(owner_slot) if owner_slot is not None else None
         owner_lbl = f"#{owner_slot} ({owner_row.alias})" if owner_row else (f"#{owner_slot}" if owner_slot else "unknown")
         cur_row = rows.get(s.slot) if s.slot is not None else None
         cur_lbl = f"#{s.slot} ({cur_row.alias})" if cur_row else f"#{s.slot}"
         mismatch = (not s.pinned) and (owner_slot is not None) and (owner_slot != s.slot)
-        if mismatch and owner_slot is not None:
-            owner_counts[owner_slot] = owner_counts.get(owner_slot, 0) + 1
+        if mismatch:
+            mismatch_count += 1
+        if (not s.pinned) and owner_slot is not None:
+            weight = 3 if (s.status or "").lower() == "busy" else 1
+            owner_counts[owner_slot] = owner_counts.get(owner_slot, 0) + weight
 
         mode_badge = f"{CYAN}📌 PINNED{RESET}" if s.pinned else (f"{GOLD}⚠ ORG SHIFTED{RESET}" if mismatch else f"{GREEN}● MATCHED{RESET}")
         print(f"  PID {s.pid:<6} {BOLD}{short_w:<18}{RESET} [{s.status or 'idle':<7}] {mode_badge}  cur={cur_lbl}  thinking_org={owner_lbl}")
@@ -1070,28 +1120,33 @@ def _cmd_sessions(args: list[str]) -> int:
                     pass
 
     if pinned_workspaces:
-        print(f"\n  {GREEN}✓ Pinned {len(pinned_workspaces)} workspace(s) to their original thinking organization for future `bswap claude` launches.{RESET}")
+        print(f"\n  {GREEN}✓ Pinned {len(pinned_workspaces)} workspace(s) to their current thinking organization for future `bswap claude` launches.{RESET}")
 
-    if owner_counts:
-        # Find dominant healthy owner slot
-        best_owner = None
-        for cand_slot, _cnt in sorted(owner_counts.items(), key=lambda kv: kv[1], reverse=True):
-            r = rows.get(cand_slot)
-            if r and not r.disabled and not r.attention_note and (r.five_hour_pct or 0.0) < 90.0 and (r.seven_day_pct or 0.0) < 95.0:
-                best_owner = r
-                break
+    best_owner = None
+    for cand_slot, _cnt in sorted(owner_counts.items(), key=lambda kv: kv[1], reverse=True):
+        r = rows.get(cand_slot)
+        if r and not r.disabled and not r.attention_note and (r.five_hour_pct or 0.0) < 90.0 and (r.seven_day_pct or 0.0) < 95.0:
+            best_owner = r
+            break
+
+    if best_owner is not None and best_owner.slot != active_slot:
         print()
-        if best_owner is not None and do_fix:
+        if do_fix:
             src.switch_to(str(best_owner.slot))
             print(
                 f"  {GREEN}✓ Restored global login to Slot #{best_owner.slot} ({best_owner.alias}) "
                 f"so your active sessions regain their Preserved Thinking & Prompt Cache!{RESET}"
             )
-        elif best_owner is not None:
+        else:
             print(
                 f"  {GOLD}💡 Tip:{RESET} Run {ORANGE}bswap fix-thinking{RESET} to restore Slot #{best_owner.slot} ({best_owner.alias}) "
                 f"and pin workspaces, or launch future terminals with {ORANGE}bswap claude{RESET} for 100% org isolation."
             )
+    elif mismatch_count > 0:
+        print(
+            f"\n  {GREEN}✓ Global login Slot #{active_slot} ({active.alias if active else ''}) already matches your dominant busy sessions!{RESET}\n"
+            f"  {DIM}💡 Launch separate workspaces with `{ORANGE}bswap claude{DIM}` so each project stays locked to its own slot.{RESET}"
+        )
     else:
         print(f"\n  {GREEN}✓ All active sessions match their thinking organization!{RESET}")
     return 0
