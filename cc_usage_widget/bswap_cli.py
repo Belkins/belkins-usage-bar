@@ -961,33 +961,25 @@ def _cmd_update(args: list[str]) -> int:
 def _detect_jsonl_owner_slot(jsonl_path: Path, org_to_slot: dict[str, int]) -> int | None:
     """Return the slot whose ``organizationUuid`` signed the most recent turns in *jsonl_path*."""
     try:
-        with jsonl_path.open("rb") as fh:
-            fh.seek(0, os.SEEK_END)
-            size = fh.tell()
-            fh.seek(max(0, size - 262_144), os.SEEK_SET)
-            tail_lines = fh.read().decode("utf-8", errors="replace").splitlines()
+        data = jsonl_path.read_bytes()
     except OSError:
         return None
-    # Scan from newest to oldest: prefer credential_org (actual API token org), then session-owner
-    fallback_slot: int | None = None
-    for line in reversed(tail_lines):
-        if "credential_org" in line:
+    for needle in (b'"credential_org"', b'"session-owner"'):
+        pos = data.rfind(needle)
+        while pos != -1:
+            line_start = data.rfind(b"\n", 0, pos) + 1
+            line_end = data.find(b"\n", pos)
+            if line_end == -1:
+                line_end = len(data)
             try:
-                obj = json.loads(line)
-                org = (obj.get("attachment") or {}).get("organizationUuid")
+                obj = json.loads(data[line_start:line_end].decode("utf-8", errors="replace"))
+                org = (obj.get("attachment") or {}).get("organizationUuid") or obj.get("organizationUuid")
                 if org and org in org_to_slot:
                     return org_to_slot[org]
             except Exception:
                 pass
-        elif fallback_slot is None and "session-owner" in line:
-            try:
-                obj = json.loads(line)
-                org = obj.get("organizationUuid")
-                if org and org in org_to_slot:
-                    fallback_slot = org_to_slot[org]
-            except Exception:
-                pass
-    return fallback_slot
+            pos = data.rfind(needle, 0, max(0, line_start - 1))
+    return None
 
 
 def _detect_workspace_owner_slot(
