@@ -1254,10 +1254,10 @@ def test_app_two_tier_notch_fallback_alert_badge_and_pure_set_setting() -> None:
                     {**SETTINGS_DEFAULTS, "title_compact": True, "title_view": "compact"}
                 ),
             )
-            fake_hidden = True
-            fake_clock = 500.0
+            hidden_state[0] = True
+            clock[0] = 1200.0
             app._check_title_fits()
-            fake_clock = 535.0
+            clock[0] = 1240.0
             app._check_title_fits()
             assert app._auto_icon_only is True
         finally:
