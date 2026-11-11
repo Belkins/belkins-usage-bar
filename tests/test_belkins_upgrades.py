@@ -1296,6 +1296,98 @@ def test_app_two_tier_notch_fallback_alert_badge_and_pure_set_setting() -> None:
     assert d_custom.data[pos_key] == 420.0
 
 
+def test_macos26_proxy_window_visibility_never_false_positives() -> None:
+    """macOS 26 (Tahoe) proxy NSStatusBarWindow (0x100000000, occlusionState=8192)
+    must never trigger false-positive hidden verdicts during layout or fullscreen."""
+    proxy_num = 0x100000000
+    base_rows = [
+        {
+            "kCGWindowLayer": menubar.STATUS_ITEM_LAYER,
+            "kCGWindowNumber": 64,
+            "kCGWindowOwnerPID": 695,
+            "kCGWindowIsOnscreen": True,
+            "kCGWindowBounds": {"X": 1650.0, "Y": 0.0, "Width": 150.0, "Height": 39.0},
+        },
+        {
+            "kCGWindowLayer": menubar.STATUS_ITEM_LAYER,
+            "kCGWindowNumber": 66,
+            "kCGWindowOwnerPID": 695,
+            "kCGWindowIsOnscreen": True,
+            "kCGWindowBounds": {"X": 1470.0, "Y": 0.0, "Width": 38.0, "Height": 39.0},
+        },
+        {
+            "kCGWindowLayer": menubar.STATUS_ITEM_LAYER,
+            "kCGWindowNumber": 311,
+            "kCGWindowOwnerPID": 695,
+            "kCGWindowIsOnscreen": True,
+            "kCGWindowBounds": {"X": 1057.0, "Y": 0.0, "Width": 32.0, "Height": 39.0},
+        },
+        # Tall layer-25 dropdown panel (e.g. WeatherMenu) must be ignored
+        {
+            "kCGWindowLayer": menubar.STATUS_ITEM_LAYER,
+            "kCGWindowNumber": 145,
+            "kCGWindowOwnerPID": 1349,
+            "kCGWindowIsOnscreen": True,
+            "kCGWindowBounds": {"X": 1081.0, "Y": 38.0, "Width": 332.0, "Height": 1200.0},
+        },
+    ]
+
+    def _proxy_win(x: float, w: float) -> Any:
+        return SimpleNamespace(
+            frame=lambda: SimpleNamespace(
+                origin=SimpleNamespace(x=x, y=1130.0),
+                size=SimpleNamespace(width=w, height=39.0),
+            ),
+            occlusionState=lambda: 8192,  # bit 2 NOT set on macOS 26 proxy window
+        )
+
+    orig_wl = menubar._window_list
+    try:
+        # 1. Onscreen slot on macOS 26 -> False (even with occlusionState=8192)
+        rows_onscreen = base_rows + [
+            {
+                "kCGWindowLayer": menubar.STATUS_ITEM_LAYER,
+                "kCGWindowNumber": 18210,
+                "kCGWindowOwnerPID": 695,
+                "kCGWindowIsOnscreen": True,
+                "kCGWindowBounds": {"X": 1361.0, "Y": 0.0, "Width": 109.0, "Height": 39.0},
+            }
+        ]
+        menubar._window_list = lambda: (
+            lambda opt, _rel: [r for r in rows_onscreen if r.get("kCGWindowIsOnscreen")]
+            if opt == 1
+            else rows_onscreen
+        )
+        w_vis = _proxy_win(1361.0, 109.0)
+        assert menubar.own_window_hidden(proxy_num, win=w_vis) is False
+        assert menubar.onscreen_other_count(proxy_num, win=w_vis) == 3
+
+        # 2. Layout in flight after setTitle_ (width shifted 109 -> 115 before Control Centre flushed)
+        # Must return None (no verdict), NEVER True!
+        w_inflight = _proxy_win(1355.0, 115.0)
+        assert menubar.own_window_hidden(proxy_num, win=w_inflight) is None
+
+        # 3. Genuinely clipped behind notch (X=924 < leftmost onscreen 1057, kCGWindowIsOnscreen=None)
+        rows_clipped = base_rows + [
+            {
+                "kCGWindowLayer": menubar.STATUS_ITEM_LAYER,
+                "kCGWindowNumber": 18211,
+                "kCGWindowOwnerPID": 695,
+                "kCGWindowIsOnscreen": None,
+                "kCGWindowBounds": {"X": 924.0, "Y": 0.0, "Width": 109.0, "Height": 39.0},
+            }
+        ]
+        menubar._window_list = lambda: (
+            lambda opt, _rel: [r for r in rows_clipped if r.get("kCGWindowIsOnscreen")]
+            if opt == 1
+            else rows_clipped
+        )
+        w_clip = _proxy_win(924.0, 109.0)
+        assert menubar.own_window_hidden(proxy_num, win=w_clip) is True
+    finally:
+        menubar._window_list = orig_wl
+
+
 # ---------------------------------------------------------------------------
 # Standalone Test Runner
 # ---------------------------------------------------------------------------

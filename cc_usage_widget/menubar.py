@@ -49,13 +49,23 @@ def _window_list() -> Any:
     return _cg_window_list
 
 
+def _is_strip_bounds(bounds: dict[str, Any]) -> bool:
+    """True for menu-bar status-item strip windows (excludes tall layer-25 popovers)."""
+    try:
+        h = float(bounds.get("Height", 0) or 0)
+        w = float(bounds.get("Width", 0) or 0)
+    except Exception:
+        return False
+    return 10.0 <= h <= 60.0 and w > 0.0
+
+
 def status_item_windows() -> list[tuple[int, bool]]:
     """``(owner pid, onscreen)`` for every menu-bar status item window.
 
     Empty on any failure: no verdict is always the safe answer.
     Note: global CoreGraphics ``X`` coordinates are negative on secondary
     displays arranged to the left of the primary monitor, so only degenerate
-    zero-width / sub-10pt auxiliary windows are filtered out.
+    zero-width / sub-10pt auxiliary windows and >60pt popovers are filtered out.
     """
     try:
         rows = _window_list()(0, 0)  # kCGWindowListOptionAll, kCGNullWindowID
@@ -64,7 +74,7 @@ def status_item_windows() -> list[tuple[int, bool]]:
             if row.get("kCGWindowLayer") != STATUS_ITEM_LAYER:
                 continue
             bounds = row.get("kCGWindowBounds") or {}
-            if bounds.get("Height", 0) < 10 or bounds.get("Width", 0) <= 0:
+            if not _is_strip_bounds(bounds):
                 continue
             out.append((int(row.get("kCGWindowOwnerPID", 0)), bool(row.get("kCGWindowIsOnscreen", False))))
         return out
@@ -72,27 +82,46 @@ def status_item_windows() -> list[tuple[int, bool]]:
         return []
 
 
-def onscreen_other_count(window_number: int | None = None) -> int | None:
-    """Count onscreen status-item windows other than *window_number* (or ``os.getpid()``).
+def onscreen_other_count(window_number: int | None = None, *, win: Any = None) -> int | None:
+    """Count onscreen status-item windows other than *window_number* (or *win* / ``os.getpid()``).
 
     Returns ``None`` when the menu bar itself is hidden (fewer than
     :data:`MIN_OTHERS_ONSCREEN` items onscreen) or when CoreGraphics is unavailable.
     """
     try:
         pid = os.getpid()
+        wx: float | None = None
+        ww: float | None = None
+        if win is not None:
+            try:
+                fr = win.frame()
+                wx = float(fr.origin.x)
+                ww = float(fr.size.width)
+            except Exception:
+                wx = ww = None
         onscreen_rows = _window_list()(1, 0)
         others = 0
+        skipped_self = False
         for row in onscreen_rows or ():
             if row.get("kCGWindowLayer") != STATUS_ITEM_LAYER:
                 continue
             bounds = row.get("kCGWindowBounds") or {}
-            if bounds.get("Height", 0) < 10 or bounds.get("Width", 0) <= 0:
+            if not _is_strip_bounds(bounds):
                 continue
             wnum = int(row.get("kCGWindowNumber", 0))
             owner = int(row.get("kCGWindowOwnerPID", 0))
             if window_number and 0 < window_number < 0x100000000:
                 if wnum == window_number:
                     continue
+            elif (
+                not skipped_self
+                and wx is not None
+                and ww is not None
+                and abs(float(bounds.get("X", -99999)) - wx) <= 4.0
+                and abs(float(bounds.get("Width", -99999)) - ww) <= 4.0
+            ):
+                skipped_self = True
+                continue
             elif owner == pid:
                 continue
             others += 1
@@ -131,29 +160,34 @@ def own_window_hidden(window_number: int | None, *, win: Any = None) -> bool | N
 
     On macOS 26 (Tahoe), status-item windows on layer 25 report ``Control Centre``
     as ``kCGWindowOwnerPID`` rather than ``os.getpid()``, and ``win.windowNumber()``
-    returns the out-of-process proxy sentinel ``0x100000000`` (``4294967296``).
-    When *win* is provided, ``win.occlusionState()`` (bit 1 = ``NSWindowOcclusionStateVisible``)
-    and ``win.frame()`` geometry against ``CGWindowListCopyWindowInfo(1, 0)`` give the
-    true composited visibility once the menu bar itself is confirmed visible.
+    returns the out-of-process proxy sentinel ``0x100000000`` (``4294967296``) whose
+    ``occlusionState()`` does NOT set ``NSWindowOcclusionStateVisible`` (returning
+    ``8192`` even when drawn). Therefore we match ``win.frame()`` directly against
+    all layer-25 strip windows from ``CGWindowListCopyWindowInfo(0, 0)`` and read
+    WindowServer's ``kCGWindowIsOnscreen`` flag, returning ``None`` whenever layout
+    is still in flight or the target display's menu bar is hidden (fullscreen/auto-hide).
     """
     try:
-        onscreen_rows = _window_list()(1, 0)  # kCGWindowListOptionOnScreenOnly = 1
-        onscreen_nums: set[int] = set()
-        onscreen_bounds: list[tuple[float, float]] = []
-        others_onscreen = 0
-        for row in onscreen_rows or ():
+        all_rows = _window_list()(0, 0)  # kCGWindowListOptionAll = 0
+        strip: list[tuple[int, int, float, float, float, bool]] = []
+        for row in all_rows or ():
             if row.get("kCGWindowLayer") != STATUS_ITEM_LAYER:
                 continue
             bounds = row.get("kCGWindowBounds") or {}
-            if bounds.get("Height", 0) < 10 or bounds.get("Width", 0) <= 0:
+            if not _is_strip_bounds(bounds):
                 continue
-            wnum = int(row.get("kCGWindowNumber", 0))
-            onscreen_nums.add(wnum)
-            onscreen_bounds.append((float(bounds.get("X", -999)), float(bounds.get("Width", -999))))
-            if not window_number or wnum != window_number:
-                others_onscreen += 1
-        if others_onscreen < MIN_OTHERS_ONSCREEN:
-            return None
+            strip.append(
+                (
+                    int(row.get("kCGWindowNumber", 0)),
+                    int(row.get("kCGWindowOwnerPID", 0)),
+                    float(bounds.get("X", -99999)),
+                    float(bounds.get("Y", 0)),
+                    float(bounds.get("Width", 0)),
+                    bool(row.get("kCGWindowIsOnscreen", False)),
+                )
+            )
+
+        matched_idx: int | None = None
         if win is not None:
             try:
                 fr = win.frame()
@@ -162,15 +196,52 @@ def own_window_hidden(window_number: int | None, *, win: Any = None) -> bool | N
                 wh = float(fr.size.height)
                 if ww <= 0 or wh <= 0:
                     return None
-                for bx, bw in onscreen_bounds:
-                    if abs(bx - wx) <= 2.0 and abs(bw - ww) <= 2.0:
-                        return False
-                occ = int(win.occlusionState())
-                return not bool(occ & 2)
+                best_dist = 999.0
+                for idx, (_wnum, _owner, bx, _by, bw, _on) in enumerate(strip):
+                    if abs(bx - wx) <= 4.0 and abs(bw - ww) <= 4.0:
+                        dist = abs(bx - wx) + abs(bw - ww)
+                        if dist < best_dist:
+                            best_dist = dist
+                            matched_idx = idx
             except Exception:
-                pass
-        if not window_number or window_number <= 0 or window_number >= 0x100000000:
+                matched_idx = None
+
+        if matched_idx is None and window_number and 0 < window_number < 0x100000000:
+            for idx, (wnum, _owner, _bx, _by, _bw, _on) in enumerate(strip):
+                if wnum == window_number:
+                    matched_idx = idx
+                    break
+
+        others_onscreen = sum(
+            1 for idx, row in enumerate(strip) if idx != matched_idx and row[5]
+        )
+        if others_onscreen < MIN_OTHERS_ONSCREEN:
+            return None
+
+        if matched_idx is not None:
+            _wnum, _owner, mbx, mby, _mbw, is_onscreen = strip[matched_idx]
+            if is_onscreen:
+                return False
+            # Confirm that THIS display's menu-bar strip is actually onscreen
+            # (not a fullscreen Space while a second monitor has >=3 items) and
+            # that no onscreen item sits to our left on the same strip (since
+            # notch/overflow eviction always clips from the left).
+            same_strip_onscreen = [
+                bx
+                for idx, (_w, _o, bx, by, _bw, on) in enumerate(strip)
+                if idx != matched_idx and on and abs(by - mby) <= 10.0 and abs(bx - mbx) <= 2500.0
+            ]
+            if not same_strip_onscreen:
+                return None
+            if any(ox + 2.0 <= mbx for ox in same_strip_onscreen):
+                return None
+            return True
+
+        # Layout in flight after a title width change on a macOS 26 proxy window,
+        # or window not yet composited: wait for the next check tick rather than
+        # trusting proxy occlusionState() (which reports 8192 = non-visible).
+        if win is not None or not window_number or window_number <= 0 or window_number >= 0x100000000:
             return own_item_hidden()
-        return window_number not in onscreen_nums
+        return None
     except Exception:
         return own_item_hidden()

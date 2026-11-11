@@ -5802,7 +5802,11 @@ class CCUsageWidgetApp(rumps.App):
             if (self._auto_compact or getattr(self, "_auto_icon_only", False)) and (
                 now - getattr(self, "_auto_compact_since", 0.0) >= 60.0
             ):
-                others_now = menubar.onscreen_other_count(win_num)
+                others_now = (
+                    menubar.onscreen_other_count(win_num, win=win_obj)
+                    if win_obj is not None
+                    else menubar.onscreen_other_count(win_num)
+                )
                 trig_others = getattr(self, "_compact_trigger_others", 0)
                 trig_len = getattr(self, "_compact_trigger_title_len", 0)
                 shrank = trig_len > 0 and self._uncompacted_title_len() <= trig_len - 4
@@ -5836,7 +5840,16 @@ class CCUsageWidgetApp(rumps.App):
         if not self._auto_compact and not user_compact:
             self._compact_trigger_title_len = self._uncompacted_title_len()
             self._compact_trigger_others = (
-                (menubar.onscreen_other_count(win_num) or 0) if live_probe else 0
+                (
+                    (
+                        menubar.onscreen_other_count(win_num, win=win_obj)
+                        if win_obj is not None
+                        else menubar.onscreen_other_count(win_num)
+                    )
+                    or 0
+                )
+                if live_probe
+                else 0
             )
             self._auto_compact = True
             self._auto_compact_since = now
@@ -5845,7 +5858,16 @@ class CCUsageWidgetApp(rumps.App):
             if not self._auto_compact:
                 self._compact_trigger_title_len = self._uncompacted_title_len()
                 self._compact_trigger_others = (
-                    (menubar.onscreen_other_count(win_num) or 0) if live_probe else 0
+                    (
+                        (
+                            menubar.onscreen_other_count(win_num, win=win_obj)
+                            if win_obj is not None
+                            else menubar.onscreen_other_count(win_num)
+                        )
+                        or 0
+                    )
+                    if live_probe
+                    else 0
                 )
             self._auto_icon_only = True
             self._auto_compact_since = now
@@ -6702,7 +6724,11 @@ class CCUsageWidgetApp(rumps.App):
         """
         snapshot = snapshot or self.snapshot()
         self._sync_status_icon(snapshot)
-        self.title = self.render_title(snapshot)
+        new_title = self.render_title(snapshot)
+        if getattr(self, "_running", False) and new_title != getattr(self, "_last_rendered_title", None):
+            self._last_rendered_title = new_title
+            self._title_fit_checked_at = time.monotonic()
+        self.title = new_title
         layout = self._menu_layout(snapshot)
         items = None
         if layout == "classic":
