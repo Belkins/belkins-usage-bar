@@ -1245,6 +1245,21 @@ def test_app_two_tier_notch_fallback_alert_badge_and_pure_set_setting() -> None:
             app._check_title_fits()
             assert app._auto_compact is False
             assert app._auto_icon_only is False
+
+            # Even when user explicitly enabled title_compact=True, two hidden
+            # readings still escalate to _auto_icon_only so it doesn't stay behind notch
+            app._snapshot = replace(
+                app.snapshot(),
+                settings=normalize_settings(
+                    {**SETTINGS_DEFAULTS, "title_compact": True, "title_view": "compact"}
+                ),
+            )
+            fake_hidden = True
+            fake_clock = 500.0
+            app._check_title_fits()
+            fake_clock = 535.0
+            app._check_title_fits()
+            assert app._auto_icon_only is True
         finally:
             app_mod.time.monotonic = orig_mono
             menubar.own_window_hidden = orig_own_hidden
@@ -1252,6 +1267,33 @@ def test_app_two_tier_notch_fallback_alert_badge_and_pure_set_setting() -> None:
     finally:
         app._running = False
         app._worker.stop(timeout=2.0)
+
+    # _seed_status_item_position migrates legacy 2000.0 (far-left notch clip) -> 250.0
+    # while preserving user Cmd-dragged values (e.g. 420.0)
+    from cc_usage_widget import __main__ as main_mod
+
+    class _FakeDefaults:
+        def __init__(self, initial: dict[str, Any]) -> None:
+            self.data = dict(initial)
+
+        def objectForKey_(self, k: str) -> Any:
+            return self.data.get(k)
+
+        def setFloat_forKey_(self, val: float, k: str) -> None:
+            self.data[k] = float(val)
+
+    pos_key = "NSStatusItem Preferred Position Item-0"
+    d_empty = _FakeDefaults({})
+    main_mod._seed_status_item_position(d_empty)
+    assert d_empty.data[pos_key] == 250.0
+
+    d_legacy = _FakeDefaults({pos_key: 2000.0})
+    main_mod._seed_status_item_position(d_legacy)
+    assert d_legacy.data[pos_key] == 250.0
+
+    d_custom = _FakeDefaults({pos_key: 420.0})
+    main_mod._seed_status_item_position(d_custom)
+    assert d_custom.data[pos_key] == 420.0
 
 
 # ---------------------------------------------------------------------------

@@ -1033,31 +1033,37 @@ def _diagnostics(app: CCUsageWidgetApp) -> str:
     return "\n".join(lines)
 
 
-def _seed_status_item_position() -> None:
-    """Self-heal the one thing that made the widget invisible (RCA 2026-08-17).
+_DEFAULT_STATUS_ITEM_POS = 250.0
+"""Distance in points from the right edge of the menu bar (between Wi-Fi ~227
+and Battery ~347). Earlier builds seeded ``2000.0`` thinking larger meant
+further right; in ``NSStatusBar`` larger means further LEFT from the right
+edge, which placed the item behind the MacBook notch once ~600 pt of icons
+were open."""
 
-    On a saturated, notched menu bar macOS arbitrates overflow by each item's
-    persisted ``NSStatusItem Preferred Position``; an item with NO stored
-    position sorts last and is silently never composited (created, isVisible
-    True, kCGWindowIsOnscreen False — proven by controlled toggle, same width
-    hidden→rendered on this exact key). rumps never sets an autosave name, so
-    seed the key ourselves when absent. 2000 = "rightmost priority"; macOS
-    clamps it into the bar. Never overwrite an existing value — that would
-    stomp the position the user chose by Cmd-dragging.
 
-    Domain hazard, documented: upstream ``cswap menubar`` wrote an Info.plist
-    beside the interpreter (bundle id ``com.claude-swap.menubar``), so every
-    Python from this venv shares one defaults domain and one ``Item-0`` slot.
-    Acceptable while this widget replaces upstream's; isolating via
-    ``setAutosaveName_`` is the follow-up if both must ever coexist.
+def _seed_status_item_position(defaults: Any = None) -> None:
+    """Self-heal ``NSStatusItem Preferred Position Item-0`` so the item sits in
+    the visible right-hand menu-bar zone instead of behind the camera notch.
+
+    Seeds ``250.0`` when absent, and migrates the legacy ``>= 1800.0`` seed
+    (which pushed the item to the far left behind the notch on 14"/16" notched
+    MacBooks) to ``250.0``. Preserves any normal position chosen by Cmd-drag.
     """
     try:
-        from Foundation import NSUserDefaults  # noqa: PLC0415
+        if defaults is None:
+            from Foundation import NSUserDefaults  # noqa: PLC0415
 
-        defaults = NSUserDefaults.standardUserDefaults()
+            defaults = NSUserDefaults.standardUserDefaults()
         key = "NSStatusItem Preferred Position Item-0"
-        if defaults.objectForKey_(key) is None:
-            defaults.setFloat_forKey_(2000.0, key)
+        existing = defaults.objectForKey_(key)
+        needs_seed = existing is None
+        if not needs_seed:
+            try:
+                needs_seed = float(existing) >= 1800.0
+            except (TypeError, ValueError):
+                needs_seed = False
+        if needs_seed:
+            defaults.setFloat_forKey_(_DEFAULT_STATUS_ITEM_POS, key)
     except Exception:  # pragma: no cover - cosmetic self-heal must never block launch
         pass
 

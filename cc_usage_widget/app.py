@@ -5777,8 +5777,12 @@ class CCUsageWidgetApp(rumps.App):
         On live WindowServer checks, recovers back to the full title after >=60 s
         only if other status items closed or our uncompacted title shrank.
         """
-        if bool(self.snapshot().settings.get("title_compact", False)):
+        settings = self.snapshot().settings
+        if str(settings.get("title_view", "")) == "icon_only":
             return False
+        user_compact = bool(settings.get("title_compact", False)) or (
+            str(settings.get("title_view", "")) == "compact"
+        )
         now = time.monotonic()
         live_probe = hidden is None
         win_num: int | None = None
@@ -5829,7 +5833,7 @@ class CCUsageWidgetApp(rumps.App):
         if self._title_hidden_streak < 2:
             return False
         self._title_hidden_streak = 0
-        if not self._auto_compact:
+        if not self._auto_compact and not user_compact:
             self._compact_trigger_title_len = self._uncompacted_title_len()
             self._compact_trigger_others = (
                 (menubar.onscreen_other_count(win_num) or 0) if live_probe else 0
@@ -5838,6 +5842,11 @@ class CCUsageWidgetApp(rumps.App):
             self._auto_compact_since = now
             _log("title: status item hidden by a full menu bar; showing the compact title")
         else:
+            if not self._auto_compact:
+                self._compact_trigger_title_len = self._uncompacted_title_len()
+                self._compact_trigger_others = (
+                    (menubar.onscreen_other_count(win_num) or 0) if live_probe else 0
+                )
             self._auto_icon_only = True
             self._auto_compact_since = now
             _log("title: compact title still hidden by a full menu bar; escalating to icon-only")
