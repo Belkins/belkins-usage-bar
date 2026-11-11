@@ -521,6 +521,8 @@ class CodexQuota:
     resets_at: float | None = None
     plan_type: str | None = None
     observed_at: float = 0.0
+    five_hour_pct: Pct | None = None
+    five_hour_resets_at: float | None = None
 
     @property
     def is_weekly(self) -> bool:
@@ -534,13 +536,18 @@ class CodexQuota:
 
     def to_json(self) -> dict[str, Any]:
         """Sidecar form; ``None`` fields are kept so the shape is stable."""
-        return {
+        out: dict[str, Any] = {
             "used_percent": self.used_percent,
             "window_minutes": self.window_minutes,
             "resets_at": self.resets_at,
             "plan_type": self.plan_type,
             "observed_at": self.observed_at,
         }
+        if self.five_hour_pct is not None:
+            out["five_hour_pct"] = self.five_hour_pct
+        if self.five_hour_resets_at is not None:
+            out["five_hour_resets_at"] = self.five_hour_resets_at
+        return out
 
     @classmethod
     def from_json(cls, obj: Any) -> CodexQuota | None:
@@ -555,6 +562,7 @@ class CodexQuota:
         resets = obj.get("resets_at")
         plan = obj.get("plan_type")
         observed = obj.get("observed_at")
+        fh_resets = obj.get("five_hour_resets_at")
         return cls(
             used_percent=_to_pct(obj.get("used_percent")),
             window_minutes=(
@@ -573,6 +581,12 @@ class CodexQuota:
                 if isinstance(observed, (int, float)) and not isinstance(observed, bool)
                 else 0.0
             ),
+            five_hour_pct=_to_pct(obj.get("five_hour_pct")),
+            five_hour_resets_at=(
+                float(fh_resets)
+                if isinstance(fh_resets, (int, float)) and not isinstance(fh_resets, bool)
+                else None
+            ),
         )
 
     @classmethod
@@ -586,12 +600,27 @@ class CodexQuota:
         if not isinstance(rate_limits, Mapping):
             return None
         primary = rate_limits.get("primary")
+        secondary = rate_limits.get("secondary")
+        fh_pct: Pct | None = None
+        fh_resets: float | None = None
+        if isinstance(secondary, Mapping):
+            sec_win = secondary.get("window_minutes")
+            if isinstance(sec_win, (int, float)) and not isinstance(sec_win, bool) and int(sec_win) == 300:
+                fh_pct = _to_pct(secondary.get("used_percent"))
+                sec_res = secondary.get("resets_at")
+                if isinstance(sec_res, (int, float)) and not isinstance(sec_res, bool):
+                    fh_resets = float(sec_res)
         plan = rate_limits.get("plan_type")
         plan = plan if isinstance(plan, str) and plan else None
         if not isinstance(primary, Mapping):
-            if plan is None:
+            if plan is None and fh_pct is None:
                 return None
-            return cls(plan_type=plan, observed_at=observed_at)
+            return cls(
+                plan_type=plan,
+                observed_at=observed_at,
+                five_hour_pct=fh_pct,
+                five_hour_resets_at=fh_resets,
+            )
         window = primary.get("window_minutes")
         resets = primary.get("resets_at")
         return cls(
@@ -608,6 +637,8 @@ class CodexQuota:
             ),
             plan_type=plan,
             observed_at=observed_at,
+            five_hour_pct=fh_pct,
+            five_hour_resets_at=fh_resets,
         )
 
     def account_row(self, *, now: float) -> AccountRow:
@@ -666,15 +697,25 @@ class CodexQuota:
             if expired:
                 expired_windows = (label,)
         age = now - self.observed_at if self.observed_at else None
+        fh_reset_text = (
+            _format_reset_clock(self.five_hour_resets_at, now)
+            if self.five_hour_resets_at is not None
+            else None
+        )
+        fh_expired = self.five_hour_resets_at is not None and self.five_hour_resets_at < now
+        if fh_expired and fh_reset_text:
+            fh_reset_text = f"overdue ({fh_reset_text})"
+        if fh_expired and self.five_hour_pct is not None:
+            expired_windows = (*expired_windows, "five_hour")
         return AccountRow(
             slot=CODEX_PSEUDO_ACCOUNT_SLOT,
             alias=vendor_label(VENDOR_CODEX),
             email="",
             is_active=False,
-            five_hour_pct=None,
+            five_hour_pct=self.five_hour_pct,
             seven_day_pct=seven_day_pct,
             scoped_windows=scoped,
-            five_hour_resets_at=None,
+            five_hour_resets_at=fh_reset_text or None,
             seven_day_resets_at=seven_day_resets,
             scoped_resets_at=scoped_resets,
             usage_age_seconds=age if age is not None and age >= 0 else None,
@@ -721,8 +762,16 @@ class CodexIndexer:
         state_saver: Callable[[Mapping[str, Any]], bool | None] | None = None,
         defer_state_commit: bool = False,
         audit_limits: Mapping[str, tuple[int, int]] | None = None,
+        extra_dirs: Sequence[os.PathLike[str] | str] = (),
+        discover_extra_dirs: Callable[[], Sequence[os.PathLike[str] | str]] | None = None,
     ) -> None:
         self._sessions_dir = os.path.abspath(os.fspath(sessions_dir))
+        self._extra_dirs: tuple[str, ...] = tuple(
+            os.path.abspath(os.fspath(d))
+            for d in extra_dirs
+            if os.fspath(d) and not os.path.islink(os.fspath(d))
+        )
+        self._discover_extra_dirs = discover_extra_dirs
         self._state_path = os.fspath(state_path)
         if lookback_days is None:
             source = settings if settings is not None else SETTINGS_DEFAULTS
@@ -842,6 +891,20 @@ class CodexIndexer:
         """Corpus root. Shown in Settings; **never written to**."""
         return Path(self._sessions_dir)
 
+    def _all_candidate_dirs(self) -> list[str]:
+        out = [self._sessions_dir, *self._extra_dirs]
+        if self._discover_extra_dirs is not None:
+            try:
+                for cand in self._discover_extra_dirs():
+                    raw_cand = os.fspath(cand)
+                    if raw_cand and not os.path.islink(raw_cand):
+                        abs_cand = os.path.abspath(raw_cand)
+                        if abs_cand not in out:
+                            out.append(abs_cand)
+            except Exception:
+                pass
+        return out
+
     def available(self) -> bool:
         """True when ``~/.codex/sessions`` exists and is readable.
 
@@ -851,9 +914,10 @@ class CodexIndexer:
         because the owner calls it on every tick.
         """
         try:
-            return os.path.isdir(self._sessions_dir) and os.access(
-                self._sessions_dir, os.R_OK | os.X_OK
-            )
+            for root_dir in self._all_candidate_dirs():
+                if os.path.isdir(root_dir) and os.access(root_dir, os.R_OK | os.X_OK):
+                    return True
+            return False
         except OSError:  # pragma: no cover - isdir/access do not normally raise
             return False
 
@@ -1033,6 +1097,8 @@ class CodexIndexer:
             chunk_files=self._chunk_files,
             now=self._now,
             audit_limits=limits,
+            extra_dirs=self._extra_dirs,
+            discover_extra_dirs=self._discover_extra_dirs,
         )
 
     @property
@@ -1132,12 +1198,16 @@ class CodexIndexer:
         payload, ``KeyboardInterrupt``/``SystemExit`` mid-write - unlinks the
         tmp and propagates, like ``rollup._atomic_write_json``.
         """
-        text = json.dumps(payload, separators=(",", ":"))
+        data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         tmp = f"{path}.tmp.{os.getpid()}"
         try:
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-            with open(tmp, "w", encoding="utf-8") as fh:
-                fh.write(text)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, data)
+            finally:
+                os.close(fd)
+            os.chmod(tmp, 0o600)
             os.replace(tmp, path)
             return True
         except BaseException as exc:
@@ -1299,9 +1369,15 @@ class CodexIndexer:
         A **missing root is silent** — no error is appended (SPEC-CODEX 5.5).
         Only a root that exists but cannot be walked is reported.
         """
-        if not os.path.isdir(self._sessions_dir):
+        roots = [
+            d
+            for d in self._all_candidate_dirs()
+            if not os.path.islink(d) and os.path.isdir(d)
+        ]
+        if not roots:
             return
-        stack = [self._sessions_dir]
+        seen_inodes: set[tuple[int, int]] = set()
+        stack = list(reversed(roots))
         while stack:
             current = stack.pop()
             try:
@@ -1337,6 +1413,10 @@ class CodexIndexer:
                     except OSError:
                         # Deleted between readdir and stat: nothing to count.
                         continue
+                    file_id = (st.st_dev, st.st_ino)
+                    if file_id in seen_inodes:
+                        continue
+                    seen_inodes.add(file_id)
                     yield entry.path, st.st_size, st.st_mtime, st.st_ino
 
     def has_anything_changed(self) -> bool:
@@ -2138,7 +2218,9 @@ class CodexIndexer:
                                 # thing) sets the model for every token_count
                                 # that follows.
                                 found = self._consume_model_line(
-                                    buf[start:end], stats=stats
+                                    buf[start:end],
+                                    stats=stats,
+                                    current_model=current_model,
                                 )
                                 if found is not None:
                                     current_model = found
@@ -2232,7 +2314,11 @@ class CodexIndexer:
     # -- line handlers ---------------------------------------------------
 
     def _consume_model_line(
-        self, raw: bytes | bytearray, *, stats: _Stats
+        self,
+        raw: bytes | bytearray,
+        *,
+        stats: _Stats,
+        current_model: str | None = None,
     ) -> str | None:
         """TRAP 1: read the model a record states, for the turns that follow it.
 
@@ -2281,6 +2367,8 @@ class CodexIndexer:
             holder = payload.get("state")
         elif payload.get("type") == "thread_settings_applied":
             holder = payload.get("thread_settings")
+        elif record_type == "session_meta" and current_model is None:
+            holder = payload
         else:
             return None
         if not isinstance(holder, Mapping):

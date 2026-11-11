@@ -292,6 +292,31 @@ def _subagent_layout(
     return parts[index - 1], project_dir, workflow, agent
 
 
+def _project_basename(cwd: str | None) -> str:
+    """Resolve a working-directory path to one project basename component.
+
+    Ephemeral agent worktrees created inside a repository (``<repo>/.claude/
+    worktrees/<id>``, ``<repo>/.codex/worktrees/<id>``, ``<repo>/.worktrees/
+    <id>``) fold back into ``<repo>``'s basename so a 500-agent swarm attributes
+    to the repository rather than 500 throwaway worktree folders. Only that
+    exact nested worktree layout is collapsed; every other directory keeps its
+    own ``Path(cwd).name``.
+    """
+    if not cwd:
+        return ""
+    parts = Path(cwd).parts
+    n = len(parts)
+    if n >= 4 and parts[-2] == "worktrees" and parts[-3] in (".claude", ".codex"):
+        candidate = parts[-4]
+        if candidate and candidate not in ("/", os.sep, ".", ".."):
+            return candidate
+    if n >= 3 and parts[-2] in (".worktrees",):
+        candidate = parts[-3]
+        if candidate and candidate not in ("/", os.sep, ".", ".."):
+            return candidate
+    return Path(cwd).name
+
+
 def claude_scope(path: str | os.PathLike[str], cwd: str | None = None) -> Attribution:
     """Scope of one Claude transcript, from its path (and its ``cwd`` if seen).
 
@@ -322,7 +347,7 @@ def claude_scope(path: str | os.PathLike[str], cwd: str | None = None) -> Attrib
     if layout is not None:
         session, parent_dir, workflow, agent = layout
         project_dir = parent_dir or project_dir
-    name = Path(cwd).name if cwd else ""
+    name = _project_basename(cwd)
     return Attribution(
         vendor=VENDOR_CLAUDE,
         project=_clean(name or project_dir or UNKNOWN_PROJECT) or UNKNOWN_PROJECT,
@@ -388,7 +413,7 @@ def codex_scope(
         # `rollout-2026-08-24T16-06-26-<uuid>` - the file's own identity is the
         # honest fallback, and it is stable across passes.
         session = Path(path).stem
-    name = Path(directory).name if directory else ""
+    name = _project_basename(directory)
     return Attribution(
         vendor=VENDOR_CODEX,
         project=_clean(name) or UNKNOWN_PROJECT,
@@ -1122,6 +1147,54 @@ class AttributionStore:
     ) -> tuple[AttributionRow, ...]:
         """The most expensive projects of *day*, dearest first."""
         return self._rows(self._projects, day, pricing, limit=limit, sessions=False)
+
+    def top_projects_window(
+        self,
+        days: int,
+        *,
+        today: DayKey,
+        pricing: PricingTable | None = None,
+        limit: int = 5,
+    ) -> tuple[AttributionRow, ...]:
+        """The most expensive projects across the *days*-day window ending on *today*."""
+        parse_day_key(today)
+        window_days = max(1, int(days))
+        today_date = parse_day_key(today)
+        start_date = today_date - dt.timedelta(days=window_days - 1)
+        with self._lock:
+            selected = [
+                (d, {k: dict(m) for k, m in self._projects[d].items()})
+                for d in sorted(self._projects)
+                if start_date <= parse_day_key(d) <= today_date
+            ]
+        agg: dict[str, list[Any]] = {}
+        for d, bucket in selected:
+            d_date = parse_day_key(d)
+            for key, models in bucket.items():
+                vendor, project, _ = _split_key(key)
+                # Fold vendors sharing one repo basename together under vendor of largest spend,
+                # or keep per-(vendor, project) key consistent with top_projects:
+                slot = agg.setdefault(key, [vendor, project, ModelUsage(), Decimal(0), 0])
+                for model, counters in models.items():
+                    usage = ModelUsage.from_counters(tuple(counters))
+                    slot[2] = slot[2] + usage
+                    usd_val, unp = _cell_cost(pricing, model, usage, d_date)
+                    slot[3] += usd_val
+                    slot[4] += unp
+        rows = [
+            AttributionRow(
+                vendor=v,
+                project=proj,
+                session="",
+                usage=tot,
+                usd=_quantise(usd_dec),
+                unpriced_tokens=unp,
+            )
+            for v, proj, tot, usd_dec, unp in agg.values()
+            if not tot.is_zero
+        ]
+        rows.sort(key=lambda row: (-row.usd, -row.total_tokens, row.label))
+        return tuple(rows[: max(0, int(limit))])
 
     def top_sessions(
         self,

@@ -363,24 +363,47 @@ ICON_STYLE_SYMBOLS: dict[str, tuple[str, ...]] = {
 
 
 def companion_sprite_icon(stage_num: int = 1, *, mono: bool = False) -> Any | None:
-    """Render the active Belkins Companion 12x12 pixel sprite as a menu-bar NSImage."""
+    """Render the active Belkins Companion 14x14 pixel sprite as a menu-bar NSImage."""
     AppKit = _appkit()
     if AppKit is None:
         return None
     try:
-        from .themes.belkins import _SPRITES, _STAGE_COLORS
+        from .belkins_game import EVOLUTION_LINE, load_game_save
     except Exception:
         return status_icon()
 
-    grid = _SPRITES.get(stage_num) or _SPRITES.get(1)
+    idx = max(0, min(len(EVOLUTION_LINE) - 1, int(stage_num or 1) - 1))
+    stage = EVOLUTION_LINE[idx]
+    grid = stage.sprite
     if not grid:
         return status_icon()
-    body_rgb, acc_rgb, glow_rgb = _STAGE_COLORS.get(stage_num, _STAGE_COLORS[1])
 
-    size = 15.0
-    px = 1.15
-    ox = (size - 12 * px) / 2.0
-    oy = (size - 12 * px) / 2.0
+    shiny = False
+    if not mono:
+        try:
+            shiny = "shiny_core" in (load_game_save().get("equipped") or ())
+        except Exception:
+            shiny = False
+
+    if shiny:
+        b_rgb = (245 / 255.0, 196 / 255.0, 48 / 255.0)
+        a_rgb = (224 / 255.0, 242 / 255.0, 254 / 255.0)
+        c_rgb = (192 / 255.0, 132 / 255.0, 252 / 255.0)
+        s_rgb = (56 / 255.0, 189 / 255.0, 248 / 255.0)
+        o_rgb = (54 / 255.0, 46 / 255.0, 82 / 255.0)
+    else:
+        b_rgb = tuple(v / 255.0 for v in stage.body_rgb)
+        a_rgb = tuple(v / 255.0 for v in stage.accent_rgb)
+        c_rgb = tuple(v / 255.0 for v in stage.crest_rgb)
+        s_rgb = tuple(v / 255.0 for v in stage.spark_rgb)
+        o_rgb = (0.14, 0.16, 0.24)
+
+    rows = len(grid)
+    cols = len(grid[0]) if rows else 14
+    size = 16.0
+    px = 1.05
+    ox = (size - cols * px) / 2.0
+    oy = (size - rows * px) / 2.0
     try:
         image = AppKit.NSImage.alloc().initWithSize_(AppKit.NSMakeSize(size, size))
         image.lockFocus()
@@ -394,17 +417,21 @@ def companion_sprite_icon(stage_num: int = 1, *, mono: bool = False) -> Any | No
                             continue
                         col = AppKit.NSColor.blackColor()
                     elif ch == "O":
-                        col = AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(*body_rgb, 1.0)
+                        col = AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(*o_rgb, 1.0)
+                    elif ch == "B":
+                        col = AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(*b_rgb, 1.0)
                     elif ch == "A":
-                        col = AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(*acc_rgb, 1.0)
-                    elif ch == "W":
-                        col = AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(*glow_rgb, 1.0)
+                        col = AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(*a_rgb, 1.0)
+                    elif ch == "C":
+                        col = AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(*c_rgb, 1.0)
+                    elif ch == "S":
+                        col = AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(*s_rgb, 1.0)
                     elif ch == "E":
-                        col = AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(0.08, 0.09, 0.12, 1.0)
+                        col = AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(1.0, 1.0, 1.0, 1.0)
                     else:
                         continue
                     col.setFill()
-                    rect = AppKit.NSMakeRect(ox + c_idx * px, oy + r_idx * px, px + 0.15, px + 0.15)
+                    rect = AppKit.NSMakeRect(ox + c_idx * px, oy + r_idx * px, px + 0.12, px + 0.12)
                     AppKit.NSBezierPath.fillRect_(rect)
         finally:
             image.unlockFocus()

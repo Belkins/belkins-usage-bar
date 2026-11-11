@@ -2908,6 +2908,13 @@ SETTINGS_DEFAULTS: dict[str, Any] = {
     "belkins_hub_view": "luxury",
     "belkins_thinking_guard": True,
     "belkins_native_tail": False,
+    "belkins_slim_hero": False,
+    # --- smart fleet & ROI upgrades --------------------------------------
+    "codex_autoswitch_enabled": False,
+    "expiring_quota_alert_enabled": True,
+    "telegram_commands_enabled": True,
+    "global_hotkeys_enabled": False,
+    "monthly_subscription_usd": 0,
 }
 """Full ``settings.json`` schema with defaults.
 
@@ -3084,6 +3091,7 @@ SETTINGS_BOUNDS: dict[str, tuple[int, int]] = {
     "codex_quota_interval_seconds": (60, 3600),
     "notification_threshold_pct": (50, 100),
     "unpriced_alert_min_tokens": (0, 1_000_000_000),
+    "monthly_subscription_usd": (0, 100_000),
 }
 """Inclusive clamps for the integer settings.
 

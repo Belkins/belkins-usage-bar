@@ -3963,28 +3963,198 @@ without ``skills/`` gets four links and no error. Deliberately NOT here:
 braid four accounts' history into one file), and :data:`COPY_TARGETS`."""
 
 
+def safe_switch_codex_auth(
+    target_account_id: str,
+    *,
+    accounts_dir: os.PathLike[str] | str = CODEX_ACCOUNTS_DIR,
+    auth_path: os.PathLike[str] | str = CODEX_AUTH_PATH,
+) -> tuple[bool, str]:
+    """Safely switch ``~/.codex/auth.json`` to *target_account_id*.
+
+    Only called by explicit operator switches or opt-in ``codex_autoswitch_enabled``
+    — :class:`CodexAccountsSource` itself remains strictly read-only on *auth_path*.
+
+    Protections before overwriting *auth_path*:
+    1. If *auth_path* currently holds a **tracked** account whose token was rotated by
+       the Codex CLI or ChatGPT app (newer ``exp`` or newer ``mtime_ns``), syncs those
+       bytes atomically back to ``<accounts_dir>/<cur_id>/auth.json`` so single-use
+       OpenAI refresh tokens are never lost (``refresh_token_reused`` protection).
+    2. If *auth_path* holds an **untracked** OAuth login or API-key config, backs it up
+       to ``<accounts_dir>/untracked-<id>/auth.json`` (0700/0600) so it is never lost.
+    3. Writes ``<accounts_dir>/<target_account_id>/auth.json`` to *auth_path* via a
+       ``0o600`` temporary file + ``os.replace``. Never logs token contents.
+    """
+    acct_root = Path(accounts_dir)
+    dst = Path(auth_path)
+    src = acct_root / str(target_account_id).strip() / "auth.json"
+    if not src.is_file():
+        return False, f"credential file missing at {src}"
+
+    def _atomic_write_0600(target: Path, payload: bytes) -> None:
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, payload)
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
+        else:
+            os.close(fd)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, target)
+
+    def _token_exp(raw_obj: Any) -> float | None:
+        if not isinstance(raw_obj, Mapping):
+            return None
+        toks = raw_obj.get("tokens")
+        if not isinstance(toks, Mapping):
+            return None
+        access = toks.get("access_token")
+        if not isinstance(access, str) or not access:
+            return None
+        claims = decode_jwt_claims(access)
+        exp_val = claims.get("exp") if isinstance(claims, Mapping) else None
+        return float(exp_val) if isinstance(exp_val, (int, float)) else None
+
+    try:
+        src_bytes = src.read_bytes()
+        src_obj = json.loads(src_bytes.decode("utf-8"))
+        if not isinstance(src_obj, Mapping):
+            return False, f"invalid JSON object in {src}"
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        return False, f"unreadable credential at {src}: {type(exc).__name__}"
+
+    if dst.is_file():
+        try:
+            dst_bytes = dst.read_bytes()
+            dst_stat = dst.stat()
+            dst_obj = json.loads(dst_bytes.decode("utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError):
+            dst_bytes = b""
+            dst_stat = None
+            dst_obj = None
+
+        if isinstance(dst_obj, Mapping) and dst_bytes:
+            toks = dst_obj.get("tokens")
+            cur_id = (
+                str(toks.get("account_id") or "").strip()
+                if isinstance(toks, Mapping)
+                else ""
+            )
+            has_usable_tokens = (
+                isinstance(toks, Mapping)
+                and isinstance(toks.get("access_token"), str)
+                and bool(toks.get("access_token"))
+            )
+            if cur_id:
+                cur_home = acct_root / cur_id
+                cur_tracked = cur_home / "auth.json"
+                if cur_tracked.is_file():
+                    if has_usable_tokens:
+                        try:
+                            tr_bytes = cur_tracked.read_bytes()
+                            tr_stat = cur_tracked.stat()
+                            tr_obj = json.loads(tr_bytes.decode("utf-8"))
+                            dst_exp = _token_exp(dst_obj)
+                            tr_exp = _token_exp(tr_obj)
+                            newer = False
+                            if dst_exp is not None and tr_exp is not None:
+                                newer = dst_exp > tr_exp or (
+                                    dst_exp == tr_exp
+                                    and dst_stat is not None
+                                    and dst_stat.st_mtime_ns > tr_stat.st_mtime_ns
+                                    and dst_bytes != tr_bytes
+                                )
+                            elif dst_stat is not None and dst_stat.st_mtime_ns > tr_stat.st_mtime_ns:
+                                newer = dst_bytes != tr_bytes
+                            if newer:
+                                _atomic_write_0600(cur_tracked, dst_bytes)
+                                if cur_id == str(target_account_id).strip():
+                                    src_bytes = dst_bytes
+                        except (OSError, ValueError, UnicodeDecodeError):
+                            pass
+                else:
+                    # Preserve untracked OAuth login so switching never destroys it
+                    safe_tag = "".join(ch for ch in cur_id[:12] if ch.isalnum() or ch in "-_") or "unknown"
+                    backup_auth = acct_root / f"untracked-{safe_tag}" / "auth.json"
+                    try:
+                        _atomic_write_0600(backup_auth, dst_bytes)
+                        os.chmod(backup_auth.parent, 0o700)
+                    except OSError:
+                        pass
+            elif dst_obj.get("OPENAI_API_KEY"):
+                backup_auth = acct_root / "untracked-apikey" / "auth.json"
+                try:
+                    _atomic_write_0600(backup_auth, dst_bytes)
+                    os.chmod(backup_auth.parent, 0o700)
+                except OSError:
+                    pass
+
+    try:
+        _atomic_write_0600(dst, src_bytes)
+    except OSError as exc:
+        return False, f"failed to write {dst}: {type(exc).__name__}"
+    return True, f"switched active Codex login to {str(target_account_id)[:8]}"
+
+
 def best_codex_row(rows: Sequence[AccountRow]) -> AccountRow | None:
     """The Codex account with the most headroom, or ``None`` (UX-5).
 
     Pure: the ranking ``best`` prints and the menu's ``best:`` line shows, so
     the two cannot disagree. Among LIVE rows (negative slots) that are not
-    disabled and carry no ``warn``/``crit`` verdict, the lowest KNOWN weekly
-    percentage below 100 wins; a tie goes to the earlier row. A withheld
-    figure (``None``) is not room, and neither is a credit block (``crit``)
-    standing over an unspent percentage. ``None`` when no row has room.
+    disabled and carry no ``warn``/``crit`` verdict, prefers rows whose 5-hour
+    window is below 95% and whose scoped windows are below 100%, picking the
+    lowest KNOWN weekly percentage below 100; when weekly percentages tie and
+    one account resets >= 6h sooner, prefers the sooner reset so expiring
+    quota is harvested first; otherwise ties go to the earlier row. Falls back
+    to any ``< 100%`` weekly row if all candidates have high 5-hour usage.
     """
-    best: AccountRow | None = None
-    for row in rows:
-        if row.slot >= 0 or getattr(row, "disabled", False):
-            continue
-        if getattr(row, "attention_kind", "") in (KIND_WARN, KIND_CRIT):
-            continue
-        pct = row.seven_day_pct
-        if pct is None or pct >= 100.0:
-            continue
-        if best is None or pct < (best.seven_day_pct or 0.0):
-            best = row
-    return best
+    _TIE_RESET_GAP_S = 6 * 3600.0
+
+    def _pick(require_5h_room: bool) -> AccountRow | None:
+        best: AccountRow | None = None
+        for row in rows:
+            if row.slot >= 0 or getattr(row, "disabled", False):
+                continue
+            if getattr(row, "attention_kind", "") in (KIND_WARN, KIND_CRIT):
+                continue
+            pct = row.seven_day_pct
+            if pct is None or pct >= 100.0:
+                continue
+            if require_5h_room:
+                fh = getattr(row, "five_hour_pct", None)
+                if fh is not None and float(fh) >= 95.0:
+                    continue
+                scoped = getattr(row, "scoped_windows", ()) or ()
+                if any(sp is not None and float(sp) >= 100.0 for _n, sp in scoped):
+                    continue
+            if best is None:
+                best = row
+                continue
+            best_pct = best.seven_day_pct or 0.0
+            if pct < best_pct:
+                best = row
+            elif pct == best_pct:
+                r_rst = getattr(row, "soonest_reset_at", None)
+                b_rst = getattr(best, "soonest_reset_at", None)
+                if (
+                    isinstance(r_rst, (int, float))
+                    and isinstance(b_rst, (int, float))
+                    and (float(b_rst) - float(r_rst)) >= _TIE_RESET_GAP_S
+                ):
+                    best = row
+        return best
+
+    chosen = _pick(require_5h_room=True)
+    return chosen if chosen is not None else _pick(require_5h_room=False)
 
 
 def _cmd_best(

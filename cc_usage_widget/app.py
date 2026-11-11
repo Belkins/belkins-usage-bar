@@ -65,11 +65,14 @@ import json
 import os
 import queue
 import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
 import traceback
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any, Callable, Final, Iterable, Iterator, NamedTuple, Sequence
 
 import rumps
@@ -133,9 +136,10 @@ except Exception:  # pragma: no cover - codex_accounts is optional at import tim
 
 
 try:  # UX-5: the one "best Codex account" ranking, shared with `codex_accounts best`
-    from .codex_accounts import best_codex_row
+    from .codex_accounts import best_codex_row, safe_switch_codex_auth
 except Exception:  # pragma: no cover - codex_accounts is optional at import time
     best_codex_row = None  # type: ignore[assignment]
+    safe_switch_codex_auth = None  # type: ignore[assignment]
 
 
 try:  # CX-5/CX-7b: Codex relogin UX, optional the same way
@@ -392,6 +396,7 @@ than painting from the worker."""
 _DESKTOP_TERMINAL = "terminal"  # CX-5: a codex_login .command, opened in Terminal
 _CMD_CODEX_LOGIN = "codex_login"  # CX-5: payload = account_id | None
 _CMD_SWITCH_CODEX = "switch_codex"  # explicit user-clicked Codex account switch
+_CMD_SET_AUTOSWITCH_THRESHOLD = "set_autoswitch_threshold"
 
 
 def _log(message: str) -> None:
@@ -2447,6 +2452,10 @@ class BackgroundWorker:
         first use. A seam so the cadence can be tested without ``pgrep``."""
         self._next_rival_scan = time.monotonic() + RIVAL_RESCAN_SECONDS  # W2
         self._engine_not_before: float = 0.0  # W6
+        self._last_quota_sample_at: float = 0.0
+        self._last_codex_autoswitch_at: float = 0.0
+        self._last_tg_poll_at: float = 0.0
+        self._tg_poll_inflight: bool = False
         """Earliest monotonic time the engine may be ticked again from the
         engine-only path. Held HERE, not in the loop-local deadline, because
         the top of every iteration is free to pull that deadline in to
@@ -2756,22 +2765,37 @@ class BackgroundWorker:
                 if _codex_login is not None
                 else CODEX_ACCOUNTS_REGISTRY_PATH.parent / "codex-accounts"
             )
-            src_auth = Path(accounts_dir) / matched_id / "auth.json"
-            if not src_auth.is_file():
-                _log(f"codex switch: missing credential {src_auth}")
-                return
-            raw_bytes = src_auth.read_bytes()
-            json.loads(raw_bytes.decode("utf-8"))
-            dest_auth = Path.home() / ".codex" / "auth.json"
-            dest_auth.parent.mkdir(parents=True, exist_ok=True)
-            tmp_auth = dest_auth.with_name(f".auth.json.tmp.{os.getpid()}")
-            fd = os.open(str(tmp_auth), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            try:
-                os.write(fd, raw_bytes)
-            finally:
-                os.close(fd)
-            os.replace(str(tmp_auth), str(dest_auth))
-            _log(f"codex switch: switched active ~/.codex/auth.json -> {target} ({matched_id[:8]})")
+            if callable(safe_switch_codex_auth):
+                ok, reason = safe_switch_codex_auth(
+                    matched_id,
+                    accounts_dir=Path(accounts_dir),
+                    registry_path=(
+                        getattr(registry, "path", None)
+                        if registry is not None
+                        else CODEX_ACCOUNTS_REGISTRY_PATH
+                    ),
+                )
+                if not ok:
+                    _log(f"codex switch refused: {reason}")
+                    return
+                _log(f"codex switch: {reason}")
+            else:
+                src_auth = Path(accounts_dir) / matched_id / "auth.json"
+                if not src_auth.is_file():
+                    _log(f"codex switch: missing credential {src_auth}")
+                    return
+                raw_bytes = src_auth.read_bytes()
+                json.loads(raw_bytes.decode("utf-8"))
+                dest_auth = Path.home() / ".codex" / "auth.json"
+                dest_auth.parent.mkdir(parents=True, exist_ok=True)
+                tmp_auth = dest_auth.with_name(f".auth.json.tmp.{os.getpid()}")
+                fd = os.open(str(tmp_auth), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                try:
+                    os.write(fd, raw_bytes)
+                finally:
+                    os.close(fd)
+                os.replace(str(tmp_auth), str(dest_auth))
+                _log(f"codex switch: switched active ~/.codex/auth.json -> {target} ({matched_id[:8]})")
             self._force_sources_due()
             self._run_accounts_job(force=True)
         except Exception as exc:
@@ -3131,18 +3155,30 @@ class BackgroundWorker:
                 # is what the last tick published when there is no breakdown yet.
                 progress = cost.progress if cost is not None else snapshot.progress
                 indexing = _progress_label(progress) or "indexing…"
+            dash_kwargs: dict[str, Any] = {
+                "now": time.time(),
+                "pricing": self._pricing,
+                "indexing": indexing,
+                # Beside the store it describes, so a redirected cache never
+                # writes into the installed widget's home (history_path_for's
+                # rule, for the same reason).
+                "path": dashboard_path_for(getattr(self._rollups, "path", None)),
+            }
+            sub_usd = float(self._settings().get("monthly_subscription_usd", 0) or 0)
+            try:
+                sig = inspect.signature(build_dashboard)
+                if "monthly_subscription_usd" in sig.parameters or any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                ):
+                    dash_kwargs["monthly_subscription_usd"] = sub_usd
+            except (TypeError, ValueError):
+                pass
             path = build_dashboard(
                 self._history_store(),
                 self._rollups,
                 snapshot.quota_rows,
                 snapshot.accounts,
-                now=time.time(),
-                pricing=self._pricing,
-                indexing=indexing,
-                # Beside the store it describes, so a redirected cache never
-                # writes into the installed widget's home (history_path_for's
-                # rule, for the same reason).
-                path=dashboard_path_for(getattr(self._rollups, "path", None)),
+                **dash_kwargs,
             )
         except Exception as exc:
             message = f"dashboard failed: {_describe(exc, 'dashboard')}"
@@ -3533,13 +3569,17 @@ class BackgroundWorker:
         """
         now = time.monotonic()
         reported = self._autoswitch_due_at(now)
+        armed = self._has_armed_handoff()
         # An overdue engine (``reported <= now``) wakes us at once - that is
         # the case W6 exists for. The 15 s floor lives in worker state so an
         # adapter that keeps answering "due now" is bounded to one tick per
         # floor; ``max(inf, floor)`` is still ``inf``, so an adapter with no
-        # schedule buys no wake-up at all.
-        next_engine = min(next_engine, max(reported, self._engine_not_before))
-        due = min(next_ui, next_cost, next_engine)
+        # schedule buys no wake-up at all. When Thinking Guard has armed a
+        # deferred handoff, wake on a 2 s turn-boundary cadence instead.
+        floor_bound = (now + 2.0) if armed else self._engine_not_before
+        next_engine = min(next_engine, max(reported, floor_bound if not armed else reported))
+        tg_due = self._telegram_commands_due_at(now)
+        due = min(next_ui, next_cost, next_engine, tg_due)
         timeout = due - now
         command: tuple[str, Any] | None = None
         if timeout > 0:
@@ -3573,6 +3613,7 @@ class BackgroundWorker:
         # this function that drops the call fails that test rather than
         # silently reverting the widget to startup-only detection.
         self._maybe_rescan_rivals(now)
+        self._maybe_poll_telegram_commands(now)
         if now >= next_ui:
             # Always re-arm, even if the job raised, so one broken read
             # cannot turn into a hot loop.
@@ -3580,18 +3621,71 @@ class BackgroundWorker:
             self._run_accounts_job(force=False)
             # That job ticked the engine too, so take its new deadline.
             next_engine = max(
-                self._autoswitch_due_at(time.monotonic()), self._engine_not_before
+                self._autoswitch_due_at(time.monotonic()),
+                0.0 if self._has_armed_handoff() else self._engine_not_before,
             )
         elif now >= next_engine:
             # Re-arm BEFORE the call, in worker state: the deadline must move
             # even if the tick raises or the adapter keeps answering "due now".
-            self._engine_not_before = now + AUTOSWITCH_WAKE_FLOOR_SECONDS
+            wake_step = 2.0 if self._has_armed_handoff() else AUTOSWITCH_WAKE_FLOOR_SECONDS
+            self._engine_not_before = now + wake_step
             next_engine = self._engine_not_before
             self._run_autoswitch_tick()
-            next_engine = max(next_engine, self._autoswitch_due_at(time.monotonic()))
+            next_engine = max(
+                0.0 if self._has_armed_handoff() else next_engine,
+                self._autoswitch_due_at(time.monotonic()),
+            )
         if not self._stop.is_set() and time.monotonic() >= next_cost:
             next_cost = self._run_cost_job()
         return False, next_ui, next_cost, next_engine
+
+    def _has_armed_handoff(self) -> bool:
+        source = self._accounts
+        checker = getattr(source, "has_armed_handoff", None)
+        if source is None or not callable(checker):
+            return False
+        try:
+            return bool(checker())
+        except Exception:
+            return False
+
+    def _telegram_commands_due_at(self, now: float) -> float:
+        notifier = self._notifier
+        if notifier is None or not callable(getattr(notifier, "poll_telegram_commands", None)):
+            return float("inf")
+        settings = self._settings()
+        if not (
+            bool(settings.get("notifications_enabled", False))
+            and bool(settings.get("telegram_notifications_enabled", False))
+            and bool(settings.get("telegram_commands_enabled", False))
+        ):
+            return float("inf")
+        return max(now, self._last_tg_poll_at + 15.0)
+
+    def _maybe_poll_telegram_commands(self, now: float) -> None:
+        if self._tg_poll_inflight or now < self._telegram_commands_due_at(now):
+            return
+        notifier = self._notifier
+        if notifier is None or not callable(getattr(notifier, "poll_telegram_commands", None)):
+            return
+        self._last_tg_poll_at = now
+        self._tg_poll_inflight = True
+        snap = self._snapshot
+
+        def _bg_poll() -> None:
+            try:
+                handlers = {
+                    "best": lambda _arg: (self.submit(_CMD_SWITCH_BEST, None) or "Queued switch to best Claude slot"),
+                    "switch": lambda arg: (self.submit(_CMD_SWITCH_TO, str(arg)) or f"Queued switch to Claude slot {arg}"),
+                    "codex": lambda arg: (self.submit(_CMD_SWITCH_CODEX, str(arg)) or f"Queued Codex switch to {arg}"),
+                }
+                notifier.poll_telegram_commands(snap, handlers)
+            except Exception as exc:
+                _log(f"telegram command poll failed: {_describe(exc)}")
+            finally:
+                self._tg_poll_inflight = False
+
+        threading.Thread(target=_bg_poll, name="cc-usage-tg-cmds", daemon=True).start()
 
     def _autoswitch_due_at(self, now: float) -> float:
         """Monotonic deadline of the adapter's next autoswitch evaluation.
@@ -3601,6 +3695,8 @@ class BackgroundWorker:
         or an unreadable answer. Never guesses a cadence of its own - an
         unknown due time is "no extra wake-up", not an invented one.
         """
+        if self._has_armed_handoff():
+            return now + 2.0
         source = self._accounts
         getter = getattr(source, "next_tick_in", None)
         if source is None or not callable(getter):
@@ -3633,7 +3729,10 @@ class BackgroundWorker:
                 default=bool(self._settings().get("autoswitch_enabled", False))
             ):
                 return
-            switched = accounts.evaluate_autoswitch()
+            poll_armed = getattr(accounts, "poll_armed_handoff", None)
+            switched = poll_armed() if callable(poll_armed) else None
+            if not switched:
+                switched = accounts.evaluate_autoswitch()
             if switched:
                 _log(f"autoswitch -> {switched}")
                 accounts.refresh(force=True)
@@ -3854,11 +3953,34 @@ class BackgroundWorker:
             if name == _CMD_SWITCH_CODEX:
                 self._switch_codex(str(payload) if payload else "")
                 return True, False
+            if name == _CMD_SET_AUTOSWITCH_THRESHOLD:
+                self._set_autoswitch_threshold(float(payload))
+                return True, False
         except Exception as exc:
             self._publish(replace(self._snapshot, accounts_error=_describe(exc)))
         else:
             _log(f"ignoring unknown command {name!r}")
         return False, False
+
+    def _set_autoswitch_threshold(self, pct: float) -> None:
+        error: str | None = None
+        setter = getattr(self._accounts, "set_autoswitch_threshold", None)
+        if self._accounts is None:
+            error = "no account source wired"
+        elif callable(setter):
+            try:
+                if not setter(pct):
+                    error = getattr(self._accounts, "last_error", None) or "could not set threshold"
+            except Exception as exc:
+                error = _describe(exc)
+        truth = _autoswitch_threshold_of(self._accounts) if self._accounts is not None else None
+        self._publish(
+            replace(
+                self._snapshot,
+                autoswitch_threshold=float(truth if truth is not None else pct),
+                accounts_error=error,
+            )
+        )
 
     def _set_autoswitch(self, enabled: bool) -> None:
         """Write through to claude-swap, then publish *its* answer.
@@ -4219,6 +4341,87 @@ class BackgroundWorker:
             return None
         return f"{ACCOUNTS_UNAVAILABLE}: {cause or 'no snapshot yet'}"[:MAX_ERROR_CHARS]
 
+    def _maybe_record_quota_samples(
+        self, accounts_rows: Sequence[AccountRow], quota_rows: Sequence[AccountRow]
+    ) -> None:
+        if self._rollups is None or not bool(self._settings().get("history_enabled", True)):
+            return
+        now_mono = time.monotonic()
+        if now_mono - self._last_quota_sample_at < 60.0:
+            return
+        store = self._history_store()
+        if store is None:
+            return
+        recorder = getattr(store, "record_quota_samples", None)
+        if not callable(recorder):
+            return
+        self._last_quota_sample_at = now_mono
+        try:
+            recorder(tuple(accounts_rows) + tuple(quota_rows), now=time.time())
+        except Exception as exc:
+            _log(f"quota sample mirror failed: {_describe(exc)}")
+
+    def _maybe_autoswitch_codex(self, quota_rows: tuple[AccountRow, ...]) -> tuple[AccountRow, ...]:
+        settings = self._settings()
+        if not (
+            bool(settings.get("codex_autoswitch_enabled", False))
+            and bool(settings.get("codex_tracking_enabled", True))
+            and callable(best_codex_row)
+            and callable(safe_switch_codex_auth)
+        ):
+            return quota_rows
+        now_mono = time.monotonic()
+        if now_mono - self._last_codex_autoswitch_at < 30.0:
+            return quota_rows
+        live = [r for r in quota_rows if r.vendor == VENDOR_CODEX and r.slot < 0]
+        active_row = next((r for r in live if r.is_active), None)
+        if active_row is None:
+            return quota_rows
+        expired = set(active_row.expired_windows or ())
+        wk_capped = (
+            active_row.seven_day_pct is not None
+            and active_row.seven_day_pct >= 100.0
+            and "seven_day" not in expired
+        )
+        fh_capped = (
+            active_row.five_hour_pct is not None
+            and active_row.five_hour_pct >= 98.0
+            and "five_hour" not in expired
+        )
+        crit_note = getattr(active_row, "attention_kind", "") == "crit"
+        if not (wk_capped or fh_capped or crit_note):
+            return quota_rows
+        candidate = best_codex_row(live)
+        if candidate is None or candidate.is_active:
+            return quota_rows
+        target_alias = (candidate.alias or "").strip()
+        if not target_alias:
+            return quota_rows
+        self._last_codex_autoswitch_at = now_mono
+        try:
+            registry = _codex_registry(self._sources)
+            accounts_dir = (
+                _codex_login.accounts_dir_for(self._sources)
+                if _codex_login is not None
+                else CODEX_ACCOUNTS_REGISTRY_PATH.parent / "codex-accounts"
+            )
+            ok, reason = safe_switch_codex_auth(
+                target_alias,
+                accounts_dir=Path(accounts_dir),
+                registry_path=(
+                    getattr(registry, "path", None)
+                    if registry is not None
+                    else CODEX_ACCOUNTS_REGISTRY_PATH
+                ),
+            )
+            if ok:
+                _log(f"codex autoswitch -> {target_alias} ({reason})")
+                self._force_sources_due()
+                return self._collect_quota_rows()
+        except Exception as exc:
+            _log(f"codex autoswitch failed: {_describe(exc)}")
+        return quota_rows
+
     def _run_accounts_job(self, *, force: bool, error_override: str | None = None) -> None:
         """Read claude-swap's usage store and (if enabled) tick autoswitch.
 
@@ -4231,7 +4434,8 @@ class BackgroundWorker:
         no ``claude_swap`` at all (SPEC-CODEX 5.5).
         """
         if self._accounts is None:
-            quota = self._collect_quota_rows()
+            quota = self._maybe_autoswitch_codex(self._collect_quota_rows())
+            self._maybe_record_quota_samples((), quota)
             if quota != self._snapshot.quota_rows:
                 self._publish(replace(self._snapshot, quota_rows=quota))
             return
@@ -4246,7 +4450,10 @@ class BackgroundWorker:
                 # The adapter enforces claude-swap's own cadence and is a no-op
                 # when the toggle is off; the check above is belt-and-braces so
                 # a stale adapter cannot switch accounts behind an OFF label.
-                switched = self._accounts.evaluate_autoswitch()
+                poll_armed = getattr(self._accounts, "poll_armed_handoff", None)
+                switched = poll_armed() if callable(poll_armed) else None
+                if not switched:
+                    switched = self._accounts.evaluate_autoswitch()
                 if switched:
                     _log(f"autoswitch -> {switched}")
                     self._accounts.refresh(force=True)
@@ -4257,11 +4464,13 @@ class BackgroundWorker:
             if not error_override:
                 _forget_failures("accounts")
             fleet_snapshot = self._collect_fleet(rows, active)  # W3
+            quota = self._maybe_autoswitch_codex(self._collect_quota_rows())
+            self._maybe_record_quota_samples(rows, quota)
             self._publish(
                 replace(
                     self._snapshot,
                     accounts=rows,
-                    quota_rows=self._collect_quota_rows(),
+                    quota_rows=quota,
                     active=active,
                     autoswitch_enabled=autoswitch,
                     accounts_error=error_override,
@@ -5339,11 +5548,66 @@ class CCUsageWidgetApp(rumps.App):
         self._running = False
         self._auto_compact = False
         self._auto_icon_only = False
+        self._auto_compact_since = 0.0
+        self._compact_trigger_others = 0
+        self._compact_trigger_title_len = 0
         self._title_hidden_streak = 0
         self._title_fit_checked_at = 0.0
+        self._hotkey_monitor: Any = None
         self.rebuild_menu()
 
     # -- lifecycle ---------------------------------------------------------
+
+    def _register_sync_timer_common_modes(self) -> None:
+        """Add ``_sync_timer``'s underlying NSTimer to ``NSRunLoopCommonModes`` so
+        desktop hand-offs (opening Dashboard / Terminal) run even while NSMenu is open."""
+        try:
+            from Foundation import NSRunLoop, NSRunLoopCommonModes
+
+            nstimer = getattr(self._sync_timer, "_nstimer", None)
+            if nstimer is not None:
+                NSRunLoop.currentRunLoop().addTimer_forMode_(nstimer, NSRunLoopCommonModes)
+        except Exception:
+            pass
+
+    def _sync_global_hotkeys(self, enabled: bool) -> None:
+        """Install or remove opt-in global hotkeys (`⌃⌥B` Switch Best, `⌃⌥U` Refresh)."""
+        if not enabled or not self._running or os.environ.get(_NO_REVEAL_ENV):
+            mon, self._hotkey_monitor = getattr(self, "_hotkey_monitor", None), None
+            if mon is not None:
+                try:
+                    import AppKit
+
+                    AppKit.NSEvent.removeMonitor_(mon)
+                except Exception:
+                    pass
+            return
+        if getattr(self, "_hotkey_monitor", None) is not None:
+            return
+        try:
+            import AppKit
+
+            ctrl_opt = int(AppKit.NSEventModifierFlagControl) | int(AppKit.NSEventModifierFlagOption)
+            cmd_mask = int(AppKit.NSEventModifierFlagCommand)
+
+            def _on_key(event: Any) -> None:
+                try:
+                    flags = int(event.modifierFlags())
+                    if (flags & ctrl_opt) != ctrl_opt or (flags & cmd_mask):
+                        return
+                    ch = str(event.charactersIgnoringModifiers() or "").lower()
+                    if ch == "b":
+                        self._on_switch_best(None)
+                    elif ch == "u":
+                        self._on_refresh_now(None)
+                except Exception:
+                    pass
+
+            self._hotkey_monitor = AppKit.NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+                AppKit.NSEventMaskKeyDown, _on_key
+            )
+        except Exception as exc:
+            _log(f"global hotkeys unavailable: {_describe(exc)}")
 
     def run(self, **options: Any) -> None:
         """Start the worker and the repaint tick, then enter the AppKit loop.
@@ -5362,10 +5626,13 @@ class CCUsageWidgetApp(rumps.App):
         self._worker.submit(_CMD_WIRE_SOURCES, None)
         self._worker.start()
         self._sync_timer.start()
+        self._register_sync_timer_common_modes()
+        self._sync_global_hotkeys(bool(self.snapshot().settings.get("global_hotkeys_enabled", False)))
         try:
             super().run(**options)
         finally:
             self._running = False
+            self._sync_global_hotkeys(False)
             self._worker.stop()
 
     QUIT_GRACE_SECONDS = 5.0
@@ -5458,6 +5725,15 @@ class CCUsageWidgetApp(rumps.App):
         """
         return self._worker.extra_sources
 
+    @staticmethod
+    def _is_menu_tracking() -> bool:
+        try:
+            from Foundation import NSEventTrackingRunLoopMode, NSRunLoop
+
+            return str(NSRunLoop.currentRunLoop().currentMode() or "") == str(NSEventTrackingRunLoopMode)
+        except Exception:
+            return False
+
     def _on_sync_tick(self, _timer: Any) -> None:
         """Main-thread repaint tick: cheap when nothing changed.
 
@@ -5469,6 +5745,10 @@ class CCUsageWidgetApp(rumps.App):
             # The worker's desktop hand-offs, performed HERE because this is
             # the AppKit thread and NSWorkspace is AppKit (see _DESKTOP_REVEAL).
             self._drain_desktop_handoffs()
+            if self._is_menu_tracking():
+                # Never call menu.clear() while NSMenu is actively tracking a hover/click;
+                # keep `_dirty` set so the menu rebuilds the instant tracking ends.
+                return
             with self._lock:
                 dirty, self._dirty = self._dirty, False
                 snapshot = self._snapshot
@@ -5478,29 +5758,34 @@ class CCUsageWidgetApp(rumps.App):
         except Exception as exc:  # pragma: no cover - defensive
             _log(f"repaint failed: {_describe(exc)}")
 
-    def _check_title_fits(self, hidden: Callable[[], bool | None] | None = None) -> bool:
-        """Fall back to the compact title when the full one is not drawn.
+    def _uncompacted_title_len(self) -> int:
+        saved_c, saved_i = self._auto_compact, getattr(self, "_auto_icon_only", False)
+        try:
+            self._auto_compact = False
+            self._auto_icon_only = False
+            return len(self.render_title())
+        finally:
+            self._auto_compact = saved_c
+            self._auto_icon_only = saved_i
 
-        A full, notched menu bar drops a status item that does not fit, and
-        the full title grows with live alerts — after a reboot on 2026-09-30
-        it measured 288 pt and the widget was simply not there. Two hidden
-        readings :data:`TITLE_FIT_CHECK_SECONDS` apart (one could be the item
-        still settling after a relayout) switch this run to the compact title;
-        the stored ``title_compact`` is never written, so the next start tries
-        the full title again. No verdict (bar hidden, no item yet) resets
-        nothing and counts nothing. *hidden* is the test seam. Returns whether
-        the fallback fired on this call.
+    def _check_title_fits(self, hidden: Callable[[], bool | None] | None = None) -> bool:
+        """Two-tier notch fallback (full -> compact -> icon-only) with non-oscillating recovery.
+
+        Two hidden readings :data:`TITLE_FIT_CHECK_SECONDS` apart switch this
+        run to the compact title; if the compact title is still hidden after a
+        15 s settling window, two further hidden readings escalate to icon-only.
+        On live WindowServer checks, recovers back to the full title after >=60 s
+        only if other status items closed or our uncompacted title shrank.
         """
-        if self._auto_compact or bool(self.snapshot().settings.get("title_compact", False)):
-            return False
-        if getattr(self, "_auto_icon_only", False):
+        if bool(self.snapshot().settings.get("title_compact", False)):
             return False
         now = time.monotonic()
-        if hidden is None:
+        live_probe = hidden is None
+        win_num: int | None = None
+        win_obj: Any = None
+        if live_probe:
             if now - self._title_fit_checked_at < TITLE_FIT_CHECK_SECONDS:
                 return False
-            win_num: int | None = None
-            win_obj: Any = None
             try:
                 item = getattr(getattr(self, "_nsapp", None), "nsstatusitem", None)
                 btn = item.button() if item is not None and render._responds(item, "button") else None
@@ -5510,7 +5795,32 @@ class CCUsageWidgetApp(rumps.App):
             except Exception:
                 win_num = None
                 win_obj = None
+            if (self._auto_compact or getattr(self, "_auto_icon_only", False)) and (
+                now - getattr(self, "_auto_compact_since", 0.0) >= 60.0
+            ):
+                others_now = menubar.onscreen_other_count(win_num)
+                trig_others = getattr(self, "_compact_trigger_others", 0)
+                trig_len = getattr(self, "_compact_trigger_title_len", 0)
+                shrank = trig_len > 0 and self._uncompacted_title_len() <= trig_len - 4
+                if (
+                    trig_others > 0
+                    and others_now is not None
+                    and others_now < trig_others
+                ) or shrank:
+                    self._auto_compact = False
+                    self._auto_icon_only = False
+                    self._title_hidden_streak = 0
+                    self._title_fit_checked_at = now
+                    _log("title: menu bar gained room; restoring full title")
+                    self.rebuild_menu()
+                    return False
             hidden = lambda wn=win_num, wo=win_obj: menubar.own_window_hidden(wn, win=wo)
+
+        if getattr(self, "_auto_icon_only", False):
+            return False
+        if self._auto_compact and (now - getattr(self, "_auto_compact_since", 0.0) < 15.0):
+            return False
+
         self._title_fit_checked_at = now
         verdict = hidden()
         if verdict is None:
@@ -5519,8 +5829,18 @@ class CCUsageWidgetApp(rumps.App):
         if self._title_hidden_streak < 2:
             return False
         self._title_hidden_streak = 0
-        self._auto_compact = True
-        _log("title: status item hidden by a full menu bar; showing the compact title until restart")
+        if not self._auto_compact:
+            self._compact_trigger_title_len = self._uncompacted_title_len()
+            self._compact_trigger_others = (
+                (menubar.onscreen_other_count(win_num) or 0) if live_probe else 0
+            )
+            self._auto_compact = True
+            self._auto_compact_since = now
+            _log("title: status item hidden by a full menu bar; showing the compact title")
+        else:
+            self._auto_icon_only = True
+            self._auto_compact_since = now
+            _log("title: compact title still hidden by a full menu bar; escalating to icon-only")
         self.rebuild_menu()
         return True
 
@@ -5876,10 +6196,13 @@ class CCUsageWidgetApp(rumps.App):
                         slim.append([(txt[:4].rstrip("…"), knd)])
                         continue
                 slim.append(group)
-            if len(slim) > 1 and len(render.join_title_tokens(slim)) > 17:
-                last_txt = "".join(t for t, _k in slim[-1])
-                if last_txt.startswith("⚠") and len(last_txt) <= 3:
-                    slim = slim[:-1]
+            if len(slim) > 2 and len(render.join_title_tokens(slim)) > 18:
+                # Never strip `⚠` / `⚠N` standing-problem badges; drop the optional `$cost` chip instead.
+                slim = [
+                    grp
+                    for grp in slim
+                    if not (len(grp) == 1 and grp[0][1] is None and grp[0][0].startswith("$"))
+                ]
             parts = slim
         return parts
 
@@ -6527,6 +6850,7 @@ class CCUsageWidgetApp(rumps.App):
         def claude_relogin() -> None:
             if self.snapshot().unmanaged_login:
                 self._worker.submit(_CMD_ADD_LOGIN, None)
+                return
             if os.environ.get(_NO_REVEAL_ENV):
                 return
             try:
@@ -6576,6 +6900,23 @@ class CCUsageWidgetApp(rumps.App):
             self._apply_title_attributes(self._snapshot)
             self._worker.submit(_CMD_SET_AUTOSWITCH, target)
 
+        def set_autoswitch_threshold_from_theme(pct: float) -> None:
+            val = float(pct)
+            with self._lock:
+                self._snapshot = replace(self._snapshot, autoswitch_threshold=val)
+            self._sync_status_icon(self._snapshot)
+            self.title = self.render_title(self._snapshot)
+            self._apply_title_attributes(self._snapshot)
+            self._worker.submit(_CMD_SET_AUTOSWITCH_THRESHOLD, val)
+
+        def pin_session_dir_from_theme(cwd: str, slot: int) -> None:
+            if cwd and os.path.isabs(cwd):
+                self._worker.submit(_CMD_MAP_DIR, (str(cwd), int(slot)))
+
+        def unpin_session_dir_from_theme(cwd: str) -> None:
+            if cwd and os.path.isabs(cwd):
+                self._worker.submit(_CMD_UNMAP_DIR, str(cwd))
+
         return _themes.ThemeActions(
             switch_to=switch_to,
             switch_best=lambda: self._on_switch_best(None),
@@ -6590,6 +6931,9 @@ class CCUsageWidgetApp(rumps.App):
             open_dashboard=lambda: self._on_open_dashboard(None),
             set_setting=lambda k, v: self._set_setting_from_theme(k, v),
             toggle_autoswitch=toggle_autoswitch_from_theme,
+            set_autoswitch_threshold=set_autoswitch_threshold_from_theme,
+            pin_session_dir=pin_session_dir_from_theme,
+            unpin_session_dir=unpin_session_dir_from_theme,
             export_csv=lambda: self._on_export_csv(None),
             update_app=update_app,
             quit_app=lambda: self._on_quit(None),
@@ -8649,8 +8993,21 @@ class CCUsageWidgetApp(rumps.App):
         tail_on = bool(
             settings.get("belkins_native_tail", SETTINGS_DEFAULTS["belkins_native_tail"])
         )
+        slim_on = bool(
+            settings.get("belkins_slim_hero", SETTINGS_DEFAULTS["belkins_slim_hero"])
+        )
+        hotkeys_on = bool(
+            settings.get("global_hotkeys_enabled", SETTINGS_DEFAULTS["global_hotkeys_enabled"])
+        )
         children: list[Any] = [
             _submenu(f"Hub View: {hub_labels.get(cur_hub, cur_hub)}", hub_items),
+            _check(
+                rumps.MenuItem(
+                    self._switch_label("Slim Hero banner", slim_on),
+                    callback=self._make_setting_toggle("belkins_slim_hero"),
+                ),
+                slim_on,
+            ),
             _check(
                 rumps.MenuItem(
                     self._switch_label("Classic menu tail", tail_on),
@@ -8664,6 +9021,13 @@ class CCUsageWidgetApp(rumps.App):
                     callback=self._make_setting_toggle("belkins_animations_enabled"),
                 ),
                 anim_on,
+            ),
+            _check(
+                rumps.MenuItem(
+                    self._switch_label("Global hotkeys (⌃⌥B / ⌃⌥U)", hotkeys_on),
+                    callback=self._make_setting_toggle("global_hotkeys_enabled"),
+                ),
+                hotkeys_on,
             ),
         ]
         try:
@@ -8833,8 +9197,38 @@ class CCUsageWidgetApp(rumps.App):
                     telegram_on,
                 )
             )
+            tg_cmds_on = bool(
+                settings.get(
+                    "telegram_commands_enabled",
+                    SETTINGS_DEFAULTS["telegram_commands_enabled"],
+                )
+            )
+            children.append(
+                _check(
+                    rumps.MenuItem(
+                        self._switch_label("Telegram commands (/status, /best)", tg_cmds_on),
+                        callback=self._make_setting_toggle("telegram_commands_enabled"),
+                    ),
+                    tg_cmds_on,
+                )
+            )
         else:
             children.append(_info("Telegram: run `notify setup` (no notify.json)"))
+        exp_quota_on = bool(
+            settings.get(
+                "expiring_quota_alert_enabled",
+                SETTINGS_DEFAULTS["expiring_quota_alert_enabled"],
+            )
+        )
+        children.append(
+            _check(
+                rumps.MenuItem(
+                    self._switch_label("Expiring weekly quota reminder", exp_quota_on),
+                    callback=self._make_setting_toggle("expiring_quota_alert_enabled"),
+                ),
+                exp_quota_on,
+            )
+        )
         thresh = int(
             settings.get(
                 "notification_threshold_pct",
@@ -9010,7 +9404,10 @@ class CCUsageWidgetApp(rumps.App):
             elif key == "title_compact":
                 if str(snapshot.settings.get("title_view", "standard") or "standard") != "standard":
                     updates["title_view"] = "compact" if target else "standard"
-            self._optimistic(settings=normalize_settings({**snapshot.settings, **updates}))
+            new_settings = normalize_settings({**snapshot.settings, **updates})
+            self._optimistic(settings=new_settings)
+            if key == "global_hotkeys_enabled":
+                self._sync_global_hotkeys(bool(new_settings.get("global_hotkeys_enabled", False)))
             for k, v in updates.items():
                 self._worker.submit(_CMD_SET_SETTING, (k, v))
 
@@ -9053,17 +9450,19 @@ class CCUsageWidgetApp(rumps.App):
             ):
                 updates["title_icon_style"] = "bolt"
         new_settings = normalize_settings({**snapshot.settings, **updates})
-        if key == "belkins_native_tail":
+        if key in ("belkins_native_tail", "belkins_slim_hero"):
             self._optimistic(settings=new_settings)
             for k, v in updates.items():
                 self._worker.submit(_CMD_SET_SETTING, (k, v))
             return
-        snapshot.settings.update(new_settings)
         with self._lock:
-            self._snapshot = replace(self._snapshot, settings=snapshot.settings)
-        self._sync_status_icon(self._snapshot)
-        self.title = self.render_title(self._snapshot)
-        self._apply_title_attributes(self._snapshot)
+            self._snapshot = replace(self._snapshot, settings=dict(new_settings))
+            snap_now = self._snapshot
+        self._sync_status_icon(snap_now)
+        self.title = self.render_title(snap_now)
+        self._apply_title_attributes(snap_now)
+        if key == "global_hotkeys_enabled":
+            self._sync_global_hotkeys(bool(new_settings.get("global_hotkeys_enabled", False)))
         for k, v in updates.items():
             self._worker.submit(_CMD_SET_SETTING, (k, v))
 

@@ -163,6 +163,24 @@ _PROJECT_INDEX_SQL: Final[str] = (
     "CREATE INDEX IF NOT EXISTS daily_project_day ON daily_project (day)"
 )
 
+_QUOTA_SAMPLES_TABLE_SQL: Final[str] = """
+CREATE TABLE IF NOT EXISTS quota_samples (
+    bucket_ts       INTEGER NOT NULL,
+    vendor          TEXT    NOT NULL,
+    slot            INTEGER NOT NULL,
+    alias           TEXT    NOT NULL,
+    max_pct         REAL    NOT NULL,
+    is_capped       INTEGER NOT NULL,
+    PRIMARY KEY (bucket_ts, vendor, slot, alias)
+)
+"""
+
+_QUOTA_SAMPLES_INDEX_SQL: Final[str] = (
+    "CREATE INDEX IF NOT EXISTS quota_samples_ts ON quota_samples (bucket_ts)"
+)
+
+QUOTA_BUCKET_SECONDS: Final[int] = 900
+
 PROJECT_COLUMNS: Final[tuple[str, ...]] = (
     "day",
     "key",
@@ -806,6 +824,84 @@ class HistoryStore:
             return 0
         self._clear_error()
         return int(raw[0]) if raw else 0
+
+    def record_quota_samples(
+        self,
+        rows: Iterable[Any],
+        *,
+        now: float | None = None,
+    ) -> int:
+        """Record 15-minute bucketed quota samples for wall-time accounting."""
+        stamp = time.time() if now is None else float(now)
+        bucket = int(stamp // QUOTA_BUCKET_SECONDS) * QUOTA_BUCKET_SECONDS
+        pending: list[tuple[int, str, int, str, float, int]] = []
+        for row in rows:
+            highest = getattr(row, "max_pct", None)
+            if highest is None or isinstance(highest, bool):
+                continue
+            pct = float(highest)
+            vendor = str(getattr(row, "vendor", "") or "claude")[:16]
+            slot = int(getattr(row, "slot", 0) or 0)
+            alias = str(getattr(row, "alias", "") or vendor)[:32]
+            capped = 1 if pct >= 100.0 else 0
+            pending.append((bucket, vendor, slot, alias, round(pct, 2), capped))
+        if not pending:
+            return 0
+        written = 0
+        try:
+            with self._lock:
+                conn = self._connect()
+                if conn is None:
+                    return 0
+                try:
+                    conn.execute(_QUOTA_SAMPLES_TABLE_SQL)
+                    conn.execute(_QUOTA_SAMPLES_INDEX_SQL)
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO quota_samples "
+                        "(bucket_ts, vendor, slot, alias, max_pct, is_capped) "
+                        "VALUES (?,?,?,?,?,?)",
+                        pending,
+                    )
+                    conn.commit()
+                    written = len(pending)
+                finally:
+                    conn.close()
+        except Exception as exc:
+            self._fail("history: quota sample write failed", exc)
+            return 0
+        self._clear_error()
+        return written
+
+    def wall_hours_by_account(self, *, since_epoch: float) -> dict[tuple[str, str], float]:
+        """Measured hours spent at 100% cap since *since_epoch*, keyed by ``(vendor, alias)``."""
+        if not self._path.exists():
+            return {}
+        cutoff = int(since_epoch // QUOTA_BUCKET_SECONDS) * QUOTA_BUCKET_SECONDS
+        out: dict[tuple[str, str], float] = {}
+        try:
+            with self._lock:
+                conn = self._connect()
+                if conn is None:
+                    return {}
+                try:
+                    has_table = conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='quota_samples'"
+                    ).fetchone()
+                    if not has_table:
+                        return {}
+                    raw = conn.execute(
+                        "SELECT vendor, alias, SUM(is_capped) FROM quota_samples "
+                        "WHERE bucket_ts >= ? GROUP BY vendor, alias",
+                        (cutoff,),
+                    ).fetchall()
+                finally:
+                    conn.close()
+        except Exception:
+            return {}
+        hours_per_bucket = QUOTA_BUCKET_SECONDS / 3600.0
+        for vendor, alias, capped_buckets in raw:
+            out[(str(vendor), str(alias))] = round(int(capped_buckets or 0) * hours_per_bucket, 2)
+        return out
 
     # -- internals --------------------------------------------------------
 

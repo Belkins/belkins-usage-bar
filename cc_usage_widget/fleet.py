@@ -41,6 +41,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -89,6 +91,12 @@ class SessionRow:
     - a filesystem call - and the menu builder runs on the AppKit main thread
     (SPEC 2.3), where no syscall of ours is allowed.
     """
+    owner_slot: int | None = None
+    """Slot owning the latest ``organizationUuid`` in this session's transcript,
+    when computable on the worker; ``None`` otherwise."""
+    org_shifted: bool = False
+    """True when an unpinned session's transcript ``organizationUuid`` belongs to
+    a different organization than its current ``slot`` (risking thinking drop)."""
 
 
 @dataclass(frozen=True)
@@ -162,6 +170,208 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+_PID_MATCH_CACHE: dict[tuple[int, str], tuple[float, bool]] = {}
+_PID_MATCH_TTL_S = 60.0
+_TRANSCRIPT_TAIL_BYTES = 256 * 1024
+
+
+def _pid_matches_proc_start(pid: int, proc_start: Any) -> bool:
+    """Verify ``procStart`` against the live process (cached 60s) so recycled macOS PIDs
+    are rejected. When ``procStart`` is absent (older records / unit tests), returns True."""
+    if not proc_start:
+        return True
+    key = (pid, str(proc_start))
+    now = time.monotonic()
+    cached = _PID_MATCH_CACHE.get(key)
+    if cached is not None and (now - cached[0]) < _PID_MATCH_TTL_S:
+        return cached[1]
+    try:
+        from claude_swap.process_detection import pid_matches_record
+
+        matched = bool(pid_matches_record(pid, str(proc_start)))
+    except ImportError:
+        matched = _stdlib_pid_matches_proc_start(pid, str(proc_start))
+    except Exception:
+        matched = True
+    if len(_PID_MATCH_CACHE) > 256:
+        _PID_MATCH_CACHE.clear()
+    _PID_MATCH_CACHE[key] = (now, matched)
+    return matched
+
+
+def _stdlib_pid_matches_proc_start(pid: int, proc_start: str) -> bool:
+    """Fallback ``ps -p <pid> -o lstart=,comm=`` check when ``claude_swap`` is absent."""
+    import datetime as dt
+    import subprocess
+
+    if proc_start.isdigit():
+        return True
+    try:
+        rec_dt = dt.datetime.strptime(" ".join(proc_start.split()), "%a %b %d %H:%M:%S %Y")
+    except ValueError:
+        return True
+    try:
+        proc = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "lstart=,comm="],
+            env={**os.environ, "LC_ALL": "C"},
+            capture_output=True,
+            text=True,
+            timeout=1.5,
+        )
+    except Exception:
+        return True
+    if proc.returncode != 0:
+        return False
+    parts = proc.stdout.strip().split(None, 5)
+    if len(parts) < 5:
+        return True
+    try:
+        live_dt = dt.datetime.strptime(" ".join(parts[:5]), "%a %b %d %H:%M:%S %Y")
+    except ValueError:
+        return True
+    if live_dt <= rec_dt + dt.timedelta(seconds=5):
+        return True
+    comm = parts[5].lower() if len(parts) > 5 else ""
+    return "claude" in comm
+
+
+def detect_jsonl_owner_org(jsonl_path: Path) -> str | None:
+    """Read at most the trailing 256 KiB of *jsonl_path* and return the most recent
+    ``organizationUuid`` recorded in ``credential_org``, ``session-owner``, or turn metadata."""
+    try:
+        with jsonl_path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            if size <= 0:
+                return None
+            start = max(0, size - _TRANSCRIPT_TAIL_BYTES)
+            fh.seek(start)
+            data = fh.read(_TRANSCRIPT_TAIL_BYTES)
+    except OSError:
+        return None
+    for needle in (b'"credential_org"', b'"session-owner"', b'"organizationUuid"'):
+        pos = data.rfind(needle)
+        while pos != -1:
+            line_start = data.rfind(b"\n", 0, pos) + 1
+            line_end = data.find(b"\n", pos)
+            if line_end == -1:
+                line_end = len(data)
+            if start == 0 or line_start > 0:
+                try:
+                    obj = json.loads(data[line_start:line_end].decode("utf-8", errors="replace"))
+                    if isinstance(obj, Mapping):
+                        att = obj.get("attachment")
+                        org = (
+                            (att.get("organizationUuid") if isinstance(att, Mapping) else None)
+                            or obj.get("organizationUuid")
+                        )
+                        if isinstance(org, str) and org.strip():
+                            return org.strip()
+                except Exception:
+                    pass
+            if line_start <= 0:
+                break
+            pos = data.rfind(needle, 0, line_start - 1)
+    return None
+
+
+def detect_workspace_owner_slot(
+    cwd: Path | str,
+    identities: Mapping[int, tuple[str, str]],
+    *,
+    current_slot: int | None = None,
+    session_id: str | None = None,
+    pid: int | None = None,
+    projects_root: Path | None = None,
+) -> tuple[int | None, bool]:
+    """Return ``(owner_slot, org_shifted)`` for *cwd* using bounded 256 KiB tail reads.
+
+    Shared-organization safe: when multiple slots belong to the same ``organizationUuid``
+    and *current_slot* already shares that ``organizationUuid``, returns
+    ``(current_slot, False)`` so same-org switches are never misreported as shifted.
+    """
+    org_to_slots: dict[str, list[int]] = {}
+    for slot in sorted(identities):
+        _email, org = identities[slot]
+        if org:
+            org_to_slots.setdefault(org, []).append(slot)
+    if not org_to_slots:
+        return None, False
+
+    cwd_str = str(cwd or "").strip()
+    if not cwd_str:
+        return None, False
+
+    root = projects_root if projects_root is not None else (Path.home() / ".claude" / "projects")
+    if not root.is_dir():
+        return None, False
+
+    slugs: list[str] = []
+    for cand_slug in (
+        re.sub(r"[^a-zA-Z0-9-]", "-", cwd_str),
+        cwd_str.replace("/", "-").replace(" ", "-"),
+        cwd_str.replace("/", "-"),
+    ):
+        if cand_slug and cand_slug not in slugs:
+            slugs.append(cand_slug)
+
+    pdirs = [root / s for s in slugs if (root / s).is_dir()]
+    if not pdirs:
+        return None, False
+
+    sid = (session_id or "").strip()
+    if not sid and pid is not None:
+        reg_file = sessions_dir() / f"{pid}.json"
+        if reg_file.is_file():
+            try:
+                sid = str(
+                    json.loads(reg_file.read_text(encoding="utf-8", errors="replace")).get("sessionId")
+                    or ""
+                ).strip()
+            except Exception:
+                sid = ""
+
+    owner_org: str | None = None
+    if sid:
+        for pdir in pdirs:
+            cand = pdir / f"{sid}.jsonl"
+            if cand.is_file():
+                org = detect_jsonl_owner_org(cand)
+                if org and org in org_to_slots:
+                    owner_org = org
+                    break
+
+    if owner_org is None:
+        newest: list[tuple[float, Path]] = []
+        for pdir in pdirs:
+            try:
+                for p in pdir.glob("*.jsonl"):
+                    try:
+                        newest.append((p.stat().st_mtime, p))
+                    except OSError:
+                        continue
+            except OSError:
+                continue
+        newest.sort(key=lambda item: item[0], reverse=True)
+        for _mt, cand in newest[:3]:
+            org = detect_jsonl_owner_org(cand)
+            if org and org in org_to_slots:
+                owner_org = org
+                break
+
+    if owner_org is None:
+        return None, False
+
+    slots_for_org = org_to_slots[owner_org]
+    if current_slot is not None:
+        cur_ident = identities.get(current_slot)
+        cur_org = cur_ident[1] if cur_ident else ""
+        if cur_org and cur_org == owner_org:
+            return current_slot, False
+        return slots_for_org[0], True
+    return slots_for_org[0], False
+
+
 def read_registry(directory: Path) -> tuple[tuple[dict[str, Any], ...], int]:
     """Live ``interactive`` records under *directory*, plus an unreadable count.
 
@@ -200,6 +410,8 @@ def read_registry(directory: Path) -> tuple[tuple[dict[str, Any], ...], int]:
             LOGGER.debug("fleet: unreadable session record %s: %r", path, exc)
             continue
         if not _pid_alive(pid):
+            continue
+        if not _pid_matches_proc_start(pid, data.get("procStart")):
             continue
         if str(data.get("kind", "")) != INTERACTIVE_KIND:
             continue
@@ -459,7 +671,19 @@ def collect(
         # with no active slot known, `None != None` would hide a dead pin.
         pending = mapping is not None and (mapping.slot is None or mapping.slot != row.slot)
         own = exact_mapping(row.cwd, mappings) is not None if mappings else False
-        if pending or own:
+        owner_slot: int | None = row.slot if row.pinned else None
+        org_shifted = False
+        if not row.pinned and identities and row.cwd:
+            try:
+                owner_slot, org_shifted = detect_workspace_owner_slot(
+                    row.cwd,
+                    identities,
+                    current_slot=row.slot,
+                    pid=row.pid,
+                )
+            except Exception:
+                owner_slot, org_shifted = None, False
+        if pending or own or owner_slot is not None or org_shifted:
             row = SessionRow(
                 pid=row.pid,
                 cwd=row.cwd,
@@ -473,6 +697,8 @@ def collect(
                     mapping.email if pending and mapping.slot is None else ""
                 ),
                 pinned_here=own,
+                owner_slot=owner_slot,
+                org_shifted=org_shifted,
             )
         resolved.append(row)
 

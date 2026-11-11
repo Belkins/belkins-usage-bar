@@ -77,6 +77,7 @@ _LAST_BOSS_NOTE: str = ""
 _LAST_CFG_NOTE: str = ""
 _LIVE_SETTINGS: dict[str, Any] = {}
 _LIVE_AUTOSWITCH: bool = True
+_LIVE_AUTOSWITCH_THRESHOLD: float = 85.0
 _HUB_VIEWS: tuple[str, ...] = ("luxury", "detailed", "bento", "cleanmymac")
 
 
@@ -1044,9 +1045,12 @@ class _Card:
         for i, (h, draw, kw) in enumerate(self.parts):
             lead = gap_before if i == 0 else 0.0
             trail = gap_after if i == last else 0.0
-            out.append(
-                Block(lead + h + trail, self._painter(draw, lead - off, lead, h, card_h, kw), **kw)
-            )
+            kw_clean = dict(kw)
+            bref = kw_clean.pop("block_ref", None)
+            blk = Block(lead + h + trail, self._painter(draw, lead - off, lead, h, card_h, kw_clean), **kw_clean)
+            if isinstance(bref, list):
+                bref.append(blk)
+            out.append(blk)
             off += h
         return out
 
@@ -1083,18 +1087,51 @@ class _Card:
 
 
 def _companion_card(snapshot: Any, companion: CompanionState, actions: ThemeActions) -> _Card:
-    """Minimalist Luxury RPG Hero Header with spacious breathing room and Belkins Game Emblem."""
+    """Minimalist Luxury RPG Hero Header with Slim Hero toggle, Cache Mastery badge, and Belkins Game Emblem."""
     register_role("belkins_rpg_gold", (214, 118, 12), (255, 184, 77), hover=_WHITE)
     open_dash = getattr(actions, "open_dashboard", None)
     dash_enabled = bool(snapshot.settings.get("dashboard_enabled", True))
     act = open_dash if (callable(open_dash) and dash_enabled) else None
+    slim_mode = bool(_LIVE_SETTINGS.get("belkins_slim_hero", snapshot.settings.get("belkins_slim_hero", False)))
+    animate_enabled = bool(
+        _LIVE_SETTINGS.get("belkins_animations_enabled", snapshot.settings.get("belkins_animations_enabled", True))
+    )
+    hero_blk: Block | None = None
+
+    def _toggle_slim() -> None:
+        global _LAST_CFG_NOTE
+        cur = bool(_LIVE_SETTINGS.get("belkins_slim_hero", snapshot.settings.get("belkins_slim_hero", False)))
+        nxt = not cur
+        _LIVE_SETTINGS["belkins_slim_hero"] = nxt
+        _LAST_CFG_NOTE = f"Hero Header: {'Slim ✓' if nxt else 'Full Emblem ✓'}"
+        if callable(getattr(actions, "set_setting", None)):
+            actions.set_setting("belkins_slim_hero", nxt)
+
+    def paint_slim_header(pen: Pen, w: float, bh: float) -> None:
+        _draw_cmm_backdrop(pen, w, bh, top_glow=False)
+        live = companion_from_snapshot(snapshot)
+        b = 20.5
+        lx = 18.0
+        lv_role = "belkins_flame_rule" if live.mood_key == "overdrive" else "belkins_rpg_gold"
+        wn = pen.text(f"{live.stage.name} ", lx, b, 13.0, "bold", "label", rounded=True)
+        wlv = pen.text(f"Lv.{live.level}", lx + wn, b, 12.5, "bold", lv_role, rounded=True)
+        cx = lx + wn + wlv + 8.0
+        sub = f"·  ✦ {_fmt_compact_coins(live.coins_available)}"
+        if live.cache_mastery_active:
+            sub += f"  ·  ⚡Cache {int(round(live.cache_hit_pct))}%"
+        exp_pill = "▾ Hero"
+        pw = _pill_w(pen, exp_pill)
+        pen.pill(exp_pill, X1 - pw, b - 0.5, F["tag"][0], role="belkins_cmm_sub", bg="belkins_plan_pill", weight="semibold")
+        pen.text(sub, cx, b - 0.5, 11.0, "regular", "belkins_cmm_sub", maxw=max(30.0, X1 - pw - cx - 8.0))
 
     def paint_header(pen: Pen, w: float, bh: float) -> None:
         _draw_cmm_backdrop(pen, w, bh, top_glow=True)
         live = companion_from_snapshot(snapshot)
         coins_live = live.coins_available
         eq = set(live.equipped_items or ())
-        animate = bool(snapshot.settings.get("belkins_animations_enabled", True))
+        animate = bool(
+            _LIVE_SETTINGS.get("belkins_animations_enabled", snapshot.settings.get("belkins_animations_enabled", True))
+        )
 
         lx = 18.0
         max_left_w = w - 88.0
@@ -1103,14 +1140,24 @@ def _companion_card(snapshot: Any, companion: CompanionState, actions: ThemeActi
         b1 = 25.0
         lv_role = "belkins_flame_rule" if live.mood_key == "overdrive" else "belkins_rpg_gold"
         w_name = pen.text(f"{live.stage.name}  ", lx, b1, 17.5, "bold", "label", rounded=True)
-        pen.text(f"Lv.{live.level}", lx + w_name, b1, 17.5, "bold", lv_role, rounded=True)
+        w_lv = pen.text(f"Lv.{live.level}", lx + w_name, b1, 17.5, "bold", lv_role, rounded=True)
+        if live.cache_mastery_active and (lx + w_name + w_lv + 48.0 <= w - 72.0):
+            pen.pill(
+                "⚡+15%",
+                lx + w_name + w_lv + 7.0,
+                b1 - 1.5,
+                F["tag"][0],
+                role="good_text",
+                bg="belkins_good_pill",
+                weight="semibold",
+            )
 
         # Line 2 (11.5pt Minimalist Subtitle): `Apex Sovereign  ·  ✦ 12.7K`
         b2 = 42.5
         sub_line = f"{live.stage.title}   ·   ✦ {_fmt_compact_coins(coins_live)}"
         pen.text(sub_line, lx, b2, 11.5, "regular", "belkins_cmm_sub", maxw=max_left_w)
 
-        # Line 3 (y = 55pt): Uninterrupted, sculptural 4.0pt XP bar in clean open space
+        # Line 3 (y = 55pt): Uninterrupted, sculptural 4.0pt XP bar in clean open space + subtle `▴` slim button
         bar_y = 55.5
         bar_w = 178.0
         xp_pct = max(4.0, min(100.0, float(live.xp_fraction) * 100.0))
@@ -1124,6 +1171,7 @@ def _companion_card(snapshot: Any, companion: CompanionState, actions: ThemeActi
             xp_role = "belkins_xp_fill"
 
         luxury_bar(pen, lx, bar_y, bar_w, xp_pct, "ok", h=4.0, fill_override=xp_role)
+        pen.text("▴", lx + bar_w + 8.0, bar_y + 3.5, 9.5, "semibold", "belkins_cmm_sub")
 
         # Top-right glowing Belkins Cyber-RPG Mascot Emblem (x = w - 64, y = 11, size = 46)
         _draw_game_hero_emblem(
@@ -1137,28 +1185,45 @@ def _companion_card(snapshot: Any, companion: CompanionState, actions: ThemeActi
             mood_key=live.mood_key,
         )
 
+    def on_hero_click_x(click_x: float) -> None:
+        is_slim = bool(_LIVE_SETTINGS.get("belkins_slim_hero", snapshot.settings.get("belkins_slim_hero", False)))
+        if (is_slim and click_x >= X1 - 54.0) or (not is_slim and 196.0 <= click_x <= 224.0):
+            if hero_blk is not None:
+                hero_blk.keep_open = True
+            _toggle_slim()
+            return
+        if hero_blk is not None:
+            hero_blk.keep_open = False
+        if callable(act):
+            act()
+
     tip_lines = [
         f"Belkins Companion: {companion.stage.name} (Lv.{companion.level} · {companion.stage.title})",
         f"Passive: {companion.stage.passive} · ATK: {companion.boss.player_atk} · Crit: {companion.boss.player_crit_pct}%",
         f"Mood: {companion.mood_label} · XP: {companion.xp_total:,} (+{companion.xp_today:,} today)",
         f"Trophies: {companion.unlocked_badges_count}/{len(companion.badges)} · Streak: {max(1, companion.streak_days)}d · Bosses Slain: {companion.boss.bosses_slain}",
-        "Click to open Belkins Dex & Usage Dashboard",
     ]
+    if companion.cache_mastery_active:
+        tip_lines.append(f"Prompt-Cache Mastery Active ({companion.cache_hit_pct:.1f}% hit ≥ 85%): +15% XP & Coin Bonus!")
+    tip_lines.append("Click to open Usage Dashboard (or click ▴/▾ to toggle Slim Hero)")
     tip = "\n".join(tip_lines)
 
     class _HeaderWrap:
         def blocks(self, _before: float, _after: float) -> list[Block]:
-            return [
-                Block(
-                    68.0,
-                    paint_header,
-                    key="belkins-companion-hero",
-                    tooltip=tip,
-                    ax=tip.replace("\n", ". "),
-                    action=act,
-                    no_hover_bg=True,
-                )
-            ]
+            nonlocal hero_blk
+            hero_blk = Block(
+                31.0 if slim_mode else 68.0,
+                paint_slim_header if slim_mode else paint_header,
+                key="belkins-companion-hero",
+                tooltip=tip,
+                ax=tip.replace("\n", ". "),
+                action=act or _toggle_slim,
+                on_click_x=on_hero_click_x,
+                keep_open=False,
+                no_hover_bg=True,
+                animated=(animate_enabled and not slim_mode),
+            )
+            return [hero_blk]
 
     return _HeaderWrap()  # type: ignore[return-value]
 
@@ -1448,7 +1513,7 @@ def _claude_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) -
     header_pills: list[tuple[Any, Any, Any, Callable[[], Any]]] = [
         (
             lambda t_default=thr_int: (
-                f"⚡ Auto {int(_LIVE_SETTINGS.get('notification_threshold_pct', t_default) or t_default)}%"
+                f"⚡ Auto {int(round(_LIVE_AUTOSWITCH_THRESHOLD or t_default))}%"
                 if _LIVE_AUTOSWITCH
                 else "Auto OFF"
             ),
@@ -1712,9 +1777,7 @@ def _select_header_pills(spec: dict[str, Any], *, one_line: bool = False) -> lis
         return []
     if one_line:
         return all_pills[:1]
-    if len(all_pills) >= 3:
-        return [all_pills[0], all_pills[-1]]
-    return all_pills[:2]
+    return all_pills[:3]
 
 
 def _card_head(spec: dict[str, Any], *, one_line: bool = False, show_chevron: bool = False) -> Callable[[Any, float], float]:
@@ -1750,20 +1813,34 @@ def _card_head(spec: dict[str, Any], *, one_line: bool = False, show_chevron: bo
     return draw
 
 
-def _card_head_click_x(spec: dict[str, Any], *, one_line: bool = False) -> Callable[[float], None] | None:
+def _card_head_click_x(
+    spec: dict[str, Any],
+    *,
+    one_line: bool = False,
+    show_chevron: bool = False,
+    block_ref: list[Block] | None = None,
+) -> Callable[[float], None] | None:
     pills = _select_header_pills(spec, one_line=one_line)
     if not pills:
         return None
 
     def on_click_x(click_x: float) -> None:
         m = _Measure()
-        cur_r = X1
+        tx = X0 + (18.0 if spec.get("icon") else 0.0)
+        disp_title = spec["title"].replace(" Party", "") if one_line else spec["title"]
+        tw = text(m, disp_title, "title", "label", tx, HEAD_BASE)
+        cur_r = (X1 - 12.0) if show_chevron else X1
         for raw_lbl, _role, _bg, fn in reversed(pills):
             lbl = str(raw_lbl() if callable(raw_lbl) else raw_lbl)
             pw = _pill_w(m, lbl)
+            if cur_r - pw < tx + tw + 10.0:
+                break
             x_start = cur_r - pw - 2.0
             x_end = cur_r + 2.0
             if x_start <= click_x <= x_end and callable(fn):
+                if block_ref:
+                    for blk in block_ref:
+                        blk.keep_open = ("Auto" in lbl)
                 fn()
                 return
             cur_r -= pw + 5.0
@@ -2153,11 +2230,17 @@ def _provider_card(
     card = _Card("belkins_card", "belkins_card_edge", rule=spec.get("rule"))
     key = spec["key"]
     is_hub = not expand_attn
-    head_click_x = _card_head_click_x(spec, one_line=is_hub)
+    head_block_ref: list[Block] = []
+    head_click_x = _card_head_click_x(spec, one_line=is_hub, block_ref=head_block_ref)
     relogin_fn = spec.get("relogin_action") or (lambda: _copy_cmd_to_pasteboard("bswap add"))
     head_tip_parts = [spec["right"] or spec["title"]] + list(extra_notes or ())
     head_ax_parts = [f"{spec['title']}. {spec['right']}".strip(". ")] + list(extra_notes or ())
     head_pills = _select_header_pills(spec, one_line=is_hub)
+    default_head_lbl = (
+        str(head_pills[0][0]() if callable(head_pills[0][0]) else head_pills[0][0])
+        if head_pills
+        else ""
+    )
     card.add(
         _card_head(spec, one_line=is_hub),
         key=f"{key_prefix}-{key}-head",
@@ -2165,8 +2248,9 @@ def _provider_card(
         tooltip="\n".join(p for p in head_tip_parts if p),
         action=head_pills[0][3] if head_pills else None,
         on_click_x=head_click_x,
-        keep_open=True,
+        keep_open=("Auto" in default_head_lbl),
         no_hover_bg=True,
+        block_ref=head_block_ref,
     )
     hero = spec["hero"]
     if hero:
@@ -2362,11 +2446,43 @@ def _claude_sessions_card(snapshot: Any, actions: ThemeActions | None = None) ->
     )
     card.add(_hair(), key="belkins-claude-sessions-rule")
 
+    active_slot_default = getattr(getattr(snapshot, "active", None), "slot", None)
+    pin_fn = getattr(actions, "pin_session_dir", None) if actions is not None else None
+    unpin_fn = getattr(actions, "unpin_session_dir", None) if actions is not None else None
+    switch_to_fn = getattr(actions, "switch_to", None) if actions is not None else None
+
     for idx, (short_dir, items) in enumerate(by_dir.items()):
         full_cwd = items[0][0] or short_dir
+        has_abs_cwd = full_cwd.startswith("/")
         cnt = len(items)
         any_pinned = any(bool(getattr(s_obj, "pinned", False)) for _c, s_obj in items)
+        any_shifted = any(bool(getattr(s_obj, "org_shifted", False)) for _c, s_obj in items) and not any_pinned
+        owner_slot = next(
+            (getattr(s_obj, "owner_slot", None) for _c, s_obj in items if getattr(s_obj, "owner_slot", None) is not None),
+            None,
+        )
+        pin_target = owner_slot if owner_slot is not None else active_slot_default
         busy_cnt = sum(1 for _c, s_obj in items if str(getattr(s_obj, "status", "") or "") == "busy")
+        sess_block_ref: list[Block] = []
+
+        def _row_right_pills(
+            is_pin: bool = any_pinned,
+            is_shift: bool = any_shifted,
+            own_s: Any = owner_slot,
+            pin_t: Any = pin_target,
+            abs_c: bool = has_abs_cwd,
+        ) -> list[tuple[str, str, str]]:
+            out_p: list[tuple[str, str, str]] = []
+            if is_pin and abs_c and callable(unpin_fn):
+                out_p.append(("Unpin", "belkins_cmm_sub", "belkins_badge_off"))
+            elif is_shift and own_s is not None:
+                if callable(switch_to_fn):
+                    out_p.append((f"Restore #{own_s}", "belkins_cmm_aqua", "belkins_tab_active_glass"))
+                if abs_c and callable(pin_fn):
+                    out_p.append(("📌", "good_text", "belkins_good_pill"))
+            elif not is_pin and abs_c and pin_t is not None and callable(pin_fn):
+                out_p.append((f"Pin #{pin_t}", "belkins_cmm_sub", "belkins_badge_off"))
+            return out_p
 
         def draw_sess_row(
             pen: Any,
@@ -2374,12 +2490,23 @@ def _claude_sessions_card(snapshot: Any, actions: ThemeActions | None = None) ->
             name_s: str = short_dir,
             n_cnt: int = cnt,
             is_pin: bool = any_pinned,
+            is_shift: bool = any_shifted,
+            r_pills: list[tuple[str, str, str]] = _row_right_pills(),
         ) -> float:
             b = y0 + 17.5
-            pen.circle(X0 + 4.0, b - 6.8, 5.6, "belkins_cmm_aqua" if is_pin else "belkins_good_fill")
+            dot_role = "belkins_cmm_aqua" if is_pin else ("belkins_cmm_coral" if is_shift else "belkins_good_fill")
+            pen.circle(X0 + 4.0, b - 6.8, 5.6, dot_role)
             cnt_s = f"{n_cnt}" if n_cnt > 1 else "1"
             text(pen, cnt_s, "caption_med", "belkins_cmm_sub", X1 - 2.0, b, right=True)
-            nw = text(pen, name_s, "primary_med", "label", X0 + 16.0, b, maxw=W_INNER - 95.0)
+            cur_r = X1 - 16.0
+            for plbl, prole, pbg in reversed(r_pills):
+                pw = _pill_w(pen, plbl)
+                pen.pill(plbl, cur_r - pw, b - 0.5, F["tag"][0], role=prole, bg=pbg, weight="semibold")
+                cur_r -= pw + 4.5
+            status_lbl = "PINNED" if is_pin else ("⚠ ORG SHIFTED" if is_shift else "")
+            status_reserve = (_pill_w(pen, status_lbl) + 8.0) if status_lbl else 0.0
+            max_nw = max(48.0, cur_r - (X0 + 16.0) - status_reserve - 6.0)
+            nw = text(pen, name_s, "primary_med", "label", X0 + 16.0, b, maxw=max_nw)
             if is_pin:
                 pen.pill(
                     "PINNED",
@@ -2390,14 +2517,93 @@ def _claude_sessions_card(snapshot: Any, actions: ThemeActions | None = None) ->
                     bg="belkins_tab_active_glass",
                     weight="semibold",
                 )
+            elif is_shift:
+                pen.pill(
+                    "⚠ ORG SHIFTED",
+                    X0 + 16.0 + nw + 6.0,
+                    b - 0.5,
+                    F["tag"][0],
+                    role="warn_text",
+                    bg="belkins_crit_pill",
+                    weight="semibold",
+                )
             return b + 9.5
 
-        mode_str = "Org-Pinned profile (immune to global switches)" if any_pinned else "Shared ~/.claude profile (protected by Thinking Guard while busy)"
+        right_pills = _row_right_pills()
+        row_action: Callable[[], None] | None = None
+        row_click_x: Callable[[float], None] | None = None
+        default_keep_open = True
+
+        if right_pills:
+            def _make_sess_handlers(
+                cwd_p: str = full_cwd,
+                name_s: str = short_dir,
+                is_pin: bool = any_pinned,
+                is_shift: bool = any_shifted,
+                own_s: Any = owner_slot,
+                pin_t: Any = pin_target,
+                r_pills: list[tuple[str, str, str]] = right_pills,
+                bref: list[Block] = sess_block_ref,
+            ) -> tuple[Callable[[], None] | None, Callable[[float], None], bool]:
+                def _exec_pill(lbl: str) -> None:
+                    global _LAST_CFG_NOTE
+                    if lbl.startswith("Restore #") and own_s is not None and callable(switch_to_fn):
+                        for blk in bref:
+                            blk.keep_open = False
+                        switch_to_fn(int(own_s))
+                    elif lbl in ("📌",) or lbl.startswith("Pin #"):
+                        slot_val = int(own_s if is_shift and own_s is not None else pin_t)
+                        for blk in bref:
+                            blk.keep_open = True
+                        if callable(pin_fn):
+                            pin_fn(cwd_p, slot_val)
+                        _LAST_CFG_NOTE = f"Pinned {name_s} → #{slot_val} ✓"
+                    elif lbl == "Unpin" and callable(unpin_fn):
+                        for blk in bref:
+                            blk.keep_open = True
+                        unpin_fn(cwd_p)
+                        _LAST_CFG_NOTE = f"Unpinned {name_s} ✓"
+
+                def _on_cx(click_x: float) -> None:
+                    m = _Measure()
+                    cur_r = X1 - 16.0
+                    for plbl, _pr, _pb in reversed(r_pills):
+                        pw = _pill_w(m, plbl)
+                        if cur_r - pw - 2.0 <= click_x <= cur_r + 2.0:
+                            _exec_pill(plbl)
+                            return
+                        cur_r -= pw + 4.5
+                    # Clicking anywhere on a shifted row defaults to primary recovery action
+                    if is_shift and r_pills:
+                        _exec_pill(r_pills[0][0])
+
+                def _default_act() -> None:
+                    _exec_pill(r_pills[0][0])
+
+                return _default_act, _on_cx, not r_pills[0][0].startswith("Restore #")
+
+            row_action, row_click_x, default_keep_open = _make_sess_handlers()
+
+        if any_pinned:
+            mode_str = "Org-Pinned profile (immune to global switches; click Unpin to release)"
+        elif any_shifted:
+            mode_str = (
+                f"⚠ Organization shifted since session started on slot #{owner_slot}! "
+                f"Click Restore #{owner_slot} to switch back or 📌 to org-pin this folder."
+            )
+        else:
+            mode_str = "Shared ~/.claude profile (protected by Thinking Guard while busy; click Pin to lock org)"
+
         card.add(
             draw_sess_row,
             key=f"belkins-claude-session-dir-{idx}",
             ax=f"{short_dir}: {cnt} active Claude sessions ({full_cwd})",
-            tooltip=f"{full_cwd}\n{cnt} session(s) ({busy_cnt} busy) · {mode_str}\nTip: Run `bswap claude` in this folder to lock it to its own organization.",
+            tooltip=f"{full_cwd}\n{cnt} session(s) ({busy_cnt} busy) · {mode_str}\nTip: Run `bswap claude` in this folder to launch an isolated session.",
+            action=row_action,
+            on_click_x=row_click_x,
+            keep_open=default_keep_open,
+            block_ref=sess_block_ref,
+            **(ROW_HL if row_action is not None else {}),
         )
 
     card.add(_gap(8.0), key="belkins-claude-sessions-foot")
@@ -3440,8 +3646,6 @@ def _config_card(snapshot: Any, actions: ThemeActions, subtab: str = "header") -
 
     def _put_s(k: str, val: Any) -> None:
         _LIVE_SETTINGS[k] = val
-        if isinstance(getattr(snapshot, "settings", None), dict):
-            snapshot.settings[k] = val
 
     def _cur_view() -> str:
         v = str(_get_s("title_view", "standard") or "standard")
@@ -3614,6 +3818,8 @@ def _config_card(snapshot: Any, actions: ThemeActions, subtab: str = "header") -
         row_key: str,
         sec_label: str,
         items: list[tuple[Any, str | None, Callable[[], bool], Callable[[], None], str]],
+        *,
+        keep_open: bool = True,
     ) -> None:
         n = len(items)
         gap_s = 4.0
@@ -3661,7 +3867,7 @@ def _config_card(snapshot: Any, actions: ThemeActions, subtab: str = "header") -
             tooltip="\n".join(i[4] for i in items if i[4]),
             action=lambda seg_items=items: seg_items[0][3](),
             on_click_x=on_seg_click,
-            keep_open=True,
+            keep_open=keep_open,
             no_hover_bg=True,
         )
 
@@ -3777,7 +3983,17 @@ def _config_card(snapshot: Any, actions: ThemeActions, subtab: str = "header") -
 
     # 6. Auto-Switch & Quota Alert Threshold (5-Segment Bar)
     def _cur_thresh() -> int:
-        return int(_get_s("notification_threshold_pct", 85) or 85)
+        return int(round(float(_LIVE_AUTOSWITCH_THRESHOLD or 85.0)))
+
+    def _set_auto_thresh(pct: int) -> None:
+        global _LIVE_AUTOSWITCH_THRESHOLD, _LAST_CFG_NOTE
+        _LIVE_AUTOSWITCH_THRESHOLD = float(pct)
+        _put_s("notification_threshold_pct", pct)
+        set_thr_fn = getattr(actions, "set_autoswitch_threshold", None)
+        if callable(set_thr_fn):
+            set_thr_fn(float(pct))
+        actions.set_setting("notification_threshold_pct", pct)
+        _LAST_CFG_NOTE = f"Auto-Switch & Alert → {pct}% ✓"
 
     _add_segmented_bar(
         "belkins-cfg-thresh-bar",
@@ -3790,10 +4006,10 @@ def _config_card(snapshot: Any, actions: ThemeActions, subtab: str = "header") -
                 lambda: _toggle_autoswitch_ui(actions),
                 "Toggle automatic Claude account rotation before hitting the wall",
             ),
-            ("80%", None, lambda: _cur_thresh() == 80, lambda: _set_val("notification_threshold_pct", 80, "Alert Threshold → 80% ✓"), "Warn at 80% quota utilization"),
-            ("85%", None, lambda: _cur_thresh() == 85, lambda: _set_val("notification_threshold_pct", 85, "Alert Threshold → 85% ✓"), "Warn at 85% quota utilization (default)"),
-            ("90%", None, lambda: _cur_thresh() == 90, lambda: _set_val("notification_threshold_pct", 90, "Alert Threshold → 90% ✓"), "Warn at 90% quota utilization"),
-            ("95%", None, lambda: _cur_thresh() == 95, lambda: _set_val("notification_threshold_pct", 95, "Alert Threshold → 95% ✓"), "Warn at 95% quota utilization"),
+            ("80%", None, lambda: _cur_thresh() == 80, lambda: _set_auto_thresh(80), "Auto-switch & warn at 80% quota utilization"),
+            ("85%", None, lambda: _cur_thresh() == 85, lambda: _set_auto_thresh(85), "Auto-switch & warn at 85% quota utilization (default)"),
+            ("90%", None, lambda: _cur_thresh() == 90, lambda: _set_auto_thresh(90), "Auto-switch & warn at 90% quota utilization"),
+            ("95%", None, lambda: _cur_thresh() == 95, lambda: _set_auto_thresh(95), "Auto-switch & warn at 95% quota utilization"),
         ],
     )
 
@@ -3874,6 +4090,13 @@ def _config_card(snapshot: Any, actions: ThemeActions, subtab: str = "header") -
                 "Toggle retro pixel breathing/bobbing animations while menu is open",
             ),
             (
+                lambda: f"Slim: {'ON' if bool(_get_s('belkins_slim_hero', False)) else 'OFF'}",
+                "rectangle.compress.vertical",
+                lambda: bool(_get_s("belkins_slim_hero", False)),
+                lambda: _toggle_key("belkins_slim_hero", "Slim Hero Banner", False),
+                "Collapse the top Companion Hero into a crisp 1-line HUD banner",
+            ),
+            (
                 lambda: f"Tail: {'ON' if bool(_get_s('belkins_native_tail', False)) else 'OFF'}",
                 "list.bullet.rectangle",
                 lambda: bool(_get_s("belkins_native_tail", False)),
@@ -3891,6 +4114,7 @@ def _config_card(snapshot: Any, actions: ThemeActions, subtab: str = "header") -
             ("Web Dashboard", "safari.fill", lambda: False, _trig_dash, "Open the local Belkins HTML Usage & Companion Dashboard"),
             ("Export CSV", "square.and.arrow.down.fill", lambda: False, _trig_csv, "Export daily token & USD history to ~/Downloads"),
         ],
+        keep_open=False,
     )
 
     card.add(_gap(8.0), key="belkins-cfg-foot")
@@ -3986,8 +4210,6 @@ def _footer_dock_block(snapshot: Any, actions: ThemeActions) -> Block:
                 cur_v = _cur_hub_view(snapshot)
                 nxt_v = _HUB_VIEWS[(_HUB_VIEWS.index(cur_v) + 1) % len(_HUB_VIEWS)]
                 _LIVE_SETTINGS["belkins_hub_view"] = nxt_v
-                if isinstance(getattr(snapshot, "settings", None), dict):
-                    snapshot.settings["belkins_hub_view"] = nxt_v
                 actions.set_setting("belkins_hub_view", nxt_v)
                 _LAST_CFG_NOTE = f"Hub View → {nxt_v.title()} ✓"
                 set_active_tab("party")
@@ -4033,13 +4255,17 @@ def build(snapshot: Any, now: float, actions: ThemeActions | None = None) -> lis
     from .. import app as A
     from .. import render as R
 
-    global _LIVE_AUTOSWITCH
+    global _LIVE_AUTOSWITCH, _LIVE_AUTOSWITCH_THRESHOLD
     _ensure_roles()
     acts = actions or ThemeActions()
     _LIVE_SETTINGS.clear()
     if isinstance(getattr(snapshot, "settings", None), dict):
         _LIVE_SETTINGS.update(snapshot.settings)
     _LIVE_AUTOSWITCH = bool(getattr(snapshot, "autoswitch_enabled", False))
+    raw_thr = getattr(snapshot, "autoswitch_threshold", None)
+    _LIVE_AUTOSWITCH_THRESHOLD = float(
+        raw_thr if raw_thr is not None else (_LIVE_SETTINGS.get("notification_threshold_pct", 85.0) or 85.0)
+    )
     companion = companion_from_snapshot(snapshot)
 
     # 1. Always-visible Companion Hero + Segmented 6-Tab Bar

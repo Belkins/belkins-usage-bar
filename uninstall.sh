@@ -32,5 +32,10 @@ fi
 rm -rf "$HERE/.venv" "$HERE/logs"
 rm -f "$HERE"/codex_scan_state.json "$HERE"/codex_scan_state_quota.json \
       "$HERE"/scan_state.json "$HERE"/scan_state_dedup.json \
-      "$HERE"/rollups.json "$HERE"/settings.json "$HERE"/widget.lock "$HERE"/run.sh
+      "$HERE"/rollups.json "$HERE"/settings.json "$HERE"/widget.lock "$HERE"/run.sh \
+      "$HERE"/.bswap_last_switch.json "$HERE"/attribution.json "$HERE"/audit_state.json \
+      "$HERE"/notify_state.json "$HERE"/dashboard.html "$HERE"/belkins_shop.json
+if [ -f "$HOME/.local/bin/bswap" ] && grep -qF "$HERE" "$HOME/.local/bin/bswap" 2>/dev/null; then
+    rm -f "$HOME/.local/bin/bswap" "$HOME/.local/bin/belkins"
+fi
 echo "removed venv and state. Delete this folder to finish: $HERE"

@@ -1,5 +1,7 @@
 __pycache__/
 *.pyc
+.pytest_cache/
+.venv/
 logs/
 dist/
 scan_state*
@@ -8,6 +10,7 @@ rollups.json
 settings.json
 settings.local.json
 widget.lock
+.bswap_last_switch.json
 run.sh
 # Half-written files from an atomic write (mkstemp + os.replace). Both
 # shapes are in use: `<name>.tmp.<pid>` (indexer, audit) and

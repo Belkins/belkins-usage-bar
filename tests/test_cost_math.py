@@ -1073,6 +1073,7 @@ def test_a_point_release_never_borrows_its_predecessors_rate() -> None:
     for new, old, new_usd, old_usd in (
         ("claude-opus-5-5", "claude-opus-5", 2.00, 5.00),
         ("claude-fable-5-1", "claude-fable-5", 2.50, 10.00),
+        ("claude-fable-5-2", "claude-fable-5-1", 2.00, 2.50),
     ):
         assert DEFAULT_PRICING.canonical_model(new) == new
         assert DEFAULT_PRICING.canonical_model(new) != old
@@ -1087,7 +1088,8 @@ def test_a_point_release_never_borrows_its_predecessors_rate() -> None:
         "claude-opus-5-7",
         "claude-opus-5-7[1m]",
         "claude-opus-5-5-1",
-        "claude-fable-5-2",
+        "claude-fable-5-3",
+        "claude-fable-5-2-1",
         "claude-fable-5-1-1",
     ):
         assert DEFAULT_PRICING.canonical_model(future) == UNKNOWN_MODEL, future
@@ -1147,6 +1149,7 @@ def test_the_cache_read_override_moves_no_pre_existing_rate() -> None:
     added = sorted(k[1] for k in rows if k not in _PRE_EXISTING_RATES)
     assert added == [
         "claude-fable-5-1",
+        "claude-fable-5-2",
         "claude-haiku-5-5",
         "claude-opus-5-5",
         "claude-sonnet-5-5",

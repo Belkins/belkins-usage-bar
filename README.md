@@ -98,30 +98,30 @@ Remove everything: `./uninstall.sh`
 
 ### Interactive 6-Tab Menu Bar Architecture
 - **`Hub` (Minimalist Party Showcase & Telemetry)**:
-  - **Belkins Companion Hero**: Calm, minimalist companion showcase (`Belkins Prime  Lv.89`, `Apex Sovereign · ✦ 12.7K`, and an uninterrupted `178pt` gold XP bar) paired with a glowing hexagonal game medallion and controller badge.
-  - **Claude & Codex Party Cards**: Single-line header (`✦ Claude · 3/9` + `[⚡ Auto 85%]`), recessed active account showcase (`● podol` + `45% free` + `5.5pt` stamina gauge + concise window summary), up to 2 ready standby accounts (`● callowayrupert NEXT  100% free`), and a 1-line summary footer (`4 need re-login · +2 more  All ▸`).
+  - **Belkins Companion Hero & Slim Hero Mode**: Calm, minimalist companion showcase (`Belkins Prime  Lv.89`, `Apex Sovereign · ✦ 12.7K`, and an uninterrupted `178pt` gold XP bar) paired with a glowing hexagonal game medallion — or flip **`Slim Hero`** (`belkins_slim_hero`) in `Settings` to collapse the hero into an ultra-compact `38pt` single-line bar for small laptop screens.
+  - **Claude & Codex Party Cards**: Single-line header (`✦ Claude · 3/9` + `[⚡ Best]` + `[⚡ Auto 85% ▾]`), recessed active account showcase (`● podol` + `45% free` + `5.5pt` stamina gauge + concise window summary), up to 2 ready standby accounts (`● callowayrupert NEXT  100% free`), and a 1-line summary footer (`4 need re-login · +2 more  All ▸`).
   - **Sleek Telemetry Strip**: Two single-line glass pills at the bottom of the Hub (`⚡ Today  $388` and `✦ 30d  $58.1K`).
   - **4 Switchable Hub View Styles**: Switch anytime in `Settings` between **`Luxury`** (Minimalist Party Showcase, default), **`Detailed`** (Full Party Roster), **`Bento`** (2-Column Game Deck), and **`Studio`** (Clean Gauge Rings).
 - **`Claude` & `Codex` Full Party Tabs**:
   - **Recessed Active Account Panel**: Shows `● active`, plan badge, `45% free`, and individual `luxury_bar` tracks for `5h`, `7d`, and `Fable` / `Weekly` windows with concise reset times (`↺ 10:20`, `↺ Sat`).
-  - **Single-Line `30pt` Standby Rows**: Click **any** standby Claude or Codex account row to switch your active login immediately, or click the right-aligned `⏸` / `▶ Enable` control to pause or resume a slot in auto-switch rotation.
+  - **Single-Line `30pt` Standby Rows & Perishable-Quota Harvester**: Click **any** standby Claude or Codex account row to switch immediately, click **`[⚡ Best]`** to pick the optimal seat (prioritizing same-organization affinity to preserve thinking blocks and harvesting capacity from seats whose weekly reset is < 48 hours away), or click `⏸` / `▶ Enable` to pause/resume a slot.
   - **Collapsed Re-Login Banner**: Multiple expired slots collapse into a single actionable line (`4 need re-login · main, dmitry, sm +1  [bswap add]`).
-  - **Active Sessions Card (`Claude` tab)**: Displays running Claude Code CLI processes grouped cleanly by workspace name (`● Rightmark  5`), `PINNED` badges, and a one-click **`[🛡️ Guard ON]`** Preserved-Thinking Guard toggle that holds mid-turn proactive switches while sessions are busy.
+  - **Active Sessions Card & Turn-Boundary Guard (`Claude` tab)**: Displays running Claude Code CLI processes (verified against PID reuse) grouped by workspace name, flags **`⚠ ORG SHIFTED`** sessions with one-click **`[Restore #N]`** and **`[Pin #N]`** remedies, and pairs **`[🛡️ Guard ON]`** with automatic **idle turn-boundary handoff** — holding mid-turn switches while sessions are busy and executing the queued switch as soon as all sessions go idle.
 - **`Evo` Tab (Boss Raid Arena, Daily Supply Crate, 8 Cyber-Forms & 14 Trophies)**:
   - **Boss Raid Arena**: Recessed glass inner panel with a `luxury_bar` Boss HP gauge. Click directly in the menu to strike Raid Bosses (`HTTP-429 Golem`, `Context Leviathan`, `Latency Archlich`, `Quota Behemoth`, `Null Singularity`) using your Companion's **ATK & Crit** to loot **SparkCoins (`✦ CR`)** and **Bonus XP**!
   - **Daily Supply Crate (`🎁 Daily Supply Crate · Day N Streak`)**: Claimable once per calendar day directly inside `Evo` (or via `bswap claim`) for `+150..300 ✦ CR` and `+15,000..45,000 XP` scaling with your consecutive daily streak!
-  - **8-Stage Cyber-Forms**: `Sparkbit` (Lv.1) → `Outreachik` (Lv.8) → `Pipelinex` (Lv.18) → `Contexton` (Lv.30) → `Belkinosaur` (Lv.45) → `Chronoflare` (Lv.62) → `Belkins Prime` (Lv.80) → `Omega Belkion` (Lv.95). Click any unlocked form to morph your active Companion and activate its passive buff!
-  - **14 Hall of Fame Trophies**: `7×2` Bento Grid tracking mid-to-endgame milestones (`Kilowatt Day` \$1.5K/day, `Quarter-Trillion` 250B tokens, `Fleet Admiral` 8+ healthy accounts, `Flawless Rotator` 15+ rotations with 0 alerts, `Leviathan Hunter` 10+ Bosses, `Raid Godslayer` 50+ Bosses, `Serum Alchemist` 25+ Serums, `Vault Tycoon` 12/12 Vault relics, `Prismatic Triad`, `Omega Ascendant` Lv.95, and `Lv.99 Immortal`).
+  - **8-Stage Cyber-Forms with Real Passives**: `Sparkbit` (Lv.1) → `Outreachik` (Lv.8) → `Pipelinex` (Lv.18) → `Contexton` (Lv.30) → `Belkinosaur` (Lv.45) → `Chronoflare` (Lv.62) → `Belkins Prime` (Lv.80) → `Omega Belkion` (Lv.95). Morphing into any unlocked form activates real passive multipliers (`+XP%`, `+ATK%`, `+Crit%`, `+SparkCoin%`), alongside dynamic moods including **Cache Master** (≥ 85% prompt-cache hit ratio) and **Wall Guard**.
+  - **14 Hall of Fame Trophies**: `7×2` Bento Grid tracking mid-to-endgame milestones (`Kilowatt Day` \$1.5K/day, `Quarter-Trillion` 250B tokens, `Fleet Admiral` 8+ healthy accounts, `Flawless Rotator` 15+ clean rotations with 0 alerts, `Leviathan Hunter` 10+ Bosses, `Raid Godslayer` 50+ Bosses, `Serum Alchemist` 25+ Serums, `Vault Tycoon` 12/12 Vault relics, `Prismatic Triad`, `Omega Ascendant` Lv.95, and `Lv.99 Immortal`).
 - **`Vault` Tab (12-Item Belkins Spark Vault)**:
   - **`⚔️ Relics & Lab`**: `Cool-Down Cell`, repeatable `Overclock Serum` (`+60K XP & +20 ATK` per serum), `Deal Closer Visor`, `Plasma Token Blade`, `Sovereign Crown`, and `Prismatic Core` (mutates your Companion into its ★ Prismatic gold/violet/cyan palette!).
   - **`🎨 Skins & Bots`**: `Solar Forge Pad`, `Emerald Grove Pad`, `Void Nebula Pad`, `Cyber Halo Aura`, `Mini-Drone Sidekick`, and `Cyber Arcade UI Skin` (reskins all menu cards into a Gold Arcade Console!).
 - **`Settings` Tab (Minimalist Control Studio with `✓` Active State Pills)**:
   - **Live Menu-Bar Preview Strip**: Shows a real-time preview of your macOS menu-bar status item (`LIVE MENU BAR` + active icon + live rendered title text) and confirms every setting toggle immediately in the header.
-  - **`HUB VIEW`**: 4-segment picker (`Luxury ✓`, `Detailed`, `Bento`, `Studio`).
+  - **`HUB VIEW` & `SLIM HERO`**: 4-segment picker (`Luxury ✓`, `Detailed`, `Bento`, `Studio`) plus `Slim Hero` toggle (`belkins_slim_hero`).
   - **`THEME`**: 5-segment picker (`Belkins ⚡ ✓`, `Cards`, `Apple`, `Dense`, `Classic`).
   - **`HEADER ICON`**: 6-segment picker (`Game` controller default, `Bolt`, `Crown`, `Flame`, `Bars`, `None`).
   - **`HEADER PRESET` & `HEADER STATS`**: 4 layout presets (`Custom`, `Full Info`, `Companion`, `Compact`) + `4×2` toggle grid (`Alias`, `5h %`, `7d %`, `Codex`, `$ Cost`, `Tokens`, `Lv/Form`, `Boss HP`) with explicit `✓` active indicators and `ON` / `OFF` badges.
-  - **`AUTO-SWITCH`, `ALERTS & POLLING`, `MODULES`, `TOOLS`**: One-click controls for Auto-Switch (`ON ✓` / `OFF` + `80%`..`95%`), Desktop Notifications (`Bell ON ✓` + `1m`..`15m`), `Codex Live`, `Cost Track`, `Idle Anim`, `Update App`, `Web Dashboard`, and `Export CSV`.
+  - **`AUTO-SWITCH`, `ALERTS & POLLING`, `MODULES`, `TOOLS`**: One-click controls for Claude & opt-in Codex Auto-Switch (`codex_autoswitch_enabled`), Desktop Notifications (`Bell ON ✓` + `1m`..`15m`), 12h Use-It-Or-Lose-It Reminder (`expiring_quota_alert_enabled`), opt-in 2-Way Telegram Commands (`telegram_commands_enabled`), opt-in Global Hotkeys (`⌃⌥U` / `⌃⌥B`, `global_hotkeys_enabled`), `Codex Live`, `Cost Track`, `Idle Anim`, and auto-dismissing `Update App`, `Web Dashboard`, and `Export CSV` buttons.
 
 ### `bswap` / `belkins` Interactive TUI & CLI Reference
 ```bash
@@ -130,17 +130,22 @@ bswap update                # Pull latest Belkins Usage Bar from GitHub & restar
 bswap claim                 # Claim your Daily Supply Crate (+150..300 CR & +15K..45K XP)
 bswap status                # Print Companion HUD + Claude & Codex fleet status in terminal
 bswap watch                 # Launch live multi-account Watch monitor in TUI
+bswap roi [monthly_usd]     # Print 30d notional API value, subscription ROI multiple & cache savings
+bswap shim [on|off|status]  # Install/remove optional shell wrapper routing `claude` -> `bswap claude`
+bswap threshold <50..99>    # Set claude-swap proactive auto-switch percentage threshold
+bswap strategy <best|round-robin> # Set claude-swap rotation strategy
 bswap evo                   # 8-Stage Cyber-Forms, Boss Raid status & 14 Hall of Fame Trophies
 bswap raid [strikes]        # Attack the active Raid Boss for SparkCoins & Bonus XP (e.g. bswap raid 3)
 bswap morph <1..8|auto>     # Morph your active Companion into any unlocked Cyber-Form
 bswap vault                 # Open the 12-item Belkins Spark Vault in terminal (alias: bswap shop)
 bswap buy <item>            # Buy, equip, or inject a relic (e.g. bswap buy serum, blade, core, arcade)
 bswap <slot|alias>          # Switch active Claude account to slot number or alias
-bswap best                  # Switch to the healthiest Claude account with the most headroom
+bswap best                  # Switch to the healthiest Claude account (same-org + perishable-quota aware)
 bswap claude [slot] [args]  # Launch Claude Code pinned to its owning slot (prevents cross-org thinking drops)
+bswap unpin [dir]           # Remove directory-to-slot workspace pin for [dir] (default: cwd)
 bswap sessions              # Inspect active Claude Code sessions, org owners & Preserved-Thinking health
 bswap fix-thinking          # Auto-align active account to session org owners, pin workspaces & tune thresholds
-bswap codex switch <alias>  # Switch active Codex account in ~/.codex/auth.json
+bswap codex switch <alias>  # Safely switch active Codex account (syncs rotated tokens & backs up untracked)
 bswap codex list            # List tracked Codex accounts and active login
 bswap dashboard             # Open the local Belkins HTML Usage & Companion Dashboard
 bswap bar [restart|status]  # Control the Belkins menu-bar LaunchAgent
@@ -419,6 +424,8 @@ It notifies on:
 | Claude **extra-usage spend** crossing the threshold, and again at its limit | `Claude main · extra usage $480.00 / $500.00 (96%) · crossed 85% of the extra-usage limit` |
 | a model with **no published rate** reaching `unpriced_alert_min_tokens` today (default 1,000,000; 0 = off) | `Usage Bar · unpriced model · Codex gpt-… · 2.0M tokens today, counted at $0 (no published rate)` |
 | a Codex **reset credit** becoming usable | `Codex reset available · vlad: 1 reset credit usable now — weekly 87%` |
+| **all accounts exhausted** or an **unmanaged login** blocking auto-switch | standing alert verdict (`all accounts exhausted · soonest …` / `… isn't in the pool`) |
+| **Use-It-Or-Lose-It** (`expiring_quota_alert_enabled`, off by default) | a weekly window resetting within 12 h with ≥ 40 % unused capacity |
 
 Once per transition, not once per tick: a standing condition notifies once and
 is only re-armed when it stops being true, so an account that sits at 100 % for
@@ -452,12 +459,18 @@ PY=$(sed -n 's/.*exec "\(.*\)" -m cc_usage_widget.*/\1/p' run.sh)
 "$PY" -m cc_usage_widget.notify status   # prints no secret
 ```
 
-`setup` writes `notify.json` at `0600`. The widget refuses to send from a
+`setup` writes `notify.json` at `0600` (and the running widget picks up changes
+to `notify.json` automatically without a restart). The widget refuses to send from a
 credential file that anyone else on the machine can read, and the Telegram
 switch in Settings stays greyed out until the file is there. The token goes into
 exactly one URL and is never logged, never rendered and never written anywhere
 else — there is a test that plants a canary token and asserts it, plus a
 companion test proving that check can fail.
+
+When `telegram_commands_enabled` is explicitly switched on (**off by default**),
+the widget also polls `getUpdates` for commands from your configured `chat_id`
+only (`/status`, `/best`, `/switch <slot>`, `/codex <alias>`), ignoring any
+other sender and never echoing emails, tokens, or transcript text.
 
 Sends happen on their own short-lived thread: a Telegram request that times out
 cannot delay the widget's tick.
@@ -487,12 +500,13 @@ inert while it is on, and a standing problem still replaces the figure it
 invalidates (`V·C ⚠/100`) rather than showing a percentage the account can no
 longer support.
 
-The widget also switches to the compact title **by itself** when the full one is
-not drawn: every 30 seconds it asks the window server whether its item is
-onscreen, and two hidden readings while the menu bar is visible (never in a
-fullscreen app) turn compact on for the rest of that run. The setting is not
-written — Title ▸ Compact reads `— on for now: menu bar full` — so the next
-start tries the full title again.
+The widget also compacts its title in **two tiers** (`full` → `compact` →
+`icon-only`) when the menu bar is crowded: every 30 seconds it asks the window
+server whether its item is onscreen (including negative-X secondary displays),
+steps down after two hidden readings while the menu bar is visible (never in a
+fullscreen app), and **self-heals** back up after 60 seconds once menu-bar
+neighbors close. The setting is not written — Title ▸ Compact reads `— on for
+now: menu bar full` — so the next start tries the full title again.
 
 ## Run Codex on the best account
 
@@ -545,16 +559,16 @@ codexb() {
 }
 ```
 
-Caveat worth knowing before you use it daily: **Codex writes under the
-`CODEX_HOME` you give it** — sessions, history and logs land in that account's
-directory, not in `~/.codex`. That is the point (each account keeps its own
-credential), but it means your rollout history is split across the account
-homes, and `~/.codex/sessions` no longer sees everything. The widget's Codex
-**cost** figures are read from `~/.codex/sessions/**/rollout-*.jsonl`, so tokens
-spent in a `codexb` session show up in that account's quota row (which comes
-from the vendor) but not in the cost block (which comes from the corpus). The
-quota rows stay right either way; the dollar figures under-count by whatever
-you ran on another home.
+Note on multi-home indexing: **Codex writes under the `CODEX_HOME` you give it**
+— sessions, history and logs land in that account's directory, not in `~/.codex`.
+The widget's indexers automatically discover and scan `codex-accounts/*/sessions`
+(plus `CODEX_HOME` when set) alongside `~/.codex/sessions`, as well as
+`claude-swap` per-account profile directories alongside `~/.claude/projects`, so
+both quota rows and cost rollups stay accurate across every isolated home. You
+can also switch `~/.codex/auth.json` safely via `bswap codex switch <alias>` (or
+opt in to proactive switching via `codex_autoswitch_enabled`), which syncs any
+CLI-rotated token back into `codex-accounts/<id>/auth.json` and backs up
+untracked logins before replacing `~/.codex/auth.json`.
 
 ## What it costs your machine
 
@@ -575,9 +589,11 @@ modification time, and only the bytes appended since last time are parsed.
 **Everything stays on your machine.** The widget has no telemetry, no analytics,
 and no update check, and by default it makes no network calls at all.
 
-There are exactly three exceptions, and you have to switch each of them on. The
+There are four opt-in network paths, and you have to switch them on. The
 first is [Telegram notifications](#telegram-optional), which POST one line of
-text — the same line Notification Center shows — to your own bot. The second is
+text — the same line Notification Center shows — to your own bot (and, only if
+you also enable `telegram_commands_enabled`, poll `getUpdates` restricted to
+your own `chat_id`). The second is
 the [live per-account Codex quota](#optional-a-live-row-for-each-of-your-codex-accounts), which
 reads `https://chatgpt.com/backend-api/wham/usage` — your own account, with your
 own login, for your own quota numbers. The third is
@@ -636,7 +652,7 @@ guessed — if you see an unpriced model, please
 published rate.
 
 Priced today (Anthropic's table re-verified 2026-09-09, with Opus 5.5 and
-Fable 5.1 read 2026-09-23; OpenAI's re-read 2026-09-25): Anthropic's Fable 5, Fable 5.1, Mythos 5, Opus 5, Opus 5.5, Opus 4.8, Sonnet 5,
+Fable 5.1 read 2026-09-23, and Fable 5.2 added 2026-11-11; OpenAI's re-read 2026-09-25): Anthropic's Fable 5.2, Fable 5.1, Fable 5, Mythos 5, Opus 5, Opus 5.5, Opus 4.8, Sonnet 5,
 Sonnet 4.6 and Haiku 4.5; OpenAI's `gpt-6-astra` (the current Codex flagship),
 `gpt-6-sol`, `gpt-6-luna`, `gpt-5.6-sol` / `-terra` / `-luna`, `gpt-5.5`,
 `gpt-5.4` and `gpt-5.4-mini`, with cache writes at OpenAI's published "Cache
@@ -691,10 +707,12 @@ mirror you deliberately turned off.
 every open, so it is a snapshot of what the stores held at that moment, with the
 timestamp printed at the top.
 
-It answers the questions a menu cannot: how the last 30 and 90 days compare, how
-tokens and notional dollars split by vendor and by model, how each vendor's model
-mix moved day by day (this is where "Astra took over from Sol" is visible), which
-windows each account is currently sitting in, and how much volume is unpriced.
+It answers the questions a menu cannot: how the last 30 and 90 days compare,
+your **Subscription ROI** multiple against flat-rate seat spend (`monthly_subscription_usd`),
+**Prompt-cache efficiency** (cache hit ratio and notional dollar savings vs uncached input),
+how tokens and notional dollars split by vendor, by model, and **by project** (with 7d/30d/90d
+live repricing and automatic git worktree collapsing), how each vendor's model mix moved day
+by day, which windows each account is currently sitting in, and how much volume is unpriced.
 
 Workflow swarms count toward the session that ran them. When one ran today, the
 menu's Cost section adds `today's top workflow runs` (`wf_<id> · <project>`,
@@ -717,9 +735,10 @@ Everything about the file is deliberate:
 * **Days inside the 30-day window come from the live store; older days come from
   `history.sqlite`.** Where both hold a day the live store wins, because a
   rebuild or an audit repair lands there first.
-* **What is not measured is not drawn.** Nothing in the widget stores a quota
-  time series, so the "hours at the wall" panel reports the wall each account is
-  at right now and says why a weekly total is not derivable, instead of
+* **What is not measured is not drawn.** `history.sqlite` records append-only
+  15-minute `quota_samples` (by vendor + alias, never tokens or emails), so the
+  "hours at the wall" panel reports measured 7-day wall time once samples exist
+  and honestly states when no history has been recorded yet instead of
   estimating one.
 
 To switch it off, set `"dashboard_enabled": false` in `settings.json`: the menu

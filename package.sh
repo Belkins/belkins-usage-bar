@@ -122,7 +122,7 @@ tail -n +4 <<<"$LISTING"
 # PIPELINE status is therefore non-zero, and the `if` concludes "no leak" for
 # exactly the input it was supposed to catch. Verified: the pipe form let a
 # deliberately allowlisted settings.json through with exit 0.
-if grep -E 'rollups\.json|scan_state|settings\.json|widget\.lock|belkins_shop\.json' \
+if grep -E 'rollups\.json|scan_state|settings\.json|widget\.lock|belkins_shop\.json|\.bswap_last_switch\.json|attribution\.json|audit_state\.json|codex_accounts\.json|codex_quota_snapshots\.json|notify\.json|notify_state\.json|history\.sqlite|dashboard\.html' \
     <<<"$LISTING" >/dev/null; then
   echo "PRIVATE RUNTIME STATE LEAKED INTO ${OUT}" >&2
   exit 1

@@ -50,7 +50,7 @@ import json
 import os
 import threading
 import time
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import Any, Final
 
 from .attribution import AttributionCollector, AttributionPass, claude_scope
@@ -115,6 +115,12 @@ enough to stay far inside the < 10 MB peak-allocation budget."""
 _DEADLINE_LINE_INTERVAL: Final[int] = 4096
 """Lines between ``time.monotonic()`` deadline checks *inside* one file. A
 single transcript can be 36 MB, so yielding only between files is not enough."""
+
+_MAX_LINE_BYTES: Final[int] = 8 << 20
+"""Hard cap on how much of a single line is ever buffered in memory (8 MiB)."""
+
+_MARKER_OVERLAP: Final[int] = 16
+_MAX_OVERSIZE_ERRORS: Final[int] = 4
 
 _DEDUP_PERSIST_LIMIT: Final[int] = 50_000
 """Cap on the number of request IDs written to the dedup sidecar. One day of
@@ -365,12 +371,16 @@ def _write_json_atomic(path: str, payload: Any) -> bool:
     keeps its dirty flag and retries); anything else - an unserialisable
     payload, ``KeyboardInterrupt``/``SystemExit`` mid-write - propagates.
     """
-    text = json.dumps(payload, separators=(",", ":"))
+    data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     tmp = f"{path}.tmp.{os.getpid()}"
     try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(text)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, data)
+        finally:
+            os.close(fd)
+        os.chmod(tmp, 0o600)
         os.replace(tmp, path)
         return True
     except BaseException as exc:
@@ -411,8 +421,16 @@ class Indexer:
         dedup_within_file: bool = True,
         defer_state_commit: bool = False,
         audit_limits: Mapping[str, tuple[int, int]] | None = None,
+        extra_roots: Sequence[os.PathLike[str] | str] = (),
+        discover_extra_roots: Callable[[], Sequence[os.PathLike[str] | str]] | None = None,
     ) -> None:
         self._projects_dir = os.path.abspath(os.fspath(projects_dir))
+        self._extra_roots: tuple[str, ...] = tuple(
+            os.path.abspath(os.fspath(r))
+            for r in extra_roots
+            if os.fspath(r) and not os.path.islink(os.fspath(r))
+        )
+        self._discover_extra_roots = discover_extra_roots
         self._state_path = os.fspath(state_path)
         if lookback_days is None:
             source = settings if settings is not None else SETTINGS_DEFAULTS
@@ -760,6 +778,8 @@ class Indexer:
             now=self._now,
             dedup_within_file=self._dedup_within_file,
             audit_limits=limits,
+            extra_roots=self._extra_roots,
+            discover_extra_roots=self._discover_extra_roots,
         )
 
     @property
@@ -950,6 +970,7 @@ class Indexer:
             return
         usage = self._dedup_usage
         if len(usage) > _DEDUP_PERSIST_LIMIT:
+            self._drop_dedup_file()
             return
         owners = {
             path: sorted(ids) for path, ids in self._dedup_owners.items() if ids
@@ -1023,43 +1044,71 @@ class Indexer:
                 "backup path (would double-count sessions)"
             )
             return
-        if not os.path.isdir(self._projects_dir):
-            return
-        stack = [self._projects_dir]
-        while stack:
-            current = stack.pop()
+        seen_inodes: set[tuple[int, int]] = set()
+        seen_relpaths: set[str] = set()
+        roots: list[tuple[str, bool]] = []
+        if os.path.isdir(self._projects_dir):
+            roots.append((self._projects_dir, False))
+        dynamic_extras: list[str] = list(self._extra_roots)
+        if self._discover_extra_roots is not None:
             try:
-                scandir_it = os.scandir(current)
-            except OSError as exc:
-                errors.append(f"{current}: {exc}")
-                continue
-            with scandir_it:
-                while True:
-                    try:
-                        entry = next(scandir_it)
-                    except StopIteration:
-                        break
-                    except OSError as exc:  # pragma: no cover - dir vanished mid-walk
-                        errors.append(f"{current}: {exc}")
-                        break
-                    name = entry.name
-                    try:
-                        if entry.is_symlink():
-                            continue
-                        if entry.is_dir(follow_symlinks=False):
-                            if name.startswith(".") or name in _EXCLUDED_DIR_NAMES:
+                for cand in self._discover_extra_roots():
+                    raw_cand = os.fspath(cand)
+                    if raw_cand and not os.path.islink(raw_cand):
+                        abs_cand = os.path.abspath(raw_cand)
+                        if abs_cand not in dynamic_extras:
+                            dynamic_extras.append(abs_cand)
+            except Exception:
+                pass
+        for extra in dynamic_extras:
+            if extra != self._projects_dir and not os.path.islink(extra) and os.path.isdir(extra):
+                roots.append((extra, True))
+        if not roots:
+            return
+        for root_dir, is_extra in roots:
+            stack = [root_dir]
+            while stack:
+                current = stack.pop()
+                try:
+                    scandir_it = os.scandir(current)
+                except OSError as exc:
+                    errors.append(f"{current}: {exc}")
+                    continue
+                with scandir_it:
+                    while True:
+                        try:
+                            entry = next(scandir_it)
+                        except StopIteration:
+                            break
+                        except OSError as exc:  # pragma: no cover - dir vanished mid-walk
+                            errors.append(f"{current}: {exc}")
+                            break
+                        name = entry.name
+                        try:
+                            if entry.is_symlink():
                                 continue
-                            if name in _FORBIDDEN_PATH_PARTS:
+                            if entry.is_dir(follow_symlinks=False):
+                                if name.startswith(".") or name in _EXCLUDED_DIR_NAMES:
+                                    continue
+                                if not is_extra and name in _FORBIDDEN_PATH_PARTS:
+                                    continue
+                                stack.append(entry.path)
                                 continue
-                            stack.append(entry.path)
+                            if not name.endswith(TRANSCRIPT_SUFFIX):
+                                continue
+                            st = entry.stat(follow_symlinks=False)
+                        except OSError:
+                            # File deleted between readdir and stat: nothing to count.
                             continue
-                        if not name.endswith(TRANSCRIPT_SUFFIX):
+                        file_id = (st.st_dev, st.st_ino)
+                        if file_id in seen_inodes:
                             continue
-                        st = entry.stat(follow_symlinks=False)
-                    except OSError:
-                        # File deleted between readdir and stat: nothing to count.
-                        continue
-                    yield entry.path, st.st_size, st.st_mtime, st.st_ino
+                        rel = os.path.relpath(entry.path, root_dir)
+                        if is_extra and rel in seen_relpaths:
+                            continue
+                        seen_inodes.add(file_id)
+                        seen_relpaths.add(rel)
+                        yield entry.path, st.st_size, st.st_mtime, st.st_ino
 
     def has_anything_changed(self) -> bool:
         """Cheap pre-check the caller uses to skip the whole scan (SPEC 3.5).
@@ -1158,6 +1207,8 @@ class Indexer:
                 self._dedup_usage = stored_usage
                 self._dedup_owners = stored_owners
                 return
+        if self._dedup_day is not None and self._dedup_day != today:
+            self._drop_dedup_file()
         self._dedup_day = today
         self._dedup_usage = {}
         self._dedup_owners = {}
@@ -1367,7 +1418,7 @@ class Indexer:
             if processed >= self._chunk_files:
                 interrupted = True
                 break
-            if deadline is not None and time.monotonic() >= deadline:
+            if deadline is not None and time.monotonic() >= deadline and processed:
                 interrupted = True
                 break
             prev = self._states.get(path)
@@ -1511,6 +1562,25 @@ class Indexer:
                     if replacement != stale:
                         self._states[gone] = replacement
                         self._states_dirty = True
+                # Also drop aged-out live entries whose mtime AND ledger have
+                # fallen completely outside the lookback window, so `_states` stays
+                # bounded across months without re-opening old files (STEP 3 skips
+                # untracked files with `mtime < window_start_epoch` in O(1), while
+                # widening `lookback_days` later can re-index them cleanly).
+                for aged in [
+                    p
+                    for p, st_val in self._states.items()
+                    if p in seen_paths and st_val.mtime < window_start_epoch
+                ]:
+                    st_val = self._states[aged]
+                    if _windowed_ledger(st_val.ledger, since=window_start_key):
+                        continue
+                    if legacy_day_for_vanished(st_val, window_start=window_start_key) is not None:
+                        continue
+                    if self._attribution is not None:
+                        self._attribution.forget_path(aged)
+                    del self._states[aged]
+                    self._states_dirty = True
             if not self._complete:
                 self._complete = True
                 self._files_done = self._files_total
@@ -1666,6 +1736,9 @@ class Indexer:
                 # review's own stage-disable attribution put 38.9 MB of the
                 # growth on the raw line iteration, not on JSON or dedup.
                 buf = bytearray()
+                dropped = 0
+                oversize_hit = False
+                oversize_errors = 0
                 eof = False
                 # AUDIT TWIN ONLY: `size` has been clamped to the live
                 # scanner's offset by `_collect`, and the read must stop
@@ -1694,12 +1767,23 @@ class Indexer:
                             # to advance `pos`; the next read completes it.
                             break
                         end = newline + 1
-                        pos += end - start
+                        pos += end - start + dropped
                         stats.lines_seen += 1
 
+                        if dropped:
+                            if oversize_hit or buf.find(USAGE_MARKER, start, newline) >= 0:
+                                stats.records_malformed += 1
+                                if oversize_errors < _MAX_OVERSIZE_ERRORS:
+                                    oversize_errors += 1
+                                    errors.append(
+                                        f"{path}: skipped a line over "
+                                        f"{_MAX_LINE_BYTES} bytes that carried a usage marker"
+                                    )
+                            dropped = 0
+                            oversize_hit = False
                         # STEP 7 - skips ~49% of parses, and does it without
                         # copying the line first.
-                        if buf.find(USAGE_MARKER, start, newline) >= 0:
+                        elif buf.find(USAGE_MARKER, start, newline) >= 0:
                             self._consume_line(
                                 buf[start:end],
                                 fallback_day=fallback_day,
@@ -1724,6 +1808,12 @@ class Indexer:
                         del buf[:start]
                     if stopped_early:
                         break
+                    if len(buf) > _MAX_LINE_BYTES:
+                        if not oversize_hit and buf.find(USAGE_MARKER) >= 0:
+                            oversize_hit = True
+                        keep = _MARKER_OVERLAP
+                        dropped += len(buf) - keep
+                        del buf[: len(buf) - keep]
         except OSError as exc:
             errors.append(f"{path}: {exc}")
             # Keep whatever we counted; record the offset we actually reached so

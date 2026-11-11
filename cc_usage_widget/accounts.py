@@ -99,6 +99,8 @@ __all__ = [
     "AUTOSWITCH_ENABLED_KEY",
     "SwapAccountSource",
     "create_account_source",
+    "harvest_best_slot",
+    "record_cli_switch_marker",
 ]
 
 LOGGER: Final[logging.Logger] = logging.getLogger("cc_usage_widget.accounts")
@@ -227,6 +229,138 @@ _SWAP_LOG_SWITCH_RE: Final[re.Pattern[str]] = re.compile(
     re.MULTILINE,
 )
 """A ``%(asctime)s - %(levelname)s - %(message)s`` switch line (local time)."""
+
+_CLI_SWITCH_MARKER_NAME: Final[str] = ".bswap_switch_marker"
+_CLI_SWITCH_MARKER_MAX_AGE_S: Final[float] = 60.0
+
+
+def record_cli_switch_marker(backup_dir: Path | None, target: str = "*") -> None:
+    """Stamp a short-lived marker in *backup_dir* so the running widget treats
+    an intentional ``bswap`` CLI switch as operator-owned instead of raising
+    :data:`ALERT_EXTERNAL_SWITCH`. Best-effort; never raises."""
+    if backup_dir is None:
+        return
+    import os
+
+    try:
+        root = Path(backup_dir)
+        if not root.is_dir():
+            return
+        marker = root / _CLI_SWITCH_MARKER_NAME
+        tmp = root / f".{_CLI_SWITCH_MARKER_NAME}.{os.getpid()}.tmp"
+        payload = json.dumps({"ts": time.time(), "target": str(target or "*")}).encode("utf-8")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, payload)
+        finally:
+            os.close(fd)
+        os.replace(tmp, marker)
+    except Exception:
+        return
+
+
+def _hours_until_reset_label(label: str | None, now_epoch: float) -> float | None:
+    """Best-effort hours until a window reset label (ISO or ``HH:MM`` / ``Mon D HH:MM``)."""
+    if not label or not isinstance(label, str):
+        return None
+    text = label.strip()
+    if not text:
+        return None
+    iso_val = _iso_ts(text)
+    if iso_val is not None:
+        diff = (iso_val - now_epoch) / 3600.0
+        return diff if diff > 0 else None
+    now_dt = dt.datetime.fromtimestamp(now_epoch)
+    try:
+        if len(text) == 5 and text[2] == ":":
+            hh, mm = int(text[:2]), int(text[3:])
+            cand = now_dt.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if cand <= now_dt:
+                cand += dt.timedelta(days=1)
+            return (cand.timestamp() - now_epoch) / 3600.0
+        parsed = dt.datetime.strptime(f"{now_dt.year} {text}", "%Y %b %d %H:%M")
+        if parsed.timestamp() < now_epoch - 86400.0 * 180:
+            parsed = parsed.replace(year=now_dt.year + 1)
+        diff = (parsed.timestamp() - now_epoch) / 3600.0
+        return diff if diff > 0 else None
+    except ValueError:
+        return None
+
+
+def harvest_best_slot(
+    rows: tuple[AccountRow, ...] | list[AccountRow],
+    *,
+    sentinels: Mapping[int, str] | None = None,
+    identities: Mapping[int, tuple[str, str]] | None = None,
+    prefer_org: str | None = None,
+    models: tuple[str, ...] | list[str] = (),
+    now: float | None = None,
+) -> AccountRow | None:
+    """Smart Perishable-Quota & Org-Aware Claude slot selector.
+
+    1. Filters out disabled, unswitchable, sentinel-flagged, or attention-flagged slots.
+    2. Evaluates 5-hour, 7-day, AND per-model ``scoped_windows`` (e.g. ``Fable``) so
+       exhausted model sub-quotas are never chosen.
+    3. Applies a Perishable-Quota Urgency bonus to seats with ``>= 15%`` remaining
+       weekly capacity expiring within ``<= 48h`` ("Consume-Expiring-First").
+    4. Applies a Same-Organization bonus when *prefer_org* matches a healthy candidate,
+       preventing ``thinking_drop`` and 1-hour prompt-cache invalidation across orgs.
+    """
+    moment = time.time() if now is None else float(now)
+    wanted_models = {m.strip().lower() for m in models if m and m.strip()}
+    sentinel_map = sentinels or {}
+    id_map = identities or {}
+
+    def _window_metrics(r: AccountRow) -> tuple[float, float]:
+        fh = float(r.five_hour_pct or 0.0)
+        wk = float(r.seven_day_pct or 0.0)
+        for name, pct in r.scoped_windows or ():
+            if pct is None:
+                continue
+            val = float(pct)
+            if not wanted_models or name.strip().lower() in wanted_models or val >= 99.0:
+                if val > wk:
+                    wk = val
+        return fh, wk
+
+    eligible: list[tuple[AccountRow, float, float]] = []
+    for r in rows:
+        if r.slot < 0 or r.disabled or not r.switchable:
+            continue
+        if r.attention_note or r.slot in sentinel_map:
+            continue
+        fh, wk = _window_metrics(r)
+        if fh >= 100.0 or wk >= 100.0:
+            continue
+        eligible.append((r, fh, wk))
+
+    if not eligible:
+        return None
+
+    comfortable = [(r, fh, wk) for (r, fh, wk) in eligible if fh < 95.0 and wk < 99.0]
+    pool = comfortable if comfortable else eligible
+
+    best_row: AccountRow | None = None
+    best_score: float = -1e9
+    for r, fh, wk in pool:
+        base_headroom = 100.0 - max(fh, wk * 0.85)
+        perishable_bonus = 0.0
+        hours_left = _hours_until_reset_label(r.seven_day_resets_at, moment)
+        rem_wk = max(0.0, 100.0 - wk)
+        if hours_left is not None and 0.0 < hours_left <= 48.0 and rem_wk >= 15.0 and fh < 80.0:
+            perishable_bonus = min(35.0, (rem_wk / max(hours_left, 4.0)) * 2.5)
+
+        same_org_bonus = 0.0
+        if prefer_org and fh < 88.0 and wk < 95.0:
+            ident = id_map.get(r.slot)
+            if ident and ident[1] and ident[1] == prefer_org:
+                same_org_bonus = 20.0
+
+        score = base_headroom + perishable_bonus + same_org_bonus
+        if score > best_score:
+            best_score = score
+            best_row = r
+    return best_row
 
 
 # ---------------------------------------------------------------------------
@@ -732,6 +866,8 @@ class SwapAccountSource:
         self._fetch_failing_seen: dict[int, tuple[int, Any]] = {}
         self._switchable: frozenset[int] = frozenset()
         self._alias_by_slot: dict[int, str] = {}
+        self._rows_cache: tuple[AccountRow, ...] = ()
+        self._handoff_armed: bool = False
         # Stored-login plan per config backup, keyed by path and re-read only
         # when the file's (mtime_ns, size) moves: the file is ~190 KB and a
         # switch rewrites it, the plan inside almost never changes.
@@ -1052,6 +1188,13 @@ class SwapAccountSource:
         if verdict == "ghost":
             self._note_ghost_flip(previous, current)
             return
+        if verdict == "cswap" and self._consume_cli_switch_marker(current):
+            target_lbl = self._alias_or_slot(current)
+            LOGGER.info("accounts: active %s -> %s (bswap CLI switch)", previous, current)
+            with self._lock:
+                self._event_log.append(f"{_stamp()} bswap \u2192 {target_lbl}")
+                self._external_alert = None
+            return
         LOGGER.warning(
             "accounts: active changed outside the widget: %s -> %s (%s)",
             previous,
@@ -1065,6 +1208,31 @@ class SwapAccountSource:
         with self._lock:
             self._event_log.append(line)
             self._external_alert = (ALERT_EXTERNAL_SWITCH, line)
+
+    def _consume_cli_switch_marker(self, current: str) -> bool:
+        """Return True if ``.bswap_switch_marker`` inside ``backup_dir`` proves
+        an intentional ``bswap`` CLI switch onto *current* within the last minute."""
+        backend = self._backend_or_none()
+        if backend is None:
+            return False
+        try:
+            marker = Path(backend.backup_dir) / _CLI_SWITCH_MARKER_NAME
+            if not marker.is_file():
+                return False
+            raw = json.loads(marker.read_text(encoding="utf-8"))
+            try:
+                marker.unlink()
+            except OSError:
+                pass
+            if not isinstance(raw, Mapping):
+                return False
+            ts = float(raw.get("ts", 0.0) or 0.0)
+            target = str(raw.get("target") or "*")
+            if abs(self._wall() - ts) > _CLI_SWITCH_MARKER_MAX_AGE_S:
+                return False
+            return target in ("*", current)
+        except Exception:
+            return False
 
     def _alias_or_slot(self, slot: str) -> str:
         """Display alias of *slot* from the last built rows, else ``account-N``."""
@@ -1302,12 +1470,14 @@ class SwapAccountSource:
                 switchable.add(row.slot)
 
         rows.sort(key=lambda row: row.slot)
+        built = tuple(rows)
         with self._lock:
             self._sentinels = sentinels
             self._sentinel_kinds = sentinel_kinds
             self._switchable = frozenset(switchable)
             self._alias_by_slot = aliases
-        return tuple(rows)
+            self._rows_cache = built
+        return built
 
     def _build_row(
         self,
@@ -2252,10 +2422,14 @@ class SwapAccountSource:
         hand-editing user's broken file is theirs to fix, and replacing it would
         also wipe their autoswitch policy.
         """
+        return self._update_autoswitch_section({AUTOSWITCH_ENABLED_KEY: enabled})
+
+    def _update_autoswitch_section(self, updates: Mapping[str, Any]) -> bool:
+        """Atomically merge *updates* into ``autoswitch`` in claude-swap's settings.json."""
         backend = self._backend_or_none()
         path = self._policy_path()
         if backend is None or path is None:
-            self._record_error("cannot persist autoswitch toggle: claude-swap unavailable")
+            self._record_error("cannot persist autoswitch policy: claude-swap unavailable")
             return False
 
         raw: Any
@@ -2272,7 +2446,7 @@ class SwapAccountSource:
 
         section = raw.get(AUTOSWITCH_SECTION)
         section = dict(section) if isinstance(section, Mapping) else {}
-        section[AUTOSWITCH_ENABLED_KEY] = enabled
+        section.update(updates)
         raw[AUTOSWITCH_SECTION] = section
         raw.setdefault("schemaVersion", backend.schema_version)
         try:
@@ -2281,6 +2455,73 @@ class SwapAccountSource:
             self._record_error(f"could not write {path}", exc)
             return False
         return True
+
+    def set_autoswitch_threshold(self, pct: float) -> bool:
+        """Persist ``autoswitch.threshold`` (50..99%) into claude-swap's settings.json
+        and invalidate the live engine cache so the new ceiling takes effect immediately."""
+        clamped = round(min(99.0, max(50.0, float(pct))), 1)
+        ok = self._update_autoswitch_section({"threshold": clamped})
+        if ok:
+            with self._lock:
+                self._policy_threshold = clamped
+                self._engine_policy_mtime = None
+                self._next_tick_at = 0.0
+            self._log.info("accounts: autoswitch threshold set to %.1f%%", clamped)
+            self._append_event(f"autoswitch threshold \u2192 {clamped:.0f}%")
+        return ok
+
+    def autoswitch_strategy(self) -> str:
+        """Return ``autoswitch.strategy`` from claude-swap's policy (``'best'`` or ``'consume-first'``)."""
+        backend = self._backend_or_none()
+        if backend is None:
+            return "best"
+        try:
+            strat = str(getattr(backend.load_policy(backend.backup_dir), "strategy", "best") or "best")
+            return strat if strat in ("best", "consume-first") else "best"
+        except Exception:
+            return "best"
+
+    def set_autoswitch_strategy(self, strategy: str) -> bool:
+        """Persist ``autoswitch.strategy`` (``'best'`` or ``'consume-first'``) into claude-swap's settings.json."""
+        norm = str(strategy).strip().lower()
+        if norm not in ("best", "consume-first"):
+            self._record_error(f"unsupported autoswitch strategy: {strategy!r}")
+            return False
+        ok = self._update_autoswitch_section({"strategy": norm})
+        if ok:
+            with self._lock:
+                self._engine_policy_mtime = None
+                self._next_tick_at = 0.0
+            self._log.info("accounts: autoswitch strategy set to %s", norm)
+            self._append_event(f"autoswitch strategy \u2192 {norm}")
+        return ok
+
+    def has_armed_handoff(self) -> bool:
+        """Whether Preserved-Thinking Guard is currently holding an over-threshold
+        switch waiting for a busy default-profile Claude turn to go idle."""
+        with self._lock:
+            return self._handoff_armed
+
+    def poll_armed_handoff(self) -> str | None:
+        """Check whether an armed Preserved-Thinking Guard hold has cleared (all
+        default-profile sessions are no longer ``busy``), and if so run an immediate
+        autoswitch tick at the clean turn boundary."""
+        if not self.has_armed_handoff():
+            return None
+        try:
+            from . import fleet
+
+            records, _unreadable = fleet.read_registry(fleet.sessions_dir())
+            busy_count = sum(1 for r in records if str(r.get("status") or "").lower() == "busy")
+        except Exception:
+            return None
+        if busy_count > 0:
+            return None
+        with self._lock:
+            self._handoff_armed = False
+            self._next_tick_at = 0.0
+        self._log.info("accounts: busy Claude turn finished; executing armed turn-boundary autoswitch")
+        return self.evaluate_autoswitch()
 
     def _mirror_local_setting(self, enabled: bool) -> None:
         """Best-effort write-back of the toggle into our own settings store."""
@@ -2406,9 +2647,10 @@ class SwapAccountSource:
 
         1. Separates weekly ceiling (``weekly_threshold = 98.0`` when unset) so 7-day / ``Fable``
            windows are not abandoned prematurely at 85% across organizations.
-        2. Holds proactive mid-turn switches up to ``96.0%`` (5h) while any unpinned default-profile
-           Claude Code session has ``status == 'busy'``, preventing mid-turn ``thinking_drop`` and
-           1-hour prompt-cache invalidation.
+        2. Holds proactive mid-turn switches up to a concurrency-scaled emergency cap
+           (``max(88%, 97% - 2% * busy_count)`` 5h / ``max(90%, 98% - 1.5% * busy_count)`` 7d)
+           while any unpinned default-profile Claude Code session has ``status == 'busy'``,
+           arming a turn-boundary handoff that fires as soon as the turn completes.
         """
         import dataclasses
         import os
@@ -2420,6 +2662,8 @@ class SwapAccountSource:
             return None
         settings_map = _as_mapping(self._settings_obj) or {}
         if not settings_map.get("belkins_thinking_guard", True):
+            with self._lock:
+                self._handoff_armed = False
             return None
 
         try:
@@ -2429,27 +2673,61 @@ class SwapAccountSource:
             new_thresh = cur_thresh
 
             with self._lock:
-                active = self._active
-            if active is not None and not active.attention_note:
+                rows_cache = self._rows_cache
+                snapshot = self._snapshot
+            if not rows_cache and snapshot is not None:
+                rows_cache = self._build_rows(snapshot)
+            with self._lock:
+                sentinels = dict(self._sentinels)
+
+            active = next((r for r in rows_cache if r.is_active), None)
+            armed = False
+            if (
+                active is not None
+                and not active.disabled
+                and active.switchable
+                and not active.attention_note
+                and active.slot not in sentinels
+            ):
                 fh = float(active.five_hour_pct or 0.0)
                 sd = float(active.seven_day_pct or 0.0)
-                scoped_max = max((float(pct) for _n, pct in (active.scoped_windows or ())), default=0.0)
-                if fh < 96.0 and sd < 98.0 and scoped_max < 98.0:
-                    from . import fleet
+                scoped_max = max((float(pct) for _n, pct in (active.scoped_windows or ()) if pct is not None), default=0.0)
+                wk_max = max(sd, scoped_max)
 
-                    records, _unreadable = fleet.read_registry(fleet.sessions_dir())
-                    busy_count = sum(1 for r in records if str(r.get("status") or "") == "busy")
-                    if busy_count > 0 and cur_thresh < 96.0:
-                        new_thresh = 96.0
-                        if fh >= cur_thresh:
+                from . import fleet
+
+                records, _unreadable = fleet.read_registry(fleet.sessions_dir())
+                busy_count = sum(1 for r in records if str(r.get("status") or "").lower() == "busy")
+                if busy_count > 0:
+                    busy_5h_cap = max(88.0, 97.0 - 2.0 * busy_count)
+                    busy_7d_cap = max(90.0, 98.0 - 1.5 * busy_count)
+                    if fh < busy_5h_cap and wk_max < busy_7d_cap:
+                        if cur_thresh < busy_5h_cap:
+                            new_thresh = busy_5h_cap
+                        if cur_weekly is None:
+                            new_weekly = max(new_weekly, busy_7d_cap)
+                        elif float(cur_weekly) < busy_7d_cap:
+                            new_weekly = busy_7d_cap
+                        over_normal = fh >= cur_thresh or (
+                            cur_weekly is not None and wk_max >= float(cur_weekly)
+                        )
+                        if over_normal:
+                            armed = True
                             self._log.info(
-                                "accounts: thinking guard holding %s (5h %.0f%% < 96%%) for %d busy Claude session(s)",
+                                "accounts: thinking guard holding %s (5h %.0f%% < %.0f%%, 7d %.0f%% < %.0f%%) "
+                                "for %d busy Claude session(s); armed turn-boundary handoff",
                                 active.alias,
                                 fh,
+                                busy_5h_cap,
+                                wk_max,
+                                busy_7d_cap,
                                 busy_count,
                             )
 
-            if new_thresh != cur_thresh or cur_weekly is None:
+            with self._lock:
+                self._handoff_armed = armed
+
+            if new_thresh != cur_thresh or cur_weekly is None or (cur_weekly is not None and new_weekly != float(cur_weekly)):
                 return dataclasses.replace(
                     orig_policy,
                     threshold=new_thresh,
@@ -2522,6 +2800,7 @@ class SwapAccountSource:
             engine = self._engine
             self._engine = None
             self._engine_policy_mtime = None
+            self._handoff_armed = False
             # The alert is the RUNNING engine's verdict. Keeping it past the
             # engine that produced it is the same "stale state rendered as
             # live" bug this alert was added to end (2026-08-26). Anything

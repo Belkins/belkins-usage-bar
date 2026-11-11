@@ -63,9 +63,11 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Final, Iterable, Mapping, Sequence
+from typing import Any, Callable, Final, Mapping, Sequence
 
 from .contracts import (
+    ALERT_ALL_EXHAUSTED,
+    ALERT_UNMANAGED_LOGIN,
     ATTENTION_PCT,
     ATTENTION_REARM_SECONDS,
     NOTIFY_EXPIRING_SECONDS,
@@ -74,6 +76,7 @@ from .contracts import (
     WIDGET_HOME,
     format_pct,
     format_tokens,
+    format_usd,
     vendor_label,
 )
 
@@ -418,11 +421,37 @@ def _standing_conditions(
         return out
     if now is not None:
         out.update(_expiring_conditions(snapshot, now=now))
+        out.update(_expiring_quota_conditions(snapshot, now=now))
     if threshold is not None:
         out.update(_spend_conditions(snapshot, threshold=threshold))
     if unpriced_min_tokens:
         out.update(_unpriced_conditions(snapshot, min_tokens=unpriced_min_tokens))
     out.update(_reset_usable_conditions(snapshot))
+
+    alert = getattr(snapshot, "alert", None)
+    if isinstance(alert, (tuple, list)) and len(alert) >= 2:
+        alert_kind = str(alert[0] or "").strip()
+        alert_text = str(alert[1] or "").strip()
+        if alert_kind == ALERT_ALL_EXHAUSTED:
+            out["alert:all_exhausted"] = Event(
+                key="alert:all_exhausted",
+                kind="alert",
+                severity=SEVERITY_CRIT,
+                scope=SCOPE_SENTINEL,
+                title=f"{APP_TITLE} · all accounts exhausted",
+                subtitle=alert_text,
+                message="Every enabled Claude account is at its quota wall",
+            )
+        elif alert_kind == ALERT_UNMANAGED_LOGIN:
+            out["alert:unmanaged_login"] = Event(
+                key="alert:unmanaged_login",
+                kind="alert",
+                severity=SEVERITY_WARN,
+                scope=SCOPE_SENTINEL,
+                title=f"{APP_TITLE} · login not in pool",
+                subtitle=alert_text,
+                message="Auto-switch is paused; add this login to the pool",
+            )
 
     for key, row in _rows(snapshot).items():
         note = (getattr(row, "attention_note", "") or "").strip()
@@ -496,6 +525,70 @@ def _format_expiry(epoch: float) -> str:
     except (OSError, OverflowError, TypeError, ValueError):
         return ""
     return f"{when:%b} {when.day} {when:%H:%M}"
+
+
+def _parse_iso_epoch(value: str | None) -> float | None:
+    """Parse an unambiguous ISO-8601 timestamp (containing ``T``) to epoch seconds."""
+    raw = (value or "").strip()
+    if not raw or "T" not in raw:
+        return None
+    if raw.endswith(("Z", "z")):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = dt.datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.timestamp()
+
+
+def _expiring_quota_conditions(snapshot: Any, *, now: float) -> dict[str, Event]:
+    """``expiring-quota:<row>`` — weekly quota resetting within 12h with >=35% unused."""
+    out: dict[str, Event] = {}
+    snap_settings = getattr(snapshot, "settings", None)
+    if not isinstance(snap_settings, Mapping):
+        return out
+    if not bool(snap_settings.get("expiring_quota_alert_enabled", True)):
+        return out
+    for key, row in _rows(snapshot).items():
+        if bool(getattr(row, "disabled", False)):
+            continue
+        if (getattr(row, "attention_note", "") or "").strip():
+            continue
+        expired = set(getattr(row, "expired_windows", ()) or ())
+        if _SEVEN_DAY_KEY in expired:
+            continue
+        pct = getattr(row, "seven_day_pct", None)
+        resets_raw = getattr(row, "seven_day_resets_at", None)
+        if pct is None or not resets_raw:
+            continue
+        try:
+            pct_val = float(pct)
+        except (TypeError, ValueError):
+            continue
+        if pct_val > 65.0:
+            continue
+        reset_epoch = _parse_iso_epoch(str(resets_raw))
+        if reset_epoch is None:
+            continue
+        left = reset_epoch - float(now)
+        if not 0.0 < left <= 12.0 * 3600.0:
+            continue
+        unused_pct = max(0.0, 100.0 - pct_val)
+        hrs_left = max(1, int(round(left / 3600.0)))
+        vendor = vendor_label(getattr(row, "vendor", "claude"))
+        ledger_key = f"expiring-quota:{key}"
+        out[ledger_key] = Event(
+            key=ledger_key,
+            kind="expiring-quota",
+            severity=SEVERITY_INFO,
+            scope=key,
+            title=f"{vendor} {_display_name(row)}",
+            subtitle=f"weekly {format_pct(pct_val)} · resets in ~{hrs_left}h",
+            message=f"Use-it-or-lose-it: {unused_pct:.0f}% weekly quota unused",
+        )
+    return out
 
 
 def _expiring_conditions(snapshot: Any, *, now: float) -> dict[str, Event]:
@@ -826,7 +919,11 @@ def observed_scopes(snapshot: Any) -> set[str]:
     if cost is not None and not getattr(cost, "is_partial", True):
         scopes.add(SCOPE_COST)
     notes = getattr(snapshot, "account_notes", None)
-    if (notes and isinstance(notes, Mapping)) or (getattr(snapshot, "accounts", ()) or ()):
+    if (
+        (notes and isinstance(notes, Mapping))
+        or (getattr(snapshot, "accounts", ()) or ())
+        or getattr(snapshot, "alert", None)
+    ):
         scopes.add(SCOPE_SENTINEL)
     return scopes
 
@@ -1209,7 +1306,10 @@ class Notifier:
         self._credentials_path = Path(credentials_path)
         self._mac_sender = mac_sender
         self._telegram_sender = telegram_sender
-        self._telegram_resolved = telegram_sender is not None
+        self._telegram_injected = telegram_sender is not None
+        self._credentials_sig: tuple[int, int, int] | None = None
+        self._credentials_checked = False
+        self._tg_update_offset: int = 0
         self._clock = clock
         self._dispatch = dispatch
         self._log = log
@@ -1324,9 +1424,18 @@ class Notifier:
                 self._log(f"notify: sent {event.key} via telegram")
 
     def _telegram(self) -> Any | None:
-        if self._telegram_resolved:
+        if self._telegram_injected:
             return self._telegram_sender
-        self._telegram_resolved = True
+        sig: tuple[int, int, int] | None = None
+        try:
+            st = self._credentials_path.stat()
+            sig = (int(st.st_mtime_ns), int(st.st_size), int(stat.S_IMODE(st.st_mode)))
+        except OSError:
+            sig = None
+        if self._credentials_checked and sig == self._credentials_sig:
+            return self._telegram_sender
+        self._credentials_checked = True
+        self._credentials_sig = sig
         credentials, reason = load_telegram_credentials(self._credentials_path)
         if credentials is None:
             self._log(f"notify: telegram disabled ({reason})")
@@ -1334,6 +1443,172 @@ class Notifier:
         else:
             self._telegram_sender = TelegramSender(credentials, log=self._log)
         return self._telegram_sender
+
+    # -- opt-in 2-way Telegram commands -----------------------------------
+
+    def _format_status_reply(self, snapshot: Any) -> str:
+        """Build a privacy-safe status summary (aliases & slots only; never emails or tokens)."""
+        parts: list[str] = []
+        active = getattr(snapshot, "active", None)
+        if active is not None:
+            alias = getattr(active, "alias", "") or f"#{getattr(active, 'slot', '?')}"
+            fh = getattr(active, "five_hour_pct", None)
+            wk = getattr(active, "seven_day_pct", None)
+            win_bits = []
+            if fh is not None:
+                win_bits.append(f"5h {format_pct(fh)}")
+            if wk is not None:
+                win_bits.append(f"7d {format_pct(wk)}")
+            parts.append(f"Claude #{getattr(active, 'slot', '?')} ({alias}): " + (", ".join(win_bits) or "ok"))
+        accounts = tuple(getattr(snapshot, "accounts", ()) or ())
+        if accounts:
+            ready = sum(
+                1
+                for r in accounts
+                if not getattr(r, "disabled", False)
+                and not (getattr(r, "attention_note", "") or "").strip()
+                and (getattr(r, "five_hour_pct", None) or 0.0) < 100.0
+                and (getattr(r, "seven_day_pct", None) or 0.0) < 100.0
+            )
+            parts.append(f"Fleet {ready}/{len(accounts)} ready")
+        codex_rows = [
+            r
+            for r in (getattr(snapshot, "quota_rows", ()) or ())
+            if getattr(r, "vendor", "") == VENDOR_CODEX and getattr(r, "slot", 0) < 0
+        ]
+        act_codex = next((r for r in codex_rows if getattr(r, "is_active", False)), None)
+        if act_codex is not None:
+            calias = getattr(act_codex, "alias", "") or "codex"
+            cwk = getattr(act_codex, "seven_day_pct", None)
+            parts.append(f"Codex {calias}: {format_pct(cwk) if cwk is not None else 'ok'}")
+        cost = getattr(snapshot, "cost", None)
+        if cost is not None and not getattr(cost, "is_partial", True):
+            today_usd = float(getattr(getattr(cost, "today", None), "usd", 0.0) or 0.0)
+            parts.append(f"Today {format_usd(today_usd)}")
+        return " | ".join(parts) if parts else "Usage Bar running (no active snapshot yet)"
+
+    def poll_telegram_commands(
+        self,
+        snapshot: Any,
+        handlers: Mapping[str, Callable[[str], str]] | None = None,
+        *,
+        opener: Callable[..., Any] | None = None,
+        api_root: str = TELEGRAM_API_ROOT,
+    ) -> int:
+        """Poll ``getUpdates`` when ``telegram_commands_enabled`` is explicitly ``True``.
+
+        Strict security invariants:
+        * Zero I/O unless ``notifications_enabled``, ``telegram_notifications_enabled``,
+          AND ``telegram_commands_enabled`` are all ``True``.
+        * Rejects any message whose ``chat.id`` does not match ``notify.json``'s ``chat_id``.
+        * Never logs or echoes tokens, emails, or transcript text.
+        """
+        settings = self._current_settings()
+        if not (
+            bool(settings.get("notifications_enabled", False))
+            and bool(settings.get("telegram_notifications_enabled", False))
+            and bool(settings.get("telegram_commands_enabled", False))
+        ):
+            return 0
+        credentials, _reason = load_telegram_credentials(self._credentials_path)
+        if credentials is None:
+            return 0
+        url_opener = opener if opener is not None else urllib.request.urlopen
+        root = api_root.rstrip("/")
+        params: dict[str, Any] = {
+            "timeout": 0,
+            "limit": 10,
+            "allowed_updates": '["message"]',
+        }
+        if self._tg_update_offset > 0:
+            params["offset"] = self._tg_update_offset
+        query = urllib.parse.urlencode(params)
+        url = f"{root}/bot{credentials.token}/getUpdates?{query}"
+        request = urllib.request.Request(url, method="GET")
+        try:
+            response = url_opener(request, timeout=4.0)
+            raw_bytes = response.read()
+            closer = getattr(response, "close", None)
+            if callable(closer):
+                closer()
+        except Exception as exc:
+            self._log(
+                "notify: telegram getUpdates failed "
+                f"({type(exc).__name__}: {credentials.redact(str(exc))})"
+            )
+            return 0
+        try:
+            payload = json.loads(raw_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return 0
+        if not isinstance(payload, Mapping) or not payload.get("ok"):
+            return 0
+        results = payload.get("result")
+        if not isinstance(results, list) or not results:
+            return 0
+
+        dispatch_map = dict(handlers or {})
+        reply_sender = TelegramSender(
+            credentials,
+            opener=opener,
+            timeout=6.0,
+            log=self._log,
+            api_root=root,
+        )
+        handled = 0
+        for upd in results:
+            if not isinstance(upd, Mapping):
+                continue
+            try:
+                upd_id = int(upd.get("update_id", 0) or 0)
+            except (TypeError, ValueError):
+                upd_id = 0
+            if upd_id >= self._tg_update_offset:
+                self._tg_update_offset = upd_id + 1
+            msg = upd.get("message")
+            if not isinstance(msg, Mapping):
+                continue
+            chat = msg.get("chat")
+            chat_id = str(chat.get("id", "") if isinstance(chat, Mapping) else "")
+            if chat_id != str(credentials.chat_id):
+                self._log("notify: ignored telegram message from unauthorized chat")
+                continue
+            text = str(msg.get("text", "") or "").strip()
+            if not text.startswith("/"):
+                continue
+            parts = text.split(None, 1)
+            cmd = parts[0].split("@", 1)[0].lower()
+            arg = parts[1].strip() if len(parts) > 1 else ""
+            reply_msg = ""
+            if cmd in ("/status", "/start"):
+                reply_msg = self._format_status_reply(snapshot)
+            elif cmd == "/help":
+                reply_msg = "Commands: /status · /best · /switch <slot> · /codex <alias>"
+            elif cmd == "/best" and callable(dispatch_map.get("best")):
+                reply_msg = str(dispatch_map["best"](arg) or "Queued switch to best Claude slot")
+            elif cmd == "/switch" and callable(dispatch_map.get("switch")):
+                if not arg:
+                    reply_msg = "Usage: /switch <slot>"
+                else:
+                    reply_msg = str(dispatch_map["switch"](arg) or f"Queued switch to slot {arg}")
+            elif cmd == "/codex" and callable(dispatch_map.get("codex")):
+                if not arg:
+                    reply_msg = "Usage: /codex <alias>"
+                else:
+                    reply_msg = str(dispatch_map["codex"](arg) or f"Queued Codex switch to {arg}")
+            else:
+                reply_msg = "Unknown command. Try /status, /best, /switch <slot>, /codex <alias>"
+            reply_sender.send(
+                Event(
+                    key="tg:reply",
+                    kind="command",
+                    severity=SEVERITY_INFO,
+                    title=APP_TITLE,
+                    message=reply_msg,
+                )
+            )
+            handled += 1
+        return handled
 
     # -- introspection for the menu ---------------------------------------
 

@@ -43,7 +43,6 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from . import accounts as accounts_mod
-from . import app as app_mod
 from . import codex_indexer as codex_mod
 from . import indexer as indexer_mod
 from . import pricing as pricing_mod
@@ -575,6 +574,49 @@ def _scan_state_hooks(
 # ---------------------------------------------------------------------------
 
 
+def _discover_claude_extra_roots() -> tuple[Path, ...]:
+    """Non-symlinked ``projects/`` dirs inside isolated ``claude-swap`` profiles."""
+    if os.environ.get("CC_USAGE_WIDGET_PROJECTS_DIR"):
+        return ()
+    sessions_root = Path.home() / ".claude-swap-backup" / "sessions"
+    out: list[Path] = []
+    try:
+        if not sessions_root.is_dir():
+            return ()
+        for child in sessions_root.iterdir():
+            proj = child / "projects"
+            if proj.exists() and not proj.is_symlink() and proj.is_dir():
+                out.append(proj)
+    except OSError:
+        return ()
+    return tuple(sorted(out))
+
+
+def _discover_codex_extra_dirs() -> tuple[Path, ...]:
+    """Per-account Codex ``sessions/`` and ``archived_sessions/`` roots."""
+    if os.environ.get("CC_USAGE_WIDGET_CODEX_DIR"):
+        return ()
+    out: list[Path] = []
+    archived_main = CODEX_SESSIONS_DIR.parent / "archived_sessions"
+    try:
+        if archived_main.exists() and not archived_main.is_symlink() and archived_main.is_dir():
+            out.append(archived_main)
+    except OSError:
+        pass
+    try:
+        if CODEX_ACCOUNTS_DIR.is_dir():
+            for child in sorted(CODEX_ACCOUNTS_DIR.iterdir()):
+                if not child.is_dir() or child.is_symlink():
+                    continue
+                for sub in ("sessions", "archived_sessions"):
+                    cand = child / sub
+                    if cand.exists() and not cand.is_symlink() and cand.is_dir():
+                        out.append(cand)
+    except OSError:
+        pass
+    return tuple(out)
+
+
 def build(extra_errors: Sequence[str] = ()) -> CCUsageWidgetApp:
     """Construct the app with real collaborators. Never raises.
 
@@ -651,6 +693,7 @@ def build(extra_errors: Sequence[str] = ()) -> CCUsageWidgetApp:
             # "consumed" before the caller has the tokens) turns any crash in
             # that window into a permanent, invisible undercount.
             defer_state_commit=True,
+            discover_extra_roots=_discover_claude_extra_roots,
         )
     except Exception as exc:
         fail(f"transcript indexer unavailable ({PROJECTS_DIR})", exc)
@@ -691,6 +734,7 @@ def build(extra_errors: Sequence[str] = ()) -> CCUsageWidgetApp:
                 # Same invariant as the Claude indexer: the worker commits the
                 # offsets only once the rollup they belong to is on disk.
                 defer_state_commit=True,
+                discover_extra_dirs=_discover_codex_extra_dirs,
             )
         )
     except Exception as exc:

@@ -53,6 +53,9 @@ def status_item_windows() -> list[tuple[int, bool]]:
     """``(owner pid, onscreen)`` for every menu-bar status item window.
 
     Empty on any failure: no verdict is always the safe answer.
+    Note: global CoreGraphics ``X`` coordinates are negative on secondary
+    displays arranged to the left of the primary monitor, so only degenerate
+    zero-width / sub-10pt auxiliary windows are filtered out.
     """
     try:
         rows = _window_list()(0, 0)  # kCGWindowListOptionAll, kCGNullWindowID
@@ -61,12 +64,41 @@ def status_item_windows() -> list[tuple[int, bool]]:
             if row.get("kCGWindowLayer") != STATUS_ITEM_LAYER:
                 continue
             bounds = row.get("kCGWindowBounds") or {}
-            if bounds.get("Height", 0) < 10 or bounds.get("X", -1) < 0:
+            if bounds.get("Height", 0) < 10 or bounds.get("Width", 0) <= 0:
                 continue
             out.append((int(row.get("kCGWindowOwnerPID", 0)), bool(row.get("kCGWindowIsOnscreen", False))))
         return out
     except Exception:
         return []
+
+
+def onscreen_other_count(window_number: int | None = None) -> int | None:
+    """Count onscreen status-item windows other than *window_number* (or ``os.getpid()``).
+
+    Returns ``None`` when the menu bar itself is hidden (fewer than
+    :data:`MIN_OTHERS_ONSCREEN` items onscreen) or when CoreGraphics is unavailable.
+    """
+    try:
+        pid = os.getpid()
+        onscreen_rows = _window_list()(1, 0)
+        others = 0
+        for row in onscreen_rows or ():
+            if row.get("kCGWindowLayer") != STATUS_ITEM_LAYER:
+                continue
+            bounds = row.get("kCGWindowBounds") or {}
+            if bounds.get("Height", 0) < 10 or bounds.get("Width", 0) <= 0:
+                continue
+            wnum = int(row.get("kCGWindowNumber", 0))
+            owner = int(row.get("kCGWindowOwnerPID", 0))
+            if window_number and 0 < window_number < 0x100000000:
+                if wnum == window_number:
+                    continue
+            elif owner == pid:
+                continue
+            others += 1
+        return others if others >= MIN_OTHERS_ONSCREEN else None
+    except Exception:
+        return None
 
 
 def item_hidden(windows: Iterable[tuple[int, bool]], pid: int) -> bool | None:
@@ -113,7 +145,7 @@ def own_window_hidden(window_number: int | None, *, win: Any = None) -> bool | N
             if row.get("kCGWindowLayer") != STATUS_ITEM_LAYER:
                 continue
             bounds = row.get("kCGWindowBounds") or {}
-            if bounds.get("Height", 0) < 10 or bounds.get("X", -1) < 0:
+            if bounds.get("Height", 0) < 10 or bounds.get("Width", 0) <= 0:
                 continue
             wnum = int(row.get("kCGWindowNumber", 0))
             onscreen_nums.add(wnum)

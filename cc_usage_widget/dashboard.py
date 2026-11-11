@@ -104,6 +104,7 @@ __all__ = [
     "build_dashboard",
     "collect_cells",
     "dashboard_path_for",
+    "estimate_monthly_seat_usd",
     "render_dashboard",
     "write_dashboard",
 ]
@@ -597,6 +598,7 @@ def _columns(
     *,
     label: str,
     normalize: bool = False,
+    fmt_value: Any = None,
 ) -> str:
     """A stacked column chart over *days*: one column per day, in order.
 
@@ -634,10 +636,13 @@ def _columns(
                 continue
             span = scale * (amount / total)
             y -= span
+            rendered_val = (
+                fmt_value(amount) if callable(fmt_value) else _int(int(amount))
+            )
             parts.append(
                 f'<rect x="{_round(x)}" y="{_round(y)}" width="{_round(bar_width)}" '
                 f'height="{_round(span)}" fill="{_color(index_of.get(key, 0))}">'
-                f"<title>{_esc(day)} {_esc(key)}: {_esc(_int(int(amount)))}</title></rect>"
+                f"<title>{_esc(day)} {_esc(key)}: {_esc(rendered_val)}</title></rect>"
             )
     axis = (
         f'<line class="axis" x1="0" y1="{_round(height)}" x2="{_round(width)}" '
@@ -741,6 +746,181 @@ def _daily_section(cells: Sequence[Cell], today: DayKey) -> str:
     return chart + legend
 
 
+def _daily_usd_section(cells: Sequence[Cell], today: DayKey) -> str:
+    """Notional dollars per day over the long window, stacked by vendor."""
+    window = day_keys_back(today, max(WINDOW_DAYS))
+    scoped = _window_cells(cells, window)
+    if not scoped:
+        return ""
+    order = [item.label for item in _by_vendor(scoped)]
+    stacks: dict[DayKey, list[tuple[str, float]]] = {}
+    for cell in scoped:
+        if cell.usd > 0:
+            stacks.setdefault(cell.day, []).append((cell.vendor, float(cell.usd)))
+    if not stacks:
+        return ""
+    folded = {
+        day: tuple(_fold(entries).items()) for day, entries in stacks.items()
+    }
+    chart = _columns(
+        window,
+        folded,
+        order,
+        label=f"notional dollars per day, last {len(window)} days",
+        fmt_value=format_usd,
+    )
+    if not chart:
+        return ""
+    legend = _legend([vendor_label(key) for key in order])
+    return chart + legend
+
+
+def _cache_efficiency_section(
+    cells: Sequence[Cell], today: DayKey, pricing: PricingTable | None
+) -> str:
+    """30-day prompt-cache hit ratio, 5m-TTL reuse diagnostics, and dollar savings."""
+    scoped = _window_cells(cells, day_keys_back(today, 30))
+    if not scoped:
+        return ""
+    c_read = sum(c.usage.cache_read for c in scoped)
+    c_w5 = sum(c.usage.cache_write_5m for c in scoped)
+    c_w1h = sum(c.usage.cache_write_1h for c in scoped)
+    c_write = c_w5 + c_w1h
+    uncached_in = sum(c.usage.input for c in scoped)
+    if c_read <= 0 and c_write <= 0:
+        return ""
+    prompt_total = uncached_in + c_write + c_read
+    hit_pct = _pct_of(float(c_read), float(prompt_total))
+    reuse = (float(c_read) / float(c_write)) if c_write > 0 else float("inf")
+    actual_prompt_usd = 0.0
+    uncached_equiv_usd = 0.0
+    for cell in scoped:
+        if pricing is None or cell.unpriced:
+            continue
+        p_only = ModelUsage(
+            input=cell.usage.input,
+            output=0,
+            cache_read=cell.usage.cache_read,
+            cache_write_5m=cell.usage.cache_write_5m,
+            cache_write_1h=cell.usage.cache_write_1h,
+        )
+        eq_only = ModelUsage(
+            input=cell.usage.input + cell.usage.cache_read + cell.usage.cache_write_5m + cell.usage.cache_write_1h,
+            output=0,
+        )
+        actual_prompt_usd += _safe_cost(pricing, cell.key, p_only, cell.day)
+        uncached_equiv_usd += _safe_cost(pricing, cell.key, eq_only, cell.day)
+    saved_usd = uncached_equiv_usd - actual_prompt_usd
+    reuse_str = f"{reuse:.1f}x" if reuse != float("inf") else "direct cache hit"
+    verdict_cls = "note"
+    if c_write > 0 and reuse < 4.0:
+        verdict_cls = "note warn"
+        verdict = (
+            f"5m TTL cache-thrash warning: each written cache prefix is reused only {reuse:.1f}x "
+            "(break-even is ~1.3x; healthy swarm reuse is 8x+). Idle gaps over 5 minutes or "
+            "switching global accounts mid-session forces expensive 1.25x cache rebuilds."
+        )
+    else:
+        verdict = (
+            f"Healthy prompt-cache reuse ({reuse_str}): {hit_pct:.1f}% of all prompt context "
+            "was served from warm cache reads."
+        )
+    savings_label = (
+        f"{format_usd(saved_usd)} saved vs uncached input"
+        if saved_usd >= 0
+        else f"{format_usd(abs(saved_usd))} net cache-write overhead"
+    )
+    return (
+        f'<p class="{verdict_cls}">{_esc(verdict)}</p>'
+        '<table><thead><tr><th>Metric (30d)</th><th class="num">Volume / Ratio</th>'
+        '<th class="num exact">exact</th></tr></thead><tbody>'
+        f'<tr><td>Cache hit share of prompt tokens</td><td class="num">{hit_pct:.1f}%</td>'
+        f'<td class="num exact">{_int(c_read)} / {_int(prompt_total)}</td></tr>'
+        f'<tr><td>Cache reuse per write (read / write)</td><td class="num">{_esc(reuse_str)}</td>'
+        f'<td class="num exact">5m writes: {_int(c_w5)} &middot; 1h writes: {_int(c_w1h)}</td></tr>'
+        f'<tr><td>Net prompt-cache impact</td><td class="num">{_esc(savings_label)}</td>'
+        f'<td class="num exact">uncached equiv {format_usd(uncached_equiv_usd)} vs actual {format_usd(actual_prompt_usd)}</td></tr>'
+        "</tbody></table>"
+    )
+
+
+def estimate_monthly_seat_usd(
+    rows: Sequence[AccountRow], explicit_monthly_usd: float = 0.0
+) -> tuple[float, list[tuple[str, str, float]]]:
+    """Estimate monthly subscription cost across tracked seats.
+
+    Returns ``(total_monthly_usd, [(label, plan_display, seat_usd), ...])``.
+    Pseudo-accounts (``slot == 0``) are skipped whenever real per-account rows
+    exist for that vendor so a single active login is never counted twice.
+    """
+    real_vendors = {r.vendor for r in rows if r.slot != 0}
+    breakdown: list[tuple[str, str, float]] = []
+    for row in rows:
+        if row.slot == 0 and row.vendor in real_vendors:
+            continue
+        raw = str(row.plan_type or "").strip().lower()
+        if not raw:
+            continue
+        seat = 0.0
+        if "20x" in raw:
+            seat = 200.0
+        elif "5x" in raw or raw in ("max", "claude_max"):
+            seat = 100.0
+        elif raw == "pro":
+            seat = 200.0 if row.vendor == "codex" else 20.0
+        elif "plus" in raw or "claude_pro" in raw:
+            seat = 20.0
+        elif any(tok in raw for tok in ("team", "business", "enterprise")):
+            seat = 30.0
+        if seat > 0:
+            breakdown.append((row.alias or row.vendor_label, plan_label(row.plan_type), seat))
+    inferred = sum(item[2] for item in breakdown)
+    total = float(explicit_monthly_usd) if explicit_monthly_usd > 0 else inferred
+    return total, breakdown
+
+
+def _roi_section(
+    cells: Sequence[Cell],
+    rows: Sequence[AccountRow],
+    today: DayKey,
+    *,
+    monthly_subscription_usd: float = 0.0,
+) -> str:
+    """30-day API notional value vs monthly subscription spend."""
+    scoped = _window_cells(cells, day_keys_back(today, 30))
+    usd_30d = sum(c.usd for c in scoped)
+    if usd_30d <= 0:
+        return ""
+    monthly_cost, seats = estimate_monthly_seat_usd(rows, monthly_subscription_usd)
+    if monthly_cost <= 0:
+        return ""
+    multiplier = usd_30d / monthly_cost
+    net_value = usd_30d - monthly_cost
+    source_note = (
+        "custom monthly_subscription_usd setting"
+        if monthly_subscription_usd > 0
+        else f"estimated from {len(seats)} detected plan tier(s)"
+    )
+    seat_rows = "".join(
+        f"<tr><td>{_esc(alias)}</td><td>{_esc(plan)}</td>"
+        f'<td class="num">{_esc(format_usd(cost))}/mo</td></tr>'
+        for alias, plan, cost in seats
+    )
+    seat_table = (
+        '<table style="margin-top:10px"><thead><tr><th>Account</th><th>Plan tier</th>'
+        f'<th class="num">Est. seat</th></tr></thead><tbody>{seat_rows}</tbody></table>'
+        if seat_rows and monthly_subscription_usd <= 0
+        else ""
+    )
+    return (
+        f'<p class="headline"><strong>{multiplier:.1f}x ROI</strong>'
+        f'<span>{_esc(format_usd(usd_30d))} API notional (30d) vs '
+        f'{_esc(format_usd(monthly_cost))}/mo ({_esc(source_note)})</span>'
+        f'<strong>{_esc(format_usd(max(0.0, net_value)))} net value</strong></p>'
+        + seat_table
+    )
+
+
 def _fold(entries: Sequence[tuple[str, float]]) -> dict[str, float]:
     out: dict[str, float] = {}
     for key, amount in entries:
@@ -748,7 +928,9 @@ def _fold(entries: Sequence[tuple[str, float]]) -> dict[str, float]:
     return out
 
 
-def _model_section(cells: Sequence[Cell], today: DayKey) -> str:
+def _model_section(
+    cells: Sequence[Cell], today: DayKey, pricing: PricingTable | None = None
+) -> str:
     """Per-model tokens and dollars for each window, largest first."""
     blocks: list[str] = []
     for days in WINDOW_DAYS:
@@ -756,14 +938,29 @@ def _model_section(cells: Sequence[Cell], today: DayKey) -> str:
         if not scoped:
             continue
         series = _capped(_by(scoped, "model"), MAX_MODELS)
-        rows = "".join(
-            f"<tr><td>{_esc(item.label)}</td>"
-            f'<td class="num">{_esc(format_tokens(item.tokens))}</td>'
-            f'<td class="num exact">{_int(item.tokens)}</td>'
-            f'<td class="num">{_esc(format_usd(item.usd))}'
-            f'{"+" if item.unpriced_tokens else ""}</td></tr>'
-            for item in series
-        )
+        row_parts: list[str] = []
+        for item in series:
+            friendly = ""
+            if pricing is not None and not item.label.startswith("other ("):
+                try:
+                    cand = pricing.display_name(item.label)
+                    if isinstance(cand, str) and cand and cand != item.label:
+                        friendly = cand
+                except Exception:
+                    friendly = ""
+            label_html = (
+                f'{_esc(friendly)} <span class="exact">({_esc(item.label)})</span>'
+                if friendly
+                else _esc(item.label)
+            )
+            row_parts.append(
+                f"<tr><td>{label_html}</td>"
+                f'<td class="num">{_esc(format_tokens(item.tokens))}</td>'
+                f'<td class="num exact">{_int(item.tokens)}</td>'
+                f'<td class="num">{_esc(format_usd(item.usd))}'
+                f'{"+" if item.unpriced_tokens else ""}</td></tr>'
+            )
+        rows = "".join(row_parts)
         blocks.append(
             f'<div class="window"><h3>Last {days} days</h3>'
             + _stacked_bar(series, value="tokens", label=f"tokens by model, last {days} days")
@@ -820,7 +1017,9 @@ def _mix_section(cells: Sequence[Cell], today: DayKey) -> str:
     return f'<div class="windows">{"".join(blocks)}</div>'
 
 
-def _project_section(history: Any, today: DayKey) -> str:
+def _project_section(
+    history: Any, today: DayKey, *, pricing: PricingTable | None = None
+) -> str:
     """Per-project totals, from the mirror's project table.
 
     Absent - not empty, absent - when there is nothing to show: a heading over
@@ -834,32 +1033,51 @@ def _project_section(history: Any, today: DayKey) -> str:
     data.
     """
     rows = _history_project_rows(history, day_keys_back(today, max(WINDOW_DAYS))[0])
+    days_7d = set(day_keys_back(today, 7))
+    days_30d = set(day_keys_back(today, 30))
     tokens: dict[str, int] = {}
     usd: dict[str, float] = {}
+    usd_7d: dict[str, float] = {}
+    usd_30d: dict[str, float] = {}
     for row in rows:
         project = str(getattr(row, "project", "") or "")
         if not project:
             continue
         usage = getattr(row, "usage", None)
-        if not isinstance(usage, ModelUsage):
+        if not isinstance(usage, ModelUsage) or usage.total_tokens <= 0:
             continue
+        row_day = str(getattr(row, "day", today) or today)
+        row_key = str(getattr(row, "key", "") or "")
         tokens[project] = tokens.get(project, 0) + usage.total_tokens
-        recorded = getattr(row, "usd_at_record", 0.0)
-        if isinstance(recorded, (int, float)) and not isinstance(recorded, bool):
-            usd[project] = usd.get(project, 0.0) + max(0.0, float(recorded))
+        cell_usd = _safe_cost(pricing, row_key, usage, row_day)
+        if cell_usd <= 0.0:
+            recorded = getattr(row, "usd_at_record", 0.0)
+            if isinstance(recorded, (int, float)) and not isinstance(recorded, bool):
+                cell_usd = max(0.0, float(recorded))
+        usd[project] = usd.get(project, 0.0) + cell_usd
+        if row_day in days_7d:
+            usd_7d[project] = usd_7d.get(project, 0.0) + cell_usd
+        if row_day in days_30d:
+            usd_30d[project] = usd_30d.get(project, 0.0) + cell_usd
     if not tokens:
         return ""
-    ranked = sorted(tokens.items(), key=lambda pair: (-pair[1], pair[0]))[:MAX_PROJECTS]
+    ranked = sorted(
+        tokens.items(),
+        key=lambda pair: (-usd.get(pair[0], 0.0), -pair[1], pair[0]),
+    )[:MAX_PROJECTS]
     body = "".join(
         f"<tr><td>{_esc(name)}</td>"
         f'<td class="num">{_esc(format_tokens(count))}</td>'
         f'<td class="num exact">{_int(count)}</td>'
+        f'<td class="num">{_esc(format_usd(usd_7d.get(name, 0.0)))}</td>'
+        f'<td class="num">{_esc(format_usd(usd_30d.get(name, 0.0)))}</td>'
         f'<td class="num">{_esc(format_usd(usd.get(name, 0.0)))}</td></tr>'
         for name, count in ranked
     )
     return (
-        '<table><thead><tr><th>Project</th><th class="num">Tokens</th>'
-        '<th class="num exact">exact</th><th class="num">Notional at record</th>'
+        '<table><thead><tr><th>Project</th><th class="num">Tokens (90d)</th>'
+        '<th class="num exact">exact</th><th class="num">7d Notional</th>'
+        '<th class="num">30d Notional</th><th class="num">90d Notional</th>'
         f"</tr></thead><tbody>{body}</tbody></table>"
     )
 
@@ -1034,15 +1252,20 @@ def _window_bar(name: str, pct: float, reset: str, expired: bool) -> str:
     )
 
 
-def _wall_section(rows: Sequence[AccountRow], now: float) -> str:
-    """What each account's wall is right now - and why there is no weekly total.
-
-    See :data:`WALL_NO_HISTORY_NOTE`. Everything here is read off the row: the
-    percentage the source reported, and a countdown computed from the epoch it
-    reported. Nothing is reconstructed.
-    """
+def _wall_section(
+    rows: Sequence[AccountRow], now: float, *, history: Any = None
+) -> tuple[str, str]:
+    """What each account's wall is right now - and measured 7d wall time when recorded."""
     if not rows:
-        return ""
+        return "", ""
+    measured: dict[tuple[str, str], float] = {}
+    reader = getattr(history, "wall_hours_by_account", None) if history is not None else None
+    if callable(reader):
+        try:
+            measured = dict(reader(since_epoch=now - 7 * 86_400.0) or {})
+        except Exception:
+            measured = {}
+    has_measured = bool(measured)
     body: list[str] = []
     for row in rows:
         highest = row.max_pct
@@ -1059,14 +1282,26 @@ def _wall_section(rows: Sequence[AccountRow], now: float) -> str:
             state = f"at the wall now{tail}"
         else:
             state = f"{highest:.0f}% of its highest window"
+        alias_key = (row.vendor, row.alias or row.vendor_label)
+        hrs_col = ""
+        if has_measured:
+            hrs = measured.get(alias_key, 0.0)
+            hrs_col = f'<td class="num">{hrs:.2f} h</td>'
         body.append(
             f"<tr><td>{_esc(row.alias or row.vendor_label)}</td>"
             f"<td>{_esc(row.vendor_label)}</td>"
-            f"<td>{_esc(state)}</td></tr>"
+            f"<td>{_esc(state)}</td>{hrs_col}</tr>"
         )
+    hrs_head = '<th class="num">7d wall time</th>' if has_measured else ""
+    note = (
+        "7-day wall time measured from 15-minute quota samples recorded in history.sqlite."
+        if has_measured
+        else WALL_NO_HISTORY_NOTE
+    )
     return (
-        "<table><thead><tr><th>Account</th><th>Vendor</th><th>Wall</th></tr></thead>"
-        f"<tbody>{''.join(body)}</tbody></table>"
+        f"<table><thead><tr><th>Account</th><th>Vendor</th><th>Wall</th>{hrs_head}</tr></thead>"
+        f"<tbody>{''.join(body)}</tbody></table>",
+        note,
     )
 
 
@@ -1369,6 +1604,7 @@ def render_dashboard(
     pricing: PricingTable | None = None,
     indexing: str | None = None,
     workflow_runs: Sequence[Any] = (),
+    monthly_subscription_usd: float = 0.0,
 ) -> str:
     """One self-contained HTML document describing what the stores hold.
 
@@ -1406,22 +1642,43 @@ def render_dashboard(
         history, rollups, today=today, days=max(WINDOW_DAYS), pricing=pricing
     )
     rows = tuple(accounts) + tuple(quota_rows)
+    wall_body, wall_note = _wall_section(rows, stamp, history=history)
 
     sections = [
-        _section("Belkins Companion & Trophy Dex", _belkins_dex_section(cells, accounts, quota_rows, today)),
         _section("Windows", _totals_section(cells, today)),
+        _section(
+            "Subscription ROI",
+            _roi_section(
+                cells,
+                rows,
+                today,
+                monthly_subscription_usd=monthly_subscription_usd,
+            ),
+            ident="roi",
+        ),
         _section("Tokens per day", _daily_section(cells, today)),
-        _section("By model", _model_section(cells, today)),
+        _section("Notional spend per day", _daily_usd_section(cells, today)),
+        _section(
+            "Prompt-cache efficiency",
+            _cache_efficiency_section(cells, today, pricing),
+            ident="cache-efficiency",
+        ),
+        _section("By model", _model_section(cells, today, pricing=pricing)),
         _section(
             "Model mix over time",
             _mix_section(cells, today),
             note="Share of each day's tokens, per vendor. Absolute volume is the chart above.",
         ),
-        _section("By project", _project_section(history, today)),
+        _section("By project", _project_section(history, today, pricing=pricing)),
         _section("Workflow runs", _workflow_section(workflow_runs), note=WORKFLOW_NOTE),
         _section("Quota windows", _quota_section(rows)),
-        _section("Hours at the wall", _wall_section(rows, stamp), note=WALL_NO_HISTORY_NOTE),
+        _section("Hours at the wall", wall_body, note=wall_note),
         _section("Unpriced volume", _unpriced_section(cells, today)),
+        _section(
+            "Belkins Companion & Trophy Dex",
+            _belkins_dex_section(cells, accounts, quota_rows, today),
+            ident="belkins-dex",
+        ),
     ]
     body = "".join(section for section in sections if section)
     if not body:
@@ -1491,6 +1748,7 @@ def build_dashboard(
     path: Path | str | None = None,
     indexing: str | None = None,
     projects_dir: Path | str | None = None,
+    monthly_subscription_usd: float = 0.0,
 ) -> Path:
     """Render and write in one call. Returns the file written.
 
@@ -1509,6 +1767,7 @@ def build_dashboard(
         pricing=pricing,
         indexing=indexing,
         workflow_runs=_workflow_runs_beside(rollups, pricing, projects_dir),
+        monthly_subscription_usd=monthly_subscription_usd,
     )
     destination = (
         Path(path)

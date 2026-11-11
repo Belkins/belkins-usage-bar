@@ -757,6 +757,12 @@ def save_game_state(state: dict[str, Any]) -> bool:
             "equipped": sorted(equipped),
         }
         tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        try:
+            import os as _os
+
+            _os.chmod(tmp, 0o600)
+        except OSError:
+            pass
         tmp.replace(path)
         return True
     except Exception:
@@ -879,6 +885,10 @@ def strike_raid_boss(companion: CompanionState) -> tuple[bool, str]:
         coin_mult = 1.50 if "shiny_core" in st["equipped"] else 1.0
         if "sovereign_crown" in st["equipped"]:
             coin_mult += 0.25
+        if companion.stage.stage == 8:
+            coin_mult += 0.50
+        elif companion.stage.stage == 7:
+            coin_mult += 0.35
         reward_coins = int(boss.spec.coin_reward * coin_mult)
         reward_xp = int(boss.spec.xp_reward)
         st["bonus_coins"] = int(st.get("bonus_coins", 0)) + reward_coins
@@ -968,6 +978,8 @@ class CompanionState:
     equipped_items: tuple[str, ...] = ()
     streak_days: int = 1
     daily_crate_available: bool = True
+    cache_hit_pct: float = 0.0
+    cache_mastery_active: bool = False
 
     @property
     def unlocked_badges_count(self) -> int:
@@ -1011,6 +1023,31 @@ def stage_for_level(level: int) -> tuple[EvolutionStage, EvolutionStage | None]:
     return current, next_st
 
 
+_STAGE_PASSIVE_BONUSES: Final[dict[int, tuple[float, float, float, int]]] = {
+    # stage_num: (xp_bonus, coin_bonus, atk_mult, crit_bonus)
+    1: (0.05, 0.00, 1.00, 0),   # Sparkbit: +5% XP Gain
+    2: (0.00, 0.10, 1.00, 0),   # Outreachik: +10% Coin Drops
+    3: (0.15, 0.00, 1.00, 10),  # Pipelinex: +15% XP & +10% Crit
+    4: (0.00, 0.15, 1.00, 20),  # Contexton: +20% Crit & +15% Coins
+    5: (0.00, 0.00, 1.25, 15),  # Belkinosaur: +25% Boss Raid DMG
+    6: (0.25, 0.25, 1.10, 20),  # Chronoflare: +25% XP & Coin Gain
+    7: (0.35, 0.35, 1.35, 25),  # Belkins Prime: +35% All Stats
+    8: (0.50, 0.50, 1.50, 35),  # Omega Belkion: +50% All Stats & Loot
+}
+
+
+def _count_switch_rotations(events: Sequence[str]) -> int:
+    """Count real account rotation lines from ``UiSnapshot.recent_events``."""
+    cnt = 0
+    for ev in events or ():
+        s = str(ev or "").strip().lower()
+        if not s:
+            continue
+        if "->" in s or "→" in s or "switch" in s or "rotat" in s or "autoswitch" in s:
+            cnt += 1
+    return cnt
+
+
 def compute_companion(
     *,
     tokens_today: int = 0,
@@ -1022,10 +1059,22 @@ def compute_companion(
     account_notes: dict[int, str] | None = None,
     active_sessions: int = 0,
     recent_switches_count: int = 0,
+    recent_events: Sequence[str] = (),
     distinct_models_count: int = 0,
     threshold_pct: float = 85.0,
+    autoswitch_threshold: float | None = None,
+    cache_hit_pct: float = 0.0,
 ) -> CompanionState:
     """Compute the full :class:`CompanionState` from raw usage, game save, and fleet metrics."""
+    eff_threshold = (
+        float(autoswitch_threshold)
+        if autoswitch_threshold is not None
+        else float(threshold_pct or 85.0)
+    )
+    rotations = max(int(recent_switches_count or 0), _count_switch_rotations(recent_events))
+    safe_cache_pct = max(0.0, min(100.0, float(cache_hit_pct or 0.0)))
+    cache_mastery = safe_cache_pct >= 85.0
+
     notes = account_notes or {}
     claude_slots = [
         r for r in accounts
@@ -1042,7 +1091,7 @@ def compute_companion(
         max_p = max(pcts) if pcts else None
         if row.is_active and max_p is not None:
             active_binding_pct = float(max_p)
-        if row.slot not in notes and max_p is not None and max_p < threshold_pct:
+        if row.slot not in notes and max_p is not None and max_p < eff_threshold:
             claude_ready += 1
 
     live_codex = [
@@ -1073,16 +1122,33 @@ def compute_companion(
     boss_damage = max(0, int(game_st.get("boss_damage", 0) or 0))
     selected_stage_num = int(game_st.get("selected_stage", 0) or 0)
 
-    xp_mult = 1.0
+    gear_xp_mult = 1.0
     if "sovereign_crown" in equipped_slugs:
-        xp_mult += 0.25
+        gear_xp_mult += 0.25
     if "context_berry" in equipped_slugs:
-        xp_mult += 0.15
+        gear_xp_mult += 0.15
+    if cache_mastery:
+        gear_xp_mult += 0.15
 
     xp_from_tokens = int((tok_30d / 1_000_000.0) * 18.0)
     xp_from_spend = int(spend_30d * 28.0)
-    xp_from_fleet = len(claude_slots) * 350 + len(live_codex) * 400 + recent_switches_count * 250
-    xp_total = int((max(150, xp_from_tokens + xp_from_spend + xp_from_fleet) + bonus_xp) * xp_mult)
+    xp_from_fleet = len(claude_slots) * 350 + len(live_codex) * 400 + rotations * 250
+    raw_xp_pool = max(150, xp_from_tokens + xp_from_spend + xp_from_fleet) + bonus_xp
+
+    # First pass resolves base evolution stage; second pass applies that stage's published passive!
+    pre_level, _, _, _ = level_from_xp(int(raw_xp_pool * gear_xp_mult))
+    pre_stage, _ = stage_for_level(pre_level)
+    active_stage = pre_stage
+    if selected_stage_num > 0:
+        chosen = next((s for s in EVOLUTION_LINE if s.stage == selected_stage_num), None)
+        if chosen is not None and pre_level >= chosen.min_level:
+            active_stage = chosen
+
+    st_xp_bonus, st_coin_bonus, st_atk_mult, st_crit_bonus = _STAGE_PASSIVE_BONUSES.get(
+        active_stage.stage, (0.0, 0.0, 1.0, 0)
+    )
+    xp_mult = gear_xp_mult + st_xp_bonus
+    xp_total = int(raw_xp_pool * xp_mult)
     xp_today = int(((tok_today / 1_000_000.0) * 18.0 + spend_today * 28.0) * xp_mult)
 
     level, xp_into, xp_band, xp_frac = level_from_xp(xp_total)
@@ -1094,16 +1160,19 @@ def compute_companion(
         chosen = next((s for s in EVOLUTION_LINE if s.stage == selected_stage_num), None)
         if chosen is not None and level >= chosen.min_level:
             stage = chosen
+    st_xp_bonus, st_coin_bonus, st_atk_mult, st_crit_bonus = _STAGE_PASSIVE_BONUSES.get(
+        stage.stage, (0.0, 0.0, 1.0, 0)
+    )
 
-    # Mood determination
-    if "context_berry" in equipped_slugs:
-        mood_key = "overdrive"
-        mood_label = "🔋 Cell Overdrive"
-        mood_role = "Claude"
-    elif active_binding_pct >= threshold_pct:
+    # Mood determination: NEVER mask real quota wall danger behind `context_berry`!
+    if active_binding_pct >= eff_threshold:
         mood_key = "wall_guard"
         mood_label = "🛡️ Wall Guard"
         mood_role = "amber"
+    elif "context_berry" in equipped_slugs:
+        mood_key = "overdrive"
+        mood_label = "🔋 Cell Overdrive"
+        mood_role = "Claude"
     elif spend_today >= 45.0 or active_binding_pct >= 55.0 or (active_sessions >= 2 and tok_today >= 15_000_000):
         mood_key = "overdrive"
         mood_label = "🔥 Overdrive"
@@ -1155,9 +1224,9 @@ def compute_companion(
             icon="🛡️",
             name="Flawless Rotator",
             description="Log 15+ account rotations with 0 Claude accounts stuck in re-login.",
-            unlocked=recent_switches_count >= 15 and len(notes) == 0,
-            progress_text=f"{recent_switches_count}/15 rotations · {len(notes)} alerts",
-            short_progress=f"{recent_switches_count}/15" if len(notes) == 0 else f"{len(notes)} err",
+            unlocked=rotations >= 15 and len(notes) == 0,
+            progress_text=f"{rotations}/15 rotations · {len(notes)} alerts",
+            short_progress=f"{rotations}/15" if len(notes) == 0 else f"{len(notes)} err",
         ),
         BadgeState(
             slug="hundred_billion",
@@ -1252,18 +1321,19 @@ def compute_companion(
     )
 
     # Balanced RPG Coin Economy:
-    # Base 500 + power-scaled token/spend coins + 250 per unlocked trophy + Boss loot
+    # Base 500 + power-scaled token/spend coins (boosted by Evolution passive & Cache Mastery) + 250 per trophy + Boss loot
     unlocked_count = sum(1 for b in badges if b.unlocked)
     token_m = max(0.0, tok_30d / 1_000_000.0)
-    token_coins = int((token_m ** 0.58) * 14.0)
-    spend_coins = int((max(0.0, spend_30d) ** 0.65) * 3.2)
+    coin_drop_mult = 1.0 + st_coin_bonus + (0.15 if cache_mastery else 0.0)
+    token_coins = int((token_m ** 0.58) * 14.0 * coin_drop_mult)
+    spend_coins = int((max(0.0, spend_30d) ** 0.65) * 3.2 * coin_drop_mult)
     coins_earned = 500 + token_coins + spend_coins + unlocked_count * 250 + bonus_coins
     spent_total = _spent_coins(game_st)
     coins_available = max(0, coins_earned - spent_total)
 
-    # Compute Companion Battle Stats (ATK & Crit) from Stage + Level + Equipped Mart Gear
+    # Compute Companion Battle Stats (ATK & Crit) from Stage Passive + Level + Equipped Mart Gear
     atk = stage.base_atk + level * 2 + candies_fed * 20
-    crit_pct = 15 + (10 if stage.stage >= 3 else 0) + (15 if stage.stage >= 4 else 0)
+    crit_pct = 15 + st_crit_bonus
     if "context_berry" in equipped_slugs:
         atk += 25
     if "deal_shades" in equipped_slugs:
@@ -1281,6 +1351,7 @@ def compute_companion(
         crit_pct += 15
     if "mini_drone" in equipped_slugs:
         atk += 70
+    atk = int(round(atk * st_atk_mult))
     crit_pct = min(95, crit_pct)
 
     # Active Raid Boss state
@@ -1355,6 +1426,8 @@ def compute_companion(
         equipped_items=tuple(sorted(equipped_slugs)),
         streak_days=streak_days,
         daily_crate_available=daily_crate_available,
+        cache_hit_pct=safe_cache_pct,
+        cache_mastery_active=cache_mastery,
     )
 
 
@@ -1371,6 +1444,7 @@ def companion_from_snapshot(snapshot: Any) -> CompanionState:
     usd_today = 0.0
     usd_30d = 0.0
     distinct_models = 0
+    cache_hit_pct = 0.0
     if cost is not None and not getattr(cost, "is_partial", False):
         today_w = getattr(cost, "today", None)
         last30_w = getattr(cost, "last_30d", None)
@@ -1380,6 +1454,12 @@ def companion_from_snapshot(snapshot: Any) -> CompanionState:
         if last30_w is not None:
             tokens_30d = int(getattr(last30_w, "total_tokens", 0) or 0)
             usd_30d = float(getattr(last30_w, "usd", 0.0) or 0.0)
+            in_t = int(getattr(last30_w, "input_tokens", 0) or 0)
+            cc_t = int(getattr(last30_w, "cache_creation_tokens", 0) or 0)
+            cr_t = int(getattr(last30_w, "cache_read_tokens", 0) or 0)
+            prompt_pool = in_t + cc_t + cr_t
+            if prompt_pool >= 100_000:
+                cache_hit_pct = (cr_t / float(prompt_pool)) * 100.0
         by_model = getattr(cost, "by_model", ()) or ()
         distinct_models = len(by_model)
 
@@ -1387,8 +1467,15 @@ def companion_from_snapshot(snapshot: Any) -> CompanionState:
     quota_rows = getattr(snapshot, "quota_rows", ()) or ()
     notes = dict(getattr(snapshot, "account_notes", {}) or {})
     sessions = getattr(snapshot, "sessions", ()) or ()
-    recent = getattr(snapshot, "recent_switches", ()) or ()
-    threshold = float(getattr(snapshot, "autoswitch_threshold_pct", 85.0) or 85.0)
+    recent_events = tuple(
+        getattr(snapshot, "recent_events", ())
+        or getattr(snapshot, "recent_switches", ())
+        or ()
+    )
+    raw_thr = getattr(snapshot, "autoswitch_threshold", None)
+    if raw_thr is None:
+        raw_thr = getattr(snapshot, "autoswitch_threshold_pct", None)
+    threshold = float(raw_thr if raw_thr is not None else 85.0)
 
     res = compute_companion(
         tokens_today=tokens_today,
@@ -1399,9 +1486,12 @@ def companion_from_snapshot(snapshot: Any) -> CompanionState:
         quota_rows=quota_rows,
         account_notes=notes,
         active_sessions=len(sessions),
-        recent_switches_count=len(recent),
+        recent_switches_count=_count_switch_rotations(recent_events),
+        recent_events=recent_events,
         distinct_models_count=distinct_models,
         threshold_pct=threshold,
+        autoswitch_threshold=threshold,
+        cache_hit_pct=cache_hit_pct,
     )
     if len(_COMPANION_CACHE) >= 8:
         _COMPANION_CACHE.clear()

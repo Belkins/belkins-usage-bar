@@ -504,10 +504,15 @@ class SelfAudit:
         tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            tmp.write_text(
-                json.dumps(self._state, separators=(",", ":"), sort_keys=True),
-                encoding="utf-8",
-            )
+            data = json.dumps(
+                self._state, separators=(",", ":"), sort_keys=True
+            ).encode("utf-8")
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, data)
+            finally:
+                os.close(fd)
+            os.chmod(tmp, 0o600)
             os.replace(tmp, path)
         except OSError as exc:
             _LOG.warning("audit state not saved: %s", exc)

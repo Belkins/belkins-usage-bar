@@ -825,9 +825,8 @@ if _APPKIT:
                 mi = v.enclosingMenuItem()
                 if mi is not None and mi.isHidden():
                     continue
-                b = v.bounds()
-                # Redraw only the 64pt-wide pixel sprite strip on the left!
-                v.setNeedsDisplayInRect_(NSMakeRect(16.0, 0.0, 64.0, b.size.height))
+                # Redraw the animated block (supports both left Boss sprites and right Hero emblems).
+                v.setNeedsDisplay_(True)
             except Exception:
                 pass
 
@@ -871,7 +870,7 @@ if _APPKIT:
         def viewForBlock_width_(cls, block: Block, width: float) -> Any:
             view = cls.alloc().initWithFrame_(NSMakeRect(0, 0, width, block.height))
             view.block = block
-            if block.tooltip and not (block.key or "").startswith("belkins-"):
+            if block.tooltip:
                 view.setToolTip_(block.tooltip)
             # A spacer or rule has nothing to say: hidden from VoiceOver, so
             # it does not stop on blank elements between the cards.
@@ -1064,7 +1063,7 @@ def menu_items_for(blocks: Sequence[Block], *, width: float = W) -> list[Any]:
         item = rumps.MenuItem(fit_menu_title(block.label or " "), callback=callback)
         view = BlockView.viewForBlock_width_(block, width)
         item._menuitem.setView_(view)
-        if block.tooltip and not (block.key or "").startswith("belkins-"):
+        if block.tooltip:
             item._menuitem.setToolTip_(block.tooltip)
         if block.is_visible is not None and not block.is_visible():
             item._menuitem.setHidden_(True)

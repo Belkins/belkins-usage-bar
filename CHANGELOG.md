@@ -1,5 +1,26 @@
 # Changelog
 
+## 2026-11-11 — Accuracy, Smart Fleet Rotation, Turn-Boundary Guard, ROI Forensics & Resilience
+
+- **Pricing, Multi-Root Indexing & Attribution (`pricing.py`, `state.py`, `indexer.py`, `codex_indexer.py`, `attribution.py`, `audit.py`):**
+  - Added `claude-fable-5-2` (`Fable 5.2`) published rate (\$8 / \$40 / \$0.20 cache read per MTok) and display formatting.
+  - Preserved `inode == 0` incremental tombstones across `scan_state.json` round-trips (`raw_ino is not None`), preventing redundant re-scans of skipped files.
+  - Extended Claude and Codex indexers + daily self-audit to discover transcripts across `claude-swap` per-account profile directories, `CLAUDE_CONFIG_DIR`, `codex-accounts/*/sessions`, and `CODEX_HOME`, with bounded memory guard (`MAX_TRANSCRIPT_LINE_BYTES = 8 MiB`) on oversized single-line tool payloads.
+  - Captured `session_meta` workspace `cwd` and primary 5-hour Codex rate-limit windows (`five_hour_pct`, `five_hour_resets_at`) in `codex_indexer.py`.
+  - Collapsed git worktree paths (`/.claude/worktrees/...`, `/.worktrees/...`, `/worktrees/...`) onto canonical repository names and windowed `top_projects()` over `days` (`1..30`) instead of `today` only.
+- **History Quota Samples, Live Project Repricing & Subscription ROI (`history.py`, `dashboard.py`, `bswap_cli.py`):**
+  - Added append-only 15-minute `quota_samples` table (`SCHEMA_VERSION == 2` preserved, no `DELETE`/`DROP`/`TRUNCATE`) for measured 7-day **Hours at the wall**.
+  - Added **Subscription ROI** (`monthly_subscription_usd` + seat auto-estimation), **Prompt-cache efficiency** SVG breakdown, and live `DEFAULT_PRICING` 7d/30d/90d repricing in the **By project** dashboard table.
+  - Added `bswap roi`, `bswap shim [on|off|status]`, `bswap threshold`, `bswap strategy`, and `bswap unpin` CLI commands.
+- **Turn-Boundary Thinking Guard, Perishable-Quota Harvester & Safe Codex Switching (`accounts.py`, `codex_accounts.py`, `codex_login.py`, `fleet.py`):**
+  - Fixed `belkins_thinking_guard` to inspect live cached `AccountRow` windows (`five_hour_pct`, `seven_day_pct`, `scoped_windows`), skip `disabled` / sentinel-quarantined slots, and arm a **deferred turn-boundary handoff** (`_handoff_armed`) that switches automatically once busy Claude sessions go idle.
+  - Upgraded `pick_best_slot` and `bswap best` with **Same-Organization Affinity** (preserving Anthropic extended thinking blocks) and **Perishable-Quota Harvesting** (spending down healthy seats whose 7-day reset is `< 48h` away).
+  - Eliminated false external-switch warnings after `bswap` switches via `.bswap_last_switch.json`, hardened `fleet.py` against OS PID reuse (`pid_matches_record`) while surfacing `org_shifted` + `owner_slot`, fixed `codex_login` unique `order` allocation + stale `new-*` directory cleanup, and added `safe_switch_codex_auth` (syncing CLI-rotated tokens back to `codex-accounts/<id>/auth.json` and backing up untracked logins) plus opt-in `codex_autoswitch_enabled`.
+- **Menu-Bar Resilience, Belkins Passives, Dynamic Notifications & Opt-In Controls (`menubar.py`, `app.py`, `belkins_game.py`, `themes/belkins.py`, `notify.py`):**
+  - Fixed `menubar.py` multi-monitor negative-X bounds checks, eliminated `ImportError` log spam in `_companion_sprite_icon`, and upgraded notch handling to **two-tier compaction** (`full` → `compact` → `icon-only`) with 60s self-healing recovery and compact alert badges (`!`).
+  - Wired real gameplay passives across all 8 Cyber-Forms, added `cache_master` / `wall_guard` moods, fixed Trophy #8 (`Flawless Rotator`), added **Slim Hero Mode** (`belkins_slim_hero`), `[⚡ Best]` / `[⚡ Auto 85% ▾]` controls, and `[Restore #N]` / `[Pin #N]` remedies on `⚠ ORG SHIFTED` sessions.
+  - Added dynamic `notify.json` reload, standing `ALERT_ALL_EXHAUSTED` / `ALERT_UNMANAGED_LOGIN` notifications, opt-in 12h **Use-It-Or-Lose-It** expiring-quota alerts (`expiring_quota_alert_enabled`), opt-in 2-way Telegram commands (`telegram_commands_enabled`), and opt-in global hotkeys (`⌃⌥U` / `⌃⌥B`, `global_hotkeys_enabled`).
+
 ## 2026-10-26 — Belkins Minimalist Luxury v7, 4 Hub Views, Game Icon & Interactive Settings
 
 - **Minimalist Luxury UI (`cc_usage_widget/themes/belkins.py`):**

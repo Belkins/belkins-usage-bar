@@ -522,7 +522,8 @@ def test_package_ships_every_module_and_no_runtime_state() -> None:
     on_disk = {
         str(path.relative_to(repo))
         for folder in ("cc_usage_widget", "tests")
-        for path in (repo / folder).glob("*.py")
+        for path in (repo / folder).rglob("*.py")
+        if "__pycache__" not in path.parts
     }
     assert on_disk <= listed, sorted(on_disk - listed)
     assert {"README.md", "LICENSE", "install.sh"} <= listed, listed
@@ -903,6 +904,7 @@ CLAUDE_SWAP_CONTRACT: tuple[tuple[str, str], ...] = (
     ("claude_swap.paths", "get_claude_config_home"),
     ("claude_swap.session", "session_dir_for"),
     ("claude_swap.mappings", "MappingStore"),
+    ("claude_swap.process_detection", "pid_matches_record"),
     # methods called on the switcher
     ("claude_swap.switcher", "ClaudeAccountSwitcher.switch_to"),
     ("claude_swap.switcher", "ClaudeAccountSwitcher._account_is_switchable"),  # PRIVATE
@@ -946,7 +948,7 @@ def test_claude_swap_contract() -> None:
     """Proved once by renaming ``compute_pace`` to ``compute_pacex`` in the
     table: AttributeError ... red. Needs the claude-swap venv; without the
     package (CI) it is a counted skip, never a pass (R2-CI-1)."""
-    assert len(CLAUDE_SWAP_CONTRACT) == 21
+    assert len(CLAUDE_SWAP_CONTRACT) == 22
     _require_claude_swap()
     missing = []
     for module, dotted in CLAUDE_SWAP_CONTRACT:

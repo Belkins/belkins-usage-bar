@@ -11,16 +11,16 @@ shown confidently is worse than an honest blank.
 ## Before a pull request
 
 ```bash
-python tests/test_cost_math.py
-python tests/test_codex.py
-python tests/test_privacy.py
-python tests/test_regressions.py
+for f in tests/test_*.py; do
+  CC_USAGE_WIDGET_NO_REVEAL=1 python "$f" || exit 1
+done
 ```
 
-All 53 must pass. If you fix a bug, add a test that **fails on the unfixed code**
-— verify it does by reverting your fix and watching it go red. Several tests here
-exist because a plausible-looking implementation produced a plausible wrong
-number; only a test that can actually fail proves the guard works.
+Every test module in `tests/test_*.py` must pass (`0` failures). If you fix a bug,
+add a test that **fails on the unfixed code** — verify it does by reverting your
+fix and watching it go red. Several tests here exist because a plausible-looking
+implementation produced a plausible wrong number; only a test that can actually
+fail proves the guard works.
 
 ## Things worth knowing before changing the indexers
 

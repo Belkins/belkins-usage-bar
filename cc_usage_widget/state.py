@@ -406,10 +406,21 @@ class ScanStateStore(_JsonStore):
         else:
             kept = {}
             for key, entry in payload.items():
-                mtime = entry.get("mtime") if isinstance(entry, Mapping) else None
-                if isinstance(mtime, (int, float)) and not isinstance(mtime, bool):
-                    if float(mtime) < cutoff:
-                        continue
+                if isinstance(entry, Mapping):
+                    # Preserve vanished-file tombstones (inode=0, size=0, mtime=0.0)
+                    # while their windowed ledger still holds days inside lookback;
+                    # stripping them here caused SelfAudit to lose deleted/archived
+                    # transcript contributions after a restart.
+                    is_tombstone = (
+                        entry.get("inode") == 0
+                        and entry.get("size") == 0
+                        and bool(entry.get("ledger") or entry.get("legacy_day"))
+                    )
+                    if not is_tombstone:
+                        mtime = entry.get("mtime")
+                        if isinstance(mtime, (int, float)) and not isinstance(mtime, bool):
+                            if float(mtime) < cutoff:
+                                continue
                 kept[str(key)] = entry
         ok = self._write(kept, indent=None, sort_keys=False)
         if ok:

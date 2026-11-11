@@ -98,6 +98,9 @@ class ThemeActions:
     open_dashboard: Callable[[], Any] = _noop
     set_setting: Callable[[str, Any], Any] = _noop
     toggle_autoswitch: Callable[[], Any] = _noop
+    set_autoswitch_threshold: Callable[[float], Any] = _noop
+    pin_session_dir: Callable[[str, int], Any] = _noop
+    unpin_session_dir: Callable[[str], Any] = _noop
     export_csv: Callable[[], Any] = _noop
     update_app: Callable[[], Any] = _noop
     quit_app: Callable[[], Any] = _noop

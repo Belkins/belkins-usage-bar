@@ -305,10 +305,12 @@ def adopt_pending(
     lines: list[str] = []
     now = float(clock())
     try:
-        tracked = {entry.account_id for entry in registry.entries()}
+        entries = list(registry.entries())
+        tracked = {entry.account_id for entry in entries}
+        order = max((int(entry.order) for entry in entries), default=-1) + 1
     except Exception:
         tracked = set()
-    order = len(tracked)
+        order = 0
     for source in _pending_dirs(root):
         auth = source / "auth.json"
         try:
@@ -385,13 +387,21 @@ def _prune_old_commands(accounts_dir: Path, now: float) -> None:
     except OSError:
         return
     for child in children:
-        if not (child.name.startswith(COMMAND_PREFIX) and child.name.endswith(COMMAND_SUFFIX)):
-            continue
-        try:
-            if now - child.stat().st_mtime > COMMAND_MAX_AGE_SECONDS:
-                child.unlink()
-        except OSError:
-            continue
+        if child.name.startswith(COMMAND_PREFIX) and child.name.endswith(COMMAND_SUFFIX):
+            try:
+                if now - child.stat().st_mtime > COMMAND_MAX_AGE_SECONDS:
+                    child.unlink()
+            except OSError:
+                continue
+        elif child.name.startswith(PENDING_PREFIX) and child.is_dir() and not child.is_symlink():
+            # Clean up abandoned staging directories where `codex login` never wrote auth.json
+            try:
+                if not (child / "auth.json").exists() and (
+                    now - child.stat().st_mtime > COMMAND_MAX_AGE_SECONDS
+                ):
+                    shutil.rmtree(child, ignore_errors=True)
+            except OSError:
+                continue
 
 
 def write_login_command(

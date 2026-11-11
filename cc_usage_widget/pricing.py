@@ -658,6 +658,11 @@ rather than hidden, per `OpenAI rate history`_.
 
 CLAUDE_PRICE_ROWS: Final[tuple[PriceRow, ...]] = (
     # model              input   output   from          until
+    # Fable 5.2: $8 in / $40 out (20% cut vs Fable 5.1); cache read $0.20
+    # (0.025x input); cache writes by standard 1.25x ($10) / 2x ($16).
+    # Source: Anthropic official API pricing (claude.com / platform.claude.com),
+    # verified 2026-11-10.
+    _row("claude-fable-5-2", "8.00", "40.00", cache_read_usd="0.20"),
     _row("claude-fable-5", "10.00", "50.00"),
     # Fable 5.1: $10 in / $50 out; cache read $0.25 (0.025x input, NOT the
     # standard 0.1x); cache writes by the standard 1.25x / 2x multipliers.
@@ -786,6 +791,7 @@ model would occupy two independent entries rather than colliding.
 MODEL_DISPLAY_NAMES: Final[Mapping[VendorModelKey, str]] = {
     # Claude keys stay BARE - this map is public and pre-Codex callers index it
     # with a plain model string.
+    "claude-fable-5-2": "Fable 5.2",
     "claude-fable-5": "Fable 5",
     "claude-fable-5-1": "Fable 5.1",
     "claude-mythos-5": "Mythos 5",
