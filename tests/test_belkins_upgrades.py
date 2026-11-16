@@ -1388,6 +1388,134 @@ def test_macos26_proxy_window_visibility_never_false_positives() -> None:
         menubar._window_list = orig_wl
 
 
+def test_fable_scoped_model_policy_seeding_stale_busy_sessions_and_at_limit_wakeup() -> None:
+    """Verify Fable / per-model scoped limits are seeded (`model='all'`), legacy 98% weekly /
+    3600s cooldown are migrated, stale lingering `busy` sessions do not trap Thinking Guard,
+    and active scoped >=99% triggers immediate autoswitch wakeup."""
+    import dataclasses
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg_path = Path(tmp) / "settings.json"
+        cfg_path.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "autoswitch": {
+                        "threshold": 85.0,
+                        "cooldownSeconds": 3600.0,
+                        "weeklyThreshold": 98.0,
+                        "hysteresisPct": 12.0,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        wrote = accounts_mod._seed_default_model_policy(
+            cfg_path,
+            lambda p, d: p.write_text(json.dumps(d), encoding="utf-8"),
+        )
+        assert wrote is True
+        migrated = json.loads(cfg_path.read_text(encoding="utf-8"))["autoswitch"]
+        assert migrated["model"] == "all", migrated
+        assert migrated["weeklyThreshold"] == 92.0, migrated
+        assert migrated["cooldownSeconds"] == 300.0, migrated
+
+        # Explicit user choice (e.g. model="") is never overwritten on subsequent runs
+        cfg_path.write_text(
+            json.dumps({"schemaVersion": 1, "autoswitch": {"model": "", "weeklyThreshold": 95.0}}),
+            encoding="utf-8",
+        )
+        assert (
+            accounts_mod._seed_default_model_policy(
+                cfg_path, lambda p, d: p.write_text(json.dumps(d), encoding="utf-8")
+            )
+            is False
+        )
+
+    # Stale 2.5h `busy` session with lingering background shell is ignored; fresh (<5m) is counted
+    now_s = 1_794_826_000.0
+    stale_and_fresh = [
+        {"pid": 15358, "status": "busy", "statusUpdatedAt": (now_s - 9300.0) * 1000.0},
+        {"pid": 19549, "status": "busy", "statusUpdatedAt": (now_s - 45.0) * 1000.0},
+        {"pid": 46144, "status": "idle", "statusUpdatedAt": (now_s - 10.0) * 1000.0},
+    ]
+    assert accounts_mod._fresh_busy_session_count(stale_and_fresh, now_s=now_s) == 1
+    assert accounts_mod._fresh_busy_session_count([stale_and_fresh[0]], now_s=now_s) == 0
+
+    # Active slot with Fable 100% (even while 7d is 55%) flags at-limit immediately
+    fake_snap = SimpleNamespace(
+        active_number="2",
+        accounts=[
+            SimpleNamespace(
+                number="2",
+                usage=SimpleNamespace(
+                    last_good={
+                        "seven_day": {"pct": 55.0},
+                        "scoped": [{"name": "Fable", "pct": 100.0}],
+                    }
+                ),
+            )
+        ],
+    )
+    assert accounts_mod._snapshot_active_at_limit(fake_snap) is True
+
+    # Thinking Guard with cur_weekly=None defaults idle weekly to 92.0, arms handoff at 93%
+    # during a fresh busy turn, and releases immediately when Fable hits 100%!
+    @dataclasses.dataclass
+    class _PolicyNoneWeekly:
+        threshold: float = 85.0
+        weekly_threshold: float | None = None
+
+    src = accounts_mod.SwapAccountSource.__new__(accounts_mod.SwapAccountSource)
+    src._lock = threading.Lock()
+    src._settings_obj = {"belkins_thinking_guard": True}
+    src._handoff_armed = False
+    src._snapshot = None
+    src._sentinels = {}
+    src._log = accounts_mod.LOGGER
+    src._rows_cache = (
+        _arow(1, "vlad", is_active=True, five_hour_pct=0.0, seven_day_pct=55.0, scoped_windows=(("Fable", 93.0),)),
+        _arow(4, "work1", is_active=False, five_hour_pct=0.0, seven_day_pct=0.0, scoped_windows=(("Fable", 0.0),)),
+    )
+    pol = _PolicyNoneWeekly()
+    eng = SimpleNamespace(_policy=pol)
+    with tempfile.TemporaryDirectory() as sess_tmp:
+        orig_env = os.environ.get("CC_USAGE_WIDGET_SESSIONS_DIR")
+        orig_read = fleet.read_registry
+        try:
+            os.environ["CC_USAGE_WIDGET_SESSIONS_DIR"] = sess_tmp
+            # Fresh busy turn at Fable 93% (>= 92% default weekly, < 96.5% busy cap) -> holds & arms!
+            fleet.read_registry = lambda _d: ([{"status": "busy"}], 0)
+            g_busy = src._thinking_guard_policy(eng, pol)
+            assert g_busy is not None and g_busy.weekly_threshold == 96.5
+            assert src.has_armed_handoff() is True
+
+            # Only stale busy session (>5m old) -> treated as idle -> weekly_threshold=92.0 -> switches!
+            fleet.read_registry = lambda _d: (
+                [{"status": "busy", "statusUpdatedAt": (time.time() - 9000.0) * 1000.0}],
+                0,
+            )
+            g_idle = src._thinking_guard_policy(eng, pol)
+            assert g_idle is not None and g_idle.weekly_threshold == 92.0
+            assert src.has_armed_handoff() is False
+
+            # Fable at 100% -> never held even with fresh busy session!
+            src._rows_cache = (
+                replace(src._rows_cache[0], scoped_windows=(("Fable", 100.0),)),
+                src._rows_cache[1],
+            )
+            fleet.read_registry = lambda _d: ([{"status": "busy"}], 0)
+            g_capped = src._thinking_guard_policy(eng, pol)
+            assert g_capped is not None and g_capped.weekly_threshold == 92.0
+            assert src.has_armed_handoff() is False
+        finally:
+            fleet.read_registry = orig_read
+            if orig_env is None:
+                os.environ.pop("CC_USAGE_WIDGET_SESSIONS_DIR", None)
+            else:
+                os.environ["CC_USAGE_WIDGET_SESSIONS_DIR"] = orig_env
+
+
 # ---------------------------------------------------------------------------
 # Standalone Test Runner
 # ---------------------------------------------------------------------------

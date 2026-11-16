@@ -991,7 +991,8 @@ def _backup_dir() -> Path:
 
 
 def _ensure_optimal_autoswitch_policy(backup_dir: Path) -> bool:
-    """Ensure claude-swap's settings.json sets weeklyThreshold=98.0 and hysteresisPct>=12.0 to prevent premature cross-org switches."""
+    """Ensure claude-swap's settings.json watches all per-model limits (`model='all'`, e.g. Fable)
+    with a 92% weekly buffer and >=12% hysteresis to prevent both rate-limit walls and ping-pong."""
     s_path = backup_dir / "settings.json"
     try:
         raw = json.loads(s_path.read_text(encoding="utf-8")) if s_path.is_file() else {}
@@ -1001,11 +1002,19 @@ def _ensure_optimal_autoswitch_policy(backup_dir: Path) -> bool:
         return False
     auto = dict(raw.get("autoswitch") or {})
     changed = False
-    if auto.get("weeklyThreshold") is None or float(auto.get("weeklyThreshold", 0) or 0) < 95.0:
-        auto["weeklyThreshold"] = 98.0
+    if "model" not in auto or auto.get("model") is None:
+        auto["model"] = "all"
+        changed = True
+    wt_raw = auto.get("weeklyThreshold")
+    if wt_raw is None or float(wt_raw or 0) < 90.0 or float(wt_raw or 0) >= 98.0:
+        auto["weeklyThreshold"] = 92.0
         changed = True
     if float(auto.get("hysteresisPct", 10.0) or 10.0) < 12.0:
         auto["hysteresisPct"] = 12.0
+        changed = True
+    cd_raw = auto.get("cooldownSeconds")
+    if isinstance(cd_raw, (int, float)) and not isinstance(cd_raw, bool) and float(cd_raw) >= 1800.0:
+        auto["cooldownSeconds"] = 300.0
         changed = True
     if changed:
         raw["autoswitch"] = auto
@@ -1059,9 +1068,9 @@ def _cmd_sessions(args: list[str]) -> int:
     _print_banner()
     print(f"  {BOLD}{ORANGE}🛡️  BELKINS PRESERVED-THINKING & SESSION QUALITY DIAGNOSTIC{RESET}")
     if policy_updated:
-        print(f"  {GREEN}✓ Upgraded autoswitch policy: weeklyThreshold → 98.0%, hysteresisPct → 12.0%{RESET}")
+        print(f"  {GREEN}✓ Upgraded autoswitch policy: model → all (Fable/Opus/Sonnet), weeklyThreshold → 92.0%, hysteresisPct → 12.0%{RESET}")
     else:
-        print(f"  {GREEN}✓ Thinking Guard: ACTIVE (concurrency-scaled busy hold · weekly ceiling 98%){RESET}")
+        print(f"  {GREEN}✓ Thinking Guard: ACTIVE (concurrency-scaled busy hold · all per-model windows tracked){RESET}")
     print()
 
     if not snap.sessions:
@@ -1450,25 +1459,57 @@ def _cmd_roi(args: list[str]) -> int:
 
 
 def _cmd_threshold(args: list[str]) -> int:
-    """View or update claude-swap's autoswitch.threshold (50..99%)."""
+    """View or update claude-swap's autoswitch.threshold (5h) and optional weeklyThreshold (7d/Fable)."""
     from . import accounts
 
     src = accounts.create_account_source()
     if not args:
         cur = src.autoswitch_threshold()
+        wk = src.autoswitch_weekly_threshold()
+        mdl = src.autoswitch_model() or "5h/7d only"
         lbl = f"{cur:.0f}%" if cur is not None else "default (90%)"
-        print(f"  {BOLD}Auto-switch threshold:{RESET} {ORANGE}{lbl}{RESET}  {DIM}(change with `bswap threshold <50..99>`){RESET}")
+        wk_lbl = f"{wk:.0f}%" if wk is not None else f"auto ({max(float(cur or 90.0), 92.0):.0f}%)"
+        print(f"  {BOLD}Auto-switch 5h threshold:{RESET}     {ORANGE}{lbl}{RESET}")
+        print(f"  {BOLD}Weekly / Fable threshold:{RESET}    {ORANGE}{wk_lbl}{RESET}")
+        print(f"  {BOLD}Scoped model limits:{RESET}         {CYAN}{mdl}{RESET}  {DIM}(`bswap model all|Fable|off`){RESET}")
         return 0
     try:
         pct = float(args[0].rstrip("%"))
+        wk_pct = float(args[1].rstrip("%")) if len(args) >= 2 else None
     except ValueError:
-        print(f"{RED}Usage: bswap threshold <50..99>{RESET}", file=sys.stderr)
+        print(f"{RED}Usage: bswap threshold <50..99> [weekly_50..99]{RESET}", file=sys.stderr)
         return 2
     if src.set_autoswitch_threshold(pct):
         clamped = min(99.0, max(50.0, pct))
-        print(f"{GREEN}✓ Auto-switch threshold set to {BOLD}{clamped:.0f}%{RESET}{GREEN} (live in menu bar & claude-swap){RESET}")
+        if wk_pct is not None:
+            src.set_autoswitch_weekly_threshold(wk_pct)
+            wk_clamped = min(99.0, max(50.0, wk_pct))
+            print(
+                f"{GREEN}✓ Auto-switch set to {BOLD}{clamped:.0f}%{RESET}{GREEN} (5h) · "
+                f"{BOLD}{wk_clamped:.0f}%{RESET}{GREEN} (weekly/Fable){RESET}"
+            )
+        else:
+            print(f"{GREEN}✓ Auto-switch threshold set to {BOLD}{clamped:.0f}%{RESET}{GREEN} (live in menu bar & claude-swap){RESET}")
         return 0
     print(f"{RED}✗ Failed to update threshold: {src.last_error or 'unknown error'}{RESET}", file=sys.stderr)
+    return 1
+
+
+def _cmd_model(args: list[str]) -> int:
+    """View or update claude-swap's autoswitch.model (`all`, `Fable`, `Fable,Opus`, or `off`)."""
+    from . import accounts
+
+    src = accounts.create_account_source()
+    if not args:
+        cur = src.autoswitch_model() or "5h/7d only"
+        print(f"  {BOLD}Scoped model limits:{RESET} {ORANGE}{cur}{RESET}  {DIM}(set with `bswap model all`, `bswap model Fable`, or `bswap model off`){RESET}")
+        return 0
+    wanted = ",".join(args).strip()
+    if src.set_autoswitch_model(wanted):
+        shown = "5h/7d only" if wanted.lower() in {"off", "none", "5h7d", ""} else ("all" if wanted.lower() == "all" else wanted)
+        print(f"{GREEN}✓ Auto-switch model limits set to {BOLD}{shown}{RESET}")
+        return 0
+    print(f"{RED}✗ Failed to update model limits: {src.last_error or 'unknown error'}{RESET}", file=sys.stderr)
     return 1
 
 
@@ -1532,10 +1573,11 @@ def _cmd_help() -> int:
     print(f"{BOLD}Claude Fleet & Preserved-Thinking Commands:{RESET}")
     print(f"  {ORANGE}bswap claude [slot] [args]{RESET} Launch Claude Code in an org-locked profile (never drops thinking!)")
     print(f"  {ORANGE}bswap shim [on|off|status]{RESET} Install/remove auto-isolating `claude` & `codex` CLI shims")
-    print(f"  {ORANGE}bswap fix-thinking{RESET}         Diagnose & restore session orgs + set 98% weekly switch guard")
+    print(f"  {ORANGE}bswap fix-thinking{RESET}         Diagnose & restore session orgs + set 92% weekly/Fable guard")
     print(f"  {ORANGE}bswap sessions{RESET}             Inspect live Claude sessions & their Preserved-Thinking org owners")
     print(f"  {ORANGE}bswap unpin [dir]{RESET}          Remove workspace directory pin (defaults to current directory)")
-    print(f"  {ORANGE}bswap threshold [50..99]{RESET}   View or set live Claude auto-switch threshold %")
+    print(f"  {ORANGE}bswap threshold [50..99]{RESET}   View or set live Claude 5h & weekly/Fable auto-switch threshold %")
+    print(f"  {ORANGE}bswap model [all|Fable|off]{RESET} Configure per-model weekly auto-switch limits (default: `all`)")
     print(f"  {ORANGE}bswap strategy [best|consume-first]{RESET} Set auto-switch rotation strategy")
     print(f"  {ORANGE}bswap <slot|alias>{RESET}         Switch active Claude account to slot number or alias")
     print(f"  {ORANGE}bswap best{RESET}                 Switch to the healthiest Claude account with most room")
@@ -1637,6 +1679,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_roi(args[1:])
     if cmd in {"threshold", "thresh"}:
         return _cmd_threshold(args[1:])
+    if cmd in {"model", "models"}:
+        return _cmd_model(args[1:])
     if cmd in {"strategy", "strat"}:
         return _cmd_strategy(args[1:])
     if cmd in {"unpin", "unmap"}:

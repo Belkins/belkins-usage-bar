@@ -569,6 +569,110 @@ def _parse_policy_models(policy: Any) -> tuple[str, ...]:
         return ()
 
 
+_BUSY_SESSION_MAX_AGE_S: Final[float] = 300.0
+"""Max staleness for a ``status == 'busy'`` Claude session record.
+
+Claude Code leaves ``status = 'busy'`` in ``~/.claude/sessions/<pid>.json``
+for hours when a background shell or subagent remains open after a turn ends;
+ignoring ``busy`` stamps older than 5 minutes prevents stuck holds."""
+
+
+def _fresh_busy_session_count(
+    records: Iterable[Mapping[str, Any]],
+    *,
+    now_s: float | None = None,
+    max_age_s: float = _BUSY_SESSION_MAX_AGE_S,
+) -> int:
+    """Count actively mid-turn ``busy`` sessions, skipping stale lingering records."""
+    now_ms = (time.time() if now_s is None else float(now_s)) * 1000.0
+    count = 0
+    for r in records:
+        if str(r.get("status") or "").lower() != "busy":
+            continue
+        ts_raw = r.get("statusUpdatedAt")
+        if ts_raw is None:
+            ts_raw = r.get("updatedAt")
+        if isinstance(ts_raw, (int, float)) and not isinstance(ts_raw, bool) and ts_raw > 0:
+            # Timestamps in ~/.claude/sessions/*.json are epoch milliseconds.
+            ts_ms = float(ts_raw) if float(ts_raw) > 1e11 else float(ts_raw) * 1000.0
+            if (now_ms - ts_ms) > max_age_s * 1000.0:
+                continue
+        count += 1
+    return count
+
+
+def _is_real_claude_swap(backend: Any) -> bool:
+    """True when *backend.switcher* is a live ``claude_swap`` switcher instance."""
+    sw = getattr(backend, "switcher", None)
+    return bool(sw is not None and type(sw).__module__.startswith("claude_swap"))
+
+
+def _snapshot_active_at_limit(snapshot: Any) -> bool:
+    """True when the active account in *snapshot* has any window (5h, 7d, or scoped) >= 99%."""
+    active_num = getattr(snapshot, "active_number", None)
+    if not active_num:
+        return False
+    for acc in getattr(snapshot, "accounts", ()) or ():
+        if str(getattr(acc, "number", "")) != str(active_num):
+            continue
+        entry = getattr(acc, "usage", None)
+        data = getattr(entry, "last_good", None) if entry is not None else None
+        if not isinstance(data, Mapping):
+            return False
+        for key in ("five_hour", "seven_day"):
+            w = data.get(key)
+            if isinstance(w, Mapping) and isinstance(w.get("pct"), (int, float)) and float(w["pct"]) >= 99.0:
+                return True
+        scoped = data.get("scoped")
+        if isinstance(scoped, list):
+            for s in scoped:
+                if isinstance(s, Mapping) and isinstance(s.get("pct"), (int, float)) and float(s["pct"]) >= 99.0:
+                    return True
+        return False
+    return False
+
+
+def _seed_default_model_policy(
+    path: Path,
+    write_json: Callable[[Path, dict], None],
+    *,
+    schema_version: int = 1,
+) -> bool:
+    """Seed ``autoswitch.model = 'all'`` when absent/null so per-model limits (e.g. ``Fable``)
+    trigger proactive auto-switching out of the box without overriding explicit user choices.
+
+    On that one-time migration, also relaxes any legacy ``weeklyThreshold >= 98``
+    down to ``92.0`` (leaving an 8% proactive buffer for fast-burning Fable turns)
+    and caps multi-hour ``cooldownSeconds >= 1800`` to ``300.0``.
+    """
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    except (OSError, ValueError, UnicodeDecodeError):
+        return False
+    if not isinstance(raw, dict):
+        return False
+    section_raw = raw.get(AUTOSWITCH_SECTION)
+    if section_raw is not None and not isinstance(section_raw, Mapping):
+        return False
+    section = dict(section_raw) if isinstance(section_raw, Mapping) else {}
+    if "model" in section and section.get("model") is not None:
+        return False
+    section["model"] = "all"
+    wt = section.get("weeklyThreshold")
+    if isinstance(wt, (int, float)) and not isinstance(wt, bool) and float(wt) >= 98.0:
+        section["weeklyThreshold"] = 92.0
+    cd = section.get("cooldownSeconds")
+    if isinstance(cd, (int, float)) and not isinstance(cd, bool) and float(cd) >= 1800.0:
+        section["cooldownSeconds"] = 300.0
+    raw[AUTOSWITCH_SECTION] = section
+    raw.setdefault("schemaVersion", schema_version)
+    try:
+        write_json(path, raw)
+        return True
+    except Exception:
+        return False
+
+
 def _on_main_thread() -> bool:
     """Whether we are on the AppKit main thread.
 
@@ -1017,6 +1121,7 @@ class SwapAccountSource:
         active_now = getattr(snapshot, "active_number", None)
         unmanaged = None if active_now else self._live_unmanaged_login(backend)
 
+        active_at_limit = _snapshot_active_at_limit(snapshot)
         with self._lock:
             self._unmanaged_login = unmanaged
             previous = self._last_active_number
@@ -1030,6 +1135,8 @@ class SwapAccountSource:
             self._snapshot = snapshot
             self._snapshot_at = time.monotonic()
             self._last_error = None
+            if force or active_at_limit:
+                self._next_tick_at = 0.0
             since, self._last_pass_wall = self._last_pass_wall, self._wall()
         if not self._note_reverted_switch(expected, current, since=since):
             self._note_external_switch(previous, current, expected, since=since)
@@ -2260,14 +2367,18 @@ class SwapAccountSource:
 
         Same key the engine reads (``autoswitch.model``), split by upstream's
         own parser so a one-click best switch weighs exactly what the engine
-        weighs. Any failure means "compare 5h/7d only" - never a guess at
-        which models matter.
+        weighs. On a live ``claude_swap`` backend where ``model`` was never
+        configured (``None``), defaults to ``("all",)`` so per-model limits
+        like ``Fable`` are never ignored.
         """
         try:
             from claude_swap.settings import parse_model_names
 
             policy = backend.load_policy(backend.backup_dir)
-            return tuple(parse_model_names(getattr(policy, "model", None)))
+            raw_model = getattr(policy, "model", None)
+            if raw_model is None and _is_real_claude_swap(backend):
+                return ("all",)
+            return tuple(parse_model_names(raw_model))
         except Exception as exc:
             LOGGER.debug(
                 "autoswitch model limits unreadable (%r); comparing 5h/7d only", exc
@@ -2457,10 +2568,25 @@ class SwapAccountSource:
         return True
 
     def set_autoswitch_threshold(self, pct: float) -> bool:
-        """Persist ``autoswitch.threshold`` (50..99%) into claude-swap's settings.json
-        and invalidate the live engine cache so the new ceiling takes effect immediately."""
+        """Persist ``autoswitch.threshold`` (50..99%) into claude-swap's settings.json,
+        ensuring ``model`` defaults to ``'all'`` (so Fable / per-model windows switch too)
+        and clamping overly high ``weeklyThreshold`` (>95%) to ``max(clamped, 92.0)``."""
         clamped = round(min(99.0, max(50.0, float(pct))), 1)
-        ok = self._update_autoswitch_section({"threshold": clamped})
+        updates: dict[str, Any] = {"threshold": clamped}
+        path = self._policy_path()
+        if path is not None and path.is_file():
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                sec = raw.get(AUTOSWITCH_SECTION) if isinstance(raw, Mapping) else None
+                if isinstance(sec, Mapping):
+                    if "model" not in sec or sec.get("model") is None:
+                        updates["model"] = "all"
+                    wt = sec.get("weeklyThreshold")
+                    if isinstance(wt, (int, float)) and not isinstance(wt, bool) and float(wt) > max(clamped, 95.0):
+                        updates["weeklyThreshold"] = max(clamped, 92.0)
+            except Exception:
+                pass
+        ok = self._update_autoswitch_section(updates)
         if ok:
             with self._lock:
                 self._policy_threshold = clamped
@@ -2468,6 +2594,59 @@ class SwapAccountSource:
                 self._next_tick_at = 0.0
             self._log.info("accounts: autoswitch threshold set to %.1f%%", clamped)
             self._append_event(f"autoswitch threshold \u2192 {clamped:.0f}%")
+        return ok
+
+    def autoswitch_weekly_threshold(self) -> float | None:
+        """Return ``autoswitch.weeklyThreshold`` from claude-swap's policy, or ``None``."""
+        backend = self._backend_or_none()
+        if backend is None:
+            return None
+        try:
+            wt = getattr(backend.load_policy(backend.backup_dir), "weekly_threshold", None)
+            return float(wt) if wt is not None else None
+        except Exception:
+            return None
+
+    def set_autoswitch_weekly_threshold(self, pct: float) -> bool:
+        """Persist ``autoswitch.weeklyThreshold`` (50..99%) into claude-swap's settings.json."""
+        clamped = round(min(99.0, max(50.0, float(pct))), 1)
+        ok = self._update_autoswitch_section({"weeklyThreshold": clamped})
+        if ok:
+            with self._lock:
+                self._engine_policy_mtime = None
+                self._next_tick_at = 0.0
+            self._log.info("accounts: autoswitch weeklyThreshold set to %.1f%%", clamped)
+            self._append_event(f"autoswitch weeklyThreshold \u2192 {clamped:.0f}%")
+        return ok
+
+    def autoswitch_model(self) -> str:
+        """Return effective ``autoswitch.model`` string (``'all'`` by default on live claude-swap)."""
+        backend = self._backend_or_none()
+        if backend is None:
+            return "all"
+        try:
+            raw_m = getattr(backend.load_policy(backend.backup_dir), "model", None)
+            if raw_m is None:
+                return "all" if _is_real_claude_swap(backend) else ""
+            return str(raw_m).strip()
+        except Exception:
+            return "all"
+
+    def set_autoswitch_model(self, model: str) -> bool:
+        """Persist ``autoswitch.model`` (e.g. ``'all'``, ``'Fable'``, or ``''`` for 5h/7d only)."""
+        norm = str(model or "").strip()
+        if norm.lower() in {"off", "none", "5h7d"}:
+            norm = ""
+        elif norm.lower() == "all":
+            norm = "all"
+        ok = self._update_autoswitch_section({"model": norm})
+        if ok:
+            with self._lock:
+                self._engine_policy_mtime = None
+                self._next_tick_at = 0.0
+            label = norm or "5h/7d only"
+            self._log.info("accounts: autoswitch model limits set to %s", label)
+            self._append_event(f"autoswitch models \u2192 {label}")
         return ok
 
     def autoswitch_strategy(self) -> str:
@@ -2504,15 +2683,15 @@ class SwapAccountSource:
 
     def poll_armed_handoff(self) -> str | None:
         """Check whether an armed Preserved-Thinking Guard hold has cleared (all
-        default-profile sessions are no longer ``busy``), and if so run an immediate
-        autoswitch tick at the clean turn boundary."""
+        default-profile sessions are no longer freshly ``busy``), and if so run an
+        immediate autoswitch tick at the clean turn boundary."""
         if not self.has_armed_handoff():
             return None
         try:
             from . import fleet
 
             records, _unreadable = fleet.read_registry(fleet.sessions_dir())
-            busy_count = sum(1 for r in records if str(r.get("status") or "").lower() == "busy")
+            busy_count = _fresh_busy_session_count(records)
         except Exception:
             return None
         if busy_count > 0:
@@ -2645,12 +2824,13 @@ class SwapAccountSource:
     def _thinking_guard_policy(self, engine: Any, orig_policy: Any) -> Any | None:
         """Return a temporary ``AutoSwitchSettings`` override when Preserved-Thinking Guard is active.
 
-        1. Separates weekly ceiling (``weekly_threshold = 98.0`` when unset) so 7-day / ``Fable``
-           windows are not abandoned prematurely at 85% across organizations.
+        1. Separates weekly ceiling (``weekly_threshold = 92.0`` when unset) so 7-day / ``Fable``
+           windows are not abandoned prematurely at 85% across organizations, while still keeping
+           an 8% proactive cushion so fast-burning Fable turns never hit the hard 100% wall.
         2. Holds proactive mid-turn switches up to a concurrency-scaled emergency cap
            (``max(88%, 97% - 2% * busy_count)`` 5h / ``max(90%, 98% - 1.5% * busy_count)`` 7d)
-           while any unpinned default-profile Claude Code session has ``status == 'busy'``,
-           arming a turn-boundary handoff that fires as soon as the turn completes.
+           while any unpinned default-profile Claude Code session is freshly ``busy`` (updated
+           within the last 5 minutes), arming a turn-boundary handoff that fires on completion.
         """
         import dataclasses
         import os
@@ -2669,7 +2849,8 @@ class SwapAccountSource:
         try:
             cur_thresh = float(getattr(orig_policy, "threshold", 90.0) or 90.0)
             cur_weekly = getattr(orig_policy, "weekly_threshold", None)
-            new_weekly = float(cur_weekly) if cur_weekly is not None else max(cur_thresh, 98.0)
+            effective_weekly = float(cur_weekly) if cur_weekly is not None else max(cur_thresh, 92.0)
+            new_weekly = effective_weekly
             new_thresh = cur_thresh
 
             with self._lock:
@@ -2697,24 +2878,20 @@ class SwapAccountSource:
                 from . import fleet
 
                 records, _unreadable = fleet.read_registry(fleet.sessions_dir())
-                busy_count = sum(1 for r in records if str(r.get("status") or "").lower() == "busy")
-                if busy_count > 0:
+                busy_count = _fresh_busy_session_count(records)
+                if busy_count > 0 and fh < 98.0 and wk_max < 98.0:
                     busy_5h_cap = max(88.0, 97.0 - 2.0 * busy_count)
                     busy_7d_cap = max(90.0, 98.0 - 1.5 * busy_count)
                     if fh < busy_5h_cap and wk_max < busy_7d_cap:
                         if cur_thresh < busy_5h_cap:
                             new_thresh = busy_5h_cap
-                        if cur_weekly is None:
-                            new_weekly = max(new_weekly, busy_7d_cap)
-                        elif float(cur_weekly) < busy_7d_cap:
+                        if effective_weekly < busy_7d_cap:
                             new_weekly = busy_7d_cap
-                        over_normal = fh >= cur_thresh or (
-                            cur_weekly is not None and wk_max >= float(cur_weekly)
-                        )
+                        over_normal = fh >= cur_thresh or wk_max >= effective_weekly
                         if over_normal:
                             armed = True
                             self._log.info(
-                                "accounts: thinking guard holding %s (5h %.0f%% < %.0f%%, 7d %.0f%% < %.0f%%) "
+                                "accounts: thinking guard holding %s (5h %.0f%% < %.0f%%, 7d/scoped %.0f%% < %.0f%%) "
                                 "for %d busy Claude session(s); armed turn-boundary handoff",
                                 active.alias,
                                 fh,
@@ -2743,13 +2920,23 @@ class SwapAccountSource:
         Rebuilding on a changed ``settings.json`` mtime is what makes
         ``cswap config set autoswitch.threshold 95`` take effect without
         restarting the widget - the engine snapshots its settings at
-        construction.
+        construction. On a live ``claude_swap`` backend where ``autoswitch.model``
+        was never configured, seeds ``"all"`` so per-model weekly windows
+        (``Fable``, ``Opus``, ``Sonnet``) always participate in autoswitch.
         """
+        import dataclasses
+
         backend = self._backend_or_none()
         if backend is None:
             return None
 
         path = self._policy_path()
+        if path is not None and _is_real_claude_swap(backend):
+            _seed_default_model_policy(
+                path,
+                backend.write_json,
+                schema_version=getattr(backend, "schema_version", 1),
+            )
         mtime: float | None = None
         if path is not None:
             try:
@@ -2766,6 +2953,12 @@ class SwapAccountSource:
 
         try:
             policy = backend.load_policy(backend.backup_dir)
+            if (
+                dataclasses.is_dataclass(policy)
+                and getattr(policy, "model", None) is None
+                and _is_real_claude_swap(backend)
+            ):
+                policy = dataclasses.replace(policy, model="all")
             engine = backend.engine_cls(
                 backend.switcher,
                 policy,
@@ -2788,8 +2981,10 @@ class SwapAccountSource:
                 self._policy_threshold = None
             self._policy_models_cache = _parse_policy_models(policy)
         self._log.info(
-            "accounts: autoswitch engine started (threshold %s, interval %ss)",
+            "accounts: autoswitch engine started (threshold %s, weekly %s, models %s, interval %ss)",
             getattr(policy, "threshold", "?"),
+            getattr(policy, "weekly_threshold", None),
+            getattr(policy, "model", None) or "5h/7d",
             getattr(policy, "interval_seconds", "?"),
         )
         return engine
