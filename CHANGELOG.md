@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-11-16 — Per-Model (Fable) Auto-Switch, Stale Busy-Session Filter & macOS 26 Menu-Bar Fix
+
+- **Per-Model (`Fable` / `Opus` / `Sonnet`) Auto-Switch & Safe Proactive Buffer (`accounts.py`, `bswap_cli.py`):**
+  - Auto-seeds `autoswitch.model = "all"` on live `claude-swap` installations when unconfigured (`None`), ensuring per-model weekly windows such as `Fable` always trigger proactive rotation, urgent polling, and `Switch to best now` target selection without overriding explicit user choices.
+  - Migrates legacy `weeklyThreshold >= 98%` down to `92.0%` (leaving an 8% proactive Fable buffer so running `claude` sessions pick up refreshed Keychain credentials before hitting the 100% wall) and caps multi-hour `cooldownSeconds >= 1800s` to `300.0s`.
+  - Wakes `evaluate_autoswitch()` immediately on `refresh()` whenever the active slot hits `>= 99%` on `5h`, `7d`, or any scoped model window.
+  - Added `bswap model [all|Fable|off]` and extended `bswap threshold [5h_pct] [weekly_pct]` CLI commands.
+- **Stale `"busy"` Session Filter in Turn-Boundary Guard (`accounts.py`):**
+  - `_fresh_busy_session_count()` ignores lingering `status == "busy"` session records in `~/.claude/sessions/*.json` whose `statusUpdatedAt` / `updatedAt` is older than 5 minutes (caused by open background shells or subagents after a turn ends), preventing stuck Thinking Guard holds, and releases immediately at `>= 98%`.
+- **macOS 26 (Tahoe) Menu-Bar Visibility & Notch Migration (`menubar.py`, `app.py`, `__main__.py`):**
+  - Matched `win.frame()` directly against layer-25 strip windows (`10..60 pt` height) in `CGWindowListCopyWindowInfo(0, 0)` instead of trusting out-of-process `Control Centre` proxy `occlusionState()`, eliminating false-positive escalations to icon-only mode.
+  - Migrated legacy `NSStatusItem Preferred Position Item-0 >= 1800` out from behind the MacBook camera notch to `250.0` while preserving user `⌘`-dragged positions.
+
 ## 2026-11-11 — Accuracy, Smart Fleet Rotation, Turn-Boundary Guard, ROI Forensics & Resilience
 
 - **Pricing, Multi-Root Indexing & Attribution (`pricing.py`, `state.py`, `indexer.py`, `codex_indexer.py`, `attribution.py`, `audit.py`):**

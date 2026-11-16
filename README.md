@@ -132,8 +132,9 @@ bswap status                # Print Companion HUD + Claude & Codex fleet status 
 bswap watch                 # Launch live multi-account Watch monitor in TUI
 bswap roi [monthly_usd]     # Print 30d notional API value, subscription ROI multiple & cache savings
 bswap shim [on|off|status]  # Install/remove optional shell wrapper routing `claude` -> `bswap claude`
-bswap threshold <50..99>    # Set claude-swap proactive auto-switch percentage threshold
-bswap strategy <best|round-robin> # Set claude-swap rotation strategy
+bswap threshold [5h] [wk]   # View or set 5h and weekly/Fable proactive auto-switch thresholds
+bswap model [all|Fable|off] # Configure per-model weekly auto-switch limits (default: `all`)
+bswap strategy <best|consume-first> # Set claude-swap rotation strategy
 bswap evo                   # 8-Stage Cyber-Forms, Boss Raid status & 14 Hall of Fame Trophies
 bswap raid [strikes]        # Attack the active Raid Boss for SparkCoins & Bonus XP (e.g. bswap raid 3)
 bswap morph <1..8|auto>     # Morph your active Companion into any unlocked Cyber-Form
