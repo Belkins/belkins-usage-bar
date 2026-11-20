@@ -62,6 +62,7 @@ from __future__ import annotations
 import datetime as dt
 import inspect
 import json
+import math
 import os
 import queue
 import re
@@ -169,6 +170,7 @@ __all__ = [
     "CCUsageWidgetApp",
     "UsageWidgetApp",
     "App",
+    "copy_text",
     "build_app",
     "main",
 ]
@@ -506,6 +508,42 @@ def _open_web_url(url: str) -> bool:
         return False
 
 
+def copy_text(text: str) -> bool:
+    """Copy *text* to the macOS clipboard on an explicit user click.
+
+    Guarded by :data:`_NO_REVEAL_ENV` so tests never touch the macOS clipboard.
+    Never logs *text* and never raises. Returns True only when placed on the
+    clipboard.
+    """
+    payload = str(text or "")
+    if not payload:
+        return False
+    if os.environ.get(_NO_REVEAL_ENV):
+        _log(f"clipboard copy suppressed ({_NO_REVEAL_ENV})")
+        return False
+    try:
+        proc = subprocess.run(
+            ["pbcopy"],
+            input=payload.encode("utf-8"),
+            capture_output=True,
+            timeout=2.0,
+            check=False,
+        )
+        if proc.returncode == 0:
+            return True
+    except Exception as exc:
+        _log(f"pbcopy failed: {type(exc).__name__}")
+    try:
+        import AppKit
+
+        pb = AppKit.NSPasteboard.generalPasteboard()
+        pb.clearContents()
+        return bool(pb.setString_forType_(payload, AppKit.NSPasteboardTypeString))
+    except Exception as exc:
+        _log(f"clipboard copy failed: {type(exc).__name__}")
+        return False
+
+
 def _confirm(title: str, message: str, ok: str = "OK") -> bool:
     """Modal yes/no in front of a destructive action. ``False`` = do nothing.
 
@@ -706,6 +744,50 @@ def _autoswitch_models_of(source: Any) -> tuple[str, ...]:  # UX-1b
     return tuple(str(name) for name in value if isinstance(name, str) and name)
 
 
+def _cached_nonneg_float_of(source: Any, method: str) -> float | None:
+    """Read an optional cached non-negative finite float metric from *source*.
+
+    Runs on the worker thread only; returns ``None`` when the adapter does not
+    expose *method*, returns ``None`` / non-finite / negative, or raises.
+    """
+    getter = getattr(source, method, None)
+    if not callable(getter):
+        return None
+    try:
+        value = getter()
+    except Exception:
+        return None
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(num) or num < 0.0:
+        return None
+    return num
+
+
+def _fable_burn_eta_minutes_of(source: Any) -> float | None:
+    """Cached estimated minutes until the active Fable bucket hits 100%."""
+    return _cached_nonneg_float_of(source, "fable_burn_eta_minutes")
+
+
+def _fable_burn_rate_pct_per_min_of(source: Any) -> float | None:
+    """Cached EWMA Fable burn velocity in percentage points per minute."""
+    return _cached_nonneg_float_of(source, "fable_burn_rate_pct_per_min")
+
+
+def _session_limit_key(session: Any) -> tuple[int, str]:
+    """Stable in-memory dedup key ``(pid, session_id)`` for reactive limit wakeups."""
+    try:
+        pid = int(getattr(session, "pid", 0) or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    sid = str(getattr(session, "session_id", "") or "").strip()
+    return (pid, sid)
+
+
 def _title_note(note: str, kind: str = "") -> str:
     """Menu-bar form of a derived-usage state: short, unmistakably not a pct.
 
@@ -891,6 +973,12 @@ class UiSnapshot:
     fleet_scanned: bool = False  # W3
     """Whether the pinned-profile scan ran; the heading claims a pinned count
     only when it did."""
+    fable_burn_eta_minutes: float | None = None
+    """Cached estimated minutes until the active Fable weekly bucket reaches
+    100%, or ``None`` when unavailable or not burning."""
+    fable_burn_rate_pct_per_min: float | None = None
+    """Cached EWMA Fable burn velocity in percentage points per minute, or
+    ``None`` when unavailable."""
 
 
 # ---------------------------------------------------------------------------
@@ -2468,6 +2556,10 @@ class BackgroundWorker:
         self._last_codex_autoswitch_at: float = 0.0
         self._last_tg_poll_at: float = 0.0
         self._tg_poll_inflight: bool = False
+        self._seen_rate_limit_sessions: set[tuple[int, str]] = set()
+        """In-memory dedup set of ``(pid, session_id)`` keys currently observed
+        with ``hit_rate_limit=True`` so reactive local limit-hit wakeups fire
+        once per episode rather than every accounts tick."""
         """Earliest monotonic time the engine may be ticked again from the
         engine-only path. Held HERE, not in the loop-local deadline, because
         the top of every iteration is free to pull that deadline in to
@@ -4458,6 +4550,7 @@ class BackgroundWorker:
             autoswitch = self._read_autoswitch(
                 default=bool(self._settings().get("autoswitch_enabled", False))
             )
+            already_switched = False
             if autoswitch:
                 # The adapter enforces claude-swap's own cadence and is a no-op
                 # when the toggle is off; the check above is belt-and-braces so
@@ -4467,6 +4560,7 @@ class BackgroundWorker:
                 if not switched:
                     switched = self._accounts.evaluate_autoswitch()
                 if switched:
+                    already_switched = True
                     _log(f"autoswitch -> {switched}")
                     self._accounts.refresh(force=True)
                     rows = tuple(self._accounts.rows())
@@ -4476,6 +4570,35 @@ class BackgroundWorker:
             if not error_override:
                 _forget_failures("accounts")
             fleet_snapshot = self._collect_fleet(rows, active)  # W3
+            limited_keys = {
+                _session_limit_key(sess)
+                for sess in fleet_snapshot.sessions
+                if bool(getattr(sess, "hit_rate_limit", False))
+            }
+            fleet_ok = not any(
+                "fleet unreadable" in str(note) for note in (fleet_snapshot.notes or ())
+            )
+            if fleet_ok:
+                self._seen_rate_limit_sessions.intersection_update(limited_keys)
+            new_limited = limited_keys - self._seen_rate_limit_sessions
+            if new_limited and autoswitch:
+                self._seen_rate_limit_sessions.update(new_limited)
+                if not already_switched:
+                    notify_fn = getattr(self._accounts, "notify_local_limit_hit", None)
+                    if callable(notify_fn):
+                        try:
+                            notify_fn(kind="rate_limit")
+                        except Exception as exc:
+                            _log(f"notify_local_limit_hit failed: {_describe(exc)}")
+                    reactive_switched = self._accounts.evaluate_autoswitch()
+                    if reactive_switched:
+                        _log(f"autoswitch (local limit-hit) -> {reactive_switched}")
+                        self._accounts.refresh(force=True)
+                        rows = tuple(self._accounts.rows())
+                        active = self._accounts.active()
+                        if not error_override:
+                            error_override = self._accounts_diagnosis(rows)
+                        fleet_snapshot = self._collect_fleet(rows, active)
             quota = self._maybe_autoswitch_codex(self._collect_quota_rows())
             self._maybe_record_quota_samples(rows, quota)
             self._publish(
@@ -4499,6 +4622,8 @@ class BackgroundWorker:
                     mappings=fleet_snapshot.mappings,  # W3
                     fleet_notes=fleet_snapshot.notes,  # W3
                     fleet_scanned=fleet_snapshot.pinned_scanned,  # W3
+                    fable_burn_eta_minutes=_fable_burn_eta_minutes_of(self._accounts),
+                    fable_burn_rate_pct_per_min=_fable_burn_rate_pct_per_min_of(self._accounts),
                 )
             )
         except Exception as exc:

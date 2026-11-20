@@ -24,6 +24,7 @@ dropdown into 5 clean, in-place tabs (`⚡ Party`, `Claude`, `Codex`, `🐾 Dex`
 
 from __future__ import annotations
 
+import math
 import re
 import time
 from typing import Any, Callable
@@ -1345,7 +1346,55 @@ def _claude_bars(A: Any, row: Any, now: float) -> list[tuple[str, float, str, bo
     return out
 
 
-def _claude_tip(A: Any, row: Any, now: float, note: str = "", accounts: tuple = ()) -> str:
+_FABLE_ETA_TOOLTIP_MAX_MIN = 240.0
+_FABLE_ETA_CAPTION_MAX_MIN = 45.0
+_SAFE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+
+
+def _valid_fable_eta(snap: Any, *, max_minutes: float = _FABLE_ETA_TOOLTIP_MAX_MIN) -> float | None:
+    raw = getattr(snap, "fable_burn_eta_minutes", None)
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(val) or val <= 0.0 or val > max_minutes:
+        return None
+    return val
+
+
+def _valid_fable_rate(snap: Any) -> float | None:
+    raw = getattr(snap, "fable_burn_rate_pct_per_min", None)
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(val) or val <= 0.0:
+        return None
+    return val
+
+
+def _fmt_burn_eta(eta_min: float) -> str:
+    mins = max(1, int(round(eta_min)))
+    if mins < 60:
+        return f"~{mins}m to wall"
+    hrs, rem = divmod(mins, 60)
+    return f"~{hrs}h {rem}m to wall" if rem else f"~{hrs}h to wall"
+
+
+def _claude_tip(
+    A: Any,
+    row: Any,
+    now: float,
+    note: str = "",
+    accounts: tuple = (),
+    *,
+    fable_eta_min: float | None = None,
+    fable_rate_ppm: float | None = None,
+) -> str:
     parts = [f"{A._display_name(row)} · slot #{row.slot} · {row.email}"]
     plan = " · ".join(
         x
@@ -1361,10 +1410,29 @@ def _claude_tip(A: Any, row: Any, now: float, note: str = "", accounts: tuple = 
     if note:
         parts.append(_rebrand_bswap(note))
     else:
+        matched_fable_bar = False
         for label, pct, mark, expired in _claude_bars(A, row, now):
+            eta_suffix = ""
+            if (
+                not expired
+                and fable_eta_min is not None
+                and str(label).strip().lower().startswith("fable")
+            ):
+                matched_fable_bar = True
+                eta_lbl = _fmt_burn_eta(fable_eta_min)
+                if fable_rate_ppm is not None:
+                    eta_suffix = f" · {fable_rate_ppm:.1f}%/min ({eta_lbl})"
+                else:
+                    eta_suffix = f" · {eta_lbl}"
             parts.append(
-                f"{label} {format_pct(pct)}{' (window ended)' if expired else ''} {mark}".strip()
+                f"{label} {format_pct(pct)}{' (window ended)' if expired else ''} {mark}{eta_suffix}".strip()
             )
+        if fable_eta_min is not None and not matched_fable_bar:
+            eta_lbl = _fmt_burn_eta(fable_eta_min)
+            if fable_rate_ppm is not None:
+                parts.append(f"Fable burn: {fable_rate_ppm:.1f}%/min ({eta_lbl})")
+            else:
+                parts.append(f"Fable burn: {eta_lbl}")
     if row.usage_is_stale:
         parts.append(f"reading {A._age_label(row.usage_age_seconds)} old")
     if row.disabled:
@@ -1430,6 +1498,17 @@ def _claude_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) -
                     R.severity(sp) if sp else "dim",
                 )
             )
+        fable_eta = None if note else _valid_fable_eta(snap, max_minutes=_FABLE_ETA_TOOLTIP_MAX_MIN)
+        fable_rate = None if note else _valid_fable_rate(snap)
+        burn_eta_caption = ""
+        if fable_eta is not None and fable_eta <= _FABLE_ETA_CAPTION_MAX_MIN:
+            burn_eta_caption = _fmt_burn_eta(fable_eta)
+            cap_text = (
+                f"Fable {burn_eta_caption} ({fable_rate:.1f}%/min)"
+                if fable_rate is not None
+                else f"Fable {burn_eta_caption}"
+            )
+            captions.append((cap_text, "warn"))
         raw_plan = A._claude_plan_text(accounts, active) or A.plan_label(active.plan_type)
         hero = {
             "name": A._display_name(active),
@@ -1450,7 +1529,16 @@ def _claude_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) -
             else None,
             "bars": [] if note else _claude_bars(A, active, now),
             "captions": captions,
-            "tip": _claude_tip(A, active, now, note, accounts),
+            "burn_eta_caption": burn_eta_caption,
+            "tip": _claude_tip(
+                A,
+                active,
+                now,
+                note,
+                accounts,
+                fable_eta_min=fable_eta,
+                fable_rate_ppm=fable_rate,
+            ),
             "action": None,
         }
     from .. import accounts as _accounts_mod
@@ -1468,7 +1556,7 @@ def _claude_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) -
             and not (fable_guard and has_fable_fleet and _accounts_mod.row_lacks_fable_quota(r))
         ),
         None,
-    ) or next((r for r in targets if not r.disabled), None)
+    )
     rows = []
     toggle_fn = getattr(actions, "toggle_slot_disabled", None)
     for r in targets:
@@ -1980,6 +2068,9 @@ def _hero(hero: dict[str, Any], *, compact: bool = False) -> Callable[[Any, floa
                     meta_parts.append(f"{label} {format_pct(pct)}")
             if first_rst:
                 meta_parts.append(first_rst)
+            burn_eta_cap = str(hero.get("burn_eta_caption") or "").strip()
+            if burn_eta_cap:
+                meta_parts.append(burn_eta_cap)
             meta_line = "   ·   ".join(meta_parts)
             text(pen, meta_line, "caption", "belkins_cmm_sub", px0, b_meta, maxw=px1 - px0)
             return b_meta + 12.0
@@ -2026,7 +2117,8 @@ def _hero(hero: dict[str, Any], *, compact: bool = False) -> Callable[[Any, floa
         banners = [
             c
             for c in caps_source
-            if (c[1] == "good" and c[0].startswith("↺")) or (c[1] == "warn" and "pace" in c[0].lower())
+            if (c[1] == "good" and c[0].startswith("↺"))
+            or (c[1] == "warn" and ("pace" in c[0].lower() or "to wall" in c[0].lower()))
         ][:1]
         for cap, kind in banners:
             y = ink + 7.0
@@ -2232,16 +2324,26 @@ def _ax(tip: str) -> str:
     return tip.replace("\n", ". ")
 
 
+def _copy_text(text_s: str, actions: ThemeActions | None = None) -> bool:
+    """Copy *text_s* via ``actions.copy_text`` when injected, else ``app.copy_text``
+    (which honours ``CC_USAGE_WIDGET_NO_REVEAL`` so tests never touch the clipboard)."""
+    copy_fn = getattr(actions, "copy_text", None) if actions is not None else None
+    if callable(copy_fn):
+        try:
+            return bool(copy_fn(text_s))
+        except Exception:
+            return False
+    try:
+        from .. import app as A
+
+        return bool(A.copy_text(text_s))
+    except Exception:
+        return False
+
+
 def _copy_cmd_to_pasteboard(cmd: str = "bswap add") -> None:
     """Copy a CLI remedy (`bswap add`) to the macOS pasteboard on click."""
-    try:
-        from AppKit import NSPasteboard, NSPasteboardTypeString
-
-        pb = NSPasteboard.generalPasteboard()
-        pb.clearContents()
-        pb.setString_forType_(cmd, NSPasteboardTypeString)
-    except Exception:
-        pass
+    _copy_text(cmd)
 
 
 def _provider_card(
@@ -2290,16 +2392,23 @@ def _provider_card(
 
     all_rows = spec["rows"] or []
     if is_hub:
-        # On Hub: show at most 2 ready standby accounts (`free > 0%` and not paused) in clean minimalist rows
+        # On Hub: show at most 2 ready standby accounts (`free > 0%`, not paused, and Fable-eligible)
         ready_rows = [
             r
             for r in all_rows
-            if not r.get("disabled") and (r.get("free_pct") is None or r.get("free_pct", 0) > 0)
+            if not r.get("disabled")
+            and not r.get("no_fable")
+            and (r.get("free_pct") is None or r.get("free_pct", 0) > 0)
         ]
         shown_ready = ready_rows[:2]
         hidden_ready = max(0, len(ready_rows) - len(shown_ready))
-        capped_cnt = sum(1 for r in all_rows if not r.get("disabled") and r.get("free_pct") == 0)
+        capped_cnt = sum(
+            1
+            for r in all_rows
+            if not r.get("disabled") and not r.get("no_fable") and r.get("free_pct") == 0
+        )
         paused_cnt = sum(1 for r in all_rows if r.get("disabled"))
+        no_fable_cnt = sum(1 for r in all_rows if not r.get("disabled") and r.get("no_fable"))
         relogin_cnt = len(attn_items or ())
 
         if shown_ready:
@@ -2315,7 +2424,7 @@ def _provider_card(
                     **ROW_HL,
                 )
 
-        other_cnt = hidden_ready + capped_cnt + paused_cnt
+        other_cnt = hidden_ready + capped_cnt + paused_cnt + no_fable_cnt
         if relogin_cnt or other_cnt:
             card.add(_hair(), key=f"{key_prefix}-{key}-attn-rule")
             if relogin_cnt:
@@ -2480,6 +2589,21 @@ def _claude_sessions_card(snapshot: Any, actions: ThemeActions | None = None) ->
         full_cwd = items[0][0] or short_dir
         has_abs_cwd = full_cwd.startswith("/")
         cnt = len(items)
+        any_latched = any(bool(getattr(s_obj, "latched_credits", False)) for _c, s_obj in items)
+        latched_sid = next(
+            (
+                str(getattr(s_obj, "session_id", "") or "").strip()
+                for _c, s_obj in items
+                if bool(getattr(s_obj, "latched_credits", False))
+                and str(getattr(s_obj, "session_id", "") or "").strip()
+            ),
+            "",
+        )
+        resume_cmd = (
+            f"claude --resume {latched_sid}"
+            if (latched_sid and _SAFE_SESSION_ID_RE.fullmatch(latched_sid))
+            else "claude --resume"
+        )
         any_pinned = any(bool(getattr(s_obj, "pinned", False)) for _c, s_obj in items)
         any_shifted = any(bool(getattr(s_obj, "org_shifted", False)) for _c, s_obj in items) and not any_pinned
         owner_slot = next(
@@ -2491,6 +2615,7 @@ def _claude_sessions_card(snapshot: Any, actions: ThemeActions | None = None) ->
         sess_block_ref: list[Block] = []
 
         def _row_right_pills(
+            is_latch: bool = any_latched,
             is_pin: bool = any_pinned,
             is_shift: bool = any_shifted,
             own_s: Any = owner_slot,
@@ -2500,6 +2625,9 @@ def _claude_sessions_card(snapshot: Any, actions: ThemeActions | None = None) ->
             from .. import accounts as _acc_mod
 
             out_p: list[tuple[str, str, str]] = []
+            if is_latch:
+                out_p.append(("Copy Resume", "belkins_flame_text", "belkins_flame_pill"))
+                return out_p
             own_row = next((a for a in (snapshot.accounts or ()) if a.slot == own_s), None) if own_s is not None else None
             fg_on = bool(snapshot.settings.get("belkins_fable_guard", True))
             fable_fleet = _acc_mod.fleet_has_fable_accounts(snapshot.accounts or ())
@@ -2525,12 +2653,17 @@ def _claude_sessions_card(snapshot: Any, actions: ThemeActions | None = None) ->
             y0: float,
             name_s: str = short_dir,
             n_cnt: int = cnt,
+            is_latch: bool = any_latched,
             is_pin: bool = any_pinned,
             is_shift: bool = any_shifted,
             r_pills: list[tuple[str, str, str]] = _row_right_pills(),
         ) -> float:
             b = y0 + 17.5
-            dot_role = "belkins_cmm_aqua" if is_pin else ("belkins_cmm_coral" if is_shift else "belkins_good_fill")
+            dot_role = (
+                "belkins_cmm_coral"
+                if is_latch
+                else ("belkins_cmm_aqua" if is_pin else ("belkins_cmm_coral" if is_shift else "belkins_good_fill"))
+            )
             pen.circle(X0 + 4.0, b - 6.8, 5.6, dot_role)
             cnt_s = f"{n_cnt}" if n_cnt > 1 else "1"
             text(pen, cnt_s, "caption_med", "belkins_cmm_sub", X1 - 2.0, b, right=True)
@@ -2539,11 +2672,25 @@ def _claude_sessions_card(snapshot: Any, actions: ThemeActions | None = None) ->
                 pw = _pill_w(pen, plbl)
                 pen.pill(plbl, cur_r - pw, b - 0.5, F["tag"][0], role=prole, bg=pbg, weight="semibold")
                 cur_r -= pw + 4.5
-            status_lbl = "PINNED" if is_pin else ("⚠ ORG SHIFTED" if is_shift else "")
+            status_lbl = (
+                "⚡ LATCHED"
+                if is_latch
+                else ("PINNED" if is_pin else ("⚠ ORG SHIFTED" if is_shift else ""))
+            )
             status_reserve = (_pill_w(pen, status_lbl) + 8.0) if status_lbl else 0.0
             max_nw = max(48.0, cur_r - (X0 + 16.0) - status_reserve - 6.0)
             nw = text(pen, name_s, "primary_med", "label", X0 + 16.0, b, maxw=max_nw)
-            if is_pin:
+            if is_latch:
+                pen.pill(
+                    "⚡ LATCHED",
+                    X0 + 16.0 + nw + 6.0,
+                    b - 0.5,
+                    F["tag"][0],
+                    role="belkins_flame_text",
+                    bg="belkins_flame_pill",
+                    weight="semibold",
+                )
+            elif is_pin:
                 pen.pill(
                     "PINNED",
                     X0 + 16.0 + nw + 6.0,
@@ -2574,6 +2721,8 @@ def _claude_sessions_card(snapshot: Any, actions: ThemeActions | None = None) ->
             def _make_sess_handlers(
                 cwd_p: str = full_cwd,
                 name_s: str = short_dir,
+                is_latch: bool = any_latched,
+                resume_s: str = resume_cmd,
                 is_pin: bool = any_pinned,
                 is_shift: bool = any_shifted,
                 own_s: Any = owner_slot,
@@ -2583,7 +2732,12 @@ def _claude_sessions_card(snapshot: Any, actions: ThemeActions | None = None) ->
             ) -> tuple[Callable[[], None] | None, Callable[[float], None], bool]:
                 def _exec_pill(lbl: str) -> None:
                     global _LAST_CFG_NOTE
-                    if lbl.startswith("Restore #") and own_s is not None and callable(switch_to_fn):
+                    if lbl == "Copy Resume":
+                        for blk in bref:
+                            blk.keep_open = True
+                        _copy_text(resume_s, actions)
+                        _LAST_CFG_NOTE = "Copied `claude --resume …` — paste in terminal to clear credits latch ✓"
+                    elif lbl.startswith("Restore #") and own_s is not None and callable(switch_to_fn):
                         for blk in bref:
                             blk.keep_open = False
                         switch_to_fn(int(own_s))
@@ -2609,8 +2763,8 @@ def _claude_sessions_card(snapshot: Any, actions: ThemeActions | None = None) ->
                             _exec_pill(plbl)
                             return
                         cur_r -= pw + 4.5
-                    # Clicking anywhere on a shifted row defaults to primary recovery action
-                    if is_shift and r_pills:
+                    # Clicking anywhere on a latched or shifted row defaults to primary recovery action
+                    if (is_latch or is_shift) and r_pills:
                         _exec_pill(r_pills[0][0])
 
                 def _default_act() -> None:
@@ -2620,7 +2774,12 @@ def _claude_sessions_card(snapshot: Any, actions: ThemeActions | None = None) ->
 
             row_action, row_click_x, default_keep_open = _make_sess_handlers()
 
-        if any_pinned:
+        if any_latched:
+            mode_str = (
+                f"⚡ Usage-credits latch active! Run `/exit && {resume_cmd}` to reload onto the healthy active seat "
+                "(click Copy Resume to copy command)."
+            )
+        elif any_pinned:
             mode_str = "Org-Pinned profile (immune to global switches; click Unpin to release)"
         elif any_shifted:
             mode_str = (
@@ -2633,7 +2792,7 @@ def _claude_sessions_card(snapshot: Any, actions: ThemeActions | None = None) ->
         card.add(
             draw_sess_row,
             key=f"belkins-claude-session-dir-{idx}",
-            ax=f"{short_dir}: {cnt} active Claude sessions ({full_cwd})",
+            ax=f"{short_dir}: {cnt} active Claude sessions ({full_cwd})" + (" · ⚡ LATCHED" if any_latched else ""),
             tooltip=f"{full_cwd}\n{cnt} session(s) ({busy_cnt} busy) · {mode_str}\nTip: Run `bswap claude` in this folder to launch an isolated session.",
             action=row_action,
             on_click_x=row_click_x,
@@ -2774,16 +2933,26 @@ def _compact_usd_str(val: float) -> str:
 
 
 def _best_bento_switch_row(spec: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Return the optimal switch candidate row (`NEXT` / `BEST` tagged first, else first actionable row)."""
+    """Return the optimal switch candidate row (`NEXT` / `BEST` tagged first, else first actionable Fable-eligible row)."""
     if not spec:
         return None
     rows = spec.get("rows") or []
     for r in rows:
-        if callable(r.get("action")) and any(
-            tag in ("NEXT", "BEST") for tag, _ in (r.get("captions") or ())
+        if (
+            not r.get("disabled")
+            and not r.get("no_fable")
+            and callable(r.get("action"))
+            and any(tag in ("NEXT", "BEST") for tag, _ in (r.get("captions") or ()))
         ):
             return r
-    return next((r for r in rows if callable(r.get("action"))), None)
+    return next(
+        (
+            r
+            for r in rows
+            if not r.get("disabled") and not r.get("no_fable") and callable(r.get("action"))
+        ),
+        None,
+    )
 
 
 def _draw_provider_bento_tile(

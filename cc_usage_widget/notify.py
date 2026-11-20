@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import math
 import os
 import stat
 import sys
@@ -141,10 +142,18 @@ _WINDOW_LABELS: Final[Mapping[str, str]] = {
 SCOPE_SENTINEL: Final[str] = "sentinel"
 SCOPE_AUDIT: Final[str] = "audit"
 SCOPE_COST: Final[str] = "cost"
+SCOPE_FLEET: Final[str] = "fleet"
 """Scopes for the conditions that are facts about the SNAPSHOT rather than
 about one account row. Every other scope is a row key. ``cost`` is observed
 only by a snapshot carrying a COMPLETE cost breakdown: a tick still indexing
 (or with cost tracking off) cannot say a model stopped being unpriced."""
+
+FABLE_BURN_WARN_MINUTES: Final[float] = 12.0
+"""Warn once when estimated minutes until active Fable reaches 100% drops below
+this threshold while Auto-switch is OFF."""
+
+FABLE_BURN_RECOVER_MINUTES: Final[float] = 15.0
+"""Hysteresis ceiling so ETA jitter around 12 min does not re-trigger the alert."""
 
 SPEND_CAP_PCT: Final[float] = 100.0
 """An extra-usage spend limit at or past this is ``crit``: the next request is
@@ -427,6 +436,8 @@ def _standing_conditions(
     if unpriced_min_tokens:
         out.update(_unpriced_conditions(snapshot, min_tokens=unpriced_min_tokens))
     out.update(_reset_usable_conditions(snapshot))
+    out.update(_latched_session_conditions(snapshot))
+    out.update(_fable_burn_conditions(snapshot))
 
     alert = getattr(snapshot, "alert", None)
     if isinstance(alert, (tuple, list)) and len(alert) >= 2:
@@ -805,6 +816,137 @@ def _reset_usable_conditions(snapshot: Any) -> dict[str, Event]:
     return out
 
 
+def _active_claude_row(snapshot: Any) -> Any | None:
+    """Return the snapshot's active Claude row, if any."""
+    active = getattr(snapshot, "active", None)
+    if active is not None:
+        return active
+    for row in getattr(snapshot, "accounts", ()) or ():
+        if getattr(row, "is_active", False):
+            return row
+    return None
+
+
+def _session_dir_name(cwd: Any) -> str:
+    """Short workspace directory basename for a notification (never a full path)."""
+    text = str(cwd or "").strip().rstrip("/")
+    if not text:
+        return "workspace"
+    return text.rsplit("/", 1)[-1] or "workspace"
+
+
+def _latched_session_conditions(snapshot: Any) -> dict[str, Event]:
+    """``latched:<pid>:<session_id>`` — live Claude session stuck on usage-credits latch.
+
+    Deduped per ``(pid, session_id)`` so each latched session notifies ONCE per
+    latch episode (and stays suppressed across restarts via the ledger).
+    """
+    out: dict[str, Event] = {}
+    sessions = getattr(snapshot, "sessions", ()) or ()
+    if not sessions:
+        return out
+    active = _active_claude_row(snapshot)
+    active_alias = _display_name(active) if active is not None else ""
+    for sess in sessions:
+        if not bool(getattr(sess, "latched_credits", False)):
+            continue
+        try:
+            pid = int(getattr(sess, "pid", 0) or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        sid = str(getattr(sess, "session_id", "") or "").strip()
+        dir_name = _session_dir_name(getattr(sess, "cwd", ""))
+        if active_alias:
+            msg = (
+                f"Session {dir_name} hit usage-credits latch — "
+                f"run /exit && claude --resume to switch to {active_alias}"
+            )
+        else:
+            msg = f"Session {dir_name} hit usage-credits latch — run /exit && claude --resume"
+        ledger_key = f"latched:{pid}:{sid}"
+        out[ledger_key] = Event(
+            key=ledger_key,
+            kind="latched",
+            severity=SEVERITY_WARN,
+            scope=SCOPE_FLEET,
+            title=f"{APP_TITLE} · session latched",
+            subtitle=dir_name,
+            message=msg,
+        )
+    return out
+
+
+def _fable_burn_conditions(
+    snapshot: Any, *, max_minutes: float = FABLE_BURN_WARN_MINUTES
+) -> dict[str, Event]:
+    """``fable-burn:<row>`` — rapid Fable burn ETA < *max_minutes* while Auto-switch is OFF.
+
+    Keyed on the active row (never the countdown minutes) so a shrinking ETA
+    from 11m -> 9m -> 7m notifies once, not once per tick.
+    """
+    out: dict[str, Event] = {}
+    if bool(getattr(snapshot, "autoswitch_enabled", False)):
+        return out
+    raw_eta = getattr(snapshot, "fable_burn_eta_minutes", None)
+    if raw_eta is None or isinstance(raw_eta, bool):
+        return out
+    try:
+        eta = float(raw_eta)
+    except (TypeError, ValueError):
+        return out
+    if not math.isfinite(eta) or eta <= 0.0 or eta >= max_minutes:
+        return out
+    active = _active_claude_row(snapshot)
+    if active is None:
+        return out
+    expired = set(getattr(active, "expired_windows", ()) or ())
+    fable_pct = next(
+        (
+            pct
+            for name, pct in (getattr(active, "scoped_windows", ()) or ())
+            if pct is not None
+            and str(name).strip().lower().startswith("fable")
+            and name not in expired
+        ),
+        None,
+    )
+    if fable_pct is None:
+        return out
+    try:
+        fable_val = float(fable_pct)
+    except (TypeError, ValueError):
+        return out
+    if fable_val >= ATTENTION_PCT:
+        return out
+    rkey = _row_key(active)
+    ledger_key = f"fable-burn:{rkey}"
+    mins = max(1, int(round(eta)))
+    vendor = vendor_label(getattr(active, "vendor", "claude"))
+    name = _display_name(active)
+    rate_part = ""
+    raw_rate = getattr(snapshot, "fable_burn_rate_pct_per_min", None)
+    if raw_rate is not None and not isinstance(raw_rate, bool):
+        try:
+            rv = float(raw_rate)
+            if math.isfinite(rv) and rv > 0.0:
+                rate_part = f" at {rv:.1f}%/min"
+        except (TypeError, ValueError):
+            pass
+    out[ledger_key] = Event(
+        key=ledger_key,
+        kind="fable-burn",
+        severity=SEVERITY_WARN,
+        scope=rkey,
+        title=f"{vendor} {name}",
+        subtitle=f"Fable {format_pct(fable_val)} · ~{mins}m to wall",
+        message=(
+            f"Rapid Fable burn{rate_part} with Auto-switch OFF — "
+            "switch seats or enable Auto-switch"
+        ),
+    )
+    return out
+
+
 def rearms(key: str) -> bool:
     """Whether a held *key* is sent again after :data:`ATTENTION_REARM_SECONDS`.
 
@@ -878,6 +1020,10 @@ def retained_keys(
             snapshot, now=now, threshold=threshold, unpriced_min_tokens=unpriced_min_tokens
         )
     )
+    if snapshot is not None:
+        # Hold the rapid Fable burn key through the hysteresis band (< 15 min)
+        # so jitter around the 12 min threshold cannot fire twice.
+        keys.update(_fable_burn_conditions(snapshot, max_minutes=FABLE_BURN_RECOVER_MINUTES))
     for key in list(keys):
         if key.startswith("spend:") and key.endswith(":capped"):
             # A capped spend limit still stands past the threshold: dropping
@@ -925,6 +1071,10 @@ def observed_scopes(snapshot: Any) -> set[str]:
         or getattr(snapshot, "alert", None)
     ):
         scopes.add(SCOPE_SENTINEL)
+    if snapshot is not None and hasattr(snapshot, "sessions"):
+        fleet_notes = getattr(snapshot, "fleet_notes", ()) or ()
+        if not any("fleet unreadable" in str(note) for note in fleet_notes):
+            scopes.add(SCOPE_FLEET)
     return scopes
 
 
