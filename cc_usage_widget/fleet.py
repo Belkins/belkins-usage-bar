@@ -97,6 +97,18 @@ class SessionRow:
     org_shifted: bool = False
     """True when an unpinned session's transcript ``organizationUuid`` belongs to
     a different organization than its current ``slot`` (risking thinking drop)."""
+    session_id: str = ""
+    """Claude Code session UUID from ``<pid>.json`` (used for ``claude --resume``)."""
+    latched_credits: bool = False
+    """True when the live session's recent transcript tail tripped Claude Code's
+    usage-credits latch without a subsequent successful assistant response."""
+    hit_rate_limit: bool = False
+    """True when the live session's recent transcript tail hit a hard rate-limit
+    without a subsequent successful assistant response."""
+
+
+SessionInfo = SessionRow
+"""Backwards-compatible alias for :class:`SessionRow`."""
 
 
 @dataclass(frozen=True)
@@ -302,18 +314,19 @@ def detect_workspace_owner_slot(
     if not cwd_str:
         return None, False
 
-    root = projects_root if projects_root is not None else (Path.home() / ".claude" / "projects")
+    if projects_root is not None:
+        root = projects_root
+    else:
+        override = os.environ.get(SESSIONS_DIR_ENV)
+        root = (
+            Path(override).parent / "projects"
+            if override
+            else (Path.home() / ".claude" / "projects")
+        )
     if not root.is_dir():
         return None, False
 
-    slugs: list[str] = []
-    for cand_slug in (
-        re.sub(r"[^a-zA-Z0-9-]", "-", cwd_str),
-        cwd_str.replace("/", "-").replace(" ", "-"),
-        cwd_str.replace("/", "-"),
-    ):
-        if cand_slug and cand_slug not in slugs:
-            slugs.append(cand_slug)
+    slugs = _candidate_project_slugs(cwd_str)
 
     pdirs = [root / s for s in slugs if (root / s).is_dir()]
     if not pdirs:
@@ -419,14 +432,335 @@ def read_registry(directory: Path) -> tuple[tuple[dict[str, Any], ...], int]:
     return tuple(records), unreadable
 
 
+_INTERRUPTION_TAIL_BYTES = 16 * 1024
+"""Maximum bytes read from the tail of a live session transcript when scanning
+for usage-credits latches or rate-limit interruptions."""
+
+_LATCH_CREDIT_SIGNATURES: tuple[str, ...] = (
+    "now requires usage credits",
+    "model_requires_usage_credits",
+    "consent_unanswered",
+    "out of usage credits",
+    "you're out of usage credits",
+)
+
+_RATE_LIMIT_SIGNATURES: tuple[str, ...] = (
+    "hit your fable limit",
+    "hit your limit",
+    "usage_limit_reached",
+)
+
+
+def _candidate_project_slugs(cwd: str) -> list[str]:
+    """Claude Code project-directory slugs corresponding to *cwd*."""
+    slugs: list[str] = []
+    for cand_slug in (
+        re.sub(r"[^a-zA-Z0-9-]", "-", cwd),
+        cwd.replace("/", "-").replace(" ", "-"),
+        cwd.replace("/", "-"),
+    ):
+        if cand_slug and cand_slug not in slugs:
+            slugs.append(cand_slug)
+    return slugs
+
+
+def _default_projects_roots_for(sess_dir: Path) -> list[Path]:
+    """Resolve Claude ``projects/`` roots for *sess_dir*.
+
+    When ``CC_USAGE_WIDGET_SESSIONS_DIR`` is set (tests), stays strictly inside
+    the test hierarchy and never touches ``~/.claude``.
+    """
+    roots: list[Path] = []
+    sibling = Path(sess_dir).parent / "projects"
+    if sibling.is_dir():
+        roots.append(sibling)
+
+    override = os.environ.get(SESSIONS_DIR_ENV)
+    if override:
+        env_projects = Path(override).parent / "projects"
+        if env_projects.is_dir() and env_projects not in roots:
+            roots.append(env_projects)
+        return roots
+
+    try:
+        from claude_swap.paths import get_claude_config_home
+
+        default_projects = Path(get_claude_config_home()) / "projects"
+    except Exception:
+        default_projects = Path.home() / ".claude" / "projects"
+    if default_projects.is_dir() and default_projects not in roots:
+        roots.append(default_projects)
+    return roots
+
+
+def _locate_session_jsonl(
+    session_id: str,
+    cwd: str,
+    roots: list[Path],
+    subdir_cache: dict[Path, list[Path]],
+) -> Path | None:
+    """Locate ``<session_id>.jsonl`` in O(1) via *cwd* slug, else scan root subdirs."""
+    sid = session_id.strip()
+    if not sid or "/" in sid or "\\" in sid or ".." in sid:
+        return None
+    filename = f"{sid}.jsonl"
+
+    if cwd:
+        slugs = _candidate_project_slugs(cwd)
+        for root in roots:
+            for slug in slugs:
+                cand = root / slug / filename
+                if cand.is_file():
+                    return cand
+
+    for root in roots:
+        direct = root / filename
+        if direct.is_file():
+            return direct
+
+    for root in roots:
+        subdirs = subdir_cache.get(root)
+        if subdirs is None:
+            subdirs = []
+            try:
+                with os.scandir(root) as it:
+                    for entry in it:
+                        try:
+                            if entry.is_dir():
+                                subdirs.append(Path(entry.path))
+                        except OSError:
+                            continue
+            except OSError:
+                pass
+            subdir_cache[root] = subdirs
+        for subdir in subdirs:
+            cand = subdir / filename
+            if cand.is_file():
+                return cand
+    return None
+
+
+def _int_or_zero(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    return 0
+
+
+def _has_assistant_content(msg: Mapping[str, Any]) -> bool:
+    """True when an assistant ``message`` carries non-empty response content."""
+    content = msg.get("content")
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, str) and item.strip():
+                return True
+            if isinstance(item, Mapping):
+                itype = str(item.get("type") or "").strip().lower()
+                if itype in ("tool_use", "thinking"):
+                    return True
+                if itype == "text" and str(item.get("text") or "").strip():
+                    return True
+    return False
+
+
+def _match_interruption_signatures(line_bytes: bytes) -> tuple[bool, bool]:
+    """Check one JSONL record's bytes for latch/rate-limit signatures.
+
+    Returns ``(latched_credits, hit_rate_limit)``. Never stores, logs, or
+    returns any transcript text.
+    """
+    norm = (
+        line_bytes.decode("utf-8", errors="replace")
+        .replace("\u2019", "'")
+        .replace("\\u2019", "'")
+        .replace("\\'", "'")
+        .lower()
+    )
+    latched = any(sig in norm for sig in _LATCH_CREDIT_SIGNATURES)
+    rate_limited = any(sig in norm for sig in _RATE_LIMIT_SIGNATURES)
+    return latched, rate_limited
+
+
+def _analyze_interruption_tail(raw_tail: bytes, *, truncated: bool) -> tuple[bool, bool]:
+    """Scan bounded transcript tail bytes in chronological order.
+
+    A later successful assistant response clears any earlier latch or rate-limit
+    flag in the tail. User prompts and tool results are ignored to prevent false
+    positives when editing code or discussing errors.
+    """
+    if not raw_tail:
+        return False, False
+    if truncated:
+        nl = raw_tail.find(b"\n")
+        if nl == -1:
+            return False, False
+        raw_tail = raw_tail[nl + 1 :]
+
+    latched = False
+    rate_limited = False
+    for raw_line in raw_tail.splitlines():
+        line_bytes = raw_line.strip()
+        if not line_bytes:
+            continue
+        try:
+            obj = json.loads(line_bytes.decode("utf-8", errors="replace"))
+        except Exception:
+            continue
+        if not isinstance(obj, Mapping):
+            continue
+        rec_type = str(obj.get("type") or "").strip().lower()
+        if rec_type == "user":
+            continue
+        if rec_type == "assistant":
+            msg = obj.get("message")
+            msg_map = msg if isinstance(msg, Mapping) else {}
+            model = str(msg_map.get("model") or "").strip().lower()
+            usage = msg_map.get("usage")
+            usage_map = usage if isinstance(usage, Mapping) else {}
+            has_real_tokens = (
+                (_int_or_zero(usage_map.get("input_tokens")) > 0
+                 or _int_or_zero(usage_map.get("output_tokens")) > 0)
+                and bool(model)
+                and model != "<synthetic>"
+            )
+            is_err_obj = bool(
+                obj.get("isApiErrorMessage")
+                or obj.get("is_error")
+                or obj.get("error")
+                or msg_map.get("error")
+                or model == "<synthetic>"
+            )
+            if not is_err_obj and has_real_tokens:
+                latched = False
+                rate_limited = False
+                continue
+            m_latch, m_rl = _match_interruption_signatures(line_bytes)
+            if m_latch or m_rl:
+                if m_latch:
+                    latched = True
+                if m_rl:
+                    rate_limited = True
+                continue
+            if not is_err_obj and _has_assistant_content(msg_map):
+                latched = False
+                rate_limited = False
+            continue
+
+        m_latch, m_rl = _match_interruption_signatures(line_bytes)
+        if m_latch:
+            latched = True
+        if m_rl:
+            rate_limited = True
+    return latched, rate_limited
+
+
+def detect_session_interruptions(
+    sessions_dir: Path,
+    projects_roots: Iterable[Path] | None = None,
+    *,
+    max_age_s: float = 180.0,
+    now: float | None = None,
+) -> dict[int, dict[str, Any]]:
+    """Detect usage-credits latches and hard rate-limit hits in live sessions.
+
+    Reads ``sessionId`` from live interactive ``<pid>.json`` records under
+    *sessions_dir*, locates each ``<sessionId>.jsonl`` across *projects_roots*,
+    checks ``mtime`` against *max_age_s*, and tail-reads at most 16 KiB per
+    qualifying file. Never reads whole transcripts and never logs or returns
+    prompt or transcript text.
+
+    Returns ``{pid: {"session_id": str, "latched_credits": bool,
+    "hit_rate_limit": bool}}`` for sessions currently in an interrupted state.
+    """
+    sess_path = Path(sessions_dir)
+    records, _unreadable = read_registry(sess_path)
+    if not records:
+        return {}
+
+    if projects_roots is None:
+        roots = _default_projects_roots_for(sess_path)
+    else:
+        roots = [Path(r) for r in projects_roots if Path(r).is_dir()]
+    if not roots:
+        return {}
+
+    now_ts = time.time() if now is None else float(now)
+    subdir_cache: dict[Path, list[Path]] = {}
+    out: dict[int, dict[str, Any]] = {}
+
+    for record in records:
+        pid = int(record["pid"])
+        sid = str(record.get("sessionId") or "").strip()
+        if not sid:
+            continue
+        cwd = str(record.get("cwd") or "").strip()
+        cand = _locate_session_jsonl(sid, cwd, roots, subdir_cache)
+        if cand is None:
+            continue
+        try:
+            st = cand.stat()
+        except OSError:
+            continue
+        if max_age_s >= 0.0 and (now_ts - st.st_mtime) > max_age_s:
+            continue
+        try:
+            with cand.open("rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                if size <= 0:
+                    continue
+                start = max(0, size - _INTERRUPTION_TAIL_BYTES)
+                fh.seek(start)
+                raw_tail = fh.read(_INTERRUPTION_TAIL_BYTES)
+        except OSError:
+            continue
+        latched, rate_limited = _analyze_interruption_tail(raw_tail, truncated=(start > 0))
+        if latched or rate_limited:
+            prev = out.get(pid)
+            if prev is not None:
+                out[pid] = {
+                    "session_id": sid,
+                    "latched_credits": bool(prev["latched_credits"] or latched),
+                    "hit_rate_limit": bool(prev["hit_rate_limit"] or rate_limited),
+                }
+            else:
+                out[pid] = {
+                    "session_id": sid,
+                    "latched_credits": latched,
+                    "hit_rate_limit": rate_limited,
+                }
+            LOGGER.debug(
+                "fleet: session interruption pid=%d latched_credits=%s hit_rate_limit=%s",
+                pid,
+                latched,
+                rate_limited,
+            )
+    return out
+
+
 def _row_from_record(
-    record: Mapping[str, Any], *, slot: int | None, pinned: bool
+    record: Mapping[str, Any],
+    *,
+    slot: int | None,
+    pinned: bool,
+    interruption: Mapping[str, Any] | None = None,
 ) -> SessionRow:
     started = record.get("startedAt", 0)
     try:
         started_at = float(started) / 1000.0 if started else 0.0
     except (TypeError, ValueError):
         started_at = 0.0
+    sid = str(record.get("sessionId", "") or "").strip()
+    latched = False
+    hit_rl = False
+    if interruption:
+        intr_sid = str(interruption.get("session_id") or "").strip()
+        if not intr_sid or not sid or intr_sid == sid:
+            latched = bool(interruption.get("latched_credits", False))
+            hit_rl = bool(interruption.get("hit_rate_limit", False))
     return SessionRow(
         pid=int(record["pid"]),
         cwd=str(record.get("cwd", "") or ""),
@@ -435,6 +769,9 @@ def _row_from_record(
         started_at=started_at,
         slot=slot,
         pinned=pinned,
+        session_id=sid,
+        latched_credits=latched,
+        hit_rate_limit=hit_rl,
     )
 
 
@@ -627,9 +964,22 @@ def collect(
     notes: list[str] = []
     rows: list[SessionRow] = []
 
-    records, unreadable = read_registry(sessions_dir())
+    default_dir = sessions_dir()
+    records, unreadable = read_registry(default_dir)
+    default_interruptions: dict[int, dict[str, Any]] = {}
+    if records:
+        try:
+            default_interruptions = detect_session_interruptions(default_dir)
+        except Exception:
+            default_interruptions = {}
     rows.extend(
-        _row_from_record(record, slot=active_slot, pinned=False) for record in records
+        _row_from_record(
+            record,
+            slot=active_slot,
+            pinned=False,
+            interruption=default_interruptions.get(int(record["pid"])),
+        )
+        for record in records
     )
 
     identities = account_identities(backup_dir)
@@ -652,8 +1002,19 @@ def collect(
                 break
             profile_records, profile_unreadable = read_registry(directory)
             unreadable += profile_unreadable
+            prof_interruptions: dict[int, dict[str, Any]] = {}
+            if profile_records:
+                try:
+                    prof_interruptions = detect_session_interruptions(directory)
+                except Exception:
+                    prof_interruptions = {}
             rows.extend(
-                _row_from_record(record, slot=slot, pinned=True)
+                _row_from_record(
+                    record,
+                    slot=slot,
+                    pinned=True,
+                    interruption=prof_interruptions.get(int(record["pid"])),
+                )
                 for record in profile_records
             )
         if missing_upstream:
@@ -679,6 +1040,7 @@ def collect(
                     row.cwd,
                     identities,
                     current_slot=row.slot,
+                    session_id=row.session_id or None,
                     pid=row.pid,
                 )
             except Exception:
@@ -699,6 +1061,9 @@ def collect(
                 pinned_here=own,
                 owner_slot=owner_slot,
                 org_shifted=org_shifted,
+                session_id=row.session_id,
+                latched_credits=row.latched_credits,
+                hit_rate_limit=row.hit_rate_limit,
             )
         resolved.append(row)
 

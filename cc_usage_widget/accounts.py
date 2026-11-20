@@ -292,12 +292,22 @@ def _hours_until_reset_label(label: str | None, now_epoch: float) -> float | Non
         return None
 
 
-def row_has_fable_quota(row: Any) -> bool:
-    """True when *row* reports an included ``Fable`` weekly allowance."""
+def _row_fable_pct(row: Any) -> float | None:
+    """Return the ``Fable`` scoped utilization percentage for *row*, or ``None``."""
     for name, pct in getattr(row, "scoped_windows", ()) or ():
         if pct is not None and str(name).strip().lower().startswith("fable"):
-            return True
-    return False
+            try:
+                val = float(pct)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(val):
+                return val
+    return None
+
+
+def row_has_fable_quota(row: Any) -> bool:
+    """True when *row* reports an included ``Fable`` weekly allowance."""
+    return _row_fable_pct(row) is not None
 
 
 def row_lacks_fable_quota(row: Any) -> bool:
@@ -336,6 +346,16 @@ def fleet_has_fable_accounts(
     return False
 
 
+def _row_weekly_reset_label(row: AccountRow) -> str | None:
+    """Best weekly reset label for *row*: 7-day reset, else Fable scoped reset."""
+    if row.seven_day_resets_at:
+        return row.seven_day_resets_at
+    for name, label in getattr(row, "scoped_resets_at", ()) or ():
+        if label and str(name).strip().lower().startswith("fable"):
+            return str(label)
+    return None
+
+
 def harvest_best_slot(
     rows: tuple[AccountRow, ...] | list[AccountRow],
     *,
@@ -349,9 +369,9 @@ def harvest_best_slot(
     """Smart Perishable-Quota, Fable-Safe & Org-Aware Claude slot selector.
 
     1. Filters out disabled, unswitchable, sentinel-flagged, or attention-flagged slots.
-    2. When *require_fable_if_fleet_has_it* is True and any eligible seat carries an
-       included ``Fable`` weekly window, excludes seats proven to lack a Fable allowance
-       (e.g. ``claude_team`` seats that require paid usage credits for Fable 5.2).
+    2. When *require_fable_if_fleet_has_it* is True and the fleet carries Fable-capable
+       seats, excludes seats proven to lack a Fable allowance (e.g. ``claude_team``
+       seats that require paid usage credits for Fable 5.2).
     3. Evaluates 5-hour, 7-day, AND per-model ``scoped_windows`` (e.g. ``Fable``) so
        exhausted model sub-quotas are never chosen.
     4. Applies a Perishable-Quota Urgency bonus to seats with ``>= 15%`` remaining
@@ -365,7 +385,12 @@ def harvest_best_slot(
     sentinel_map = sentinels or {}
     id_map = identities or {}
 
-    def _window_metrics(r: AccountRow) -> tuple[float, float]:
+    def _window_metrics(r: AccountRow) -> tuple[float, float, bool]:
+        has_usage = (
+            r.five_hour_pct is not None
+            or r.seven_day_pct is not None
+            or any(pct is not None for _n, pct in (r.scoped_windows or ()))
+        )
         fh = float(r.five_hour_pct or 0.0)
         wk = float(r.seven_day_pct or 0.0)
         for name, pct in r.scoped_windows or ():
@@ -375,36 +400,43 @@ def harvest_best_slot(
             if not wanted_models or match_all or name.strip().lower() in wanted_models or val >= 99.0:
                 if val > wk:
                     wk = val
-        return fh, wk
+        return fh, wk, has_usage
 
-    eligible: list[tuple[AccountRow, float, float]] = []
+    eligible: list[tuple[AccountRow, float, float, bool]] = []
     for r in rows:
         if r.slot < 0 or r.disabled or not r.switchable:
             continue
         if r.attention_note or r.slot in sentinel_map:
             continue
-        fh, wk = _window_metrics(r)
+        fh, wk, has_usage = _window_metrics(r)
         if fh >= 100.0 or wk >= 100.0:
             continue
-        eligible.append((r, fh, wk))
+        eligible.append((r, fh, wk, has_usage))
 
     if not eligible:
         return None
 
-    if require_fable_if_fleet_has_it and any(row_has_fable_quota(r) for r, _f, _w in eligible):
-        fable_only = [(r, fh, wk) for (r, fh, wk) in eligible if not row_lacks_fable_quota(r)]
-        if fable_only:
-            eligible = fable_only
+    if require_fable_if_fleet_has_it and (
+        any(row_has_fable_quota(r) for r, _f, _w, _u in eligible)
+        or fleet_has_fable_accounts(rows, sentinels=sentinel_map)
+    ):
+        eligible = [(r, fh, wk, u) for (r, fh, wk, u) in eligible if not row_lacks_fable_quota(r)]
+        if not eligible:
+            return None
 
-    comfortable = [(r, fh, wk) for (r, fh, wk) in eligible if fh < 95.0 and wk < 99.0]
-    pool = comfortable if comfortable else eligible
+    measured = [item for item in eligible if item[3]]
+    if measured:
+        eligible = measured
+
+    comfortable = [(r, fh, wk) for (r, fh, wk, _u) in eligible if fh < 95.0 and wk < 99.0]
+    pool = comfortable if comfortable else [(r, fh, wk) for (r, fh, wk, _u) in eligible]
 
     best_row: AccountRow | None = None
     best_score: float = -1e9
     for r, fh, wk in pool:
         base_headroom = 100.0 - max(fh, wk * 0.85)
         perishable_bonus = 0.0
-        hours_left = _hours_until_reset_label(r.seven_day_resets_at, moment)
+        hours_left = _hours_until_reset_label(_row_weekly_reset_label(r), moment)
         rem_wk = max(0.0, 100.0 - wk)
         if hours_left is not None and 0.0 < hours_left <= 48.0 and rem_wk >= 15.0 and fh < 80.0:
             perishable_bonus = min(35.0, (rem_wk / max(hours_left, 4.0)) * 2.5)
@@ -735,46 +767,104 @@ def _seed_default_model_policy(
         return False
 
 
+_FABLE_BURN_ALPHA: Final[float] = 0.45
+"""EWMA smoothing factor for per-slot Fable burn velocity (pct/min)."""
+
+_FABLE_BURN_MIN_DT_S: Final[float] = 5.0
+"""Minimum seconds between distinct samples to compute an instantaneous burn rate
+(filters stale repeats with identical ``fetched_at`` and sub-5s jitter)."""
+
+_FABLE_BURN_MAX_GAP_S: Final[float] = 1800.0
+"""Maximum seconds between consecutive samples (30 min) before resetting the
+burn baseline rather than smearing velocity across idle gaps."""
+
+_FABLE_BURN_MAX_RATE: Final[float] = 25.0
+"""Upper clamp on instantaneous Fable burn velocity (pct/min)."""
+
+_FABLE_FAST_BURN_THRESHOLD: Final[float] = 0.8
+"""Active Fable burn rate (pct/min) at or above which predictive pre-switching
+shifts the weekly threshold down and shrinks busy hold caps."""
+
+_FABLE_PREDICTIVE_FLOOR: Final[float] = 75.0
+"""Floor (%) for burn-shifted proactive weekly thresholds."""
+
+_FABLE_JUMP_RELEASE_DELTA: Final[float] = 3.0
+"""Single-interval Fable percentage jump that triggers immediate release."""
+
+_FABLE_JUMP_RELEASE_MIN_PCT: Final[float] = 82.0
+"""Minimum active Fable utilization (%) for single-interval jump release."""
+
+
+@dataclass
+class _FableBurnSample:
+    """In-memory EWMA burn-velocity state for one account slot."""
+
+    last_pct: float
+    last_ts: float
+    recorded_mono: float
+    ewma_rate: float | None = None
+    last_jump: float = 0.0
+    last_jump_mono: float = 0.0
+
+
 def _clear_stale_credit_cache(switcher: Any) -> bool:
     """Drop stale ``cachedExtraUsageDisabledReason`` from ``~/.claude.json`` after
     switching onto a Fable-capable seat so resuming sessions do not inherit a prior
     Team/capped seat's ``out_of_credits`` / ``org_level_disabled`` flag.
 
-    Best-effort and atomic; returns ``True`` when the key was present and cleared.
+    Preserves all other ``~/.claude.json`` keys untouched and writes atomically
+    with the file's original mode (defaulting to ``0o600`` and never creating a
+    world-readable temp file). Returns ``True`` when the key was present and cleared.
     """
+    tmp: Path | None = None
     try:
         config_getter = getattr(switcher, "_get_claude_config_path", None)
         cfg_path = Path(config_getter()) if callable(config_getter) else Path.home() / ".claude.json"
         if not cfg_path.is_file():
             return False
-        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict) or "cachedExtraUsageDisabledReason" not in raw:
-            return False
-        raw.pop("cachedExtraUsageDisabledReason", None)
-        tmp = cfg_path.with_name(f".{cfg_path.name}.tmp.{os.getpid()}")
         try:
             mode = stat.S_IMODE(cfg_path.stat().st_mode)
         except OSError:
             mode = 0o600
-        tmp.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict) or "cachedExtraUsageDisabledReason" not in raw:
+            return False
+        raw.pop("cachedExtraUsageDisabledReason", None)
+        payload = json.dumps(raw, indent=2).encode("utf-8")
+        tmp = cfg_path.with_name(f".{cfg_path.name}.tmp.{os.getpid()}.{threading.get_ident()}")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
         try:
             os.chmod(tmp, mode)
         except OSError:
             pass
         os.replace(tmp, cfg_path)
+        tmp = None
         return True
     except Exception:
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
         return False
 
 
 class _FableGuardSwitcher:
     """Thin proxy around ``ClaudeAccountSwitcher`` for ``AutoSwitchEngine``.
 
-    When ``belkins_fable_guard`` is enabled and the pool contains Fable-capable
-    accounts (e.g. ``claude_max_20x`` seats reporting a ``Fable`` weekly bucket),
-    excludes slots proven to lack an included Fable allowance (e.g. ``claude_team``
-    seats where Fable 5.2 fails with ``requires usage credits`` and permanently
-    latches running Claude Code terminals) from automatic rotation candidates.
+    1. When ``belkins_fable_guard`` is enabled and the pool contains healthy
+       Fable-capable accounts (e.g. ``claude_max_20x`` seats reporting a
+       ``Fable`` weekly bucket), excludes non-active slots proven to lack an
+       included Fable allowance (e.g. ``claude_team`` seats where Fable 5.2
+       fails with ``requires usage credits`` and permanently latches running
+       Claude Code terminals) from automatic rotation candidates.
+    2. Also filters out disabled, unswitchable, attention-flagged, or
+       sentinel-flagged non-active slots so automatic rotation never selects a
+       broken seat when healthy alternatives exist.
+    3. Preserves sequence order by default, and surfaces same-org and
+       perishable-quota (expiring ``<= 48h``) seats ahead on headroom ties.
     """
 
     def __init__(self, inner: Any, source: "SwapAccountSource") -> None:
@@ -784,42 +874,115 @@ class _FableGuardSwitcher:
 
     def switchable_account_numbers(self) -> list[str]:
         nums = list(self._inner.switchable_account_numbers())
-        settings_map = _as_mapping(getattr(self._source, "_settings_obj", None)) or {}
-        if not settings_map.get("belkins_fable_guard", True):
-            return nums
         try:
             rows = self._source._current_rows_for_guard()
         except Exception:
             return nums
         if not rows:
             return nums
+        with self._source._lock:
+            smap = dict(getattr(self._source, "_sentinels", None) or {})
         by_num = {str(r.slot): r for r in rows}
         active_row = next((r for r in rows if r.is_active), None)
-        fable_nums = [n for n in nums if n in by_num and row_has_fable_quota(by_num[n])]
-        if not fable_nums:
-            return nums
+        settings_map = _as_mapping(getattr(self._source, "_settings_obj", None)) or {}
+        fable_guard_on = bool(settings_map.get("belkins_fable_guard", True))
+        fable_nums = [
+            n
+            for n in nums
+            if n in by_num
+            and row_has_fable_quota(by_num[n])
+            and not by_num[n].disabled
+            and by_num[n].switchable
+            and not by_num[n].attention_note
+            and by_num[n].slot not in smap
+        ]
+        exclude_non_fable = fable_guard_on and bool(fable_nums)
+
         kept: list[str] = []
         for n in nums:
             row = by_num.get(n)
+            is_active = row is not None and active_row is not None and row.slot == active_row.slot
             # Never drop the currently active slot from the list if the user explicitly
-            # selected it; only filter candidate targets that lack Fable quota.
-            if (
-                row is not None
-                and (active_row is None or row.slot != active_row.slot)
-                and row_lacks_fable_quota(row)
-            ):
-                if n not in self._logged_excluded:
-                    self._logged_excluded.add(n)
-                    self._source._log.info(
-                        "accounts: Fable Guard excluded slot %s (%s, %s) from auto-switch "
-                        "rotation (no included Fable allowance — requires usage credits)",
-                        n,
-                        row.alias,
-                        row.plan_type or "non-fable",
-                    )
-                continue
+            # selected it; only filter non-active candidate targets.
+            if row is not None and not is_active:
+                if row.disabled or not row.switchable or row.attention_note or row.slot in smap:
+                    continue
+                if exclude_non_fable and row_lacks_fable_quota(row):
+                    if n not in self._logged_excluded:
+                        self._logged_excluded.add(n)
+                        self._source._log.info(
+                            "accounts: Fable Guard excluded slot %s (%s, %s) from auto-switch "
+                            "rotation (no included Fable allowance — requires usage credits)",
+                            n,
+                            row.alias,
+                            row.plan_type or "non-fable",
+                        )
+                    continue
             kept.append(n)
-        return kept if kept else nums
+        if not kept:
+            return nums
+        return self._order_candidates_for_tiebreak(kept, by_num, active_row)
+
+    def _order_candidates_for_tiebreak(
+        self,
+        kept: list[str],
+        by_num: Mapping[str, AccountRow],
+        active_row: AccountRow | None,
+    ) -> list[str]:
+        """Rank non-active candidates by same-org + perishable-quota bonus on ties.
+
+        When no candidate has a positive bonus, returns *kept* in its original order.
+        """
+        try:
+            identities = self._source._identities_for_guard()
+        except Exception:
+            identities = {}
+        prefer_org: str | None = None
+        if active_row is not None:
+            ident = identities.get(active_row.slot)
+            if ident and ident[1]:
+                prefer_org = ident[1]
+        wall_fn = getattr(self._source, "_wall", time.time)
+        try:
+            now_epoch = float(wall_fn())
+        except Exception:
+            now_epoch = time.time()
+
+        bonuses: dict[str, float] = {}
+        any_bonus = False
+        for n in kept:
+            row = by_num.get(n)
+            if row is None or (active_row is not None and row.slot == active_row.slot):
+                bonuses[n] = 0.0
+                continue
+            fh = float(row.five_hour_pct or 0.0)
+            wk = max(
+                float(row.seven_day_pct or 0.0),
+                max((float(p) for _name, p in (row.scoped_windows or ()) if p is not None), default=0.0),
+            )
+            bonus = 0.0
+            hours_left = _hours_until_reset_label(_row_weekly_reset_label(row), now_epoch)
+            rem_wk = max(0.0, 100.0 - wk)
+            if hours_left is not None and 0.0 < hours_left <= 48.0 and rem_wk >= 15.0 and fh < 80.0:
+                bonus += min(35.0, (rem_wk / max(hours_left, 4.0)) * 2.5)
+            if prefer_org and fh < 88.0 and wk < 95.0:
+                ident = identities.get(row.slot)
+                if ident and ident[1] and ident[1] == prefer_org:
+                    bonus += 20.0
+            bonuses[n] = bonus
+            if bonus > 0.0:
+                any_bonus = True
+        if not any_bonus:
+            return kept
+
+        active_num = str(active_row.slot) if active_row is not None else None
+        non_active = [n for n in kept if n != active_num]
+        non_active.sort(key=lambda n: -bonuses.get(n, 0.0))
+        out: list[str] = []
+        non_iter = iter(non_active)
+        for n in kept:
+            out.append(n if n == active_num else next(non_iter))
+        return out
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
@@ -1126,6 +1289,11 @@ class SwapAccountSource:
         self._handoff_armed: bool = False
         self._guard_hold_started_at: float = 0.0
         self._manual_hold_until: float = 0.0
+        self._bypass_guard_once: bool = False
+        self._fable_burn: dict[int, _FableBurnSample] = {}
+        self._last_sampled_snapshot: Any | None = None
+        self._rows_cache_snapshot: Any | None = None
+        self._identities_cache: tuple[float | None, dict[int, tuple[str, str]]] = (None, {})
         # Stored-login plan per config backup, keyed by path and re-read only
         # when the file's (mtime_ns, size) moves: the file is ~190 KB and a
         # switch rewrites it, the plan inside almost never changes.
@@ -1276,6 +1444,7 @@ class SwapAccountSource:
         unmanaged = None if active_now else self._live_unmanaged_login(backend)
 
         active_at_limit = _snapshot_active_at_limit(snapshot)
+        wall_now = self._wall()
         with self._lock:
             self._unmanaged_login = unmanaged
             previous = self._last_active_number
@@ -1291,7 +1460,8 @@ class SwapAccountSource:
             self._last_error = None
             if (wake_engine and force) or active_at_limit:
                 self._next_tick_at = 0.0
-            since, self._last_pass_wall = self._last_pass_wall, self._wall()
+            since, self._last_pass_wall = self._last_pass_wall, wall_now
+        self._record_fable_samples_from_snapshot(snapshot, now=wall_now, backend=backend)
         if not self._note_reverted_switch(expected, current, since=since):
             self._note_external_switch(previous, current, expected, since=since)
 
@@ -1732,12 +1902,18 @@ class SwapAccountSource:
 
         rows.sort(key=lambda row: row.slot)
         built = tuple(rows)
+        need_sample = False
         with self._lock:
             self._sentinels = sentinels
             self._sentinel_kinds = sentinel_kinds
             self._switchable = frozenset(switchable)
             self._alias_by_slot = aliases
             self._rows_cache = built
+            self._rows_cache_snapshot = snapshot
+            if getattr(self, "_last_sampled_snapshot", None) is not snapshot:
+                need_sample = True
+        if need_sample:
+            self._record_fable_samples_from_snapshot(snapshot, now=now, backend=backend)
         return built
 
     def _build_row(
@@ -1764,7 +1940,7 @@ class SwapAccountSource:
         if not isinstance(last_good, Mapping):
             last_good = None
 
-        roll = backend.roll_weekly if backend is not None else _identity_roll
+        roll = (getattr(backend, "roll_weekly", None) if backend is not None else None) or _identity_roll
         five_hour = _window(last_good, "five_hour")
         # Weekly windows only: the 5-hour window has no fixed weekly cadence to
         # roll forward from, so upstream never rolls it either.
@@ -2379,6 +2555,7 @@ class SwapAccountSource:
                 self._manual_hold_until = time.monotonic() + 180.0
                 self._handoff_armed = False
                 self._guard_hold_started_at = 0.0
+                self._bypass_guard_once = False
             # Reflect the new active row now without immediately re-triggering autoswitch.
             self._refresh_after_switch()
         return ok
@@ -2487,58 +2664,9 @@ class SwapAccountSource:
             "manual switch (best) requested%s",
             f" (model limits: {', '.join(models)})" if models else "",
         )
-        # When Fable Guard is active on a live claude-swap fleet containing both
-        # Fable-capable (Max) and non-Fable (Team/Pro) seats, never let upstream's
-        # plain `best` pick a non-Fable seat solely because it has no Fable window.
         settings_map = _as_mapping(self._settings_obj) or {}
-        if _is_real_claude_swap(backend) and settings_map.get("belkins_fable_guard", True):
-            rows = self._current_rows_for_guard()
-            with self._lock:
-                smap = dict(self._sentinels)
-            if fleet_has_fable_accounts(rows, sentinels=smap) and any(
-                row_lacks_fable_quota(r) and not r.disabled and r.switchable for r in rows
-            ):
-                fable_pool = [r for r in rows if not row_lacks_fable_quota(r)]
-                active_row = next((r for r in rows if r.is_active), None)
-                best_fable = harvest_best_slot(
-                    [r for r in fable_pool if not r.is_active],
-                    sentinels=smap,
-                    models=models,
-                    require_fable_if_fleet_has_it=True,
-                )
-                if best_fable is None:
-                    self._record_error("no healthy Fable-capable account available")
-                    return False
-                # Already on the best Fable-capable seat?
-                if (
-                    active_row is not None
-                    and not row_lacks_fable_quota(active_row)
-                    and active_row.slot not in smap
-                    and not active_row.attention_note
-                ):
-                    overall = harvest_best_slot(
-                        fable_pool,
-                        sentinels=smap,
-                        models=models,
-                        require_fable_if_fleet_has_it=True,
-                    )
-                    if overall is not None and overall.slot == active_row.slot:
-                        msg = "Already on the Fable-capable account with the most headroom"
-                        LOGGER.info("manual switch (best): %s", msg)
-                        self._append_event(f"switch (best): {msg}")
-                        return True
-                ok = self._attempt_switch(backend, str(best_fable.slot))
-                if ok:
-                    _clear_stale_credit_cache(backend.switcher)
-                    LOGGER.info("manual switch (best) -> %s succeeded (Fable Guard)", best_fable.alias)
-                    self._append_event(f"manual switch (best) -> {best_fable.alias}")
-                    with self._lock:
-                        self._expect_active = str(best_fable.slot)
-                        self._external_alert = None
-                        self._handoff_armed = False
-                        self._guard_hold_started_at = 0.0
-                    self._refresh_after_switch()
-                return ok
+        if _is_real_claude_swap(backend):
+            return self._switch_best_harvest(backend, models, settings_map)
 
         try:
             result = backend.switcher.switch(
@@ -2585,6 +2713,97 @@ class SwapAccountSource:
             return True
         self._record_error(f"switch to the best account did not take: {message}")
         return False
+
+    def _switch_best_harvest(
+        self,
+        backend: _Backend,
+        models: tuple[str, ...],
+        settings_map: Mapping[str, Any],
+    ) -> bool:
+        """Store-refreshed, Fable-safe, org-aware and perishable-quota ``switch_best``.
+
+        Refreshes from claude-swap's usage store before ranking so stale display
+        rows cannot steer the pick, respects same-org affinity (``prefer_org``)
+        and perishable-quota urgency via :func:`harvest_best_slot`, and never
+        picks a sentinel-flagged, disabled, or non-Fable seat when Fable-capable
+        alternatives exist.
+        """
+        if getattr(backend, "snapshot_source", None) is not None:
+            try:
+                self._refresh_after_switch()
+            except Exception as exc:
+                self._log.debug("accounts: pre-switch_best refresh skipped: %r", exc)
+        with self._lock:
+            snap = getattr(self, "_snapshot", None)
+        if snap is not None:
+            try:
+                rows = self._build_rows(snap)
+            except Exception:
+                rows = self._current_rows_for_guard()
+        else:
+            rows = self._current_rows_for_guard()
+        if not rows:
+            self._record_error("no accounts available for best-account switch")
+            return False
+
+        with self._lock:
+            smap = dict(getattr(self, "_sentinels", None) or {})
+        identities = self._identities_for_guard(backend)
+        active_row = next((r for r in rows if r.is_active), None)
+        prefer_org: str | None = None
+        if active_row is not None:
+            ident = identities.get(active_row.slot)
+            if ident and ident[1]:
+                prefer_org = ident[1]
+        require_fable = bool(settings_map.get("belkins_fable_guard", True))
+        has_fable_fleet = fleet_has_fable_accounts(rows, sentinels=smap)
+        wall_fn = getattr(self, "_wall", time.time)
+        try:
+            now_epoch = float(wall_fn())
+        except Exception:
+            now_epoch = time.time()
+
+        overall = harvest_best_slot(
+            rows,
+            sentinels=smap,
+            identities=identities,
+            prefer_org=prefer_org,
+            models=models,
+            now=now_epoch,
+            require_fable_if_fleet_has_it=require_fable,
+        )
+        if overall is None:
+            msg = (
+                "no healthy Fable-capable account available"
+                if (require_fable and has_fable_fleet)
+                else "no healthy switchable account available"
+            )
+            self._record_error(msg)
+            return False
+        if active_row is not None and overall.slot == active_row.slot:
+            msg = (
+                "Already on the Fable-capable account with the most headroom"
+                if (require_fable and has_fable_fleet)
+                else "Already on the account with the most headroom"
+            )
+            LOGGER.info("manual switch (best): %s", msg)
+            self._append_event(f"switch (best): {msg}")
+            return True
+
+        ok = self._attempt_switch(backend, str(overall.slot))
+        if ok:
+            _clear_stale_credit_cache(backend.switcher)
+            tag = " (Fable Guard)" if (require_fable and has_fable_fleet) else ""
+            LOGGER.info("manual switch (best) -> %s succeeded%s", overall.alias, tag)
+            self._append_event(f"manual switch (best) -> {overall.alias}")
+            with self._lock:
+                self._expect_active = str(overall.slot)
+                self._external_alert = None
+                self._handoff_armed = False
+                self._guard_hold_started_at = 0.0
+                self._bypass_guard_once = False
+            self._refresh_after_switch()
+        return ok
 
     def _policy_models(self, backend: _Backend) -> tuple[str, ...]:
         """Per-model weekly windows the autoswitch policy names, or ``()``.
@@ -3062,14 +3281,313 @@ class SwapAccountSource:
     def _current_rows_for_guard(self) -> tuple[AccountRow, ...]:
         """Return cached AccountRows (building from the latest snapshot if needed)."""
         with self._lock:
-            rows_cache = self._rows_cache
-            snapshot = self._snapshot
+            rows_cache = getattr(self, "_rows_cache", ()) or ()
+            snapshot = getattr(self, "_snapshot", None)
         if not rows_cache and snapshot is not None:
             try:
                 rows_cache = self._build_rows(snapshot)
             except Exception:
                 return ()
         return rows_cache
+
+    def _identities_for_guard(self, backend: Any | None = None) -> dict[int, tuple[str, str]]:
+        """mtime-cached ``{slot: (email, organizationUuid)}`` from ``sequence.json``."""
+        if backend is None:
+            with self._lock:
+                backend = getattr(self, "_backend", None)
+        backup_dir = getattr(backend, "backup_dir", None) if backend is not None else None
+        if backup_dir is None:
+            return {}
+        seq_path = Path(backup_dir) / "sequence.json"
+        try:
+            mtime: float | None = seq_path.stat().st_mtime
+        except OSError:
+            return {}
+        with self._lock:
+            cached = getattr(self, "_identities_cache", None)
+            if cached is not None and cached[0] == mtime:
+                return dict(cached[1])
+        try:
+            from . import fleet
+
+            identities = fleet.account_identities(Path(backup_dir))
+        except Exception:
+            identities = {}
+        with self._lock:
+            self._identities_cache = (mtime, dict(identities))
+        return identities
+
+    def _fable_burn_map(self) -> dict[int, _FableBurnSample]:
+        """Return (or lazily create for ``__new__`` stubs) the per-slot burn table."""
+        burn = getattr(self, "_fable_burn", None)
+        if burn is None:
+            burn = {}
+            self._fable_burn = burn
+        return burn
+
+    def _record_fable_sample(self, slot: int, fable_pct: float, sample_ts: float) -> None:
+        """Record one ``(fable_pct, timestamp)`` sample and update EWMA velocity.
+
+        Bounded against stale repeats (``dt < 5s``), long idle gaps (``dt > 30m``),
+        and weekly resets (negative deltas). Purely in-memory.
+        """
+        if not (math.isfinite(fable_pct) and math.isfinite(sample_ts)):
+            return
+        pct = min(100.0, max(0.0, float(fable_pct)))
+        ts = float(sample_ts)
+        now_mono = time.monotonic()
+        with self._lock:
+            burn_map = self._fable_burn_map()
+            prev = burn_map.get(slot)
+            if prev is None:
+                burn_map[slot] = _FableBurnSample(
+                    last_pct=pct, last_ts=ts, recorded_mono=now_mono
+                )
+                return
+            dt_s = ts - prev.last_ts
+            if dt_s < _FABLE_BURN_MIN_DT_S:
+                # Stale repeat (unchanged fetched_at) or clock jitter: keep prior state.
+                return
+            if dt_s > _FABLE_BURN_MAX_GAP_S:
+                # Gap too long to treat as a single burst: start a fresh baseline.
+                burn_map[slot] = _FableBurnSample(
+                    last_pct=pct, last_ts=ts, recorded_mono=now_mono
+                )
+                return
+            delta = pct - prev.last_pct
+            if delta < 0.0:
+                if delta <= -5.0:
+                    # Weekly window rolled over / reset: zero velocity immediately.
+                    burn_map[slot] = _FableBurnSample(
+                        last_pct=pct,
+                        last_ts=ts,
+                        recorded_mono=now_mono,
+                        ewma_rate=0.0,
+                        last_jump=0.0,
+                        last_jump_mono=now_mono,
+                    )
+                else:
+                    # Small downward API jitter: clamp instantaneous burn to 0 and decay EWMA.
+                    ewma = (
+                        0.0
+                        if prev.ewma_rate is None
+                        else (1.0 - _FABLE_BURN_ALPHA) * prev.ewma_rate
+                    )
+                    burn_map[slot] = _FableBurnSample(
+                        last_pct=pct,
+                        last_ts=ts,
+                        recorded_mono=now_mono,
+                        ewma_rate=ewma,
+                        last_jump=0.0,
+                        last_jump_mono=now_mono,
+                    )
+                return
+            inst = min(_FABLE_BURN_MAX_RATE, max(0.0, delta / (dt_s / 60.0)))
+            ewma = (
+                inst
+                if prev.ewma_rate is None
+                else (_FABLE_BURN_ALPHA * inst + (1.0 - _FABLE_BURN_ALPHA) * prev.ewma_rate)
+            )
+            burn_map[slot] = _FableBurnSample(
+                last_pct=pct,
+                last_ts=ts,
+                recorded_mono=now_mono,
+                ewma_rate=ewma,
+                last_jump=delta,
+                last_jump_mono=now_mono,
+            )
+
+    def _record_fable_samples_from_snapshot(
+        self,
+        snapshot: Any,
+        *,
+        now: float | None = None,
+        backend: _Backend | None = None,
+    ) -> None:
+        """Extract rolled Fable percentages from *snapshot* and feed the EWMA tracker."""
+        if snapshot is None:
+            return
+        wall_now = (
+            float(now)
+            if now is not None
+            else float(getattr(self, "_wall", time.time)())
+        )
+        roll = (getattr(backend, "roll_weekly", None) if backend is not None else None) or _identity_roll
+        for account in getattr(snapshot, "accounts", None) or ():
+            slot = _safe_int(getattr(account, "number", ""), default=-1)
+            if slot < 0:
+                continue
+            entry = getattr(account, "usage", None)
+            last_good = getattr(entry, "last_good", None) if entry is not None else None
+            if not isinstance(last_good, Mapping):
+                continue
+            raw_scoped = last_good.get("scoped")
+            if not isinstance(raw_scoped, (list, tuple)):
+                continue
+            fable_pct: float | None = None
+            for raw in raw_scoped:
+                if not isinstance(raw, Mapping):
+                    continue
+                window = _safe_roll(roll, raw, wall_now)
+                name = window.get("name") if isinstance(window, Mapping) else None
+                if isinstance(name, str) and name.strip().lower().startswith("fable"):
+                    fable_pct = _pct(window)
+                    if fable_pct is not None:
+                        break
+            if fable_pct is None:
+                continue
+            fetched = getattr(entry, "fetched_at", None)
+            if (
+                isinstance(fetched, (int, float))
+                and not isinstance(fetched, bool)
+                and math.isfinite(float(fetched))
+            ):
+                sample_ts = float(fetched)
+            else:
+                sample_ts = wall_now
+            self._record_fable_sample(slot, fable_pct, sample_ts)
+        with self._lock:
+            self._last_sampled_snapshot = snapshot
+
+    def _resolve_active_slot_cached(self) -> int | None:
+        """Active slot from cached in-memory state only (zero I/O)."""
+        with self._lock:
+            for r in getattr(self, "_rows_cache", ()) or ():
+                if r.is_active:
+                    return r.slot
+            last_num = getattr(self, "_last_active_number", None)
+            if last_num:
+                parsed = _safe_int(last_num, default=-1)
+                if parsed >= 0:
+                    return parsed
+            snap = getattr(self, "_snapshot", None)
+            if snap is not None:
+                snap_num = getattr(snap, "active_number", None)
+                if snap_num:
+                    parsed = _safe_int(snap_num, default=-1)
+                    if parsed >= 0:
+                        return parsed
+        return None
+
+    def _fable_last_jump(self, slot: int | None = None) -> float:
+        """Most recent positive single-interval Fable delta (%) for *slot* (zero I/O)."""
+        target = self._resolve_active_slot_cached() if slot is None else int(slot)
+        if target is None:
+            return 0.0
+        with self._lock:
+            sample = self._fable_burn_map().get(target)
+            if sample is None:
+                return 0.0
+            if (time.monotonic() - sample.recorded_mono) > _FABLE_BURN_MAX_GAP_S:
+                return 0.0
+            return float(sample.last_jump)
+
+    def fable_burn_rate_pct_per_min(self, slot: int | None = None) -> float | None:
+        """EWMA Fable burn velocity in ``%/min`` for *slot* (default: active), or ``None``.
+
+        Purely in-memory (zero I/O); safe to read from any thread.
+        """
+        target = self._resolve_active_slot_cached() if slot is None else int(slot)
+        if target is None:
+            return None
+        with self._lock:
+            sample = self._fable_burn_map().get(target)
+            if sample is None or sample.ewma_rate is None:
+                return None
+            if (time.monotonic() - sample.recorded_mono) > _FABLE_BURN_MAX_GAP_S:
+                return None
+            rate = float(sample.ewma_rate)
+        if not math.isfinite(rate) or rate < 0.0:
+            return None
+        return round(rate, 4)
+
+    def fable_burn_eta_minutes(self, slot: int | None = None) -> float | None:
+        """Estimated minutes until *slot* (default: active) hits 100% Fable, or ``None``.
+
+        Returns ``0.0`` when already at 100% while burning, and ``None`` when
+        burn velocity is unknown or near-zero (``<= 0.01 %/min``). Purely in-memory.
+        """
+        target = self._resolve_active_slot_cached() if slot is None else int(slot)
+        if target is None:
+            return None
+        rate = self.fable_burn_rate_pct_per_min(target)
+        if rate is None or rate <= 0.01:
+            return None
+        fable_pct: float | None = None
+        with self._lock:
+            snap = getattr(self, "_snapshot", None)
+            rows_snap = getattr(self, "_rows_cache_snapshot", None)
+            sample = self._fable_burn_map().get(target)
+            if snap is not None and rows_snap is not snap and sample is not None:
+                fable_pct = sample.last_pct
+            if fable_pct is None:
+                for r in getattr(self, "_rows_cache", ()) or ():
+                    if r.slot == target:
+                        fable_pct = _row_fable_pct(r)
+                        break
+            if fable_pct is None and sample is not None:
+                fable_pct = sample.last_pct
+        if fable_pct is None:
+            return None
+        remaining = max(0.0, 100.0 - float(fable_pct))
+        if remaining <= 0.0:
+            return 0.0
+        eta = remaining / rate
+        return round(eta, 1) if math.isfinite(eta) else None
+
+    def fable_guard_status(self) -> dict[str, Any]:
+        """In-memory Fable Guard summary for UI/CLI (zero I/O).
+
+        Returns ``{"enabled", "fable_slots", "excluded_slots",
+        "active_eta_min", "active_burn_pct_per_min"}``.
+        """
+        settings_map = _as_mapping(getattr(self, "_settings_obj", None)) or {}
+        enabled = bool(settings_map.get("belkins_fable_guard", True))
+        with self._lock:
+            rows_cache = tuple(getattr(self, "_rows_cache", ()) or ())
+            smap = dict(getattr(self, "_sentinels", None) or {})
+        fable_slots = sorted(
+            r.slot for r in rows_cache if r.slot >= 0 and row_has_fable_quota(r)
+        )
+        has_healthy_fable = fleet_has_fable_accounts(rows_cache, sentinels=smap)
+        excluded_slots = (
+            sorted(
+                r.slot for r in rows_cache if r.slot >= 0 and row_lacks_fable_quota(r)
+            )
+            if (enabled and has_healthy_fable)
+            else []
+        )
+        return {
+            "enabled": enabled,
+            "fable_slots": fable_slots,
+            "excluded_slots": excluded_slots,
+            "active_eta_min": self.fable_burn_eta_minutes(),
+            "active_burn_pct_per_min": self.fable_burn_rate_pct_per_min(),
+        }
+
+    def notify_local_limit_hit(self, kind: str = "rate_limit") -> None:
+        """Wake autoswitch immediately after a local session hit a rate or credits limit.
+
+        Clears the tick delay, manual grace window, and Thinking Guard hold timer
+        so the next :meth:`evaluate_autoswitch` fails over without waiting out a
+        poll interval or busy hold.
+        """
+        norm = re.sub(r"[^a-zA-Z0-9_-]", "", str(kind or "rate_limit"))[:32] or "rate_limit"
+        with self._lock:
+            self._next_tick_at = 0.0
+            self._manual_hold_until = 0.0
+            self._guard_hold_started_at = 0.0
+            self._handoff_armed = False
+            self._bypass_guard_once = True
+            event_log = getattr(self, "_event_log", None)
+            if event_log is not None:
+                event_log.append(f"{_stamp()} local {norm} hit → waking autoswitch")
+        log = getattr(self, "_log", LOGGER)
+        log.warning(
+            "accounts: local %s detected in live Claude session; bypassing grace/hold "
+            "and waking autoswitch immediately",
+            norm,
+        )
 
     _GUARD_MAX_HOLD_S: Final[float] = 90.0
     """Maximum wall-clock hold for an over-threshold busy turn before releasing
@@ -3081,7 +3599,13 @@ class SwapAccountSource:
         1. Separates weekly ceiling (``weekly_threshold = 88.0`` when unset) so 7-day / ``Fable``
            windows switch proactively with a 12% buffer — preventing multi-agent Fable 5.2 bursts
            from ever hitting 100% or tripping Claude Code's permanent in-process usage-credits latch.
-        2. Holds proactive mid-turn switches briefly up to a tight concurrency-scaled emergency cap
+        2. Dynamically lowers the proactive Fable/weekly trigger line when active EWMA burn rate
+           is ``>= 0.8%/min`` (shifting down by ``min(10.0, burn_rate * 4.0)`` floored at ``75.0%``)
+           and proportionally shrinks both the busy percentage cap and wall-clock hold duration so
+           multi-tab bursts rotate ~5–8 minutes before hitting 100%.
+        3. Immediately releases (no busy hold) when Fable jumped ``>= 3.0%`` in a single sample
+           interval while ``>= 82%``, or after a :meth:`notify_local_limit_hit` wakeup.
+        4. Otherwise holds proactive mid-turn switches briefly up to a concurrency-scaled cap
            (``max(88%, 95% - 2% * busy_count)`` 5h / ``max(88%, 93% - 1.5% * busy_count)`` 7d/Fable)
            and at most :data:`_GUARD_MAX_HOLD_S` (90 s) while any unpinned default-profile Claude
            session is freshly ``busy`` (updated within 5 min), arming a 2 s turn-boundary handoff.
@@ -3099,6 +3623,7 @@ class SwapAccountSource:
             with self._lock:
                 self._handoff_armed = False
                 self._guard_hold_started_at = 0.0
+                self._bypass_guard_once = False
             return None
 
         try:
@@ -3110,8 +3635,10 @@ class SwapAccountSource:
 
             rows_cache = self._current_rows_for_guard()
             with self._lock:
-                sentinels = dict(self._sentinels)
+                sentinels = dict(getattr(self, "_sentinels", None) or {})
                 hold_started = float(getattr(self, "_guard_hold_started_at", 0.0) or 0.0)
+                bypass_once = bool(getattr(self, "_bypass_guard_once", False))
+                self._bypass_guard_once = False
 
             active = next((r for r in rows_cache if r.is_active), None)
             armed = False
@@ -3126,26 +3653,73 @@ class SwapAccountSource:
             ):
                 fh = float(active.five_hour_pct or 0.0)
                 sd = float(active.seven_day_pct or 0.0)
-                scoped_max = max((float(pct) for _n, pct in (active.scoped_windows or ()) if pct is not None), default=0.0)
+                scoped_max = max(
+                    (float(pct) for _n, pct in (active.scoped_windows or ()) if pct is not None),
+                    default=0.0,
+                )
                 wk_max = max(sd, scoped_max)
+                fable_pct = _row_fable_pct(active)
+
+                burn_rate = self.fable_burn_rate_pct_per_min(active.slot)
+                last_jump = self._fable_last_jump(active.slot)
+
+                burn_shift = 0.0
+                if burn_rate is not None and burn_rate >= _FABLE_FAST_BURN_THRESHOLD:
+                    burn_shift = min(10.0, burn_rate * 4.0)
+                    shifted_weekly = max(_FABLE_PREDICTIVE_FLOOR, effective_weekly - burn_shift)
+                    effective_weekly = min(effective_weekly, shifted_weekly)
+                    new_weekly = effective_weekly
+
+                jump_spike = (
+                    fable_pct is not None
+                    and fable_pct >= _FABLE_JUMP_RELEASE_MIN_PCT
+                    and last_jump >= _FABLE_JUMP_RELEASE_DELTA
+                )
 
                 from . import fleet
 
                 records, _unreadable = fleet.read_registry(fleet.sessions_dir())
                 busy_count = _fresh_busy_session_count(records)
-                if busy_count > 0 and fh < 94.0 and wk_max < 93.0:
+                if bypass_once:
+                    self._log.info(
+                        "accounts: thinking guard bypassed on %s due to local limit-hit wakeup",
+                        active.alias,
+                    )
+                elif jump_spike:
+                    if busy_count > 0:
+                        self._log.info(
+                            "accounts: Fable spiked +%.1f%% to %.0f%% on %s; releasing busy hold "
+                            "immediately (weekly line %.0f%%)",
+                            last_jump,
+                            fable_pct,
+                            active.alias,
+                            effective_weekly,
+                        )
+                elif busy_count > 0 and fh < 94.0 and wk_max < 93.0:
                     busy_5h_cap = max(88.0, 95.0 - 2.0 * busy_count)
-                    busy_7d_cap = max(88.0, 93.0 - 1.5 * busy_count)
+                    if burn_shift > 0.0:
+                        busy_7d_cap = max(
+                            _FABLE_PREDICTIVE_FLOOR,
+                            (93.0 - 1.5 * busy_count) - burn_shift,
+                        )
+                        max_hold_s = max(
+                            15.0,
+                            self._GUARD_MAX_HOLD_S / max(1.0, (burn_rate or 0.0) * 1.5),
+                        )
+                    else:
+                        busy_7d_cap = max(88.0, 93.0 - 1.5 * busy_count)
+                        max_hold_s = self._GUARD_MAX_HOLD_S
                     over_normal = fh >= cur_thresh or wk_max >= effective_weekly
                     if fh < busy_5h_cap and wk_max < busy_7d_cap:
                         if over_normal:
                             started = hold_started if hold_started > 0.0 else now_mono
                             elapsed = now_mono - started
-                            if elapsed >= self._GUARD_MAX_HOLD_S:
+                            if elapsed >= max_hold_s:
                                 self._log.info(
-                                    "accounts: thinking guard hold reached %.0fs ceiling on %s "
+                                    "accounts: thinking guard hold reached %.0fs/%.0fs ceiling on %s "
                                     "(5h %.0f%%, 7d/scoped %.0f%%); releasing for proactive switch",
                                     elapsed,
+                                    max_hold_s,
                                     active.alias,
                                     fh,
                                     wk_max,
@@ -3167,7 +3741,7 @@ class SwapAccountSource:
                                     busy_7d_cap,
                                     busy_count,
                                     elapsed,
-                                    self._GUARD_MAX_HOLD_S,
+                                    max_hold_s,
                                 )
                         else:
                             if cur_thresh < busy_5h_cap:
@@ -3277,6 +3851,8 @@ class SwapAccountSource:
             self._engine = None
             self._engine_policy_mtime = None
             self._handoff_armed = False
+            self._guard_hold_started_at = 0.0
+            self._bypass_guard_once = False
             # The alert is the RUNNING engine's verdict. Keeping it past the
             # engine that produced it is the same "stale state rendered as
             # live" bug this alert was added to end (2026-08-26). Anything
@@ -3455,6 +4031,7 @@ class SwapAccountSource:
             with self._lock:
                 self._guard_hold_started_at = 0.0
                 self._handoff_armed = False
+                self._bypass_guard_once = False
             self._refresh_after_switch()
         return alias
 
