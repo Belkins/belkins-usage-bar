@@ -915,6 +915,66 @@ def test_ci_compatibility_without_claude_swap() -> None:
                 sys.modules[k] = orig
 
 
+def test_doctor_reads_widget_autoswitch_enabled_fallback() -> None:
+    """When claude-swap's settings.json omits `autoswitch.enabled`, `bswap doctor`
+    falls back to widget settings.json's `autoswitch_enabled` (matching accounts.py),
+    while explicit `autoswitch.enabled: false` still wins."""
+    rows = [
+        _row(1, "max-ready", scoped_windows=(("Fable", 20.0),), is_active=True),
+    ]
+    fake_src = _FakeAccountSource(rows, autoswitch_on=False)
+    fake_snap = fleet_mod.FleetSnapshot()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with _isolated_cli(Path(tmp), fake_source=fake_src, fake_snap=fake_snap) as env:
+            pol_path = env.backup_dir / "settings.json"
+            pol_path.write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "autoswitch": {
+                            "threshold": 85.0,
+                            "weeklyThreshold": 88.0,
+                            "model": "all",
+                            "intervalSeconds": 30.0,
+                            "cooldownSeconds": 120.0,
+                            "hysteresisPct": 10.0,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (env.widget_dir / "settings.json").write_text(
+                json.dumps({"autoswitch_enabled": True, "belkins_fable_guard": True}),
+                encoding="utf-8",
+            )
+            summary, warnings = bswap_cli._read_autoswitch_policy(env.backup_dir, fake_src)
+            assert summary["enabled"] is True, (summary, warnings)
+            assert not any("enabled is OFF" in w for w in warnings), warnings
+
+            # Explicit enabled=False in claude-swap settings.json must still win
+            pol_path.write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "autoswitch": {
+                            "enabled": False,
+                            "threshold": 85.0,
+                            "weeklyThreshold": 88.0,
+                            "model": "all",
+                            "intervalSeconds": 30.0,
+                            "cooldownSeconds": 120.0,
+                            "hysteresisPct": 10.0,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            summary2, warnings2 = bswap_cli._read_autoswitch_policy(env.backup_dir, fake_src)
+            assert summary2["enabled"] is False, summary2
+            assert any("enabled is OFF" in w for w in warnings2), warnings2
+
+
 # ---------------------------------------------------------------------------
 # Standalone Test Runner
 # ---------------------------------------------------------------------------

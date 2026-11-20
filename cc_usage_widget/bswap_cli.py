@@ -1302,9 +1302,14 @@ def _read_autoswitch_policy(
     else:
         en_fn = getattr(src, "autoswitch_enabled", None)
         try:
-            enabled = bool(en_fn()) if callable(en_fn) else False
+            src_enabled = bool(en_fn()) if callable(en_fn) else False
         except Exception:
-            enabled = False
+            src_enabled = False
+        try:
+            widget_enabled = bool(_widget_settings_store().get("autoswitch_enabled", False))
+        except Exception:
+            widget_enabled = False
+        enabled = src_enabled or widget_enabled
 
     threshold = _safe_float(raw_auto.get("threshold"))
     eff_threshold = 90.0 if threshold is None else threshold
