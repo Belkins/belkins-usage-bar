@@ -10,6 +10,13 @@
   - Tightened default proactive Fable/weekly threshold to `88%`, `intervalSeconds` to `30s`, `cooldownSeconds` to `120s`, and Preserved-Thinking Guard busy ceilings (`91.5%` for 1 busy session, `90.0%` for 2, `88.0%` for 4+) with a hard `90s` max hold timeout so multi-agent Fable 5.2 bursts rotate with ~10–12% runway remaining and never hit 100% mid-turn.
   - Added a `180s` manual-switch grace window so clicking a slot manually is never immediately overridden 3 seconds later by proactive auto-switch (still bypassed on `>= 99%` at-limit failover).
   - Clears stale `cachedExtraUsageDisabledReason` from `~/.claude.json` on switches onto healthy seats.
+- **EWMA Fable Burn Velocity/ETA, Predictive Pre-Switching & Hardened Fable-Safe Rotation (`accounts.py`, `fleet.py`):**
+  - Tracks per-slot EWMA Fable burn velocity (`%/min`) and ETA to 100% (handling resets, drops, and idle gaps cleanly), shrinking the proactive Fable threshold and Thinking Guard hold ceiling under rapid burn and releasing holds early on `>= 3%` Fable jumps.
+  - Adds `notify_local_limit_hit()` reactive failover wakeup, hardens `_FableGuardSwitcher` and store-refreshed `switch_best` (same-org + perishable-quota + Fable Guard), fsyncs `0o600` atomic stale credit-cache clearing, and adds 16 KiB tail-only `detect_session_interruptions()` for latched-session detection.
+- **Real-Time Limit-Hit Wakeup, `⚡ LATCHED` / `Copy Resume` UX & Deduped Alerts (`app.py`, `themes/belkins.py`, `notify.py`):**
+  - Wakes failover immediately (deduped per `(pid, session_id)`) when local sessions hit a rate or credit limit, renders `⚡ LATCHED` badges with one-click `Copy Resume` pills in Active Sessions, surfaces Fable burn ETA tooltips (`<= 240m`) and rapid-burn captions (`<= 45m`), keeps Hub standby & Bento switchers aligned with `belkins_fable_guard`, and fires deduped latched-session and rapid-burn notifications.
+- **`bswap doctor [--fix]` & `bswap fable-guard [on|off|status]` (`bswap_cli.py`):**
+  - Added `bswap doctor [--fix]` to audit and auto-heal auto-switch policy, Fable Guard, Fleet Fable readiness, latched sessions (`claude --resume`), stale `~/.claude.json` credit caches, and LaunchAgent status, plus `bswap fable-guard [on|off|status]` and Fable-safe session isolation in `bswap claude` / `bswap best` / `bswap sessions` / `bswap shim`.
 
 ## 2026-11-16 — Per-Model (Fable) Auto-Switch, Stale Busy-Session Filter & macOS 26 Menu-Bar Fix
 

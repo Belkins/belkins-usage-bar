@@ -141,8 +141,10 @@ bswap morph <1..8|auto>     # Morph your active Companion into any unlocked Cybe
 bswap vault                 # Open the 12-item Belkins Spark Vault in terminal (alias: bswap shop)
 bswap buy <item>            # Buy, equip, or inject a relic (e.g. bswap buy serum, blade, core, arcade)
 bswap <slot|alias>          # Switch active Claude account to slot number or alias
-bswap best                  # Switch to the healthiest Claude account (same-org + perishable-quota aware)
-bswap claude [slot] [args]  # Launch Claude Code pinned to its owning slot (prevents cross-org thinking drops)
+bswap best                  # Switch to the healthiest Fable-safe Claude account (same-org + perishable-quota aware)
+bswap doctor [--fix]        # Diagnose & auto-heal Fable auto-switch policy, seats, latched sessions & LaunchAgent
+bswap fable-guard [on|off|status] # Inspect or toggle Fable Guard (skip non-Fable Team/Pro seats)
+bswap claude [slot] [args]  # Launch Claude Code pinned to its owning Fable-safe slot (prevents cross-org thinking drops)
 bswap unpin [dir]           # Remove directory-to-slot workspace pin for [dir] (default: cwd)
 bswap sessions              # Inspect active Claude Code sessions, org owners & Preserved-Thinking health
 bswap fix-thinking          # Auto-align active account to session org owners, pin workspaces & tune thresholds
