@@ -2907,6 +2907,7 @@ SETTINGS_DEFAULTS: dict[str, Any] = {
     "belkins_animations_enabled": True,
     "belkins_hub_view": "luxury",
     "belkins_thinking_guard": True,
+    "belkins_fable_guard": True,
     "belkins_native_tail": False,
     "belkins_slim_hero": False,
     # --- smart fleet & ROI upgrades --------------------------------------

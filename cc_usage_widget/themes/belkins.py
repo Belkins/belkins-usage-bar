@@ -1453,15 +1453,32 @@ def _claude_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) -
             "tip": _claude_tip(A, active, now, note, accounts),
             "action": None,
         }
+    from .. import accounts as _accounts_mod
+
     targets = [r for r in A._switch_targets(snap.accounts) if r.slot not in notes]
-    nxt = next((r for r in targets if not r.disabled), None)
+    fable_guard = bool(snap.settings.get("belkins_fable_guard", True))
+    has_fable_fleet = _accounts_mod.fleet_has_fable_accounts(snap.accounts, sentinels=notes)
+    if fable_guard and has_fable_fleet:
+        targets.sort(key=lambda r: (1 if _accounts_mod.row_lacks_fable_quota(r) else 0))
+    nxt = next(
+        (
+            r
+            for r in targets
+            if not r.disabled
+            and not (fable_guard and has_fable_fleet and _accounts_mod.row_lacks_fable_quota(r))
+        ),
+        None,
+    ) or next((r for r in targets if not r.disabled), None)
     rows = []
     toggle_fn = getattr(actions, "toggle_slot_disabled", None)
     for r in targets:
         binding = A._binding_window(r, models)
+        lacks_fable = bool(fable_guard and has_fable_fleet and _accounts_mod.row_lacks_fable_quota(r))
         caps = []
         if r is nxt:
             caps.append(("NEXT", "tag"))
+        elif lacks_fable and not r.disabled:
+            caps.append(("NO FABLE", "tag"))
         sub = A._subscription_caption(accounts, r)
         if sub:
             caps.append((sub, "dim"))
@@ -1480,6 +1497,12 @@ def _claude_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) -
             if (binding and binding[1] is not None)
             else None
         )
+        row_tip = _claude_tip(A, r, now, accounts=accounts)
+        if lacks_fable:
+            row_tip = (
+                f"{row_tip}\nNo included Fable weekly allowance (Fable 5.2 requires usage credits) — "
+                "skipped by Fable Auto-Switch. Click only if switching manually for Sonnet/Opus."
+            )
         rows.append(
             {
                 "key": f"belkins-claude-{r.slot}",
@@ -1491,6 +1514,7 @@ def _claude_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) -
                 "dual_win": dual_win,
                 "free_pct": free_pct,
                 "disabled": bool(r.disabled),
+                "no_fable": lacks_fable,
                 "is_next": bool(r is nxt),
                 "needs_relogin": False,
                 "label": binding[0] if binding else "",
@@ -1499,7 +1523,7 @@ def _claude_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) -
                 "reset": A._reset_mark_text(A._window_reset(r, binding[0]), now) if binding else "",
                 "withheld": None,
                 "captions": caps,
-                "tip": _claude_tip(A, r, now, accounts=accounts),
+                "tip": row_tip,
                 "action": (lambda slot=r.slot: actions.switch_to(slot)),
                 "toggle_disable_action": (
                     (lambda slot=r.slot: toggle_fn(slot)) if callable(toggle_fn) else None
@@ -2160,14 +2184,15 @@ def _row(r: dict[str, Any]) -> Callable[[Any, float], float]:
             pen.circle(X0 + 3.0, b - 6.8, 5.4, dot_c)
 
         tag_cap = "PAUSED" if disabled else next((c[0] for c in r["captions"] if c[1] == "tag"), "")
-        show_tag = tag_cap in ("NEXT", "BEST", "PAUSED")
+        show_tag = tag_cap in ("NEXT", "BEST", "PAUSED", "NO FABLE")
         tag_w = (_pill_w(pen, tag_cap) + 6.0) if show_tag else 0.0
         avail_w = max(48.0, right_edge - x)
-        name_role = "belkins_cmm_sub" if disabled else "label"
+        no_fable = bool(r.get("no_fable", False))
+        name_role = "belkins_cmm_sub" if (disabled or no_fable) else "label"
         nw = text(pen, r["name"], "primary_med", name_role, x, b, maxw=max(42.0, avail_w - tag_w))
         if show_tag and (x + nw + tag_w <= right_edge + 2.0):
-            t_role = "warn_text" if disabled else "belkins_cmm_aqua"
-            t_bg = "belkins_warn_pill" if disabled else "belkins_tab_active_glass"
+            t_role = "warn_text" if (disabled or tag_cap == "NO FABLE") else "belkins_cmm_aqua"
+            t_bg = "belkins_warn_pill" if (disabled or tag_cap == "NO FABLE") else "belkins_tab_active_glass"
             pen.pill(
                 tag_cap,
                 x + nw + 5.5,
@@ -2472,10 +2497,21 @@ def _claude_sessions_card(snapshot: Any, actions: ThemeActions | None = None) ->
             pin_t: Any = pin_target,
             abs_c: bool = has_abs_cwd,
         ) -> list[tuple[str, str, str]]:
+            from .. import accounts as _acc_mod
+
             out_p: list[tuple[str, str, str]] = []
+            own_row = next((a for a in (snapshot.accounts or ()) if a.slot == own_s), None) if own_s is not None else None
+            fg_on = bool(snapshot.settings.get("belkins_fable_guard", True))
+            fable_fleet = _acc_mod.fleet_has_fable_accounts(snapshot.accounts or ())
+            own_ineligible = bool(
+                own_row is not None
+                and fg_on
+                and fable_fleet
+                and _acc_mod.row_lacks_fable_quota(own_row)
+            )
             if is_pin and abs_c and callable(unpin_fn):
                 out_p.append(("Unpin", "belkins_cmm_sub", "belkins_badge_off"))
-            elif is_shift and own_s is not None:
+            elif is_shift and own_s is not None and not own_ineligible:
                 if callable(switch_to_fn):
                     out_p.append((f"Restore #{own_s}", "belkins_cmm_aqua", "belkins_tab_active_glass"))
                 if abs_c and callable(pin_fn):
@@ -4065,8 +4101,15 @@ def _config_card(snapshot: Any, actions: ThemeActions, subtab: str = "header") -
                 lambda: f"Guard: {'ON' if bool(_get_s('belkins_thinking_guard', True)) else 'OFF'}",
                 "shield.lefthalf.filled",
                 lambda: bool(_get_s("belkins_thinking_guard", True)),
-                lambda: _toggle_key("belkins_thinking_guard", "Thinking Guard (busy hold & 98% wk)", True),
-                "Hold mid-turn auto-switches up to 96% (5h) / 98% (weekly) while Claude sessions are busy to preserve Extended Thinking & Prompt Cache",
+                lambda: _toggle_key("belkins_thinking_guard", "Thinking Guard (turn-boundary hold)", True),
+                "Briefly hold mid-turn auto-switches (<=90s, up to 91.5% Fable) while Claude is busy, switching cleanly at turn boundary",
+            ),
+            (
+                lambda: f"Fable: {'ON' if bool(_get_s('belkins_fable_guard', True)) else 'OFF'}",
+                "bolt.shield.fill",
+                lambda: bool(_get_s("belkins_fable_guard", True)),
+                lambda: _toggle_key("belkins_fable_guard", "Fable-Only Auto-Switch", True),
+                "Skip Team/Pro accounts without included Fable allowance so auto-switch never hits usage-credits walls",
             ),
             (
                 lambda: f"Codex: {'ON' if bool(_get_s('codex_live_quota_enabled', False)) else 'OFF'}",

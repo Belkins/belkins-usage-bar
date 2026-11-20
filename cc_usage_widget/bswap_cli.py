@@ -992,7 +992,8 @@ def _backup_dir() -> Path:
 
 def _ensure_optimal_autoswitch_policy(backup_dir: Path) -> bool:
     """Ensure claude-swap's settings.json watches all per-model limits (`model='all'`, e.g. Fable)
-    with a 92% weekly buffer and >=12% hysteresis to prevent both rate-limit walls and ping-pong."""
+    with an 88% weekly/Fable buffer, 30s poll interval, and 120s cooldown so multi-agent Fable
+    runs rotate proactively before hitting 100% or tripping usage-credits latches."""
     s_path = backup_dir / "settings.json"
     try:
         raw = json.loads(s_path.read_text(encoding="utf-8")) if s_path.is_file() else {}
@@ -1006,15 +1007,19 @@ def _ensure_optimal_autoswitch_policy(backup_dir: Path) -> bool:
         auto["model"] = "all"
         changed = True
     wt_raw = auto.get("weeklyThreshold")
-    if wt_raw is None or float(wt_raw or 0) < 90.0 or float(wt_raw or 0) >= 98.0:
-        auto["weeklyThreshold"] = 92.0
+    if wt_raw is None or float(wt_raw or 0) >= 92.0:
+        auto["weeklyThreshold"] = 88.0
         changed = True
-    if float(auto.get("hysteresisPct", 10.0) or 10.0) < 12.0:
-        auto["hysteresisPct"] = 12.0
+    if float(auto.get("hysteresisPct", 10.0) or 10.0) < 10.0:
+        auto["hysteresisPct"] = 10.0
         changed = True
     cd_raw = auto.get("cooldownSeconds")
-    if isinstance(cd_raw, (int, float)) and not isinstance(cd_raw, bool) and float(cd_raw) >= 1800.0:
-        auto["cooldownSeconds"] = 300.0
+    if cd_raw is None or (isinstance(cd_raw, (int, float)) and not isinstance(cd_raw, bool) and float(cd_raw) >= 300.0):
+        auto["cooldownSeconds"] = 120.0
+        changed = True
+    iv_raw = auto.get("intervalSeconds")
+    if iv_raw is None or (isinstance(iv_raw, (int, float)) and not isinstance(iv_raw, bool) and float(iv_raw) > 30.0):
+        auto["intervalSeconds"] = 30.0
         changed = True
     if changed:
         raw["autoswitch"] = auto

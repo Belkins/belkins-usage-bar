@@ -122,9 +122,15 @@ from .contracts import (
 )
 
 try:  # single-sourced wording; a broken accounts.py must not stop app.py importing
-    from .accounts import ACCOUNTS_UNAVAILABLE
+    from .accounts import (
+        ACCOUNTS_UNAVAILABLE,
+        fleet_has_fable_accounts as _fleet_has_fable_accounts,
+        row_lacks_fable_quota as _row_lacks_fable_quota,
+    )
 except Exception:  # pragma: no cover - accounts.py is optional at import time
     ACCOUNTS_UNAVAILABLE = "accounts unavailable"
+    _fleet_has_fable_accounts = lambda *_a, **_kw: False  # noqa: E731
+    _row_lacks_fable_quota = lambda *_a, **_kw: False  # noqa: E731
 
 try:  # roadmap 11: a tier LABEL, imported the same optional way
     from .codex_accounts import pricing_tier_note as _pricing_tier_note
@@ -2111,6 +2117,12 @@ def _claude_room(snapshot: UiSnapshot) -> tuple[int, int] | None:
     if not rows:
         return None
     notes = snapshot.account_notes
+    if snapshot.settings.get("belkins_fable_guard", True) and _fleet_has_fable_accounts(
+        rows, sentinels=notes
+    ):
+        fable_rows = [row for row in rows if not _row_lacks_fable_quota(row)]
+        if fable_rows:
+            rows = fable_rows
 
     def _room(row: AccountRow) -> bool:
         if row.slot in notes:

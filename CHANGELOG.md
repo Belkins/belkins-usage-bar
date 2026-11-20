@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-11-20 — Fable Guard, Earlier Proactive Fable Rotation & Manual-Switch Protection
+
+- **Fable Guard — Exclude Non-Fable Team/Pro Seats from Auto-Rotation (`accounts.py`, `app.py`, `themes/belkins.py`, `contracts.py`):**
+  - Detects accounts without an included `Fable` weekly allowance (e.g. `claude_team` / `default_raven` seats where Fable 5.2 fails with `requires usage credits` and permanently latches running Claude Code sessions in memory until restart).
+  - Wraps `AutoSwitchEngine` in `_FableGuardSwitcher` (`belkins_fable_guard`, default `ON`), excluding non-Fable seats from automatic rotation, `Switch to best now` / `⚡ Best`, `bswap best`, and ready room counts while keeping explicit manual clicks working for Sonnet/Opus.
+  - Marks non-Fable seats with a `NO FABLE` pill in the Belkins party list, points `NEXT` at the highest-headroom Fable-capable seat, suppresses hazardous `Restore #N` buttons pointing back to non-Fable seats, and adds a `Fable: ON/OFF` toggle in Settings.
+- **Earlier Proactive Fable Rotation, 90s Thinking-Guard Hold Cap & Anti-Fight Grace Window (`accounts.py`, `bswap_cli.py`):**
+  - Tightened default proactive Fable/weekly threshold to `88%`, `intervalSeconds` to `30s`, `cooldownSeconds` to `120s`, and Preserved-Thinking Guard busy ceilings (`91.5%` for 1 busy session, `90.0%` for 2, `88.0%` for 4+) with a hard `90s` max hold timeout so multi-agent Fable 5.2 bursts rotate with ~10–12% runway remaining and never hit 100% mid-turn.
+  - Added a `180s` manual-switch grace window so clicking a slot manually is never immediately overridden 3 seconds later by proactive auto-switch (still bypassed on `>= 99%` at-limit failover).
+  - Clears stale `cachedExtraUsageDisabledReason` from `~/.claude.json` on switches onto healthy seats.
+
 ## 2026-11-16 — Per-Model (Fable) Auto-Switch, Stale Busy-Session Filter & macOS 26 Menu-Bar Fix
 
 - **Per-Model (`Fable` / `Opus` / `Sonnet`) Auto-Switch & Safe Proactive Buffer (`accounts.py`, `bswap_cli.py`):**

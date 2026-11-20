@@ -67,11 +67,13 @@ import io
 import json
 import logging
 import math
+import os
 import re
+import stat
 import threading
 import time
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Final
@@ -99,8 +101,11 @@ __all__ = [
     "AUTOSWITCH_ENABLED_KEY",
     "SwapAccountSource",
     "create_account_source",
+    "fleet_has_fable_accounts",
     "harvest_best_slot",
     "record_cli_switch_marker",
+    "row_has_fable_quota",
+    "row_lacks_fable_quota",
 ]
 
 LOGGER: Final[logging.Logger] = logging.getLogger("cc_usage_widget.accounts")
@@ -287,6 +292,50 @@ def _hours_until_reset_label(label: str | None, now_epoch: float) -> float | Non
         return None
 
 
+def row_has_fable_quota(row: Any) -> bool:
+    """True when *row* reports an included ``Fable`` weekly allowance."""
+    for name, pct in getattr(row, "scoped_windows", ()) or ():
+        if pct is not None and str(name).strip().lower().startswith("fable"):
+            return True
+    return False
+
+
+def row_lacks_fable_quota(row: Any) -> bool:
+    """True when *row* is proven to lack an included ``Fable`` weekly allowance
+    (e.g. a ``claude_team`` / ``claude_pro`` / ``claude_enterprise`` seat without
+    a ``Fable`` scoped window, where Fable 5.2 fails with ``requires usage credits``
+    and permanently latches running Claude Code sessions until restart).
+
+    Rows whose ``plan_type`` is unknown (e.g. minimal test stubs) return ``False``.
+    """
+    if row_has_fable_quota(row):
+        return False
+    plan = str(getattr(row, "plan_type", None) or "").strip().lower()
+    if not plan:
+        return False
+    if not plan.startswith("claude_max"):
+        return True
+    return (
+        getattr(row, "five_hour_pct", None) is not None
+        or getattr(row, "seven_day_pct", None) is not None
+    )
+
+
+def fleet_has_fable_accounts(
+    rows: Iterable[Any], *, sentinels: Mapping[int, str] | None = None
+) -> bool:
+    """True when at least one switchable, non-disabled, non-sentinel row has a Fable window."""
+    smap = sentinels or {}
+    for r in rows:
+        if getattr(r, "slot", -1) < 0 or getattr(r, "disabled", False) or not getattr(r, "switchable", True):
+            continue
+        if getattr(r, "attention_note", "") or getattr(r, "slot", -1) in smap:
+            continue
+        if row_has_fable_quota(r):
+            return True
+    return False
+
+
 def harvest_best_slot(
     rows: tuple[AccountRow, ...] | list[AccountRow],
     *,
@@ -295,19 +344,24 @@ def harvest_best_slot(
     prefer_org: str | None = None,
     models: tuple[str, ...] | list[str] = (),
     now: float | None = None,
+    require_fable_if_fleet_has_it: bool = True,
 ) -> AccountRow | None:
-    """Smart Perishable-Quota & Org-Aware Claude slot selector.
+    """Smart Perishable-Quota, Fable-Safe & Org-Aware Claude slot selector.
 
     1. Filters out disabled, unswitchable, sentinel-flagged, or attention-flagged slots.
-    2. Evaluates 5-hour, 7-day, AND per-model ``scoped_windows`` (e.g. ``Fable``) so
+    2. When *require_fable_if_fleet_has_it* is True and any eligible seat carries an
+       included ``Fable`` weekly window, excludes seats proven to lack a Fable allowance
+       (e.g. ``claude_team`` seats that require paid usage credits for Fable 5.2).
+    3. Evaluates 5-hour, 7-day, AND per-model ``scoped_windows`` (e.g. ``Fable``) so
        exhausted model sub-quotas are never chosen.
-    3. Applies a Perishable-Quota Urgency bonus to seats with ``>= 15%`` remaining
+    4. Applies a Perishable-Quota Urgency bonus to seats with ``>= 15%`` remaining
        weekly capacity expiring within ``<= 48h`` ("Consume-Expiring-First").
-    4. Applies a Same-Organization bonus when *prefer_org* matches a healthy candidate,
+    5. Applies a Same-Organization bonus when *prefer_org* matches a healthy candidate,
        preventing ``thinking_drop`` and 1-hour prompt-cache invalidation across orgs.
     """
     moment = time.time() if now is None else float(now)
     wanted_models = {m.strip().lower() for m in models if m and m.strip()}
+    match_all = "all" in wanted_models
     sentinel_map = sentinels or {}
     id_map = identities or {}
 
@@ -318,7 +372,7 @@ def harvest_best_slot(
             if pct is None:
                 continue
             val = float(pct)
-            if not wanted_models or name.strip().lower() in wanted_models or val >= 99.0:
+            if not wanted_models or match_all or name.strip().lower() in wanted_models or val >= 99.0:
                 if val > wk:
                     wk = val
         return fh, wk
@@ -336,6 +390,11 @@ def harvest_best_slot(
 
     if not eligible:
         return None
+
+    if require_fable_if_fleet_has_it and any(row_has_fable_quota(r) for r, _f, _w in eligible):
+        fable_only = [(r, fh, wk) for (r, fh, wk) in eligible if not row_lacks_fable_quota(r)]
+        if fable_only:
+            eligible = fable_only
 
     comfortable = [(r, fh, wk) for (r, fh, wk) in eligible if fh < 95.0 and wk < 99.0]
     pool = comfortable if comfortable else eligible
@@ -641,9 +700,10 @@ def _seed_default_model_policy(
     """Seed ``autoswitch.model = 'all'`` when absent/null so per-model limits (e.g. ``Fable``)
     trigger proactive auto-switching out of the box without overriding explicit user choices.
 
-    On that one-time migration, also relaxes any legacy ``weeklyThreshold >= 98``
-    down to ``92.0`` (leaving an 8% proactive buffer for fast-burning Fable turns)
-    and caps multi-hour ``cooldownSeconds >= 1800`` to ``300.0``.
+    On that one-time migration, also relaxes any legacy ``weeklyThreshold >= 92``
+    down to ``88.0`` (leaving a 12% proactive buffer so multi-agent Fable turns never
+    hit 100% or trip Claude Code's permanent in-process usage-credits latch), caps
+    ``cooldownSeconds >= 1800`` to ``120.0``, and sets ``intervalSeconds <= 30.0`` when unset.
     """
     try:
         raw = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
@@ -659,11 +719,13 @@ def _seed_default_model_policy(
         return False
     section["model"] = "all"
     wt = section.get("weeklyThreshold")
-    if isinstance(wt, (int, float)) and not isinstance(wt, bool) and float(wt) >= 98.0:
-        section["weeklyThreshold"] = 92.0
+    if isinstance(wt, (int, float)) and not isinstance(wt, bool) and float(wt) >= 92.0:
+        section["weeklyThreshold"] = 88.0
     cd = section.get("cooldownSeconds")
     if isinstance(cd, (int, float)) and not isinstance(cd, bool) and float(cd) >= 1800.0:
-        section["cooldownSeconds"] = 300.0
+        section["cooldownSeconds"] = 120.0
+    if "intervalSeconds" not in section:
+        section["intervalSeconds"] = 30.0
     raw[AUTOSWITCH_SECTION] = section
     raw.setdefault("schemaVersion", schema_version)
     try:
@@ -671,6 +733,96 @@ def _seed_default_model_policy(
         return True
     except Exception:
         return False
+
+
+def _clear_stale_credit_cache(switcher: Any) -> bool:
+    """Drop stale ``cachedExtraUsageDisabledReason`` from ``~/.claude.json`` after
+    switching onto a Fable-capable seat so resuming sessions do not inherit a prior
+    Team/capped seat's ``out_of_credits`` / ``org_level_disabled`` flag.
+
+    Best-effort and atomic; returns ``True`` when the key was present and cleared.
+    """
+    try:
+        config_getter = getattr(switcher, "_get_claude_config_path", None)
+        cfg_path = Path(config_getter()) if callable(config_getter) else Path.home() / ".claude.json"
+        if not cfg_path.is_file():
+            return False
+        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict) or "cachedExtraUsageDisabledReason" not in raw:
+            return False
+        raw.pop("cachedExtraUsageDisabledReason", None)
+        tmp = cfg_path.with_name(f".{cfg_path.name}.tmp.{os.getpid()}")
+        try:
+            mode = stat.S_IMODE(cfg_path.stat().st_mode)
+        except OSError:
+            mode = 0o600
+        tmp.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+        try:
+            os.chmod(tmp, mode)
+        except OSError:
+            pass
+        os.replace(tmp, cfg_path)
+        return True
+    except Exception:
+        return False
+
+
+class _FableGuardSwitcher:
+    """Thin proxy around ``ClaudeAccountSwitcher`` for ``AutoSwitchEngine``.
+
+    When ``belkins_fable_guard`` is enabled and the pool contains Fable-capable
+    accounts (e.g. ``claude_max_20x`` seats reporting a ``Fable`` weekly bucket),
+    excludes slots proven to lack an included Fable allowance (e.g. ``claude_team``
+    seats where Fable 5.2 fails with ``requires usage credits`` and permanently
+    latches running Claude Code terminals) from automatic rotation candidates.
+    """
+
+    def __init__(self, inner: Any, source: "SwapAccountSource") -> None:
+        self._inner = inner
+        self._source = source
+        self._logged_excluded: set[str] = set()
+
+    def switchable_account_numbers(self) -> list[str]:
+        nums = list(self._inner.switchable_account_numbers())
+        settings_map = _as_mapping(getattr(self._source, "_settings_obj", None)) or {}
+        if not settings_map.get("belkins_fable_guard", True):
+            return nums
+        try:
+            rows = self._source._current_rows_for_guard()
+        except Exception:
+            return nums
+        if not rows:
+            return nums
+        by_num = {str(r.slot): r for r in rows}
+        active_row = next((r for r in rows if r.is_active), None)
+        fable_nums = [n for n in nums if n in by_num and row_has_fable_quota(by_num[n])]
+        if not fable_nums:
+            return nums
+        kept: list[str] = []
+        for n in nums:
+            row = by_num.get(n)
+            # Never drop the currently active slot from the list if the user explicitly
+            # selected it; only filter candidate targets that lack Fable quota.
+            if (
+                row is not None
+                and (active_row is None or row.slot != active_row.slot)
+                and row_lacks_fable_quota(row)
+            ):
+                if n not in self._logged_excluded:
+                    self._logged_excluded.add(n)
+                    self._source._log.info(
+                        "accounts: Fable Guard excluded slot %s (%s, %s) from auto-switch "
+                        "rotation (no included Fable allowance — requires usage credits)",
+                        n,
+                        row.alias,
+                        row.plan_type or "non-fable",
+                    )
+                continue
+            kept.append(n)
+        return kept if kept else nums
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
 
 
 def _on_main_thread() -> bool:
@@ -972,6 +1124,8 @@ class SwapAccountSource:
         self._alias_by_slot: dict[int, str] = {}
         self._rows_cache: tuple[AccountRow, ...] = ()
         self._handoff_armed: bool = False
+        self._guard_hold_started_at: float = 0.0
+        self._manual_hold_until: float = 0.0
         # Stored-login plan per config backup, keyed by path and re-read only
         # when the file's (mtime_ns, size) moves: the file is ~190 KB and a
         # switch rewrites it, the plan inside almost never changes.
@@ -1077,7 +1231,7 @@ class SwapAccountSource:
 
     # -- AccountSource: reads ----------------------------------------------
 
-    def refresh(self, *, force: bool = False) -> None:
+    def refresh(self, *, force: bool = False, wake_engine: bool = True) -> None:
         """Re-read claude-swap's usage store.
 
         ``force=False`` respects claude-swap's own pacing (the store decides
@@ -1135,7 +1289,7 @@ class SwapAccountSource:
             self._snapshot = snapshot
             self._snapshot_at = time.monotonic()
             self._last_error = None
-            if force or active_at_limit:
+            if (wake_engine and force) or active_at_limit:
                 self._next_tick_at = 0.0
             since, self._last_pass_wall = self._last_pass_wall, self._wall()
         if not self._note_reverted_switch(expected, current, since=since):
@@ -2208,6 +2362,8 @@ class SwapAccountSource:
                 ok = self._attempt_switch(backend, fallback)
         if ok:
             LOGGER.info("manual switch -> %s succeeded", label)
+            if _is_real_claude_swap(backend):
+                _clear_stale_credit_cache(backend.switcher)
             with self._lock:
                 # Claim the change the refresh below is about to see, so our
                 # own click is never reported as an external switch. The slot
@@ -2218,9 +2374,22 @@ class SwapAccountSource:
                 self._event_log.append(f"{_stamp()} manual \u2192 {label}")
                 # Taking the wheel back retracts "another actor is driving".
                 self._external_alert = None
-            # Reflect the new active row now rather than up to a tick later.
-            self.refresh(force=True)
+                # Honour the operator's explicit choice for 180s against proactive
+                # auto-switches (still bypassed if the slot hits >=99% at-limit).
+                self._manual_hold_until = time.monotonic() + 180.0
+                self._handoff_armed = False
+                self._guard_hold_started_at = 0.0
+            # Reflect the new active row now without immediately re-triggering autoswitch.
+            self._refresh_after_switch()
         return ok
+
+    def _refresh_after_switch(self) -> None:
+        """Re-read the active slot immediately without waking proactive autoswitch."""
+        try:
+            self.refresh(force=True, wake_engine=False)
+        except TypeError:
+            # Test subclasses may override `refresh(*, force=False)` without `wake_engine`.
+            self.refresh(force=True)
 
     def _resolve_slot_for_logging(self, identifier: str) -> int | None:
         """Best-effort slot number for *identifier*; never raises.
@@ -2318,6 +2487,59 @@ class SwapAccountSource:
             "manual switch (best) requested%s",
             f" (model limits: {', '.join(models)})" if models else "",
         )
+        # When Fable Guard is active on a live claude-swap fleet containing both
+        # Fable-capable (Max) and non-Fable (Team/Pro) seats, never let upstream's
+        # plain `best` pick a non-Fable seat solely because it has no Fable window.
+        settings_map = _as_mapping(self._settings_obj) or {}
+        if _is_real_claude_swap(backend) and settings_map.get("belkins_fable_guard", True):
+            rows = self._current_rows_for_guard()
+            with self._lock:
+                smap = dict(self._sentinels)
+            if fleet_has_fable_accounts(rows, sentinels=smap) and any(
+                row_lacks_fable_quota(r) and not r.disabled and r.switchable for r in rows
+            ):
+                fable_pool = [r for r in rows if not row_lacks_fable_quota(r)]
+                active_row = next((r for r in rows if r.is_active), None)
+                best_fable = harvest_best_slot(
+                    [r for r in fable_pool if not r.is_active],
+                    sentinels=smap,
+                    models=models,
+                    require_fable_if_fleet_has_it=True,
+                )
+                if best_fable is None:
+                    self._record_error("no healthy Fable-capable account available")
+                    return False
+                # Already on the best Fable-capable seat?
+                if (
+                    active_row is not None
+                    and not row_lacks_fable_quota(active_row)
+                    and active_row.slot not in smap
+                    and not active_row.attention_note
+                ):
+                    overall = harvest_best_slot(
+                        fable_pool,
+                        sentinels=smap,
+                        models=models,
+                        require_fable_if_fleet_has_it=True,
+                    )
+                    if overall is not None and overall.slot == active_row.slot:
+                        msg = "Already on the Fable-capable account with the most headroom"
+                        LOGGER.info("manual switch (best): %s", msg)
+                        self._append_event(f"switch (best): {msg}")
+                        return True
+                ok = self._attempt_switch(backend, str(best_fable.slot))
+                if ok:
+                    _clear_stale_credit_cache(backend.switcher)
+                    LOGGER.info("manual switch (best) -> %s succeeded (Fable Guard)", best_fable.alias)
+                    self._append_event(f"manual switch (best) -> {best_fable.alias}")
+                    with self._lock:
+                        self._expect_active = str(best_fable.slot)
+                        self._external_alert = None
+                        self._handoff_armed = False
+                        self._guard_hold_started_at = 0.0
+                    self._refresh_after_switch()
+                return ok
+
         try:
             result = backend.switcher.switch(
                 strategy="best", json_output=True, models=models
@@ -2342,6 +2564,8 @@ class SwapAccountSource:
         target = self._alias_for_ref(result.get("to")) or "the best account"
         reason = result.get("reason")
         if result.get("switched") is True or reason in ("already-active", "activated"):
+            if _is_real_claude_swap(backend):
+                _clear_stale_credit_cache(backend.switcher)
             LOGGER.info("manual switch (best) -> %s succeeded", target)
             self._append_event(f"manual switch (best) -> {target}")
             with self._lock:
@@ -2351,7 +2575,7 @@ class SwapAccountSource:
                 self._expect_active = self._ref_number(result.get("to")) or _ANY_SLOT
                 self._external_alert = None
             # Reflect the new active row now rather than up to a tick later.
-            self.refresh(force=True)
+            self._refresh_after_switch()
             return True
         message = result.get("message") or reason or "unknown reason"
         if reason == "already-best":
@@ -2570,7 +2794,7 @@ class SwapAccountSource:
     def set_autoswitch_threshold(self, pct: float) -> bool:
         """Persist ``autoswitch.threshold`` (50..99%) into claude-swap's settings.json,
         ensuring ``model`` defaults to ``'all'`` (so Fable / per-model windows switch too)
-        and clamping overly high ``weeklyThreshold`` (>95%) to ``max(clamped, 92.0)``."""
+        and clamping overly high ``weeklyThreshold`` (>92%) to ``max(clamped, 88.0)``."""
         clamped = round(min(99.0, max(50.0, float(pct))), 1)
         updates: dict[str, Any] = {"threshold": clamped}
         path = self._policy_path()
@@ -2582,8 +2806,8 @@ class SwapAccountSource:
                     if "model" not in sec or sec.get("model") is None:
                         updates["model"] = "all"
                     wt = sec.get("weeklyThreshold")
-                    if isinstance(wt, (int, float)) and not isinstance(wt, bool) and float(wt) > max(clamped, 95.0):
-                        updates["weeklyThreshold"] = max(clamped, 92.0)
+                    if isinstance(wt, (int, float)) and not isinstance(wt, bool) and float(wt) > max(clamped, 92.0):
+                        updates["weeklyThreshold"] = max(clamped, 88.0)
             except Exception:
                 pass
         ok = self._update_autoswitch_section(updates)
@@ -2764,6 +2988,20 @@ class SwapAccountSource:
         with self._lock:
             if now < self._next_tick_at:
                 return None
+            manual_until = getattr(self, "_manual_hold_until", 0.0)
+            snap_now = self._snapshot
+        if now < manual_until and not _snapshot_active_at_limit(snap_now):
+            # Honour an explicit manual switch for its grace window unless the
+            # active account is hard at-limit (>=99%) or failed.
+            rows_now = self._current_rows_for_guard()
+            active_now = next((r for r in rows_now if r.is_active), None)
+            with self._lock:
+                sent_now = dict(self._sentinels)
+            if (
+                active_now is None
+                or (not active_now.attention_note and active_now.slot not in sent_now)
+            ):
+                return None
 
         engine = self._ensure_engine()
         if engine is None:
@@ -2821,16 +3059,32 @@ class SwapAccountSource:
             self._next_tick_at = time.monotonic() + delay
         return self._drain_events()
 
+    def _current_rows_for_guard(self) -> tuple[AccountRow, ...]:
+        """Return cached AccountRows (building from the latest snapshot if needed)."""
+        with self._lock:
+            rows_cache = self._rows_cache
+            snapshot = self._snapshot
+        if not rows_cache and snapshot is not None:
+            try:
+                rows_cache = self._build_rows(snapshot)
+            except Exception:
+                return ()
+        return rows_cache
+
+    _GUARD_MAX_HOLD_S: Final[float] = 90.0
+    """Maximum wall-clock hold for an over-threshold busy turn before releasing
+    for proactive switch while ample Fable runway still remains."""
+
     def _thinking_guard_policy(self, engine: Any, orig_policy: Any) -> Any | None:
         """Return a temporary ``AutoSwitchSettings`` override when Preserved-Thinking Guard is active.
 
-        1. Separates weekly ceiling (``weekly_threshold = 92.0`` when unset) so 7-day / ``Fable``
-           windows are not abandoned prematurely at 85% across organizations, while still keeping
-           an 8% proactive cushion so fast-burning Fable turns never hit the hard 100% wall.
-        2. Holds proactive mid-turn switches up to a concurrency-scaled emergency cap
-           (``max(88%, 97% - 2% * busy_count)`` 5h / ``max(90%, 98% - 1.5% * busy_count)`` 7d)
-           while any unpinned default-profile Claude Code session is freshly ``busy`` (updated
-           within the last 5 minutes), arming a turn-boundary handoff that fires on completion.
+        1. Separates weekly ceiling (``weekly_threshold = 88.0`` when unset) so 7-day / ``Fable``
+           windows switch proactively with a 12% buffer — preventing multi-agent Fable 5.2 bursts
+           from ever hitting 100% or tripping Claude Code's permanent in-process usage-credits latch.
+        2. Holds proactive mid-turn switches briefly up to a tight concurrency-scaled emergency cap
+           (``max(88%, 95% - 2% * busy_count)`` 5h / ``max(88%, 93% - 1.5% * busy_count)`` 7d/Fable)
+           and at most :data:`_GUARD_MAX_HOLD_S` (90 s) while any unpinned default-profile Claude
+           session is freshly ``busy`` (updated within 5 min), arming a 2 s turn-boundary handoff.
         """
         import dataclasses
         import os
@@ -2844,25 +3098,25 @@ class SwapAccountSource:
         if not settings_map.get("belkins_thinking_guard", True):
             with self._lock:
                 self._handoff_armed = False
+                self._guard_hold_started_at = 0.0
             return None
 
         try:
             cur_thresh = float(getattr(orig_policy, "threshold", 90.0) or 90.0)
             cur_weekly = getattr(orig_policy, "weekly_threshold", None)
-            effective_weekly = float(cur_weekly) if cur_weekly is not None else max(cur_thresh, 92.0)
+            effective_weekly = float(cur_weekly) if cur_weekly is not None else max(cur_thresh, 88.0)
             new_weekly = effective_weekly
             new_thresh = cur_thresh
 
-            with self._lock:
-                rows_cache = self._rows_cache
-                snapshot = self._snapshot
-            if not rows_cache and snapshot is not None:
-                rows_cache = self._build_rows(snapshot)
+            rows_cache = self._current_rows_for_guard()
             with self._lock:
                 sentinels = dict(self._sentinels)
+                hold_started = float(getattr(self, "_guard_hold_started_at", 0.0) or 0.0)
 
             active = next((r for r in rows_cache if r.is_active), None)
             armed = False
+            next_hold_started = 0.0
+            now_mono = time.monotonic()
             if (
                 active is not None
                 and not active.disabled
@@ -2879,30 +3133,51 @@ class SwapAccountSource:
 
                 records, _unreadable = fleet.read_registry(fleet.sessions_dir())
                 busy_count = _fresh_busy_session_count(records)
-                if busy_count > 0 and fh < 98.0 and wk_max < 98.0:
-                    busy_5h_cap = max(88.0, 97.0 - 2.0 * busy_count)
-                    busy_7d_cap = max(90.0, 98.0 - 1.5 * busy_count)
+                if busy_count > 0 and fh < 94.0 and wk_max < 93.0:
+                    busy_5h_cap = max(88.0, 95.0 - 2.0 * busy_count)
+                    busy_7d_cap = max(88.0, 93.0 - 1.5 * busy_count)
+                    over_normal = fh >= cur_thresh or wk_max >= effective_weekly
                     if fh < busy_5h_cap and wk_max < busy_7d_cap:
-                        if cur_thresh < busy_5h_cap:
-                            new_thresh = busy_5h_cap
-                        if effective_weekly < busy_7d_cap:
-                            new_weekly = busy_7d_cap
-                        over_normal = fh >= cur_thresh or wk_max >= effective_weekly
                         if over_normal:
-                            armed = True
-                            self._log.info(
-                                "accounts: thinking guard holding %s (5h %.0f%% < %.0f%%, 7d/scoped %.0f%% < %.0f%%) "
-                                "for %d busy Claude session(s); armed turn-boundary handoff",
-                                active.alias,
-                                fh,
-                                busy_5h_cap,
-                                wk_max,
-                                busy_7d_cap,
-                                busy_count,
-                            )
+                            started = hold_started if hold_started > 0.0 else now_mono
+                            elapsed = now_mono - started
+                            if elapsed >= self._GUARD_MAX_HOLD_S:
+                                self._log.info(
+                                    "accounts: thinking guard hold reached %.0fs ceiling on %s "
+                                    "(5h %.0f%%, 7d/scoped %.0f%%); releasing for proactive switch",
+                                    elapsed,
+                                    active.alias,
+                                    fh,
+                                    wk_max,
+                                )
+                            else:
+                                if cur_thresh < busy_5h_cap:
+                                    new_thresh = busy_5h_cap
+                                if effective_weekly < busy_7d_cap:
+                                    new_weekly = busy_7d_cap
+                                armed = True
+                                next_hold_started = started
+                                self._log.info(
+                                    "accounts: thinking guard holding %s (5h %.0f%% < %.0f%%, 7d/scoped %.0f%% < %.0f%%) "
+                                    "for %d busy Claude session(s) [%.0fs/%.0fs]; armed turn-boundary handoff",
+                                    active.alias,
+                                    fh,
+                                    busy_5h_cap,
+                                    wk_max,
+                                    busy_7d_cap,
+                                    busy_count,
+                                    elapsed,
+                                    self._GUARD_MAX_HOLD_S,
+                                )
+                        else:
+                            if cur_thresh < busy_5h_cap:
+                                new_thresh = busy_5h_cap
+                            if effective_weekly < busy_7d_cap:
+                                new_weekly = busy_7d_cap
 
             with self._lock:
                 self._handoff_armed = armed
+                self._guard_hold_started_at = next_hold_started
 
             if new_thresh != cur_thresh or cur_weekly is None or (cur_weekly is not None and new_weekly != float(cur_weekly)):
                 return dataclasses.replace(
@@ -2922,7 +3197,9 @@ class SwapAccountSource:
         restarting the widget - the engine snapshots its settings at
         construction. On a live ``claude_swap`` backend where ``autoswitch.model``
         was never configured, seeds ``"all"`` so per-model weekly windows
-        (``Fable``, ``Opus``, ``Sonnet``) always participate in autoswitch.
+        (``Fable``, ``Opus``, ``Sonnet``) always participate in autoswitch, and
+        wraps the switcher in :class:`_FableGuardSwitcher` so Team/Pro accounts
+        lacking a Fable allowance are never chosen for Fable auto-rotation.
         """
         import dataclasses
 
@@ -2931,7 +3208,8 @@ class SwapAccountSource:
             return None
 
         path = self._policy_path()
-        if path is not None and _is_real_claude_swap(backend):
+        real_cs = _is_real_claude_swap(backend)
+        if path is not None and real_cs:
             _seed_default_model_policy(
                 path,
                 backend.write_json,
@@ -2956,11 +3234,14 @@ class SwapAccountSource:
             if (
                 dataclasses.is_dataclass(policy)
                 and getattr(policy, "model", None) is None
-                and _is_real_claude_swap(backend)
+                and real_cs
             ):
                 policy = dataclasses.replace(policy, model="all")
+            switcher_for_engine = (
+                _FableGuardSwitcher(backend.switcher, self) if real_cs else backend.switcher
+            )
             engine = backend.engine_cls(
-                backend.switcher,
+                switcher_for_engine,
                 policy,
                 self._on_engine_event,
                 dry_run=False,
@@ -3166,8 +3447,15 @@ class SwapAccountSource:
             if alert is not False:
                 self._alert = alert
         if alias is not None:
-            # The active slot just changed under us.
-            self.refresh(force=True)
+            # The active slot just changed under us. Clear any stale credit-limit
+            # cache key in ~/.claude.json and refresh without waking another tick.
+            backend = self._backend_or_none()
+            if backend is not None and _is_real_claude_swap(backend):
+                _clear_stale_credit_cache(backend.switcher)
+            with self._lock:
+                self._guard_hold_started_at = 0.0
+                self._handoff_armed = False
+            self._refresh_after_switch()
         return alias
 
     @staticmethod

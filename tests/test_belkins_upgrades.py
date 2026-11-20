@@ -512,19 +512,23 @@ def test_thinking_guard_reads_rows_cache_scoped_windows_sentinels_and_handoff() 
         orig_read = fleet.read_registry
         try:
             os.environ["CC_USAGE_WIDGET_SESSIONS_DIR"] = sess_tmp
-            # 1 busy session -> busy_5h_cap = 95.0, busy_7d_cap = 96.5; Fable is 91.0 >= 85.0
-            # -> Guard holds the switch, raises thresholds, and arms turn-boundary handoff!
+            # 1 busy session -> busy_5h_cap = 93.0, busy_7d_cap = 91.5; Fable is 89.0 >= 85.0
+            # -> Guard holds the switch briefly, raises thresholds, and arms turn-boundary handoff!
+            src._rows_cache = (
+                replace(src._rows_cache[0], scoped_windows=(("Fable", 89.0),)),
+                src._rows_cache[1],
+            )
             fleet.read_registry = lambda _d: ([{"status": "busy"}], 0)
             guarded = src._thinking_guard_policy(engine, orig_policy)
             assert guarded is not None
-            assert guarded.threshold == 95.0, guarded
-            assert guarded.weekly_threshold == 96.5, guarded
+            assert guarded.threshold == 93.0, guarded
+            assert guarded.weekly_threshold == 91.5, guarded
             assert src.has_armed_handoff() is True
 
-            # 6 busy sessions -> busy_7d_cap = max(90.0, 98.0 - 9.0) = 90.0;
-            # Fable at 93.0 >= 90.0 -> emergency cap lets auto-switch proceed immediately!
+            # 6 busy sessions -> busy_7d_cap = max(88.0, 93.0 - 9.0) = 88.0;
+            # Fable at 90.0 >= 88.0 -> emergency cap lets auto-switch proceed immediately!
             src._rows_cache = (
-                replace(src._rows_cache[0], scoped_windows=(("Fable", 93.0),)),
+                replace(src._rows_cache[0], scoped_windows=(("Fable", 90.0),)),
                 src._rows_cache[1],
             )
             fleet.read_registry = lambda _d: ([{"status": "busy"} for _ in range(6)], 0)
@@ -1417,8 +1421,9 @@ def test_fable_scoped_model_policy_seeding_stale_busy_sessions_and_at_limit_wake
         assert wrote is True
         migrated = json.loads(cfg_path.read_text(encoding="utf-8"))["autoswitch"]
         assert migrated["model"] == "all", migrated
-        assert migrated["weeklyThreshold"] == 92.0, migrated
-        assert migrated["cooldownSeconds"] == 300.0, migrated
+        assert migrated["weeklyThreshold"] == 88.0, migrated
+        assert migrated["cooldownSeconds"] == 120.0, migrated
+        assert migrated["intervalSeconds"] == 30.0, migrated
 
         # Explicit user choice (e.g. model="") is never overwritten on subsequent runs
         cfg_path.write_text(
@@ -1474,7 +1479,7 @@ def test_fable_scoped_model_policy_seeding_stale_busy_sessions_and_at_limit_wake
     src._sentinels = {}
     src._log = accounts_mod.LOGGER
     src._rows_cache = (
-        _arow(1, "vlad", is_active=True, five_hour_pct=0.0, seven_day_pct=55.0, scoped_windows=(("Fable", 93.0),)),
+        _arow(1, "vlad", is_active=True, five_hour_pct=0.0, seven_day_pct=55.0, scoped_windows=(("Fable", 89.0),)),
         _arow(4, "work1", is_active=False, five_hour_pct=0.0, seven_day_pct=0.0, scoped_windows=(("Fable", 0.0),)),
     )
     pol = _PolicyNoneWeekly()
@@ -1484,19 +1489,19 @@ def test_fable_scoped_model_policy_seeding_stale_busy_sessions_and_at_limit_wake
         orig_read = fleet.read_registry
         try:
             os.environ["CC_USAGE_WIDGET_SESSIONS_DIR"] = sess_tmp
-            # Fresh busy turn at Fable 93% (>= 92% default weekly, < 96.5% busy cap) -> holds & arms!
+            # Fresh busy turn at Fable 89% (>= 88% default weekly, < 91.5% busy cap) -> holds & arms!
             fleet.read_registry = lambda _d: ([{"status": "busy"}], 0)
             g_busy = src._thinking_guard_policy(eng, pol)
-            assert g_busy is not None and g_busy.weekly_threshold == 96.5
+            assert g_busy is not None and g_busy.weekly_threshold == 91.5
             assert src.has_armed_handoff() is True
 
-            # Only stale busy session (>5m old) -> treated as idle -> weekly_threshold=92.0 -> switches!
+            # Only stale busy session (>5m old) -> treated as idle -> weekly_threshold=88.0 -> switches!
             fleet.read_registry = lambda _d: (
                 [{"status": "busy", "statusUpdatedAt": (time.time() - 9000.0) * 1000.0}],
                 0,
             )
             g_idle = src._thinking_guard_policy(eng, pol)
-            assert g_idle is not None and g_idle.weekly_threshold == 92.0
+            assert g_idle is not None and g_idle.weekly_threshold == 88.0
             assert src.has_armed_handoff() is False
 
             # Fable at 100% -> never held even with fresh busy session!
@@ -1506,7 +1511,7 @@ def test_fable_scoped_model_policy_seeding_stale_busy_sessions_and_at_limit_wake
             )
             fleet.read_registry = lambda _d: ([{"status": "busy"}], 0)
             g_capped = src._thinking_guard_policy(eng, pol)
-            assert g_capped is not None and g_capped.weekly_threshold == 92.0
+            assert g_capped is not None and g_capped.weekly_threshold == 88.0
             assert src.has_armed_handoff() is False
         finally:
             fleet.read_registry = orig_read
@@ -1514,6 +1519,139 @@ def test_fable_scoped_model_policy_seeding_stale_busy_sessions_and_at_limit_wake
                 os.environ.pop("CC_USAGE_WIDGET_SESSIONS_DIR", None)
             else:
                 os.environ["CC_USAGE_WIDGET_SESSIONS_DIR"] = orig_env
+
+
+def test_fable_guard_excludes_team_poison_trap_manual_grace_hold_cap_and_credit_cache() -> None:
+    """Verify Fable Guard excludes Team/non-Fable seats (`scoped=()`) from auto-rotation,
+    `harvest_best_slot`, and `_claude_room`; enforces the 90s Thinking Guard hold cap;
+    honours manual switches for 180s; and clears stale `cachedExtraUsageDisabledReason`."""
+    import dataclasses
+
+    vlad_max = replace(
+        _arow(2, "vlad", is_active=True, five_hour_pct=0.0, seven_day_pct=53.0, scoped_windows=(("Fable", 92.0),)),
+        plan_type="claude_max_20x",
+    )
+    work_team = replace(
+        _arow(4, "work1", is_active=False, five_hour_pct=16.0, seven_day_pct=21.0, scoped_windows=()),
+        plan_type="claude_team",
+    )
+    ana_max = replace(
+        _arow(7, "sm.anastasiia.g", is_active=False, five_hour_pct=0.0, seven_day_pct=24.0, scoped_windows=(("Fable", 45.0),)),
+        plan_type="claude_max_20x",
+    )
+    d_max = replace(
+        _arow(9, "d.yagmurova2", is_active=False, five_hour_pct=0.0, seven_day_pct=23.0, scoped_windows=(("Fable", 40.0),)),
+        plan_type="claude_max_20x",
+    )
+
+    assert accounts_mod.row_has_fable_quota(vlad_max) is True
+    assert accounts_mod.row_lacks_fable_quota(work_team) is True
+    assert accounts_mod.row_lacks_fable_quota(d_max) is False
+
+    # 1. harvest_best_slot skips Team seat (#4 work1 @ 79% free) and selects #9 (60% Fable free)
+    pick = accounts_mod.harvest_best_slot([work_team, ana_max, d_max], models=("all",))
+    assert pick is not None and pick.slot == 9, pick
+
+    # 2. _FableGuardSwitcher filters slot 4 from AutoSwitchEngine candidates when Fable Guard is ON
+    src = accounts_mod.SwapAccountSource.__new__(accounts_mod.SwapAccountSource)
+    src._lock = threading.Lock()
+    src._settings_obj = {"belkins_fable_guard": True, "belkins_thinking_guard": True}
+    src._rows_cache = (vlad_max, work_team, ana_max, d_max)
+    src._snapshot = None
+    src._sentinels = {}
+    src._handoff_armed = False
+    src._guard_hold_started_at = 0.0
+    src._manual_hold_until = 0.0
+    src._alert = None
+    src._log = accounts_mod.LOGGER
+
+    inner_sw = SimpleNamespace(switchable_account_numbers=lambda: ["2", "4", "7", "9"])
+    proxy = accounts_mod._FableGuardSwitcher(inner_sw, src)
+    assert proxy.switchable_account_numbers() == ["2", "7", "9"]
+
+    # Disabling belkins_fable_guard restores slot 4
+    src._settings_obj["belkins_fable_guard"] = False
+    assert proxy.switchable_account_numbers() == ["2", "4", "7", "9"]
+    src._settings_obj["belkins_fable_guard"] = True
+
+    # 3. _claude_room excludes non-Fable Team seat #4 (only #7 and #9 have room out of 3 Fable seats)
+    snap = app_mod.UiSnapshot(
+        settings=normalize_settings({**SETTINGS_DEFAULTS, "belkins_fable_guard": True}),
+        accounts=(vlad_max, work_team, ana_max, d_max),
+        active=vlad_max,
+        autoswitch_threshold=85.0,
+        autoswitch_models=("all",),
+    )
+    assert app_mod._claude_room(snap) == (2, 3), app_mod._claude_room(snap)
+
+    # 4. Thinking Guard 90s hold ceiling releases long busy turns before hitting 100%
+    @dataclasses.dataclass
+    class _Policy88:
+        threshold: float = 85.0
+        weekly_threshold: float | None = 88.0
+
+    src._rows_cache = (replace(vlad_max, scoped_windows=(("Fable", 89.0),)), ana_max)
+    pol = _Policy88()
+    eng = SimpleNamespace(_policy=pol)
+    with tempfile.TemporaryDirectory() as sess_tmp:
+        orig_env = os.environ.get("CC_USAGE_WIDGET_SESSIONS_DIR")
+        orig_read = fleet.read_registry
+        try:
+            os.environ["CC_USAGE_WIDGET_SESSIONS_DIR"] = sess_tmp
+            fleet.read_registry = lambda _d: ([{"status": "busy"}], 0)
+            g1 = src._thinking_guard_policy(eng, pol)
+            assert g1 is not None and g1.weekly_threshold == 91.5
+            assert src.has_armed_handoff() is True
+            # Simulate 95s elapsed hold -> releases hold cleanly!
+            src._guard_hold_started_at = time.monotonic() - 95.0
+            g2 = src._thinking_guard_policy(eng, pol)
+            assert g2 is None
+            assert src.has_armed_handoff() is False
+        finally:
+            fleet.read_registry = orig_read
+            if orig_env is None:
+                os.environ.pop("CC_USAGE_WIDGET_SESSIONS_DIR", None)
+            else:
+                os.environ["CC_USAGE_WIDGET_SESSIONS_DIR"] = orig_env
+
+    # 5. _clear_stale_credit_cache removes cachedExtraUsageDisabledReason atomically
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg_file = Path(tmp) / ".claude.json"
+        cfg_file.write_text(
+            json.dumps({"cachedExtraUsageDisabledReason": "org_level_disabled", "theme": "dark"}),
+            encoding="utf-8",
+        )
+        fake_sw = SimpleNamespace(_get_claude_config_path=lambda: cfg_file)
+        assert accounts_mod._clear_stale_credit_cache(fake_sw) is True
+        after = json.loads(cfg_file.read_text(encoding="utf-8"))
+        assert "cachedExtraUsageDisabledReason" not in after
+        assert after["theme"] == "dark"
+        assert accounts_mod._clear_stale_credit_cache(fake_sw) is False
+
+    # 6. Manual switch grace window prevents immediate proactive override while still allowing >=99%
+    ticks_called = [0]
+    src._next_tick_at = 0.0
+    src._manual_hold_until = time.monotonic() + 180.0
+    src.autoswitch_enabled = lambda: True  # type: ignore[method-assign]
+    src._ensure_engine = lambda: SimpleNamespace(  # type: ignore[method-assign]
+        settings=None,
+        tick=lambda: ticks_called.__setitem__(0, ticks_called[0] + 1),
+    )
+    src._snapshot = SimpleNamespace(
+        active_number="2",
+        accounts=[SimpleNamespace(number="2", usage=SimpleNamespace(last_good={"scoped": [{"name": "Fable", "pct": 92.0}]}))],
+    )
+    assert src.evaluate_autoswitch() is None
+    assert ticks_called[0] == 0
+    # At 100% Fable, emergency failover bypasses the manual grace window
+    src._snapshot = SimpleNamespace(
+        active_number="2",
+        accounts=[SimpleNamespace(number="2", usage=SimpleNamespace(last_good={"scoped": [{"name": "Fable", "pct": 100.0}]}))],
+    )
+    src._drain_events = lambda: None  # type: ignore[method-assign]
+    src._tick_delay = lambda _e, _o: 30.0  # type: ignore[method-assign]
+    src.evaluate_autoswitch()
+    assert ticks_called[0] == 1
 
 
 # ---------------------------------------------------------------------------
