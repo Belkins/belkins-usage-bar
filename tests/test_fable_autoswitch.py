@@ -793,7 +793,7 @@ def test_detect_session_interruptions_latch_recovery_rate_limit_and_collect() ->
             assert res.get(live_pid, {}).get("hit_rate_limit") is True, (idx, res)
             assert res[live_pid]["latched_credits"] is False
 
-        # D. User prompts, tool results, and normal assistant code replies NEVER false-positive!
+        # D. Benign transcript records containing literal signature strings NEVER false-positive!
         sid_fp = "no-false-positive"
         (pdir / f"{sid_fp}.jsonl").write_text(
             "\n".join(
@@ -823,12 +823,119 @@ def test_detect_session_interruptions_latch_recovery_rate_limit_and_collect() ->
                             },
                         }
                     ),
+                    json.dumps(
+                        {
+                            "type": "progress",
+                            "data": {
+                                "type": "bash_progress",
+                                "output": "PASS: tested model_requires_usage_credits and hit your Fable limit",
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "queue-operation",
+                            "operation": "enqueue",
+                            "content": "Why did it say You're out of usage credits earlier?",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "summary",
+                            "summary": "Fixed now requires usage credits and usage_limit_reached detection",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "file-history-snapshot",
+                            "snapshot": {"note": "hit your limit"},
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "last-prompt",
+                            "lastPrompt": "Check consent_unanswered handling",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "system",
+                            "subtype": "local_command",
+                            "content": "grep -n 'hit your Fable limit' fleet.py",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "system",
+                            "subtype": "compact_boundary",
+                            "content": "Compacted discussion of out of usage credits",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "system",
+                            "subtype": "turn_duration",
+                            "note": "usage_limit_reached",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "result",
+                            "is_error": False,
+                            "result": "Verified model_requires_usage_credits tests pass",
+                        }
+                    ),
                 ]
             )
             + "\n",
             encoding="utf-8",
         )
         _write_session_record(sess_dir, live_pid, session_id=sid_fp, cwd=cwd)
+        assert fleet.detect_session_interruptions(sess_dir, [proj_root], max_age_s=180.0, now=now) == {}
+
+        # D2. Genuine result(is_error=True) IS detected, and a cached-prompt assistant turn
+        #     (input_tokens=0, output_tokens=0, cache_read_input_tokens>0) clears it cleanly!
+        sid_cached = "result-err-and-cache-recovery"
+        cached_file = pdir / f"{sid_cached}.jsonl"
+        cached_file.write_text(
+            json.dumps(
+                {
+                    "type": "result",
+                    "is_error": True,
+                    "result": "You've hit your Fable limit",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        _write_session_record(sess_dir, live_pid, session_id=sid_cached, cwd=cwd)
+        res_err = fleet.detect_session_interruptions(sess_dir, [proj_root], max_age_s=180.0, now=now)
+        assert res_err.get(live_pid, {}).get("hit_rate_limit") is True, res_err
+
+        with cached_file.open("a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "role": "assistant",
+                            "model": "claude-fable-5-2",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "Discussing usage_limit_reached after cached prompt.",
+                                }
+                            ],
+                            "usage": {
+                                "input_tokens": 0,
+                                "output_tokens": 0,
+                                "cache_read_input_tokens": 4200,
+                            },
+                        },
+                    }
+                )
+                + "\n"
+            )
         assert fleet.detect_session_interruptions(sess_dir, [proj_root], max_age_s=180.0, now=now) == {}
 
         # E. Stale mtime (> max_age_s) is skipped without triggering

@@ -621,8 +621,12 @@ def _analyze_interruption_tail(raw_tail: bytes, *, truncated: bool) -> tuple[boo
             usage = msg_map.get("usage")
             usage_map = usage if isinstance(usage, Mapping) else {}
             has_real_tokens = (
-                (_int_or_zero(usage_map.get("input_tokens")) > 0
-                 or _int_or_zero(usage_map.get("output_tokens")) > 0)
+                (
+                    _int_or_zero(usage_map.get("input_tokens")) > 0
+                    or _int_or_zero(usage_map.get("output_tokens")) > 0
+                    or _int_or_zero(usage_map.get("cache_read_input_tokens")) > 0
+                    or _int_or_zero(usage_map.get("cache_creation_input_tokens")) > 0
+                )
                 and bool(model)
                 and model != "<synthetic>"
             )
@@ -649,6 +653,23 @@ def _analyze_interruption_tail(raw_tail: bytes, *, truncated: bool) -> tuple[boo
                 rate_limited = False
             continue
 
+        subtype = str(obj.get("subtype") or "").strip().lower()
+        is_explicit_err = bool(
+            obj.get("isApiErrorMessage")
+            or obj.get("is_error")
+            or obj.get("error")
+        )
+        is_error_candidate = (
+            rec_type in ("error", "api_error")
+            or (
+                rec_type == "system"
+                and (subtype in ("", "api_error", "error", "rate_limit") or is_explicit_err)
+            )
+            or (rec_type == "result" and is_explicit_err)
+            or (rec_type == "" and is_explicit_err)
+        )
+        if not is_error_candidate:
+            continue
         m_latch, m_rl = _match_interruption_signatures(line_bytes)
         if m_latch:
             latched = True

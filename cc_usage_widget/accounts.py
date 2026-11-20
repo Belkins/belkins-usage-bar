@@ -835,6 +835,8 @@ def _clear_stale_credit_cache(switcher: Any) -> bool:
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "wb") as handle:
             handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
         try:
             os.chmod(tmp, mode)
         except OSError:
