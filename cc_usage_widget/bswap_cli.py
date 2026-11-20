@@ -13,12 +13,19 @@ from __future__ import annotations
 import datetime as dt
 import inspect
 import json
+import math
 import os
 import re
+import shlex
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
+from collections.abc import Iterable, Mapping
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 from . import belkins_game
 from .contracts import VENDOR_CLAUDE, VENDOR_CODEX, AccountRow
@@ -981,6 +988,9 @@ def _cmd_update(args: list[str]) -> int:
     return 0
 
 
+_SAFE_REASON_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+
+
 def _backup_dir() -> Path:
     try:
         from claude_swap import paths
@@ -988,6 +998,116 @@ def _backup_dir() -> Path:
         return Path(paths.get_backup_root())
     except Exception:
         return Path.home() / ".claude-swap-backup"
+
+
+def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    """Atomically write JSON to *path*, preserving file permissions (default 0o600)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except OSError:
+        mode = 0o600
+    data = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+    tmp_path: Path | None = None
+    try:
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(path.parent),
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+        )
+        tmp_path = Path(tmp_name)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp_path, mode)
+        os.replace(tmp_path, path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
+def _widget_settings_store():
+    """Return a loaded SettingsStore pointing at ``WIDGET_DIR / 'settings.json'`` without seeding disk."""
+    from .state import SettingsStore
+
+    store = SettingsStore(path=WIDGET_DIR / "settings.json")
+    store.load(seed_missing=False)
+    return store
+
+
+def _fable_guard_enabled() -> bool:
+    """Return whether ``belkins_fable_guard`` is enabled in widget settings (default True)."""
+    try:
+        return bool(_widget_settings_store().get("belkins_fable_guard", True))
+    except Exception:
+        return True
+
+
+def _claude_config_path(src: Any = None) -> Path:
+    """Resolve ``~/.claude.json`` (or a test/switcher-configured Claude config path)."""
+    try:
+        backend = getattr(src, "_backend", None)
+        switcher = getattr(backend, "switcher", None)
+        getter = getattr(switcher, "_get_claude_config_path", None)
+        if callable(getter):
+            return Path(getter())
+    except Exception:
+        pass
+    return Path.home() / ".claude.json"
+
+
+def _read_stale_credit_reason(cfg_path: Path) -> tuple[bool, str]:
+    """Check whether *cfg_path* carries a stale ``cachedExtraUsageDisabledReason`` key.
+
+    Never reads, prints, or returns credentials or any other key from the file.
+    """
+    if not cfg_path.is_file():
+        return False, ""
+    try:
+        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False, ""
+    if not isinstance(raw, Mapping) or "cachedExtraUsageDisabledReason" not in raw:
+        return False, ""
+    val = raw.get("cachedExtraUsageDisabledReason")
+    if isinstance(val, str) and _SAFE_REASON_RE.match(val.strip()):
+        return True, val.strip()
+    return True, "<set>"
+
+
+def _clear_credit_cache_file(cfg_path: Path) -> bool:
+    """Clear stale ``cachedExtraUsageDisabledReason`` from *cfg_path* atomically."""
+    try:
+        from . import accounts
+
+        clear_fn = getattr(accounts, "_clear_stale_credit_cache", None)
+        if callable(clear_fn):
+            return bool(clear_fn(SimpleNamespace(_get_claude_config_path=lambda: cfg_path)))
+    except Exception:
+        pass
+    if not cfg_path.is_file():
+        return False
+    try:
+        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict) or "cachedExtraUsageDisabledReason" not in raw:
+            return False
+        raw.pop("cachedExtraUsageDisabledReason", None)
+        _atomic_write_json(cfg_path, raw)
+        return True
+    except Exception:
+        return False
+
+
+def _safe_float(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    f = float(value)
+    return f if math.isfinite(f) else None
 
 
 def _ensure_optimal_autoswitch_policy(backup_dir: Path) -> bool:
@@ -1001,26 +1121,40 @@ def _ensure_optimal_autoswitch_policy(backup_dir: Path) -> bool:
         return False
     if not isinstance(raw, dict):
         return False
-    auto = dict(raw.get("autoswitch") or {})
+    auto_raw = raw.get("autoswitch")
+    if auto_raw is not None and not isinstance(auto_raw, Mapping):
+        return False
+    auto = dict(auto_raw or {})
     changed = False
-    if "model" not in auto or auto.get("model") is None:
+
+    mdl = auto.get("model")
+    if "model" not in auto or mdl is None or (isinstance(mdl, str) and not mdl.strip()):
         auto["model"] = "all"
         changed = True
-    wt_raw = auto.get("weeklyThreshold")
-    if wt_raw is None or float(wt_raw or 0) >= 92.0:
+
+    wt = _safe_float(auto.get("weeklyThreshold"))
+    if wt is None or wt >= 92.0:
         auto["weeklyThreshold"] = 88.0
         changed = True
-    if float(auto.get("hysteresisPct", 10.0) or 10.0) < 10.0:
+
+    hy = _safe_float(auto.get("hysteresisPct"))
+    if hy is None:
         auto["hysteresisPct"] = 10.0
         changed = True
-    cd_raw = auto.get("cooldownSeconds")
-    if cd_raw is None or (isinstance(cd_raw, (int, float)) and not isinstance(cd_raw, bool) and float(cd_raw) >= 300.0):
+    elif hy < 10.0:
+        auto["hysteresisPct"] = 10.0
+        changed = True
+
+    cd = _safe_float(auto.get("cooldownSeconds"))
+    if cd is None or cd >= 300.0:
         auto["cooldownSeconds"] = 120.0
         changed = True
-    iv_raw = auto.get("intervalSeconds")
-    if iv_raw is None or (isinstance(iv_raw, (int, float)) and not isinstance(iv_raw, bool) and float(iv_raw) > 30.0):
+
+    iv = _safe_float(auto.get("intervalSeconds"))
+    if iv is None or iv > 30.0:
         auto["intervalSeconds"] = 30.0
         changed = True
+
     if changed:
         raw["autoswitch"] = auto
         raw.setdefault("schemaVersion", 1)
@@ -1030,25 +1164,829 @@ def _ensure_optimal_autoswitch_policy(backup_dir: Path) -> bool:
             atomic_write_json(s_path, raw)
             return True
         except Exception:
-            pass
+            try:
+                _atomic_write_json(s_path, raw)
+                return True
+            except Exception:
+                return False
     return False
+
+
+def _fable_pct_and_reset(row: AccountRow) -> tuple[float | None, str | None]:
+    """Return ``(fable_used_pct, fable_reset_label)`` for *row*."""
+    fable_pct: float | None = None
+    for name, pct in row.scoped_windows or ():
+        if pct is not None and str(name).strip().lower().startswith("fable"):
+            fable_pct = float(pct)
+            break
+    fable_reset: str | None = None
+    for name, label in row.scoped_resets_at or ():
+        if label and str(name).strip().lower().startswith("fable"):
+            fable_reset = str(label)
+            break
+    if fable_reset is None:
+        fable_reset = row.seven_day_resets_at
+    return fable_pct, fable_reset
+
+
+def _format_reset_countdown(reset_label: str | None, *, now: float | None = None) -> str:
+    """Format a human-readable reset countdown alongside the raw reset clock."""
+    if not reset_label:
+        return "—"
+    hours: float | None = None
+    try:
+        from . import accounts
+
+        helper = getattr(accounts, "_hours_until_reset_label", None)
+        if callable(helper):
+            moment = dt.datetime.now().timestamp() if now is None else float(now)
+            hours = helper(reset_label, moment)
+    except Exception:
+        hours = None
+    if hours is None or not math.isfinite(hours) or hours <= 0:
+        return str(reset_label)
+    total_min = max(1, int(round(hours * 60.0)))
+    days, rem_min = divmod(total_min, 24 * 60)
+    hrs, mins = divmod(rem_min, 60)
+    if days > 0:
+        cd = f"in {days}d {hrs}h"
+    elif hrs > 0:
+        cd = f"in {hrs}h {mins}m" if mins else f"in {hrs}h"
+    else:
+        cd = f"in {mins}m"
+    if str(reset_label).strip().startswith("20") and "T" in str(reset_label):
+        return cd
+    return f"{cd} ({reset_label})"
+
+
+def _resume_command(cwd: str, session_id: str) -> str:
+    """Build a shell-safe, ready-to-paste Claude Code session recovery command."""
+    sid = str(session_id or "").strip()
+    cwd_clean = str(cwd or "").strip()
+    resume_part = f"claude --resume {shlex.quote(sid)}" if sid else "claude --resume"
+    if cwd_clean:
+        return f"cd {shlex.quote(cwd_clean)} && {resume_part}"
+    return resume_part
+
+
+def _shim_status() -> dict[str, Any]:
+    claude_shim = SHIMS_DIR / "claude"
+    codex_shim = SHIMS_DIR / "codex"
+    c_ok = claude_shim.is_file()
+    x_ok = codex_shim.is_file()
+    in_path = str(SHIMS_DIR) in (os.environ.get("PATH") or "").split(":")
+    return {
+        "claude_installed": c_ok,
+        "codex_installed": x_ok,
+        "installed": c_ok and x_ok,
+        "in_path": in_path,
+        "shims_dir": SHIMS_DIR,
+    }
+
+
+def _check_launchagent_status() -> tuple[str, str]:
+    """Check macOS LaunchAgent ``com.cc-usage-widget`` liveness (graceful off-macOS and in tests)."""
+    if sys.platform != "darwin":
+        return "skipped", "non-macOS platform"
+    if os.environ.get("CC_USAGE_WIDGET_NO_REVEAL") == "1":
+        return "skipped", "test/headless mode (CC_USAGE_WIDGET_NO_REVEAL=1)"
+    if not shutil.which("launchctl"):
+        return "unavailable", "launchctl not found"
+    uid = str(os.getuid())
+    try:
+        proc = subprocess.run(
+            ["launchctl", "print", f"gui/{uid}/com.cc-usage-widget"],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except Exception:
+        return "unavailable", "launchctl check timed out or failed"
+    if proc.returncode == 0:
+        out = proc.stdout or ""
+        pid_m = re.search(r"\bpid\s*=\s*(\d+)", out)
+        state_m = re.search(r"\bstate\s*=\s*([A-Za-z0-9_-]+)", out)
+        state_txt = state_m.group(1) if state_m else "loaded"
+        if pid_m:
+            return "running", f"{state_txt} (PID {pid_m.group(1)})"
+        return "running", state_txt
+    plist = Path.home() / "Library" / "LaunchAgents" / "com.cc-usage-widget.plist"
+    if plist.is_file():
+        return "stopped", "plist present but agent not running — run `bswap bar restart`"
+    return "stopped", "not loaded — run `install.sh` or `bswap bar on`"
+
+
+def _read_autoswitch_policy(
+    backup_dir: Path, src: Any = None
+) -> tuple[dict[str, Any], list[str]]:
+    """Inspect live ``claude-swap`` autoswitch policy and return ``(summary, warnings)``."""
+    s_path = backup_dir / "settings.json"
+    raw_auto: dict[str, Any] = {}
+    file_exists = s_path.is_file()
+    parse_error = False
+    if file_exists:
+        try:
+            parsed = json.loads(s_path.read_text(encoding="utf-8"))
+            if isinstance(parsed, Mapping) and isinstance(parsed.get("autoswitch"), Mapping):
+                raw_auto = dict(parsed["autoswitch"])
+            elif not isinstance(parsed, Mapping):
+                parse_error = True
+        except Exception:
+            parse_error = True
+
+    enabled: bool
+    if isinstance(raw_auto.get("enabled"), bool):
+        enabled = bool(raw_auto["enabled"])
+    elif isinstance(raw_auto.get("enabled"), (int, float)):
+        enabled = bool(raw_auto["enabled"])
+    else:
+        en_fn = getattr(src, "autoswitch_enabled", None)
+        try:
+            enabled = bool(en_fn()) if callable(en_fn) else False
+        except Exception:
+            enabled = False
+
+    threshold = _safe_float(raw_auto.get("threshold"))
+    eff_threshold = 90.0 if threshold is None else threshold
+    weekly_raw = _safe_float(raw_auto.get("weeklyThreshold"))
+    model_raw = raw_auto.get("model")
+    model_str = str(model_raw).strip() if isinstance(model_raw, str) else ""
+    interval_raw = _safe_float(raw_auto.get("intervalSeconds"))
+    eff_interval = 60.0 if interval_raw is None else interval_raw
+    cooldown_raw = _safe_float(raw_auto.get("cooldownSeconds"))
+    eff_cooldown = 300.0 if cooldown_raw is None else cooldown_raw
+    hysteresis_raw = _safe_float(raw_auto.get("hysteresisPct"))
+    eff_hysteresis = 10.0 if hysteresis_raw is None else hysteresis_raw
+    strategy = str(raw_auto.get("strategy") or "best")
+
+    warnings: list[str] = []
+    if parse_error:
+        warnings.append(f"claude-swap settings.json at {s_path} is unreadable/corrupt")
+    if not enabled:
+        warnings.append("autoswitch.enabled is OFF — automatic Fable rotation is paused")
+    if not model_str:
+        warnings.append("autoswitch.model is unset — Fable/Opus/Sonnet weekly limits are NOT watched (recommend 'all')")
+    if weekly_raw is None:
+        warnings.append("autoswitch.weeklyThreshold is unset — recommend 88% for multi-tab Fable buffer")
+    elif weekly_raw >= 92.0:
+        warnings.append(
+            f"autoswitch.weeklyThreshold={weekly_raw:.0f}% >= 92% — leaves too little buffer for Fable bursts (recommend 88%)"
+        )
+    if cooldown_raw is None or eff_cooldown >= 300.0:
+        warnings.append(
+            f"autoswitch.cooldownSeconds={eff_cooldown:.0f}s >= 300s — slows failover under heavy burn (recommend 120s)"
+        )
+    if interval_raw is None or eff_interval > 30.0:
+        warnings.append(
+            f"autoswitch.intervalSeconds={eff_interval:.0f}s > 30s — polls too slowly under rapid Fable burn (recommend 30s)"
+        )
+    if eff_hysteresis < 10.0:
+        warnings.append(
+            f"autoswitch.hysteresisPct={eff_hysteresis:.0f}% < 10% — risks ping-pong switching (recommend >= 10%)"
+        )
+    if eff_threshold >= 95.0:
+        warnings.append(
+            f"autoswitch.threshold={eff_threshold:.0f}% >= 95% — minimal 5h margin before wall"
+        )
+
+    summary = {
+        "path": str(s_path),
+        "file_exists": file_exists,
+        "enabled": enabled,
+        "threshold": eff_threshold,
+        "weeklyThreshold": weekly_raw,
+        "model": model_str or None,
+        "intervalSeconds": eff_interval,
+        "cooldownSeconds": eff_cooldown,
+        "hysteresisPct": eff_hysteresis,
+        "strategy": strategy,
+    }
+    return summary, warnings
+
+
+def _classify_fable_slot(
+    row: AccountRow,
+    sentinels: Mapping[int, str],
+    *,
+    fable_guard: bool = True,
+    weekly_threshold: float = 88.0,
+) -> tuple[str, str, str]:
+    """Classify a Claude slot for the Fable capability table.
+
+    Returns ``(status_label, ansi_color, detail_text)``.
+    """
+    from . import accounts
+
+    fable_pct, fable_reset = _fable_pct_and_reset(row)
+    reset_txt = _format_reset_countdown(fable_reset)
+    sentinel_note = sentinels.get(row.slot) or row.attention_note or ""
+
+    if row.disabled:
+        extra = f" · {sentinel_note}" if sentinel_note else ""
+        if fable_pct is not None:
+            free_pct = max(0.0, 100.0 - fable_pct)
+            return "DISABLED", DIM, f"Fable {free_pct:.0f}% free · resets {reset_txt}{extra}"
+        return "DISABLED", DIM, f"excluded from rotation{extra}"
+
+    if sentinel_note or not row.switchable:
+        reason = sentinel_note or "missing credentials/backup"
+        return "RE-LOGIN NEEDED", RED, reason
+
+    if accounts.row_lacks_fable_quota(row):
+        sd_free = max(0.0, 100.0 - float(row.seven_day_pct)) if row.seven_day_pct is not None else None
+        sd_str = f"7d {sd_free:.0f}% free" if sd_free is not None else "7d —"
+        plan = row.plan_type or "non-Fable"
+        if fable_guard:
+            return (
+                "NO FABLE (Team/Pro — skipped by Fable Guard)",
+                GOLD,
+                f"{plan} · {sd_str} · resets {_format_reset_countdown(row.seven_day_resets_at)}",
+            )
+        return (
+            "NO FABLE (Team/Pro — Fable Guard OFF!)",
+            RED,
+            f"{plan} · {sd_str} · risk of usage-credits latch!",
+        )
+
+    fh = float(row.five_hour_pct or 0.0)
+    sd = float(row.seven_day_pct or 0.0)
+    if fable_pct is not None:
+        free_pct = max(0.0, 100.0 - fable_pct)
+        detail = f"Fable {free_pct:.0f}% free (5h {fh:.0f}% · 7d {sd:.0f}%) · resets {reset_txt}"
+        if fable_pct >= weekly_threshold or fh >= 90.0 or sd >= weekly_threshold:
+            return "FABLE LOW/CAPPED", RED if fable_pct >= 99.0 or fh >= 99.0 else GOLD, detail
+        return "FABLE READY", GREEN, detail
+
+    # Unknown/minimal row (plan_type is None and no scoped_windows reported yet)
+    if row.seven_day_pct is None and row.five_hour_pct is None:
+        return "FABLE READY", CYAN, "awaiting first usage poll"
+    sd_free = max(0.0, 100.0 - sd)
+    detail = f"7d {sd_free:.0f}% free (5h {fh:.0f}%) · resets {reset_txt}"
+    if fh >= 90.0 or sd >= weekly_threshold:
+        return "FABLE LOW/CAPPED", GOLD, detail
+    return "FABLE READY", GREEN, detail
 
 
 def _slot_is_healthy_for_session(
     row: AccountRow | None,
-    sentinels: dict[int, str],
+    sentinels: Mapping[int, str],
     *,
     max_5h: float = 90.0,
     max_7d: float = 95.0,
+    fleet_rows: Iterable[AccountRow] | None = None,
+    fable_guard: bool | None = None,
 ) -> bool:
     if row is None or row.disabled or not row.switchable:
         return False
     if row.attention_note or row.slot in sentinels:
         return False
+    guard_on = _fable_guard_enabled() if fable_guard is None else bool(fable_guard)
+    if guard_on:
+        from . import accounts
+
+        if accounts.row_lacks_fable_quota(row) and fleet_rows is not None:
+            if accounts.fleet_has_fable_accounts(fleet_rows, sentinels=sentinels):
+                return False
     fh = float(row.five_hour_pct or 0.0)
     wk = float(row.seven_day_pct or 0.0)
     scoped_max = max((float(pct) for _n, pct in (row.scoped_windows or ()) if pct is not None), default=0.0)
     return fh < max_5h and max(wk, scoped_max) < max_7d
+
+
+def _cmd_fable_guard(args: list[str]) -> int:
+    """Inspect or toggle ``belkins_fable_guard`` in widget settings and display seat classification."""
+    from . import accounts
+
+    action = (args[0].strip().lower() if args else "status")
+    settings_path = WIDGET_DIR / "settings.json"
+    store = _widget_settings_store()
+
+    if action in {"on", "enable", "true", "1"}:
+        store.set("belkins_fable_guard", True)
+        if not settings_path.is_file():
+            store.save(force=True)
+        print(f"{GREEN}✓ Fable Guard ENABLED{RESET} {DIM}(non-Fable Team/Pro seats skipped during auto-switch, bswap best & bswap claude){RESET}")
+    elif action in {"off", "disable", "false", "0"}:
+        store.set("belkins_fable_guard", False)
+        if not settings_path.is_file():
+            store.save(force=True)
+        print(f"{GOLD}! Fable Guard DISABLED{RESET} {DIM}(all healthy seats eligible, including non-Fable Team/Pro seats){RESET}")
+    elif action not in {"status", "show", "check"}:
+        print(f"{RED}Usage: bswap fable-guard [on|off|status]{RESET}", file=sys.stderr)
+        return 2
+
+    enabled = bool(store.get("belkins_fable_guard", True))
+    row_list: list[AccountRow] = []
+    sentinels: dict[int, str] = {}
+    guard_status: dict[str, Any] | None = None
+    burn_eta: float | None = None
+    burn_rate: float | None = None
+    try:
+        src = accounts.create_account_source()
+        src.refresh(force=False)
+        row_list = [r for r in src.rows() if r.slot >= 0 and r.vendor == VENDOR_CLAUDE]
+        sentinels = src.sentinels() if callable(getattr(src, "sentinels", None)) else {}
+        gs_fn = getattr(src, "fable_guard_status", None)
+        if callable(gs_fn):
+            raw_gs = gs_fn()
+            if isinstance(raw_gs, Mapping):
+                guard_status = dict(raw_gs)
+        eta_fn = getattr(src, "fable_burn_eta_minutes", None)
+        if callable(eta_fn):
+            burn_eta = _safe_float(eta_fn())
+        rate_fn = getattr(src, "fable_burn_rate_pct_per_min", None)
+        if callable(rate_fn):
+            burn_rate = _safe_float(rate_fn())
+        if guard_status:
+            if burn_eta is None:
+                burn_eta = _safe_float(guard_status.get("active_eta_min"))
+            if burn_rate is None:
+                burn_rate = _safe_float(guard_status.get("active_burn_pct_per_min"))
+    except Exception:
+        row_list = []
+
+    state_badge = f"{GREEN}ON (PROTECTED){RESET}" if enabled else f"{GOLD}OFF{RESET}"
+    print(f"\n  {BOLD}{ORANGE}🛡️  BELKINS FABLE GUARD:{RESET} {state_badge}")
+    if burn_rate is not None and burn_rate > 0:
+        eta_txt = f" (~{burn_eta:.0f}m to wall)" if burn_eta is not None and burn_eta > 0 else ""
+        print(f"  {CYAN}⚡ Active Fable burn rate:{RESET} {burn_rate:.2f}%/min{eta_txt}")
+
+    fable_rows = [r for r in row_list if accounts.row_has_fable_quota(r)]
+    excluded_rows = [r for r in row_list if accounts.row_lacks_fable_quota(r)]
+    other_rows = [r for r in row_list if r not in fable_rows and r not in excluded_rows]
+
+    if not row_list:
+        print(f"  {DIM}No live Claude accounts loaded (claude-swap unavailable or pool empty).{RESET}")
+    else:
+        print(f"\n  {BOLD}{GREEN}Protected Fable Seats ({len(fable_rows)}):{RESET}")
+        if fable_rows:
+            for r in fable_rows:
+                f_pct, f_reset = _fable_pct_and_reset(r)
+                free_s = f"{max(0.0, 100.0 - f_pct):.0f}% free" if f_pct is not None else "—"
+                mark = f"{GREEN}●{RESET}" if r.is_active else " "
+                flags = []
+                if r.disabled:
+                    flags.append("DISABLED")
+                if r.slot in sentinels or r.attention_note:
+                    flags.append("RE-LOGIN NEEDED")
+                flag_txt = f"  {RED}[{', '.join(flags)}]{RESET}" if flags else ""
+                plan = r.plan_type or "claude_max"
+                print(
+                    f"   {mark} #{r.slot:<2} {BOLD}{r.alias:<18}{RESET} ({plan})  "
+                    f"Fable {free_s:<10} · resets {_format_reset_countdown(f_reset)}{flag_txt}"
+                )
+        else:
+            print(f"    {DIM}(none detected — Fable Guard falls back cleanly to standard seats){RESET}")
+
+        print(f"\n  {BOLD}{GOLD}Excluded Non-Fable Seats ({len(excluded_rows)}):{RESET}")
+        if excluded_rows:
+            fleet_has_fable = accounts.fleet_has_fable_accounts(row_list, sentinels=sentinels)
+            for r in excluded_rows:
+                mark = f"{GOLD}●{RESET}" if r.is_active else " "
+                plan = r.plan_type or "non-Fable"
+                sd_free = f"7d {max(0.0, 100.0 - r.seven_day_pct):.0f}% free" if r.seven_day_pct is not None else "7d —"
+                if enabled and fleet_has_fable:
+                    note = f"{GOLD}skipped by Fable Guard{RESET}"
+                elif not enabled:
+                    note = f"{RED}NOT skipped (Fable Guard OFF){RESET}"
+                else:
+                    note = f"{DIM}eligible (no healthy Fable seats in fleet){RESET}"
+                print(f"   {mark} #{r.slot:<2} {BOLD}{r.alias:<18}{RESET} ({plan} · {sd_free})  → {note}")
+        else:
+            print(f"    {DIM}(none — every seat in your pool has Fable quota){RESET}")
+
+        if other_rows:
+            print(f"\n  {BOLD}{DIM}Unclassified / Awaiting Usage ({len(other_rows)}):{RESET}")
+            for r in other_rows:
+                print(f"     #{r.slot:<2} {r.alias:<18} ({r.plan_type or 'unknown plan'})")
+
+    print(
+        f"\n  {DIM}Toggle:{RESET} {ORANGE}bswap fable-guard on{RESET}  {DIM}│{RESET}  {ORANGE}bswap fable-guard off{RESET}\n"
+    )
+    return 0
+
+
+def _cmd_doctor(args: list[str]) -> int:
+    """End-to-end Fable 5.2 & Auto-Switch diagnostic report and `--fix` auto-healer."""
+    from . import accounts, fleet
+
+    do_fix = "--fix" in args or "fix" in args
+    bdir = _backup_dir()
+
+    src: Any = None
+    source_error: str | None = None
+    row_list: list[AccountRow] = []
+    sentinels: dict[int, str] = {}
+    active: AccountRow | None = None
+    try:
+        src = accounts.create_account_source()
+        src.refresh(force=False)
+        row_list = [r for r in src.rows() if r.slot >= 0 and r.vendor == VENDOR_CLAUDE]
+        sentinels = src.sentinels() if callable(getattr(src, "sentinels", None)) else {}
+        active = src.active()
+        source_error = getattr(src, "last_error", None)
+    except Exception as exc:
+        source_error = str(exc)
+
+    cfg_path = _claude_config_path(src)
+
+    # Apply auto-healing fixes BEFORE final diagnostic read so the report shows healed state.
+    fixes_applied: list[str] = []
+    if do_fix:
+        if _ensure_optimal_autoswitch_policy(bdir):
+            fixes_applied.append(
+                "Updated claude-swap autoswitch policy (model=all, weeklyThreshold=88%, cooldownSeconds=120s, intervalSeconds=30s, hysteresisPct=10%)"
+            )
+        if _clear_credit_cache_file(cfg_path):
+            fixes_applied.append(
+                f"Cleared stale cachedExtraUsageDisabledReason from {cfg_path.name}"
+            )
+        store = _widget_settings_store()
+        if not bool(store.get("belkins_fable_guard", True)):
+            store.set("belkins_fable_guard", True)
+            fixes_applied.append("Enabled belkins_fable_guard=True in widget settings.json")
+
+    fable_guard = _fable_guard_enabled()
+    policy, policy_warnings = _read_autoswitch_policy(bdir, src)
+    effective_wk = float(policy["weeklyThreshold"]) if policy["weeklyThreshold"] is not None else 88.0
+
+    # Live engine telemetry (safe getattr fallbacks before engine branch merges)
+    guard_status: dict[str, Any] | None = None
+    burn_eta: float | None = None
+    burn_rate: float | None = None
+    if src is not None:
+        try:
+            gs_fn = getattr(src, "fable_guard_status", None)
+            if callable(gs_fn):
+                raw_gs = gs_fn()
+                if isinstance(raw_gs, Mapping):
+                    guard_status = dict(raw_gs)
+        except Exception:
+            guard_status = None
+        try:
+            eta_fn = getattr(src, "fable_burn_eta_minutes", None)
+            if callable(eta_fn):
+                burn_eta = _safe_float(eta_fn())
+        except Exception:
+            burn_eta = None
+        try:
+            rate_fn = getattr(src, "fable_burn_rate_pct_per_min", None)
+            if callable(rate_fn):
+                burn_rate = _safe_float(rate_fn())
+        except Exception:
+            burn_rate = None
+        if guard_status:
+            if burn_eta is None:
+                burn_eta = _safe_float(guard_status.get("active_eta_min"))
+            if burn_rate is None:
+                burn_rate = _safe_float(guard_status.get("active_burn_pct_per_min"))
+
+    # Collect live Claude sessions
+    active_slot = active.slot if active else None
+    identities = fleet.account_identities(bdir)
+    try:
+        snap = fleet.collect(backup_dir=bdir, active_slot=active_slot)
+    except Exception:
+        snap = fleet.FleetSnapshot()
+
+    stale_credit, stale_reason = _read_stale_credit_reason(cfg_path)
+    la_state, la_detail = _check_launchagent_status()
+    shims = _shim_status()
+
+    issues: list[str] = list(policy_warnings)
+    if not fable_guard:
+        issues.append("belkins_fable_guard is OFF — non-Fable Team/Pro seats may be selected during rotation")
+    if stale_credit:
+        issues.append(f"Stale cachedExtraUsageDisabledReason={stale_reason} in {cfg_path.name}")
+    if la_state == "stopped":
+        issues.append(f"LaunchAgent com.cc-usage-widget is stopped ({la_detail})")
+
+    _print_banner()
+    print(f"{BOLD}{ORANGE}━━━ 🩺 BELKINS FABLE & AUTO-SWITCH DOCTOR ━━━{RESET}\n")
+
+    if do_fix:
+        print(f"  {BOLD}{GREEN}Auto-Heal (--fix):{RESET}")
+        if fixes_applied:
+            for item in fixes_applied:
+                print(f"    {GREEN}✓{RESET} {item}")
+        else:
+            print(f"    {GREEN}✓{RESET} Nothing needed fixing — all auto-healable settings are already optimal.")
+        print()
+
+    # Section 1: Autoswitch Policy
+    print(f"  {BOLD}{CYAN}1. Auto-Switch Policy ({policy['path']}){RESET}")
+    en_txt = f"{GREEN}ON{RESET}" if policy["enabled"] else f"{GOLD}OFF{RESET}"
+    mdl_txt = f"{GREEN}{policy['model']}{RESET}" if policy["model"] else f"{RED}unset{RESET}"
+    wk_val = policy["weeklyThreshold"]
+    wk_txt = (
+        f"{RED}unset{RESET}"
+        if wk_val is None
+        else (f"{RED}{wk_val:.0f}%{RESET}" if wk_val >= 92.0 else f"{GREEN}{wk_val:.0f}%{RESET}")
+    )
+    iv_val = policy["intervalSeconds"]
+    iv_txt = f"{RED}{iv_val:.0f}s{RESET}" if iv_val > 30.0 else f"{GREEN}{iv_val:.0f}s{RESET}"
+    cd_val = policy["cooldownSeconds"]
+    cd_txt = f"{RED}{cd_val:.0f}s{RESET}" if cd_val >= 300.0 else f"{GREEN}{cd_val:.0f}s{RESET}"
+    hy_val = policy["hysteresisPct"]
+    hy_txt = f"{RED}{hy_val:.0f}%{RESET}" if hy_val < 10.0 else f"{GREEN}{hy_val:.0f}%{RESET}"
+    fg_txt = f"{GREEN}ON{RESET}" if fable_guard else f"{RED}OFF{RESET}"
+
+    print(
+        f"     enabled={en_txt}  │  threshold={policy['threshold']:.0f}%  │  weeklyThreshold={wk_txt}  │  model={mdl_txt}"
+    )
+    print(
+        f"     intervalSeconds={iv_txt}  │  cooldownSeconds={cd_txt}  │  hysteresisPct={hy_txt}  │  Fable Guard={fg_txt}"
+    )
+    if burn_rate is not None and burn_rate > 0:
+        eta_s = f" (~{burn_eta:.0f}m to wall)" if burn_eta is not None and burn_eta > 0 else ""
+        print(f"     {CYAN}⚡ Live Fable burn:{RESET} {burn_rate:.2f}%/min{eta_s}")
+    for warn in policy_warnings:
+        print(f"     {GOLD}⚠ {warn}{RESET}")
+    if not fable_guard:
+        print(f"     {RED}⚠ belkins_fable_guard is OFF — run `bswap doctor --fix` or `bswap fable-guard on`{RESET}")
+    if not policy_warnings and fable_guard:
+        print(f"     {GREEN}✓ Optimal Fable-safe auto-switch policy active{RESET}")
+    print()
+
+    # Section 2: Fleet Fable Capability Table
+    print(f"  {BOLD}{CYAN}2. Fleet Fable Capability Table{RESET}")
+    if not row_list:
+        msg = source_error or "no Claude accounts registered or claude-swap unavailable"
+        print(f"     {DIM}No live Claude accounts available ({msg}).{RESET}")
+    else:
+        ready_cnt = 0
+        low_cnt = 0
+        no_fable_cnt = 0
+        for r in row_list:
+            status_lbl, color, detail = _classify_fable_slot(
+                r, sentinels, fable_guard=fable_guard, weekly_threshold=effective_wk
+            )
+            if status_lbl == "FABLE READY":
+                ready_cnt += 1
+            elif status_lbl == "FABLE LOW/CAPPED":
+                low_cnt += 1
+            elif status_lbl.startswith("NO FABLE"):
+                no_fable_cnt += 1
+            active_mark = f"{GREEN}●{RESET}" if r.is_active else " "
+            print(
+                f"    {active_mark} #{r.slot:<2} {BOLD}{r.alias:<18}{RESET} "
+                f"{color}[{status_lbl}]{RESET}  {DIM}{detail}{RESET}"
+            )
+        print(
+            f"     {DIM}Summary: {ready_cnt} FABLE READY · {low_cnt} FABLE LOW/CAPPED · {no_fable_cnt} NO FABLE{RESET}"
+        )
+    print()
+
+    # Section 3: Live Claude Session Health & Shims
+    print(f"  {BOLD}{CYAN}3. Live Claude Session Health & Shims{RESET}")
+    latched_count = 0
+    shifted_count = 0
+    if not snap.sessions:
+        print(f"     {DIM}No live interactive Claude Code sessions detected.{RESET}")
+    else:
+        rows_by_slot = {r.slot: r for r in row_list}
+        for s in snap.sessions:
+            is_latched = bool(getattr(s, "latched_credits", False))
+            is_limited = bool(getattr(s, "hit_rate_limit", False))
+            sess_id = str(getattr(s, "session_id", "") or "").strip()
+            cwd_p = Path(s.cwd) if s.cwd else Path.cwd()
+            short_w = cwd_p.name or s.cwd or "(unknown)"
+            org_shifted = bool(getattr(s, "org_shifted", False))
+            if (not s.pinned) and (not org_shifted) and s.owner_slot is None and identities and s.cwd:
+                try:
+                    _owner, org_shifted = fleet.detect_workspace_owner_slot(
+                        cwd_p, identities, current_slot=s.slot, pid=s.pid
+                    )
+                except Exception:
+                    org_shifted = False
+
+            cur_row = rows_by_slot.get(s.slot) if s.slot is not None else None
+            cur_lbl = f"#{s.slot} ({cur_row.alias})" if cur_row else f"#{s.slot}"
+            if is_latched:
+                latched_count += 1
+                badge = f"{RED}⚡ LATCHED (credits){RESET}"
+                issues.append(f"PID {s.pid} ({short_w}) tripped Claude Code usage-credits latch")
+            elif is_limited:
+                badge = f"{RED}⏱ RATE LIMITED{RESET}"
+                issues.append(f"PID {s.pid} ({short_w}) hit rate limit")
+            elif s.pinned:
+                badge = f"{CYAN}📌 PINNED{RESET}"
+            elif org_shifted:
+                shifted_count += 1
+                badge = f"{GOLD}⚠ ORG SHIFTED{RESET}"
+                issues.append(f"PID {s.pid} ({short_w}) is org-shifted")
+            else:
+                badge = f"{GREEN}● HEALTHY{RESET}"
+
+            print(f"     PID {s.pid:<6} {BOLD}{short_w:<18}{RESET} [{s.status or 'idle':<7}] {badge}  slot={cur_lbl}")
+            if is_latched:
+                rec_cmd = _resume_command(s.cwd, sess_id)
+                print(
+                    f"        {GOLD}↳ Recovery (run /exit then paste):{RESET} {ORANGE}{rec_cmd}{RESET}"
+                )
+
+    shim_badge = (
+        f"{GREEN}INSTALLED{RESET}" if shims["installed"] else f"{DIM}NOT INSTALLED{RESET}"
+    )
+    path_badge = (
+        f"{GREEN}ACTIVE on PATH{RESET}" if shims["in_path"] else f"{GOLD}not on PATH{RESET}"
+    )
+    print(f"     bswap shim: {shim_badge} ({path_badge})")
+    if not shims["installed"]:
+        print(f"       {DIM}Tip: run `bswap shim on` for automatic per-session org isolation{RESET}")
+    print()
+
+    # Section 4: Config Hygiene & LaunchAgent
+    print(f"  {BOLD}{CYAN}4. Credit Cache & LaunchAgent{RESET}")
+    if stale_credit:
+        print(
+            f"     {RED}⚠ ~/.claude.json cachedExtraUsageDisabledReason={stale_reason}{RESET} "
+            f"{DIM}(run `bswap doctor --fix` to clear){RESET}"
+        )
+    else:
+        print(f"     {GREEN}✓ ~/.claude.json cachedExtraUsageDisabledReason: clean{RESET}")
+
+    la_color = GREEN if la_state == "running" else (DIM if la_state == "skipped" else GOLD)
+    la_icon = "✓" if la_state == "running" else ("·" if la_state == "skipped" else "⚠")
+    print(f"     {la_color}{la_icon} LaunchAgent (com.cc-usage-widget): {la_state} — {la_detail}{RESET}")
+    print()
+
+    # Final verdict
+    if issues:
+        fix_hint = "" if do_fix else f"  Run {ORANGE}bswap doctor --fix{RESET} to auto-heal policy, credit cache & Fable Guard."
+        print(f"  {GOLD}⚠ Doctor found {len(issues)} item(s) needing attention.{RESET}{fix_hint}\n")
+    else:
+        print(f"  {GREEN}✓ All Fable 5.2 & Auto-Switch health checks passed!{RESET}\n")
+    return 0
+
+
+def _cmd_best(args: list[str]) -> int:
+    """Switch to the healthiest Claude account honoring Fable Guard, same-org affinity & perishable quota."""
+    from . import accounts, fleet
+
+    dry_run = "--dry-run" in args or "-n" in args
+    bdir = _backup_dir()
+    fable_guard = _fable_guard_enabled()
+
+    src: Any = None
+    row_list: list[AccountRow] = []
+    sentinels: dict[int, str] = {}
+    active: AccountRow | None = None
+    try:
+        src = accounts.create_account_source()
+        src.refresh(force=False)
+        row_list = [r for r in src.rows() if r.slot >= 0 and r.vendor == VENDOR_CLAUDE]
+        sentinels = src.sentinels() if callable(getattr(src, "sentinels", None)) else {}
+        active = src.active()
+    except Exception:
+        row_list = []
+
+    if not row_list:
+        accounts.record_cli_switch_marker(bdir, "*")
+        return _run_cswap(["switch", "--strategy", "best", *args], show_banner=True)
+
+    identities = fleet.account_identities(bdir)
+    active_slot = active.slot if active else None
+
+    # Determine same-org preference: workspace thinking org first, else active seat's org.
+    prefer_org: str | None = None
+    if identities:
+        try:
+            owner_slot, _shifted = fleet.detect_workspace_owner_slot(
+                Path.cwd(), identities, current_slot=active_slot
+            )
+            if owner_slot is not None:
+                prefer_org = identities.get(owner_slot, ("", ""))[1] or None
+        except Exception:
+            prefer_org = None
+        if not prefer_org and active_slot is not None:
+            prefer_org = identities.get(active_slot, ("", ""))[1] or None
+
+    # Parse watched per-model limits
+    models: tuple[str, ...] = ("all",)
+    try:
+        mdl_fn = getattr(src, "autoswitch_model", None)
+        raw_mdl = str(mdl_fn() or "").strip() if callable(mdl_fn) else "all"
+        if raw_mdl:
+            models = tuple(m.strip() for m in raw_mdl.split(",") if m.strip()) or ("all",)
+        else:
+            models = ()
+    except Exception:
+        models = ("all",)
+
+    fleet_has_fable = accounts.fleet_has_fable_accounts(row_list, sentinels=sentinels)
+    enforce_fable = fable_guard and fleet_has_fable
+
+    candidate_pool = (
+        [r for r in row_list if not accounts.row_lacks_fable_quota(r)]
+        if enforce_fable
+        else list(row_list)
+    )
+    best_row = accounts.harvest_best_slot(
+        candidate_pool,
+        sentinels=sentinels,
+        identities=identities,
+        prefer_org=prefer_org,
+        models=models,
+        require_fable_if_fleet_has_it=enforce_fable,
+    )
+
+    # Identify any healthy non-Fable seat(s) with higher 7d headroom skipped by Fable Guard.
+    skipped_non_fable: list[AccountRow] = []
+    if enforce_fable:
+        best_wk_used = 100.0
+        if best_row is not None:
+            f_pct, _ = _fable_pct_and_reset(best_row)
+            sd_pct = float(best_row.seven_day_pct or 0.0)
+            best_wk_used = max(sd_pct, f_pct if f_pct is not None else 0.0)
+        unfiltered = accounts.harvest_best_slot(
+            row_list,
+            sentinels=sentinels,
+            identities=identities,
+            prefer_org=prefer_org,
+            models=models,
+            require_fable_if_fleet_has_it=False,
+        )
+        for r in row_list:
+            if not accounts.row_lacks_fable_quota(r):
+                continue
+            if r.disabled or not r.switchable or r.attention_note or r.slot in sentinels:
+                continue
+            r_sd = float(r.seven_day_pct or 0.0)
+            r_fh = float(r.five_hour_pct or 0.0)
+            if r_fh >= 100.0 or r_sd >= 100.0:
+                continue
+            if best_row is None or r_sd < best_wk_used or (unfiltered is not None and unfiltered.slot == r.slot):
+                skipped_non_fable.append(r)
+
+    _print_banner()
+    if skipped_non_fable:
+        parts = []
+        for sr in skipped_non_fable:
+            sd_free = max(0.0, 100.0 - float(sr.seven_day_pct or 0.0))
+            parts.append(f"#{sr.slot} {sr.alias} ({sr.plan_type or 'non-Fable'} · 7d {sd_free:.0f}% free)")
+        print(
+            f"  {GOLD}🛡️  Fable Guard skipped higher-7d non-Fable seat(s):{RESET} {', '.join(parts)} "
+            f"{DIM}(no included Fable allowance){RESET}"
+        )
+
+    if best_row is None:
+        if enforce_fable:
+            print(
+                f"  {RED}✗ No healthy Fable-capable Claude account available.{RESET} "
+                f"{DIM}(Non-Fable seats skipped by Fable Guard; run `bswap fable-guard off` or `bswap <slot>` to override.){RESET}",
+                file=sys.stderr,
+            )
+        else:
+            print(f"  {RED}✗ No healthy Claude account available to switch to.{RESET}", file=sys.stderr)
+        return 1
+
+    f_pct, f_reset = _fable_pct_and_reset(best_row)
+    quota_desc = (
+        f"Fable {max(0.0, 100.0 - f_pct):.0f}% free · 5h {float(best_row.five_hour_pct or 0.0):.0f}%"
+        if f_pct is not None
+        else f"7d {max(0.0, 100.0 - float(best_row.seven_day_pct or 0.0)):.0f}% free · 5h {float(best_row.five_hour_pct or 0.0):.0f}%"
+    )
+    reasons: list[str] = []
+    if prefer_org and identities.get(best_row.slot, ("", ""))[1] == prefer_org:
+        reasons.append("same-org")
+    try:
+        hrs_left = accounts._hours_until_reset_label(
+            best_row.seven_day_resets_at, dt.datetime.now().timestamp()
+        )
+        rem_wk = max(0.0, 100.0 - float(best_row.seven_day_pct or 0.0))
+        if hrs_left is not None and 0.0 < hrs_left <= 48.0 and rem_wk >= 15.0:
+            reasons.append("perishable-quota priority")
+    except Exception:
+        pass
+    reason_suffix = f" ({', '.join(reasons)})" if reasons else ""
+
+    if active is not None and best_row.slot == active.slot:
+        print(
+            f"  {GREEN}✓ Already on the best {'Fable-capable ' if enforce_fable else ''}account: "
+            f"Slot #{best_row.slot} ({best_row.alias}){RESET}  {DIM}[{quota_desc}]{reason_suffix}{RESET}"
+        )
+        return 0
+
+    if dry_run:
+        print(
+            f"  {CYAN}→ Would switch to Slot #{best_row.slot} ({best_row.alias}){RESET}  "
+            f"{DIM}[{quota_desc}]{reason_suffix}{RESET}"
+        )
+        return 0
+
+    accounts.record_cli_switch_marker(bdir, str(best_row.slot))
+    ok = bool(src.switch_to(str(best_row.slot)))
+    if not ok:
+        err = getattr(src, "last_error", None) or "switch failed"
+        print(f"  {RED}✗ Failed to switch to Slot #{best_row.slot} ({best_row.alias}): {err}{RESET}", file=sys.stderr)
+        return 1
+
+    print(
+        f"  {GREEN}✓ Switched to Slot #{best_row.slot} ({best_row.alias}){RESET}  "
+        f"{DIM}[{quota_desc}]{reason_suffix}{RESET}"
+    )
+    return 0
 
 
 def _cmd_sessions(args: list[str]) -> int:
@@ -1057,23 +1995,29 @@ def _cmd_sessions(args: list[str]) -> int:
 
     do_fix = "--fix" in args or "fix" in args
     bdir = _backup_dir()
+    fable_guard = _fable_guard_enabled()
 
     # Read-only inspection never mutates settings.json; only --fix / fix-thinking writes policy.
     policy_updated = _ensure_optimal_autoswitch_policy(bdir) if do_fix else False
     identities = fleet.account_identities(bdir)
     src = accounts.create_account_source()
     src.refresh(force=False)
-    row_list = src.rows()
+    row_list = list(src.rows())
     rows = {r.slot: r for r in row_list}
-    sentinels = src.sentinels()
+    sentinels = src.sentinels() if callable(getattr(src, "sentinels", None)) else {}
     active = src.active()
     active_slot = active.slot if active else None
+    fleet_has_fable = accounts.fleet_has_fable_accounts(row_list, sentinels=sentinels)
+    enforce_fable = fable_guard and fleet_has_fable
 
     snap = fleet.collect(backup_dir=bdir, active_slot=active_slot)
     _print_banner()
     print(f"  {BOLD}{ORANGE}🛡️  BELKINS PRESERVED-THINKING & SESSION QUALITY DIAGNOSTIC{RESET}")
     if policy_updated:
-        print(f"  {GREEN}✓ Upgraded autoswitch policy: model → all (Fable/Opus/Sonnet), weeklyThreshold → 92.0%, hysteresisPct → 12.0%{RESET}")
+        print(
+            f"  {GREEN}✓ Upgraded autoswitch policy: model → all (Fable/Opus/Sonnet), "
+            f"weeklyThreshold → 88.0%, cooldown → 120s, interval → 30s, hysteresis → 10.0%{RESET}"
+        )
     else:
         print(f"  {GREEN}✓ Thinking Guard: ACTIVE (concurrency-scaled busy hold · all per-model windows tracked){RESET}")
     print()
@@ -1084,10 +2028,16 @@ def _cmd_sessions(args: list[str]) -> int:
 
     org_weights: dict[str, int] = {}
     mismatch_count = 0
+    latched_sessions: list[tuple[Any, str]] = []
+    skipped_non_fable_owners: set[int] = set()
     pinned_workspaces: set[str] = set()
     for s in snap.sessions:
         cwd_p = Path(s.cwd) if s.cwd else Path.cwd()
         short_w = cwd_p.name or s.cwd
+        is_latched = bool(getattr(s, "latched_credits", False))
+        is_rate_limited = bool(getattr(s, "hit_rate_limit", False))
+        sess_id = str(getattr(s, "session_id", "") or "").strip()
+
         if s.pinned:
             owner_slot = s.slot
             mismatch = False
@@ -1110,17 +2060,33 @@ def _cmd_sessions(args: list[str]) -> int:
                 weight = 3 if (s.status or "").lower() == "busy" else 1
                 org_weights[owner_org] = org_weights.get(owner_org, 0) + weight
 
-        mode_badge = f"{CYAN}📌 PINNED{RESET}" if s.pinned else (f"{GOLD}⚠ ORG SHIFTED{RESET}" if mismatch else f"{GREEN}● MATCHED{RESET}")
+        if is_latched:
+            mode_badge = f"{RED}⚡ LATCHED (credits){RESET}"
+            rec_cmd = _resume_command(s.cwd, sess_id)
+            latched_sessions.append((s, rec_cmd))
+        elif is_rate_limited:
+            mode_badge = f"{RED}⏱ RATE LIMITED{RESET}"
+        elif s.pinned:
+            mode_badge = f"{CYAN}📌 PINNED{RESET}"
+        elif mismatch:
+            mode_badge = f"{GOLD}⚠ ORG SHIFTED{RESET}"
+        else:
+            mode_badge = f"{GREEN}● MATCHED{RESET}"
         print(f"  PID {s.pid:<6} {BOLD}{short_w:<18}{RESET} [{s.status or 'idle':<7}] {mode_badge}  cur={cur_lbl}  thinking_org={owner_lbl}")
+        if is_latched:
+            print(f"    {GOLD}↳ Run /exit then resume:{RESET} {ORANGE}{rec_cmd}{RESET}")
 
         if do_fix and (not s.pinned) and owner_slot is not None and s.cwd and "/private/tmp/" not in s.cwd:
-            ident = identities.get(owner_slot)
-            if ident and s.cwd not in pinned_workspaces:
-                try:
-                    fleet.set_mapping(bdir, s.cwd, ident[0], ident[1])
-                    pinned_workspaces.add(s.cwd)
-                except Exception:
-                    pass
+            if enforce_fable and owner_row is not None and accounts.row_lacks_fable_quota(owner_row):
+                skipped_non_fable_owners.add(owner_slot)
+            else:
+                ident = identities.get(owner_slot)
+                if ident and s.cwd not in pinned_workspaces:
+                    try:
+                        fleet.set_mapping(bdir, s.cwd, ident[0], ident[1])
+                        pinned_workspaces.add(s.cwd)
+                    except Exception:
+                        pass
 
     if pinned_workspaces:
         print(f"\n  {GREEN}✓ Pinned {len(pinned_workspaces)} workspace(s) to their current thinking organization for future `bswap claude` launches.{RESET}")
@@ -1128,23 +2094,41 @@ def _cmd_sessions(args: list[str]) -> int:
     best_owner: AccountRow | None = None
     active_org = identities.get(active_slot, ("", ""))[1] if active_slot is not None else ""
     for cand_org, _cnt in sorted(org_weights.items(), key=lambda kv: kv[1], reverse=True):
-        if cand_org == active_org and _slot_is_healthy_for_session(active, sentinels):
+        if cand_org == active_org and _slot_is_healthy_for_session(
+            active, sentinels, fleet_rows=row_list, fable_guard=fable_guard
+        ):
             best_owner = active
             break
         same_org_rows = [
             r for r in row_list
             if identities.get(r.slot, ("", ""))[1] == cand_org
-            and _slot_is_healthy_for_session(r, sentinels)
+            and _slot_is_healthy_for_session(r, sentinels, fleet_rows=row_list, fable_guard=fable_guard)
         ]
+        if enforce_fable:
+            same_org_rows = [r for r in same_org_rows if not accounts.row_lacks_fable_quota(r)]
+            # Track non-Fable seats in this org so we can explain why restore skipped them
+            for r in row_list:
+                if identities.get(r.slot, ("", ""))[1] == cand_org and accounts.row_lacks_fable_quota(r):
+                    skipped_non_fable_owners.add(r.slot)
         cand = accounts.harvest_best_slot(
             same_org_rows,
             sentinels=sentinels,
             identities=identities,
             prefer_org=cand_org,
+            require_fable_if_fleet_has_it=enforce_fable,
         )
-        if cand is not None:
+        if cand is not None and not (enforce_fable and accounts.row_lacks_fable_quota(cand)):
             best_owner = cand
             break
+
+    if skipped_non_fable_owners:
+        names = ", ".join(
+            f"#{s} ({rows[s].alias})" if s in rows else f"#{s}" for s in sorted(skipped_non_fable_owners)
+        )
+        print(
+            f"\n  {GOLD}🛡️  Fable Guard skipped restoring onto non-Fable seat(s): {names}{RESET} "
+            f"{DIM}(no included Fable allowance){RESET}"
+        )
 
     if best_owner is not None and best_owner.slot != active_slot:
         print()
@@ -1161,12 +2145,24 @@ def _cmd_sessions(args: list[str]) -> int:
                 f"and pin workspaces, or launch future terminals with {ORANGE}bswap claude{RESET} for 100% org isolation."
             )
     elif mismatch_count > 0:
-        print(
-            f"\n  {GREEN}✓ Global login Slot #{active_slot} ({active.alias if active else ''}) already matches your dominant busy sessions!{RESET}\n"
-            f"  {DIM}💡 Launch separate workspaces with `{ORANGE}bswap claude{DIM}` so each project stays locked to its own slot.{RESET}"
-        )
-    else:
+        if skipped_non_fable_owners:
+            print(
+                f"  {DIM}💡 Keeping Fable-safe global login Slot #{active_slot} ({active.alias if active else ''}); "
+                f"launch separate workspaces with `{ORANGE}bswap claude{DIM}` for org isolation.{RESET}"
+            )
+        else:
+            print(
+                f"\n  {GREEN}✓ Global login Slot #{active_slot} ({active.alias if active else ''}) already matches your dominant busy sessions!{RESET}\n"
+                f"  {DIM}💡 Launch separate workspaces with `{ORANGE}bswap claude{DIM}` so each project stays locked to its own slot.{RESET}"
+            )
+    elif not latched_sessions:
         print(f"\n  {GREEN}✓ All active sessions match their thinking organization!{RESET}")
+
+    if latched_sessions:
+        print(
+            f"\n  {RED}⚡ {len(latched_sessions)} session(s) tripped Claude Code's usage-credits latch — "
+            f"run `/exit` and the `claude --resume` command above to recover on your active Fable seat.{RESET}"
+        )
     return 0
 
 
@@ -1180,19 +2176,24 @@ def _cmd_claude_session(args: list[str]) -> int:
         return 1
 
     bdir = _backup_dir()
+    fable_guard = _fable_guard_enabled()
     identities = fleet.account_identities(bdir)
     src = accounts.create_account_source()
     src.refresh(force=False)
-    row_list = src.rows()
+    row_list = list(src.rows())
     rows = {r.slot: r for r in row_list}
-    sentinels = src.sentinels()
+    sentinels = src.sentinels() if callable(getattr(src, "sentinels", None)) else {}
     active = src.active()
     active_slot = active.slot if active else None
+    fleet_has_fable = accounts.fleet_has_fable_accounts(row_list, sentinels=sentinels)
+    enforce_fable = fable_guard and fleet_has_fable
 
     explicit_target = False
     target_slot: str | None = None
     claude_args = list(args)
-    if claude_args and not claude_args[0].startswith("-"):
+    if claude_args and claude_args[0] == "--":
+        claude_args = claude_args[1:]
+    elif claude_args and not claude_args[0].startswith("-"):
         first = claude_args[0]
         matched_alias = next((r for r in row_list if r.alias.lower() == first.lower()), None)
         if first.isdigit() or matched_alias is not None:
@@ -1202,22 +2203,37 @@ def _cmd_claude_session(args: list[str]) -> int:
             if claude_args and claude_args[0] == "--":
                 claude_args = claude_args[1:]
 
+    if explicit_target and target_slot is not None and enforce_fable:
+        exp_row = rows.get(int(target_slot)) if target_slot.isdigit() else None
+        if exp_row is not None and accounts.row_lacks_fable_quota(exp_row):
+            print(
+                f"{GOLD}⚠ Warning: Slot #{exp_row.slot} ({exp_row.alias}) lacks included Fable quota "
+                f"— proceeding per explicit slot argument.{RESET}"
+            )
+
     cwd = Path.cwd()
     prefer_org: str | None = None
     if target_slot is None:
-        # 1. Honour directory pin or transcript organization owner when healthy
+        # 1. Honour directory pin or transcript organization owner when healthy & Fable-safe
         mappings = fleet.load_mappings(bdir, identities)
         mapped = fleet._mapping_for(str(cwd), mappings)
-        if mapped is not None and mapped.slot is not None and _slot_is_healthy_for_session(
-            rows.get(mapped.slot), sentinels, max_5h=92.0, max_7d=96.0
-        ):
-            r = rows[mapped.slot]
-            target_slot = str(r.slot)
-            print(
-                f"{GREEN}🛡️  Locked to Pinned Slot #{r.slot} ({r.alias}){RESET} "
-                f"{DIM}(directory mapping){RESET}"
-            )
-        else:
+        if mapped is not None and mapped.slot is not None:
+            mapped_row = rows.get(mapped.slot)
+            if _slot_is_healthy_for_session(
+                mapped_row, sentinels, max_5h=92.0, max_7d=96.0, fleet_rows=row_list, fable_guard=fable_guard
+            ):
+                r = rows[mapped.slot]
+                target_slot = str(r.slot)
+                print(
+                    f"{GREEN}🛡️  Locked to Pinned Slot #{r.slot} ({r.alias}){RESET} "
+                    f"{DIM}(directory mapping){RESET}"
+                )
+            elif enforce_fable and mapped_row is not None and accounts.row_lacks_fable_quota(mapped_row):
+                print(
+                    f"{GOLD}🛡️  Fable Guard skipped pinned non-Fable Slot #{mapped_row.slot} ({mapped_row.alias}){RESET} "
+                    f"{DIM}(selecting Fable-capable seat instead){RESET}"
+                )
+        if target_slot is None:
             owner_slot, _shifted = fleet.detect_workspace_owner_slot(
                 cwd, identities, current_slot=active_slot
             )
@@ -1226,13 +2242,20 @@ def _cmd_claude_session(args: list[str]) -> int:
                 same_org_candidates = [
                     r for r in row_list
                     if prefer_org and identities.get(r.slot, ("", ""))[1] == prefer_org
-                    and _slot_is_healthy_for_session(r, sentinels, max_5h=92.0, max_7d=96.0)
+                    and _slot_is_healthy_for_session(
+                        r, sentinels, max_5h=92.0, max_7d=96.0, fleet_rows=row_list, fable_guard=fable_guard
+                    )
                 ]
+                if enforce_fable:
+                    same_org_candidates = [
+                        r for r in same_org_candidates if not accounts.row_lacks_fable_quota(r)
+                    ]
                 chosen_org_row = accounts.harvest_best_slot(
                     same_org_candidates,
                     sentinels=sentinels,
                     identities=identities,
                     prefer_org=prefer_org,
+                    require_fable_if_fleet_has_it=enforce_fable,
                 )
                 if chosen_org_row is not None:
                     target_slot = str(chosen_org_row.slot)
@@ -1242,12 +2265,18 @@ def _cmd_claude_session(args: list[str]) -> int:
                     )
 
     if target_slot is None:
-        # 2. Pick healthiest slot via Perishable-Quota & Org-Aware Harvester
+        # 2. Pick healthiest Fable-safe slot via Perishable-Quota & Org-Aware Harvester
+        pool = (
+            [r for r in row_list if not accounts.row_lacks_fable_quota(r)]
+            if enforce_fable
+            else list(row_list)
+        )
         chosen = accounts.harvest_best_slot(
-            row_list,
+            pool,
             sentinels=sentinels,
             identities=identities,
             prefer_org=prefer_org,
+            require_fable_if_fleet_has_it=enforce_fable,
         )
         if chosen is not None:
             target_slot = str(chosen.slot)
@@ -1256,29 +2285,65 @@ def _cmd_claude_session(args: list[str]) -> int:
                 f"{DIM}(perishable-quota & org-aware selection){RESET}"
             )
         else:
-            target_slot = str(active_slot if active_slot is not None else 1)
+            fallback_slot: int | None = active_slot
+            if enforce_fable:
+                active_row = rows.get(active_slot) if active_slot is not None else None
+                if active_row is None or accounts.row_lacks_fable_quota(active_row):
+                    fable_fallbacks = [
+                        r for r in row_list
+                        if r.slot >= 0
+                        and not r.disabled
+                        and r.switchable
+                        and not r.attention_note
+                        and r.slot not in sentinels
+                        and accounts.row_has_fable_quota(r)
+                    ]
+                    if fable_fallbacks:
+                        fable_fallbacks.sort(
+                            key=lambda r: (
+                                _fable_pct_and_reset(r)[0] if _fable_pct_and_reset(r)[0] is not None else 100.0,
+                                float(r.five_hour_pct or 0.0),
+                            )
+                        )
+                        fallback_slot = fable_fallbacks[0].slot
+            target_slot = str(fallback_slot if fallback_slot is not None else 1)
 
     # Guarantee true CLAUDE_CONFIG_DIR isolation without creating duplicate refresh tokens:
     # `cswap run N` falls back to unisolated `~/.claude` if N is currently the active default login.
     # When no busy default-profile sessions hold `~/.claude`, rotate the global default login onto
-    # another healthy slot first so N runs inside `<backup>/sessions/N-.../` with shared history!
+    # another healthy Fable-safe slot first so N runs inside `<backup>/sessions/N-.../` with shared history!
     if active_slot is not None and target_slot == str(active_slot):
         other_healthy = [
             r for r in row_list
-            if r.slot != active_slot and _slot_is_healthy_for_session(r, sentinels, max_5h=95.0, max_7d=99.0)
+            if r.slot != active_slot
+            and _slot_is_healthy_for_session(
+                r, sentinels, max_5h=95.0, max_7d=99.0, fleet_rows=row_list, fable_guard=fable_guard
+            )
         ]
+        if enforce_fable:
+            other_healthy = [r for r in other_healthy if not accounts.row_lacks_fable_quota(r)]
         try:
             default_recs, _ = fleet.read_registry(fleet.sessions_dir())
             default_busy = sum(1 for rec in default_recs if str(rec.get("status") or "").lower() == "busy")
         except Exception:
             default_busy = 0
         if other_healthy and default_busy == 0:
-            standby = accounts.harvest_best_slot(other_healthy, sentinels=sentinels, identities=identities)
+            standby = accounts.harvest_best_slot(
+                other_healthy,
+                sentinels=sentinels,
+                identities=identities,
+                require_fable_if_fleet_has_it=enforce_fable,
+            )
             if standby is not None:
                 accounts.record_cli_switch_marker(bdir, str(standby.slot))
                 src.switch_to(str(standby.slot))
         elif other_healthy and not explicit_target and not prefer_org:
-            alt = accounts.harvest_best_slot(other_healthy, sentinels=sentinels, identities=identities)
+            alt = accounts.harvest_best_slot(
+                other_healthy,
+                sentinels=sentinels,
+                identities=identities,
+                require_fable_if_fleet_has_it=enforce_fable,
+            )
             if alt is not None:
                 target_slot = str(alt.slot)
 
@@ -1314,7 +2379,7 @@ def _cmd_shim(args: list[str]) -> int:
         claude_body = "\n".join(
             [
                 "#!/bin/bash",
-                "# Belkins Usage Bar — isolated org-locked Claude wrapper shim",
+                "# Belkins Usage Bar — isolated Fable-safe org-locked Claude wrapper shim",
                 f'SHIM_DIR="{SHIMS_DIR}"',
                 'find_real() {',
                 '  local IFS=":"',
@@ -1371,13 +2436,14 @@ def _cmd_shim(args: list[str]) -> int:
             path.write_text(content, encoding="utf-8")
             os.chmod(path, 0o755)
         print(f"{GREEN}✓ Installed Belkins wrapper shims in {SHIMS_DIR}:{RESET}")
-        print(f"  • {BOLD}claude{RESET} → auto-isolates sessions via `bswap claude` (recursion-safe)")
+        print(f"  • {BOLD}claude{RESET} → auto-isolates sessions via `bswap claude` (Fable-safe, recursion-safe)")
         print(f"  • {BOLD}codex{RESET}  → routes `CODEX_HOME` to healthiest seat via `codex_accounts best`")
         print(f"\n  {GOLD}Add to ~/.zshrc to activate:{RESET}\n    {ORANGE}{path_export}{RESET}")
         return 0
 
-    installed = claude_shim.is_file() and codex_shim.is_file()
-    in_path = str(SHIMS_DIR) in (os.environ.get("PATH") or "").split(":")
+    st = _shim_status()
+    installed = bool(st["installed"])
+    in_path = bool(st["in_path"])
     print(
         f"  {BOLD}Belkins Shims:{RESET} "
         f"{GREEN + 'INSTALLED' if installed else DIM + 'NOT INSTALLED'}{RESET}  "
@@ -1576,16 +2642,18 @@ def _cmd_help() -> int:
     print(f"  {ORANGE}bswap codex{RESET} [list|switch|best|adopt|probe] Manage & switch Codex accounts")
     print()
     print(f"{BOLD}Claude Fleet & Preserved-Thinking Commands:{RESET}")
-    print(f"  {ORANGE}bswap claude [slot] [args]{RESET} Launch Claude Code in an org-locked profile (never drops thinking!)")
+    print(f"  {ORANGE}bswap doctor [--fix]{RESET}       Diagnose & auto-heal Fable autoswitch, seats, latched sessions & LaunchAgent")
+    print(f"  {ORANGE}bswap fable-guard [on|off|status]{RESET} Inspect or toggle Fable Guard (skip non-Fable Team/Pro seats)")
+    print(f"  {ORANGE}bswap claude [slot] [args]{RESET} Launch Claude Code in a Fable-safe org-locked profile (never drops thinking!)")
     print(f"  {ORANGE}bswap shim [on|off|status]{RESET} Install/remove auto-isolating `claude` & `codex` CLI shims")
-    print(f"  {ORANGE}bswap fix-thinking{RESET}         Diagnose & restore session orgs + set 92% weekly/Fable guard")
-    print(f"  {ORANGE}bswap sessions{RESET}             Inspect live Claude sessions & their Preserved-Thinking org owners")
+    print(f"  {ORANGE}bswap fix-thinking{RESET}         Diagnose & restore session orgs + set 88% weekly/Fable guard")
+    print(f"  {ORANGE}bswap sessions{RESET}             Inspect live Claude sessions, latched credits & Preserved-Thinking orgs")
     print(f"  {ORANGE}bswap unpin [dir]{RESET}          Remove workspace directory pin (defaults to current directory)")
     print(f"  {ORANGE}bswap threshold [50..99]{RESET}   View or set live Claude 5h & weekly/Fable auto-switch threshold %")
     print(f"  {ORANGE}bswap model [all|Fable|off]{RESET} Configure per-model weekly auto-switch limits (default: `all`)")
     print(f"  {ORANGE}bswap strategy [best|consume-first]{RESET} Set auto-switch rotation strategy")
     print(f"  {ORANGE}bswap <slot|alias>{RESET}         Switch active Claude account to slot number or alias")
-    print(f"  {ORANGE}bswap best{RESET}                 Switch to the healthiest Claude account with most room")
+    print(f"  {ORANGE}bswap best [--dry-run]{RESET}     Switch to the healthiest Fable-safe, same-org & perishable-quota account")
     print(f"  {ORANGE}bswap list{RESET}                 List all registered Claude accounts")
     print(f"  {ORANGE}bswap add{RESET}                  Register current Claude credentials into a slot")
     print(f"  {ORANGE}bswap remove <slot>{RESET}        Remove a slot from the rotation")
@@ -1636,10 +2704,11 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "status":
         return _run_cswap(["status", *args[1:]], show_banner=True)
     if cmd == "best":
-        from . import accounts
-
-        accounts.record_cli_switch_marker(_backup_dir(), "*")
-        return _run_cswap(["switch", "--strategy", "best", *args[1:]], show_banner=True)
+        return _cmd_best(args[1:])
+    if cmd in {"doctor", "diag", "diagnose", "health"}:
+        return _cmd_doctor(args[1:])
+    if cmd in {"fable-guard", "fable_guard", "fableguard", "fable"}:
+        return _cmd_fable_guard(args[1:])
     if cmd.isdigit():
         from . import accounts
 
