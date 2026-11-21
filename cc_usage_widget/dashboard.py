@@ -63,7 +63,9 @@ from __future__ import annotations
 
 import datetime as dt
 import html
+import math
 import os
+import re
 import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -98,6 +100,7 @@ __all__ = [
     "DASHBOARD_PATH",
     "EMPTY_MARKER",
     "INDEXING_BANNER",
+    "RESET_RADAR_HEADING",
     "WINDOW_DAYS",
     "WALL_NO_HISTORY_NOTE",
     "WORKFLOW_NOTE",
@@ -156,6 +159,9 @@ WORKFLOW_NOTE: Final[str] = (
 EMPTY_MARKER: Final[str] = "No usage recorded yet"
 """The empty state's exact wording, named so a test asserts the string rather
 than a class name that could drift."""
+
+RESET_RADAR_HEADING: Final[str] = "Fleet Reset Timeline & Capacity Forecast"
+"""Heading for the unified Claude + Codex Reset Timeline & Capacity Forecast."""
 
 INDEXING_BANNER: Final[str] = (
     "The index is still being built, so every figure below is partial and will "
@@ -512,6 +518,14 @@ def _capped(series: Sequence[_Series], limit: int) -> tuple[_Series, ...]:
 # ---------------------------------------------------------------------------
 
 
+_EMAIL_RE: Final[re.Pattern[str]] = re.compile(
+    r"([A-Za-z0-9._%+-]+)@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
+)
+_TOKEN_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?:Bearer\s+[A-Za-z0-9._~+/=-]{8,}|(?:sk-ant-|sk-proj-|sk-live-|ghp_|eyJ)[A-Za-z0-9._~+/=-]{8,})"
+)
+
+
 def _esc(value: Any) -> str:
     """HTML-escape anything on its way into the document.
 
@@ -520,6 +534,37 @@ def _esc(value: Any) -> str:
     literals. One unescaped ``<`` would turn a filename into markup.
     """
     return html.escape(str(value), quote=True)
+
+
+def _sanitize_text(value: Any) -> str:
+    """Strip raw email domains and bearer/API token strings before rendering."""
+    text = str(value or "")
+    if not text:
+        return ""
+    text = _EMAIL_RE.sub(r"\1", text)
+    text = _TOKEN_RE.sub("[redacted]", text)
+    return text
+
+
+def _safe_alias(raw: Any, *, vendor: str = "", slot: int = 0) -> str:
+    """Display-safe account alias — never emits raw email addresses or tokens."""
+    cleaned = _sanitize_text(raw).strip()
+    if "@" in cleaned:
+        cleaned = cleaned.split("@", 1)[0].strip()
+    if cleaned:
+        return cleaned
+    if vendor == "codex":
+        return f"codex-{abs(slot)}" if slot else "Codex"
+    if slot > 0:
+        return f"slot-{slot}"
+    return vendor_label(vendor) if vendor else "account"
+
+
+def _clip(text: str, limit: int) -> str:
+    """Truncate plain text BEFORE HTML-escaping so entities are never split."""
+    if len(text) <= limit:
+        return text
+    return text[: max(1, limit - 1)].rstrip() + "…"
 
 
 def _int(value: int) -> str:
@@ -873,7 +918,8 @@ def estimate_monthly_seat_usd(
         elif any(tok in raw for tok in ("team", "business", "enterprise")):
             seat = 30.0
         if seat > 0:
-            breakdown.append((row.alias or row.vendor_label, plan_label(row.plan_type), seat))
+            label = _safe_alias(row.alias, vendor=row.vendor, slot=row.slot) if row.alias else row.vendor_label
+            breakdown.append((label, plan_label(row.plan_type), seat))
     inferred = sum(item[2] for item in breakdown)
     total = float(explicit_monthly_usd) if explicit_monthly_usd > 0 else inferred
     return total, breakdown
@@ -1193,7 +1239,7 @@ def _quota_section(rows: Sequence[AccountRow]) -> str:
             note = f'<p class="note {_esc(kind)}">{_esc(row.attention_note)}</p>'
         extra = "".join(f'<li>{_esc(line)}</li>' for line in row.info_notes)
         extra = f'<ul class="info">{extra}</ul>' if extra else ""
-        title = row.alias or row.vendor_label
+        title = _safe_alias(row.alias, vendor=row.vendor, slot=row.slot) if row.alias else row.vendor_label
         # The display name (`Max 20x`, `Business`), not the raw slug: Claude
         # rows carry `claude_max_20x` since 2026-09-30.
         plan = f' <span class="plan">{_esc(plan_label(row.plan_type))}</span>' if row.plan_type else ""
@@ -1287,8 +1333,9 @@ def _wall_section(
         if has_measured:
             hrs = measured.get(alias_key, 0.0)
             hrs_col = f'<td class="num">{hrs:.2f} h</td>'
+        display_alias = _safe_alias(row.alias, vendor=row.vendor, slot=row.slot) if row.alias else row.vendor_label
         body.append(
-            f"<tr><td>{_esc(row.alias or row.vendor_label)}</td>"
+            f"<tr><td>{_esc(display_alias)}</td>"
             f"<td>{_esc(row.vendor_label)}</td>"
             f"<td>{_esc(state)}</td>{hrs_col}</tr>"
         )
@@ -1479,6 +1526,1129 @@ def _belkins_dex_section(
 
 
 # ---------------------------------------------------------------------------
+# Fleet Reset Timeline & Capacity Forecast (consumes cc_usage_widget.resets)
+# ---------------------------------------------------------------------------
+
+_RR_HORIZON_SECONDS: Final[float] = 7.0 * 86_400.0
+_RR_WEEKDAYS: Final[dict[str, int]] = {
+    "mon": 0,
+    "tue": 1,
+    "wed": 2,
+    "thu": 3,
+    "fri": 4,
+    "sat": 5,
+    "sun": 6,
+}
+_RR_MONTHS: Final[dict[str, int]] = {
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
+}
+_RR_HHMM_RE: Final[re.Pattern[str]] = re.compile(r"^(\d{1,2}):(\d{2})$")
+_RR_WD_HHMM_RE: Final[re.Pattern[str]] = re.compile(
+    r"^([A-Za-z]{3})\s+(\d{1,2}):(\d{2})$"
+)
+_RR_MON_DAY_HHMM_RE: Final[re.Pattern[str]] = re.compile(
+    r"^([A-Za-z]{3})\s+(\d{1,2})\s+(\d{1,2}):(\d{2})$"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _FallbackResetEvent:
+    vendor: str
+    slot: int
+    alias: str
+    window: str
+    used_pct: float | None
+    free_pct: float | None
+    resets_at_epoch: float
+    seconds_until: float
+    reset_label: str
+    countdown_label: str
+    kind: str
+    is_active: bool = False
+    disabled: bool = False
+    plan_label: str = ""
+    no_fable: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _FallbackResetCreditAccount:
+    vendor: str
+    slot: int
+    alias: str
+    available: int
+    usable: int
+    used_pct: float | None
+    is_active: bool = False
+    needs_relogin: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _FallbackResetCreditsSummary:
+    total_available: int
+    live_available: int
+    total_usable: int
+    accounts: tuple[_FallbackResetCreditAccount, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _FallbackFleetCapacitySummary:
+    claude_fable_free_seats: float
+    claude_fable_total_seats: int
+    claude_locked_relogin_seats: int
+    claude_next_unlock: _FallbackResetEvent | None
+    codex_free_seats: float
+    codex_total_seats: int
+    codex_locked_relogin_seats: int
+    codex_next_unlock: _FallbackResetEvent | None
+    perishable_seats_48h: float
+
+
+@dataclass(frozen=True, slots=True)
+class _FallbackFleetRecommendation:
+    kind: str
+    headline: str
+    detail: str
+    target_vendor: str | None = None
+    target_slot: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _FallbackFleetResetRadar:
+    generated_at: float
+    events: tuple[_FallbackResetEvent, ...]
+    unlocks: tuple[_FallbackResetEvent, ...]
+    perishable: tuple[_FallbackResetEvent, ...]
+    credits: _FallbackResetCreditsSummary
+    capacity: _FallbackFleetCapacitySummary
+    recommendation: _FallbackFleetRecommendation | None
+
+
+def _fallback_parse_reset_epoch(value: Any, *, now: float) -> float | None:
+    """Best-effort reset timestamp parser used only when ``resets`` is absent."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        val = float(value)
+        return val if math.isfinite(val) and val > 1_000_000_000.0 else None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        num = float(text)
+        if math.isfinite(num) and num > 1_000_000_000.0:
+            return num
+    except ValueError:
+        pass
+    iso_cand = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
+    try:
+        parsed_iso = dt.datetime.fromisoformat(iso_cand)
+        return parsed_iso.timestamp()
+    except ValueError:
+        pass
+    now_dt = dt.datetime.fromtimestamp(now)
+    m = _RR_HHMM_RE.match(text)
+    if m:
+        hh, mm = int(m.group(1)), int(m.group(2))
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            cand = now_dt.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if cand.timestamp() <= now - 30.0:
+                cand += dt.timedelta(days=1)
+            return cand.timestamp()
+        return None
+    m = _RR_WD_HHMM_RE.match(text)
+    if m:
+        wd = _RR_WEEKDAYS.get(m.group(1).lower())
+        hh, mm = int(m.group(2)), int(m.group(3))
+        if wd is not None and 0 <= hh <= 23 and 0 <= mm <= 59:
+            delta = (wd - now_dt.weekday()) % 7
+            cand = (now_dt + dt.timedelta(days=delta)).replace(
+                hour=hh, minute=mm, second=0, microsecond=0
+            )
+            if cand.timestamp() <= now - 30.0:
+                cand += dt.timedelta(days=7)
+            return cand.timestamp()
+        return None
+    m = _RR_MON_DAY_HHMM_RE.match(text)
+    if m:
+        month = _RR_MONTHS.get(m.group(1).lower())
+        day = int(m.group(2))
+        hh, mm = int(m.group(3)), int(m.group(4))
+        if month is not None and 1 <= day <= 31 and 0 <= hh <= 23 and 0 <= mm <= 59:
+            for year in (now_dt.year, now_dt.year + 1, now_dt.year - 1):
+                try:
+                    cand = dt.datetime(year, month, day, hh, mm, 0)
+                except ValueError:
+                    continue
+                ts = cand.timestamp()
+                if now - 180.0 * 86_400.0 <= ts <= now + 185.0 * 86_400.0:
+                    return ts
+    return None
+
+
+def _fallback_format_countdown(seconds: float) -> str:
+    if seconds <= 0.0:
+        return "now"
+    if seconds < 60.0:
+        return "<1m"
+    total_min = int(seconds // 60)
+    if total_min < 60:
+        return f"{total_min}m"
+    hours, mins = divmod(total_min, 60)
+    if hours < 24:
+        return f"{hours}h {mins}m" if mins else f"{hours}h"
+    days, rem_h = divmod(hours, 24)
+    return f"{days}d {rem_h}h" if rem_h else f"{days}d"
+
+
+def _fallback_format_local_reset_label(epoch: float, *, now: float) -> str:
+    now_dt = dt.datetime.fromtimestamp(now)
+    target = dt.datetime.fromtimestamp(epoch)
+    clock = target.strftime("%H:%M")
+    diff_days = (target.date() - now_dt.date()).days
+    if diff_days == 0:
+        return clock
+    if diff_days == 1:
+        return f"Tom {clock}"
+    if 2 <= diff_days <= 6:
+        return f"{target.strftime('%a')} {clock}"
+    return f"{target.strftime('%b')} {target.day} {clock}"
+
+
+def _fallback_row_fable_pct(row: Any) -> float | None:
+    for name, pct in getattr(row, "scoped_windows", ()) or ():
+        if pct is not None and str(name).strip().lower().startswith("fable"):
+            try:
+                val = float(pct)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(val):
+                return val
+    return None
+
+
+def _fallback_row_lacks_fable(row: Any) -> bool:
+    if _fallback_row_fable_pct(row) is not None:
+        return False
+    plan = str(getattr(row, "plan_type", None) or "").strip().lower()
+    if not plan:
+        return False
+    if not plan.startswith("claude_max"):
+        return True
+    return (
+        getattr(row, "five_hour_pct", None) is not None
+        or getattr(row, "seven_day_pct", None) is not None
+    )
+
+
+def _fallback_is_locked(row: Any, notes: Mapping[int, str]) -> bool:
+    vendor = str(getattr(row, "vendor", "claude") or "claude")
+    slot = int(getattr(row, "slot", 0) or 0)
+    kind = str(getattr(row, "attention_kind", "") or "").lower()
+    note = str(getattr(row, "attention_note", "") or "").lower()
+    if vendor == "claude" and slot in notes:
+        return True
+    if kind == "warn":
+        return True
+    return any(
+        tok in note
+        for tok in ("relogin", "re-login", "expired", "401", "403", "quarantine", "no access")
+    )
+
+
+def _fallback_fleet_reset_radar(
+    accounts: Sequence[AccountRow],
+    quota_rows: Sequence[AccountRow],
+    *,
+    account_notes: Mapping[int, str] | None = None,
+    now: float,
+    fable_guard: bool = True,
+) -> _FallbackFleetResetRadar:
+    """Contract-compatible fallback used only when ``cc_usage_widget.resets`` is absent."""
+    notes = dict(account_notes or {})
+    claude_rows = [r for r in accounts if getattr(r, "vendor", "claude") == "claude"]
+    raw_codex = [
+        r for r in list(accounts) + list(quota_rows) if getattr(r, "vendor", "") == "codex"
+    ]
+    has_live_codex = any(int(getattr(r, "slot", 0) or 0) < 0 for r in raw_codex)
+    codex_rows = [
+        r for r in raw_codex if not (has_live_codex and int(getattr(r, "slot", 0) or 0) == 0)
+    ]
+
+    fleet_has_fable = any(
+        not getattr(r, "disabled", False)
+        and not _fallback_is_locked(r, notes)
+        and _fallback_row_fable_pct(r) is not None
+        for r in claude_rows
+    )
+
+    events: list[_FallbackResetEvent] = []
+    credit_accounts: list[_FallbackResetCreditAccount] = []
+    claude_free = 0.0
+    claude_total = 0
+    claude_locked = 0
+    codex_free = 0.0
+    codex_total = 0
+    codex_locked = 0
+
+    def _collect_row_events(
+        row: Any,
+        *,
+        vendor: str,
+        no_fable: bool,
+        disabled: bool,
+    ) -> None:
+        slot = int(getattr(row, "slot", 0) or 0)
+        alias = _safe_alias(getattr(row, "alias", ""), vendor=vendor, slot=slot)
+        expired_set = {str(w) for w in (getattr(row, "expired_windows", ()) or ())}
+        candidates: list[tuple[str, float | None, float]] = []
+
+        fh_pct = getattr(row, "five_hour_pct", None)
+        fh_ep = _fallback_parse_reset_epoch(getattr(row, "five_hour_resets_at", None), now=now)
+        if fh_ep is not None and "five_hour" not in expired_set and fh_ep > now - 30.0:
+            candidates.append(("5h", float(fh_pct) if fh_pct is not None else None, fh_ep))
+
+        sd_pct = getattr(row, "seven_day_pct", None)
+        sd_ep = _fallback_parse_reset_epoch(getattr(row, "seven_day_resets_at", None), now=now)
+        if sd_ep is None and vendor == "codex" and fh_pct is None:
+            sd_ep = _fallback_parse_reset_epoch(getattr(row, "soonest_reset_at", None), now=now)
+        if sd_ep is not None and "seven_day" not in expired_set and sd_ep > now - 30.0:
+            candidates.append(("7d", float(sd_pct) if sd_pct is not None else None, sd_ep))
+
+        scoped_resets = dict(getattr(row, "scoped_resets_at", ()) or ())
+        scoped_pcts = dict(getattr(row, "scoped_windows", ()) or ())
+        for w_name in sorted(set(scoped_resets) | set(scoped_pcts)):
+            if w_name in expired_set:
+                continue
+            w_ep = _fallback_parse_reset_epoch(scoped_resets.get(w_name), now=now)
+            if w_ep is None or w_ep <= now - 30.0:
+                continue
+            raw_pct = scoped_pcts.get(w_name)
+            candidates.append((str(w_name), float(raw_pct) if raw_pct is not None else None, w_ep))
+
+        # Deduplicate identical-minute resets on the same account (prefer Fable / higher pct).
+        by_minute: dict[int, tuple[str, float | None, float]] = {}
+        for win, pct, ep in candidates:
+            bucket = int(ep // 60)
+            prev = by_minute.get(bucket)
+            if prev is None:
+                by_minute[bucket] = (win, pct, ep)
+                continue
+            p_win, p_pct, _p_ep = prev
+            score_new = (1 if win.lower().startswith("fable") else 0, pct if pct is not None else -1.0)
+            score_old = (1 if p_win.lower().startswith("fable") else 0, p_pct if p_pct is not None else -1.0)
+            if score_new > score_old:
+                by_minute[bucket] = (win, pct, ep)
+
+        p_label = plan_label(getattr(row, "plan_type", None)) if getattr(row, "plan_type", None) else ""
+        is_active = bool(getattr(row, "is_active", False))
+        for win, pct, ep in by_minute.values():
+            secs = max(0.0, ep - now)
+            used = max(0.0, min(100.0, pct)) if pct is not None else None
+            free = (100.0 - used) if used is not None else None
+            if disabled or no_fable:
+                ev_kind = "upcoming"
+            elif used is not None and used >= 85.0:
+                ev_kind = "unlock"
+            elif free is not None and free >= 25.0 and secs <= 48.0 * 3600.0 and win != "5h":
+                ev_kind = "perishable"
+            else:
+                ev_kind = "upcoming"
+            events.append(
+                _FallbackResetEvent(
+                    vendor=vendor,
+                    slot=slot,
+                    alias=alias,
+                    window=win,
+                    used_pct=used,
+                    free_pct=free,
+                    resets_at_epoch=ep,
+                    seconds_until=secs,
+                    reset_label=_fallback_format_local_reset_label(ep, now=now),
+                    countdown_label=_fallback_format_countdown(secs),
+                    kind=ev_kind,
+                    is_active=is_active,
+                    disabled=disabled,
+                    plan_label=p_label,
+                    no_fable=no_fable,
+                )
+            )
+
+    for row in claude_rows:
+        if _fallback_is_locked(row, notes):
+            claude_locked += 1
+            continue
+        disabled = bool(getattr(row, "disabled", False))
+        no_fable = bool(fable_guard and fleet_has_fable and _fallback_row_lacks_fable(row))
+        if not disabled and not no_fable:
+            fable_pct = _fallback_row_fable_pct(row)
+            eff_pct = (
+                fable_pct
+                if fable_pct is not None
+                else getattr(row, "seven_day_pct", None)
+            )
+            if eff_pct is not None:
+                claude_total += 1
+                claude_free += max(0.0, min(1.0, (100.0 - float(eff_pct)) / 100.0))
+        _collect_row_events(row, vendor="claude", no_fable=no_fable, disabled=disabled)
+
+    for row in codex_rows:
+        slot = int(getattr(row, "slot", 0) or 0)
+        alias = _safe_alias(getattr(row, "alias", ""), vendor="codex", slot=slot)
+        locked = _fallback_is_locked(row, notes)
+        disabled = bool(getattr(row, "disabled", False))
+        avail = int(getattr(row, "reset_credits_available", None) or 0)
+        usable = int(getattr(row, "reset_credits_usable", None) or 0)
+        if avail > 0 or usable > 0:
+            credit_accounts.append(
+                _FallbackResetCreditAccount(
+                    vendor="codex",
+                    slot=slot,
+                    alias=alias,
+                    available=avail,
+                    usable=0 if locked else usable,
+                    used_pct=float(row.seven_day_pct) if row.seven_day_pct is not None else None,
+                    is_active=bool(getattr(row, "is_active", False)),
+                    needs_relogin=locked,
+                )
+            )
+        if locked:
+            codex_locked += 1
+            continue
+        if not disabled and getattr(row, "seven_day_pct", None) is not None:
+            codex_total += 1
+            codex_free += max(0.0, min(1.0, (100.0 - float(row.seven_day_pct)) / 100.0))
+        _collect_row_events(row, vendor="codex", no_fable=False, disabled=disabled)
+
+    events.sort(key=lambda e: (e.resets_at_epoch, e.vendor, e.slot, e.window))
+    ev_tuple = tuple(events)
+    unlocks = tuple(e for e in ev_tuple if e.kind == "unlock")
+    perishable = tuple(e for e in ev_tuple if e.kind == "perishable")
+
+    claude_next = next(
+        (e for e in unlocks if e.vendor == "claude" and not e.no_fable and not e.disabled),
+        None,
+    )
+    codex_next = next(
+        (e for e in unlocks if e.vendor == "codex" and not e.disabled),
+        None,
+    )
+
+    perish_by_acct: dict[tuple[str, int], float] = {}
+    for ev in perishable:
+        if ev.free_pct is not None:
+            key = (ev.vendor, ev.slot)
+            perish_by_acct[key] = max(perish_by_acct.get(key, 0.0), ev.free_pct / 100.0)
+    perishable_seats = sum(perish_by_acct.values())
+
+    credit_accounts.sort(key=lambda c: (-c.usable, -c.available, c.alias, c.slot))
+    credits_summary = _FallbackResetCreditsSummary(
+        total_available=sum(c.available for c in credit_accounts),
+        live_available=sum(c.available for c in credit_accounts if not c.needs_relogin),
+        total_usable=sum(c.usable for c in credit_accounts if not c.needs_relogin),
+        accounts=tuple(credit_accounts),
+    )
+
+    capacity = _FallbackFleetCapacitySummary(
+        claude_fable_free_seats=round(claude_free, 4),
+        claude_fable_total_seats=claude_total,
+        claude_locked_relogin_seats=claude_locked,
+        claude_next_unlock=claude_next,
+        codex_free_seats=round(codex_free, 4),
+        codex_total_seats=codex_total,
+        codex_locked_relogin_seats=codex_locked,
+        codex_next_unlock=codex_next,
+        perishable_seats_48h=round(perishable_seats, 4),
+    )
+
+    # Smart Fleet Advisor (5-tier priority matching resets.py contract).
+    rec: _FallbackFleetRecommendation | None = None
+    usable_hot = [
+        c
+        for c in credit_accounts
+        if not c.needs_relogin
+        and c.usable > 0
+        and (c.is_active or (c.used_pct is not None and c.used_pct >= 85.0))
+    ]
+    urgent_perish = [
+        e
+        for e in perishable
+        if e.free_pct is not None and e.free_pct >= 40.0 and e.seconds_until <= 36.0 * 3600.0
+    ]
+    soon_unlock = [
+        e
+        for e in unlocks
+        if e.seconds_until <= 6.0 * 3600.0
+        and (
+            (e.vendor == "claude" and claude_free <= 1.5)
+            or (e.vendor == "codex" and codex_free <= 1.5)
+        )
+    ]
+    if usable_hot:
+        pick = usable_hot[0]
+        rec = _FallbackFleetRecommendation(
+            kind="use_reset_credit",
+            headline=f"Redeem reset credit on {pick.alias} ({pick.usable}× usable)",
+            detail=f"{pick.alias} holds {pick.available}× banked credit(s) with {pick.usable}× usable now.",
+            target_vendor=pick.vendor,
+            target_slot=pick.slot,
+        )
+    elif urgent_perish:
+        pick = urgent_perish[0]
+        rec = _FallbackFleetRecommendation(
+            kind="burn_perishable",
+            headline=f"Burn {pick.alias} ({pick.free_pct:.0f}% free, expires in {pick.countdown_label})",
+            detail=f"{pick.window} quota on {pick.alias} resets at {pick.reset_label} — use before it expires.",
+            target_vendor=pick.vendor,
+            target_slot=pick.slot,
+        )
+    elif soon_unlock:
+        pick = soon_unlock[0]
+        rec = _FallbackFleetRecommendation(
+            kind="unlock_soon",
+            headline=f"{pick.alias} ({pick.window}) unlocks in {pick.countdown_label}",
+            detail=f"Fresh capacity arrives at {pick.reset_label} while fleet headroom is tight.",
+            target_vendor=pick.vendor,
+            target_slot=pick.slot,
+        )
+    elif claude_locked + codex_locked >= 2:
+        total_locked = claude_locked + codex_locked
+        rec = _FallbackFleetRecommendation(
+            kind="relogin_capacity",
+            headline=f"Re-login {total_locked} locked seat(s) to restore fleet capacity",
+            detail=f"{claude_locked} Claude and {codex_locked} Codex account(s) need fresh auth.",
+        )
+    elif claude_total > 0 or codex_total > 0 or ev_tuple:
+        next_hint = ""
+        if claude_next is not None:
+            next_hint = f" · next Claude unlock {claude_next.alias} in {claude_next.countdown_label}"
+        elif codex_next is not None:
+            next_hint = f" · next Codex unlock {codex_next.alias} in {codex_next.countdown_label}"
+        rec = _FallbackFleetRecommendation(
+            kind="healthy",
+            headline=f"Fleet healthy: {claude_free:.2f}/{claude_total} Fable · {codex_free:.2f}/{codex_total} Codex seats",
+            detail=f"Ready capacity across active Claude and Codex pools{next_hint}.",
+        )
+
+    return _FallbackFleetResetRadar(
+        generated_at=now,
+        events=ev_tuple,
+        unlocks=unlocks,
+        perishable=perishable,
+        credits=credits_summary,
+        capacity=capacity,
+        recommendation=rec,
+    )
+
+
+def _build_reset_radar(
+    accounts: Sequence[AccountRow],
+    quota_rows: Sequence[AccountRow],
+    *,
+    now: float,
+    account_notes: Mapping[int, str] | None = None,
+    fable_guard: bool = True,
+) -> Any:
+    """Lazily invoke ``cc_usage_widget.resets.build_fleet_reset_radar`` with clean fallback."""
+    if not accounts and not quota_rows:
+        return None
+    try:
+        from . import resets as resets_mod
+    except Exception:
+        resets_mod = None
+    if resets_mod is not None:
+        builder = getattr(resets_mod, "build_fleet_reset_radar", None)
+        if callable(builder):
+            try:
+                return builder(
+                    accounts,
+                    quota_rows,
+                    account_notes=account_notes,
+                    now=now,
+                    fable_guard=fable_guard,
+                )
+            except Exception:
+                return None
+    return _fallback_fleet_reset_radar(
+        accounts,
+        quota_rows,
+        account_notes=account_notes,
+        now=now,
+        fable_guard=fable_guard,
+    )
+
+
+def _vendor_glyph(vendor: str) -> str:
+    return "✦" if vendor == "claude" else ("◈" if vendor == "codex" else "•")
+
+
+def _status_bucket(kind: str) -> str:
+    low = str(kind or "").strip().lower()
+    if low == "unlock":
+        return "unlock"
+    if low == "perishable":
+        return "perish"
+    return "upcoming"
+
+
+def _credit_lookup(radar: Any) -> dict[tuple[str, int], Any]:
+    credits = getattr(radar, "credits", None)
+    accounts = getattr(credits, "accounts", ()) if credits is not None else ()
+    out: dict[tuple[str, int], Any] = {}
+    for acct in accounts or ():
+        key = (str(getattr(acct, "vendor", "")), int(getattr(acct, "slot", 0) or 0))
+        out[key] = acct
+    return out
+
+
+def _reset_kpi_strip(radar: Any) -> str:
+    """A. Fleet Capacity & Banked Resets KPI Strip (4 responsive cards)."""
+    cap = getattr(radar, "capacity", None)
+    credits = getattr(radar, "credits", None)
+    perish_events = tuple(getattr(radar, "perishable", ()) or ())
+    if cap is None:
+        return ""
+
+    c_free = float(getattr(cap, "claude_fable_free_seats", 0.0) or 0.0)
+    c_total = int(getattr(cap, "claude_fable_total_seats", 0) or 0)
+    c_next = getattr(cap, "claude_next_unlock", None)
+    c_pct = max(0.0, min(100.0, (c_free / c_total * 100.0) if c_total > 0 else 0.0))
+    if c_next is not None:
+        c_alias = _safe_alias(
+            getattr(c_next, "alias", ""),
+            vendor=str(getattr(c_next, "vendor", "claude")),
+            slot=int(getattr(c_next, "slot", 0) or 0),
+        )
+        c_cd = _sanitize_text(getattr(c_next, "countdown_label", ""))
+        c_lbl = _sanitize_text(getattr(c_next, "reset_label", ""))
+        c_sub = (
+            f'Next unlock: <strong>{_esc(c_alias)} in {_esc(c_cd)}</strong>'
+            + (f' <span class="exact">({_esc(c_lbl)})</span>' if c_lbl else "")
+        )
+    elif c_total > 0:
+        c_sub = "All Fable seats clear &middot; no active cap"
+    else:
+        c_sub = "No Fable seats tracked"
+
+    x_free = float(getattr(cap, "codex_free_seats", 0.0) or 0.0)
+    x_total = int(getattr(cap, "codex_total_seats", 0) or 0)
+    x_next = getattr(cap, "codex_next_unlock", None)
+    x_pct = max(0.0, min(100.0, (x_free / x_total * 100.0) if x_total > 0 else 0.0))
+    if x_next is not None:
+        x_alias = _safe_alias(
+            getattr(x_next, "alias", ""),
+            vendor=str(getattr(x_next, "vendor", "codex")),
+            slot=int(getattr(x_next, "slot", 0) or 0),
+        )
+        x_cd = _sanitize_text(getattr(x_next, "countdown_label", ""))
+        x_lbl = _sanitize_text(getattr(x_next, "reset_label", ""))
+        x_sub = (
+            f'Next unlock: <strong>{_esc(x_alias)} in {_esc(x_cd)}</strong>'
+            + (f' <span class="exact">({_esc(x_lbl)})</span>' if x_lbl else "")
+        )
+    elif x_total > 0:
+        x_sub = "All live Codex seats clear"
+    else:
+        x_sub = "No live Codex seats tracked"
+
+    live_cr = int(getattr(credits, "live_available", 0) or 0) if credits is not None else 0
+    total_cr = int(getattr(credits, "total_available", 0) or 0) if credits is not None else 0
+    usable_cr = int(getattr(credits, "total_usable", 0) or 0) if credits is not None else 0
+    cr_accts = tuple(getattr(credits, "accounts", ()) or ()) if credits is not None else ()
+    usable_badge = (
+        f'<span class="rr-pill rr-pill-unlock">{usable_cr}× usable now</span>'
+        if usable_cr > 0
+        else ""
+    )
+    if cr_accts:
+        top_bits: list[str] = []
+        for ca in cr_accts[:3]:
+            ca_alias = _safe_alias(
+                getattr(ca, "alias", ""),
+                vendor=str(getattr(ca, "vendor", "codex")),
+                slot=int(getattr(ca, "slot", 0) or 0),
+            )
+            ca_av = int(getattr(ca, "available", 0) or 0)
+            ca_us = int(getattr(ca, "usable", 0) or 0)
+            ca_rel = bool(getattr(ca, "needs_relogin", False))
+            tag = " relogin" if ca_rel else (" usable" if ca_us > 0 else "")
+            top_bits.append(f"{ca_alias} {ca_av}×{tag}")
+        cr_sub = _esc(" · ".join(top_bits))
+    else:
+        cr_sub = "No banked reset credits reported"
+
+    perish_eq = float(getattr(cap, "perishable_seats_48h", 0.0) or 0.0)
+    c_locked = int(getattr(cap, "claude_locked_relogin_seats", 0) or 0)
+    x_locked = int(getattr(cap, "codex_locked_relogin_seats", 0) or 0)
+    total_locked = c_locked + x_locked
+    locked_detail = (
+        f" ({c_locked} Claude · {x_locked} Codex)" if total_locked > 0 else ""
+    )
+    perish_cls = " rr-kpi-warn" if perish_eq > 0.0 else ""
+    perish_count_note = (
+        f"{len(perish_events)} window(s) expiring &lt;48h · "
+        if perish_events
+        else ""
+    )
+
+    return (
+        '<div class="rr-kpi-grid">'
+        '<div class="rr-kpi">'
+        '<div class="rr-kpi-label"><span class="rr-v-claude">✦</span> Claude Fable Ready</div>'
+        f'<div class="rr-kpi-val">{c_free:.2f} / {c_total} seats</div>'
+        f'<div class="rr-mini-track"><div class="rr-mini-fill rr-fill-unlock" style="width:{c_pct:.1f}%"></div></div>'
+        f'<div class="rr-kpi-sub">{c_sub}</div>'
+        "</div>"
+        '<div class="rr-kpi">'
+        '<div class="rr-kpi-label"><span class="rr-v-codex">◈</span> Codex Weekly Ready</div>'
+        f'<div class="rr-kpi-val">{x_free:.2f} / {x_total} seats</div>'
+        f'<div class="rr-mini-track"><div class="rr-mini-fill rr-fill-credit" style="width:{x_pct:.1f}%"></div></div>'
+        f'<div class="rr-kpi-sub">{x_sub}</div>'
+        "</div>"
+        '<div class="rr-kpi">'
+        '<div class="rr-kpi-label">↺ Banked Reset Credits</div>'
+        f'<div class="rr-kpi-val">{live_cr}× live / {total_cr}× total {usable_badge}</div>'
+        f'<div class="rr-kpi-sub">{cr_sub}</div>'
+        "</div>"
+        f'<div class="rr-kpi{perish_cls}">'
+        '<div class="rr-kpi-label">⏳ Perishable &lt; 48h &amp; Relogin</div>'
+        f'<div class="rr-kpi-val">{perish_eq:.2f} seat-eq at risk</div>'
+        f'<div class="rr-kpi-sub">{perish_count_note}Locked relogin: '
+        f"<strong>{total_locked} seats</strong>{_esc(locked_detail)}</div>"
+        "</div>"
+        "</div>"
+    )
+
+
+def _reset_advisor_callout(radar: Any) -> str:
+    """Smart Fleet Advisor callout (uses ``.rr-advisor``, never ``.banner``)."""
+    rec = getattr(radar, "recommendation", None)
+    if rec is None:
+        return ""
+    headline = _sanitize_text(getattr(rec, "headline", "")).strip()
+    detail = _sanitize_text(getattr(rec, "detail", "")).strip()
+    if not headline and not detail:
+        return ""
+    raw_kind = str(getattr(rec, "kind", "healthy") or "healthy").strip().lower()
+    safe_kind = re.sub(r"[^a-z0-9_-]", "", raw_kind) or "healthy"
+    meta: dict[str, tuple[str, str]] = {
+        "use_reset_credit": ("⚡", "RESET CREDIT READY"),
+        "burn_perishable": ("⏳", "BURN EXPIRING FIRST"),
+        "unlock_soon": ("🔓", "UNLOCK INCOMING"),
+        "relogin_capacity": ("🔑", "RELOGIN CAPACITY"),
+        "healthy": ("✓", "FLEET HEALTHY"),
+    }
+    icon, badge = meta.get(safe_kind, ("•", "FLEET ADVISOR"))
+    detail_html = f'<span class="rr-advisor-detail">{_esc(detail)}</span>' if detail else ""
+    return (
+        f'<div class="rr-advisor rr-advisor-{_esc(safe_kind)}" role="status">'
+        f'<span class="rr-advisor-badge">{_esc(icon)} {_esc(badge)}</span>'
+        '<div class="rr-advisor-body">'
+        f'<strong>{_esc(headline)}</strong>{detail_html}'
+        "</div></div>"
+    )
+
+
+def _reset_gantt_svg(radar: Any) -> str:
+    """B. Pure SVG 7-Day Reset Gantt / Swimlane Chart (zero scripts, zero url())."""
+    raw_events = tuple(getattr(radar, "events", ()) or ())
+    if not raw_events:
+        return ""
+    ordered = sorted(
+        raw_events,
+        key=lambda e: (
+            float(getattr(e, "resets_at_epoch", 0.0) or 0.0),
+            str(getattr(e, "vendor", "")),
+            int(getattr(e, "slot", 0) or 0),
+            str(getattr(e, "window", "")),
+        ),
+    )
+
+    # Group into one swimlane per account, ordered by soonest reset first.
+    lanes: list[tuple[tuple[str, int, str], list[Any]]] = []
+    lane_index: dict[tuple[str, int, str], int] = {}
+    for ev in ordered:
+        vendor = str(getattr(ev, "vendor", "claude") or "claude")
+        slot = int(getattr(ev, "slot", 0) or 0)
+        alias = _safe_alias(getattr(ev, "alias", ""), vendor=vendor, slot=slot)
+        key = (vendor, slot, alias)
+        idx = lane_index.get(key)
+        if idx is None:
+            lane_index[key] = len(lanes)
+            lanes.append((key, [ev]))
+        else:
+            lanes[idx][1].append(ev)
+
+    credits_map = _credit_lookup(radar)
+    width = 960.0
+    label_w = 216.0
+    plot_x = label_w
+    plot_w = 588.0  # 84 px per day * 7 days
+    day_w = plot_w / 7.0
+    top_h = 34.0
+    row_h = 36.0
+    bot_h = 12.0
+    plot_h = len(lanes) * row_h
+    total_h = top_h + plot_h + bot_h
+
+    parts: list[str] = []
+
+    # 24h highlight band
+    parts.append(
+        f'<rect class="rr-band-24h" x="{_round(plot_x)}" y="{_round(top_h - 8.0)}" '
+        f'width="{_round(day_w)}" height="{_round(plot_h + 8.0)}" rx="3">'
+        "<title>Next 24 hours</title></rect>"
+    )
+    parts.append(
+        f'<text class="rr-band-label" x="{_round(plot_x + day_w / 2.0)}" y="12" '
+        'text-anchor="middle">24h</text>'
+    )
+
+    # Vertical day gridlines & X-axis labels (Now, +1d .. +7d)
+    for day_i in range(8):
+        gx = plot_x + day_i * day_w
+        grid_cls = "rr-grid rr-grid-now" if day_i == 0 else "rr-grid"
+        parts.append(
+            f'<line class="{grid_cls}" x1="{_round(gx)}" y1="{_round(top_h - 6.0)}" '
+            f'x2="{_round(gx)}" y2="{_round(top_h + plot_h)}"></line>'
+        )
+        tick = "Now" if day_i == 0 else f"+{day_i}d"
+        anchor = "start" if day_i == 0 else ("end" if day_i == 7 else "middle")
+        parts.append(
+            f'<text class="rr-axis-txt" x="{_round(gx)}" y="24" '
+            f'text-anchor="{anchor}">{tick}</text>'
+        )
+
+    # Swimlanes
+    for row_idx, ((vendor, slot, alias), lane_events) in enumerate(lanes):
+        row_y = top_h + row_idx * row_h
+        cy = row_y + row_h / 2.0
+        primary = lane_events[0]
+        is_active = any(bool(getattr(e, "is_active", False)) for e in lane_events)
+        is_muted = all(
+            bool(getattr(e, "no_fable", False)) or bool(getattr(e, "disabled", False))
+            for e in lane_events
+        )
+        alt_cls = " rr-lane-alt" if row_idx % 2 == 1 else ""
+        glyph = _vendor_glyph(vendor)
+        v_cls = "rr-svg-v-claude" if vendor == "claude" else "rr-svg-v-codex"
+        name_cls = (
+            "rr-lane-name rr-lane-muted"
+            if is_muted
+            else ("rr-lane-name rr-lane-active" if is_active else "rr-lane-name")
+        )
+        shown_alias = _clip(alias, 15) + (" ●" if is_active else "")
+        win_names: list[str] = []
+        for ev in lane_events:
+            wn = _sanitize_text(getattr(ev, "window", "")).strip()
+            if wn and wn not in win_names:
+                win_names.append(wn)
+        win_tag = _clip("·".join(win_names[:2]), 11)
+        if all(bool(getattr(e, "no_fable", False)) for e in lane_events):
+            win_tag = _clip(f"{win_tag} noF" if win_tag else "no-Fable", 12)
+
+        parts.append(f'<g class="rr-lane">')
+        parts.append(
+            f'<rect class="rr-lane-bg{alt_cls}" x="0" y="{_round(row_y)}" '
+            f'width="{_round(width)}" height="{_round(row_h)}" rx="4"></rect>'
+        )
+        parts.append(
+            f'<line class="rr-track-line" x1="{_round(plot_x)}" y1="{_round(cy)}" '
+            f'x2="{_round(plot_x + plot_w)}" y2="{_round(cy)}"></line>'
+        )
+        parts.append(
+            f'<text class="{v_cls}" x="10" y="{_round(cy + 4.0)}">{_esc(glyph)}</text>'
+        )
+        parts.append(
+            f'<text class="{name_cls}" x="26" y="{_round(cy + 4.0)}">{_esc(shown_alias)}'
+            f"<title>{_esc(vendor_label(vendor))}: {_esc(alias)}</title></text>"
+        )
+        parts.append(
+            f'<text class="rr-lane-win" x="{_round(plot_x - 10.0)}" y="{_round(cy + 3.5)}" '
+            f'text-anchor="end">{_esc(win_tag)}</text>'
+        )
+
+        # Draw farthest bars first so the soonest bar & marker sit clearly on top.
+        for ev in reversed(lane_events):
+            secs = max(0.0, float(getattr(ev, "seconds_until", 0.0) or 0.0))
+            beyond = secs > _RR_HORIZON_SECONDS
+            frac = min(1.0, secs / _RR_HORIZON_SECONDS)
+            bar_w = max(5.0, frac * plot_w)
+            mx = min(plot_x + plot_w, plot_x + bar_w)
+            bucket = _status_bucket(str(getattr(ev, "kind", "upcoming")))
+            used_pct = getattr(ev, "used_pct", None)
+            pct_str = f"{float(used_pct):.0f}% used" if used_pct is not None else "usage n/a"
+            cd_lbl = _sanitize_text(getattr(ev, "countdown_label", ""))
+            rst_lbl = _sanitize_text(getattr(ev, "reset_label", ""))
+            ev_win = _sanitize_text(getattr(ev, "window", ""))
+            tip = (
+                f"{alias} · {ev_win} · {pct_str} · resets {rst_lbl} "
+                f"(in {cd_lbl}{' · >7d' if beyond else ''})"
+            )
+            parts.append(
+                f'<rect class="rr-bar rr-bar-{bucket}" x="{_round(plot_x)}" '
+                f'y="{_round(cy - 4.0)}" width="{_round(bar_w)}" height="8" rx="4">'
+                f"<title>{_esc(tip)}</title></rect>"
+            )
+            parts.append(
+                f'<circle class="rr-halo rr-halo-{bucket}" cx="{_round(mx)}" '
+                f'cy="{_round(cy)}" r="8.5"></circle>'
+            )
+            parts.append(
+                f'<circle class="rr-mk rr-mk-{bucket}" cx="{_round(mx)}" '
+                f'cy="{_round(cy)}" r="4.8"><title>{_esc(tip)}</title></circle>'
+            )
+
+        # Right annotation: primary countdown + utilization + Codex reset-credit pill
+        credit = credits_map.get((vendor, slot))
+        has_credit = credit is not None and int(getattr(credit, "available", 0) or 0) > 0
+        p_cd = _sanitize_text(getattr(primary, "countdown_label", ""))
+        p_used = getattr(primary, "used_pct", None)
+        right_txt = (
+            f"{p_cd} · {float(p_used):.0f}%"
+            if p_used is not None
+            else p_cd
+        )
+        right_txt = _clip(right_txt, 13 if has_credit else 20)
+        parts.append(
+            f'<text class="rr-right-txt" x="{_round(plot_x + plot_w + 10.0)}" '
+            f'y="{_round(cy + 3.5)}">{_esc(right_txt)}</text>'
+        )
+
+        if has_credit:
+            av = int(getattr(credit, "available", 0) or 0)
+            us = int(getattr(credit, "usable", 0) or 0)
+            pill_cls = "rr-svg-pill-usable" if us > 0 else "rr-svg-pill-credit"
+            pill_txt_cls = "rr-svg-pill-txt-usable" if us > 0 else "rr-svg-pill-txt-credit"
+            pill_tip = f"{alias}: {av}× banked reset credit(s), {us}× usable now"
+            parts.append(
+                f'<rect class="{pill_cls}" x="902" y="{_round(cy - 9.0)}" '
+                f'width="50" height="18" rx="9"><title>{_esc(pill_tip)}</title></rect>'
+            )
+            parts.append(
+                f'<text class="{pill_txt_cls}" x="927" y="{_round(cy + 3.5)}" '
+                f'text-anchor="middle">↺ {av}×<title>{_esc(pill_tip)}</title></text>'
+            )
+
+        parts.append("</g>")
+
+    svg = (
+        f'<svg class="rr-gantt" viewBox="0 0 {_round(width)} {_round(total_h)}" '
+        'role="img" aria-label="7-day fleet reset timeline">'
+        + "".join(parts)
+        + "</svg>"
+    )
+    legend = (
+        '<ul class="legend rr-legend">'
+        '<li><span class="swatch rr-sw-unlock"></span><span>Unlock (≥85% used → fresh capacity)</span></li>'
+        '<li><span class="swatch rr-sw-perish"></span><span>Perishable (≥25% free expiring ≤48h → burn first)</span></li>'
+        '<li><span class="swatch rr-sw-upcoming"></span><span>Upcoming reset</span></li>'
+        '<li><span class="swatch rr-sw-credit"></span><span>↺ N× Banked Codex reset credit (emerald = usable now)</span></li>'
+        "</ul>"
+    )
+    return f'<div class="rr-gantt-wrap">{svg}{legend}</div>'
+
+
+def _reset_schedule_table(radar: Any) -> str:
+    """C. Unified Reset Schedule & Banked Reset Credits Table across all accounts."""
+    raw_events = tuple(getattr(radar, "events", ()) or ())
+    ordered = sorted(
+        raw_events,
+        key=lambda e: (
+            float(getattr(e, "resets_at_epoch", 0.0) or 0.0),
+            str(getattr(e, "vendor", "")),
+            int(getattr(e, "slot", 0) or 0),
+            str(getattr(e, "window", "")),
+        ),
+    )
+    credits_map = _credit_lookup(radar)
+    seen_credit_keys: set[tuple[str, int]] = set()
+    rows_html: list[str] = []
+
+    for ev in ordered:
+        vendor = str(getattr(ev, "vendor", "claude") or "claude")
+        slot = int(getattr(ev, "slot", 0) or 0)
+        alias = _safe_alias(getattr(ev, "alias", ""), vendor=vendor, slot=slot)
+        v_cls = "rr-v-claude" if vendor == "claude" else "rr-v-codex"
+        v_cell = f'<span class="{v_cls}">{_esc(_vendor_glyph(vendor))}</span> {_esc(vendor_label(vendor))}'
+
+        tags: list[str] = []
+        if bool(getattr(ev, "is_active", False)):
+            tags.append('<span class="rr-tag rr-tag-active">active</span>')
+        p_lbl = _sanitize_text(getattr(ev, "plan_label", "")).strip()
+        if p_lbl:
+            tags.append(f'<span class="rr-tag">{_esc(p_lbl)}</span>')
+        if bool(getattr(ev, "no_fable", False)):
+            tags.append('<span class="rr-tag rr-tag-muted">no Fable</span>')
+        if bool(getattr(ev, "disabled", False)):
+            tags.append('<span class="rr-tag rr-tag-muted">disabled</span>')
+        acct_cell = f"<strong>{_esc(alias)}</strong>" + (" " + " ".join(tags) if tags else "")
+
+        win = _sanitize_text(getattr(ev, "window", ""))
+        used_pct = getattr(ev, "used_pct", None)
+        free_pct = getattr(ev, "free_pct", None)
+        if used_pct is not None:
+            free_note = (
+                f' <span class="exact">({float(free_pct):.0f}% free)</span>'
+                if free_pct is not None
+                else ""
+            )
+            util_cell = f"{float(used_pct):.0f}%{free_note}"
+        else:
+            util_cell = "—"
+
+        rst_lbl = _sanitize_text(getattr(ev, "reset_label", ""))
+        cd_lbl = _sanitize_text(getattr(ev, "countdown_label", ""))
+
+        bucket = _status_bucket(str(getattr(ev, "kind", "upcoming")))
+        status_labels = {
+            "unlock": ("rr-pill-unlock", "Unlock"),
+            "perish": ("rr-pill-perish", "Perishable"),
+            "upcoming": ("rr-pill-upcoming", "Upcoming"),
+        }
+        p_cls, p_txt = status_labels[bucket]
+        pills = [f'<span class="rr-pill {p_cls}">{p_txt}</span>']
+
+        credit = credits_map.get((vendor, slot))
+        if credit is not None:
+            seen_credit_keys.add((vendor, slot))
+            av = int(getattr(credit, "available", 0) or 0)
+            us = int(getattr(credit, "usable", 0) or 0)
+            if us > 0:
+                pills.append(
+                    f'<span class="rr-pill rr-pill-unlock">↺ {av}× ({us}× usable)</span>'
+                )
+            elif av > 0:
+                pills.append(
+                    f'<span class="rr-pill rr-pill-credit">↺ {av}× banked</span>'
+                )
+
+        rows_html.append(
+            "<tr>"
+            f"<td>{v_cell}</td>"
+            f"<td>{acct_cell}</td>"
+            f"<td><code>{_esc(win)}</code></td>"
+            f'<td class="num">{util_cell}</td>'
+            f"<td>{_esc(rst_lbl)}</td>"
+            f'<td class="num"><strong>{_esc(cd_lbl)}</strong></td>'
+            f'<td>{" ".join(pills)}</td>'
+            "</tr>"
+        )
+
+    # Surface credit-holding accounts with no upcoming timed reset (e.g. relogin seats).
+    credits = getattr(radar, "credits", None)
+    credit_accounts = tuple(getattr(credits, "accounts", ()) or ()) if credits is not None else ()
+    extra_credits = sorted(
+        (
+            ca
+            for ca in credit_accounts
+            if (str(getattr(ca, "vendor", "")), int(getattr(ca, "slot", 0) or 0))
+            not in seen_credit_keys
+            and int(getattr(ca, "available", 0) or 0) > 0
+        ),
+        key=lambda c: (
+            str(getattr(c, "vendor", "")),
+            int(getattr(c, "slot", 0) or 0),
+            str(getattr(c, "alias", "")),
+        ),
+    )
+    for ca in extra_credits:
+        vendor = str(getattr(ca, "vendor", "codex") or "codex")
+        slot = int(getattr(ca, "slot", 0) or 0)
+        alias = _safe_alias(getattr(ca, "alias", ""), vendor=vendor, slot=slot)
+        v_cls = "rr-v-claude" if vendor == "claude" else "rr-v-codex"
+        v_cell = f'<span class="{v_cls}">{_esc(_vendor_glyph(vendor))}</span> {_esc(vendor_label(vendor))}'
+        av = int(getattr(ca, "available", 0) or 0)
+        us = int(getattr(ca, "usable", 0) or 0)
+        relogin = bool(getattr(ca, "needs_relogin", False))
+        used_pct = getattr(ca, "used_pct", None)
+        util_cell = f"{float(used_pct):.0f}%" if used_pct is not None else "—"
+        pills: list[str] = []
+        if relogin:
+            pills.append('<span class="rr-pill rr-pill-warn">Relogin</span>')
+        if us > 0:
+            pills.append(
+                f'<span class="rr-pill rr-pill-unlock">↺ {av}× ({us}× usable)</span>'
+            )
+        else:
+            pills.append(f'<span class="rr-pill rr-pill-credit">↺ {av}× banked</span>')
+        rows_html.append(
+            "<tr>"
+            f"<td>{v_cell}</td>"
+            f"<td><strong>{_esc(alias)}</strong></td>"
+            "<td><code>7d</code></td>"
+            f'<td class="num">{util_cell}</td>'
+            "<td>—</td>"
+            f'<td class="num">{"relogin" if relogin else "—"}</td>'
+            f'<td>{" ".join(pills)}</td>'
+            "</tr>"
+        )
+
+    if not rows_html:
+        return ""
+    return (
+        '<div class="rr-table-wrap">'
+        "<table><thead><tr>"
+        "<th>Vendor</th><th>Account</th><th>Window</th>"
+        '<th class="num">Utilization</th><th>Reset Time</th>'
+        '<th class="num">Countdown</th><th>Status / Banked Credits</th>'
+        f"</tr></thead><tbody>{''.join(rows_html)}</tbody></table></div>"
+    )
+
+
+def _reset_radar_section(radar: Any) -> str:
+    """Visual Fleet Reset Timeline & Capacity Forecast section, or ``""`` when empty."""
+    if radar is None:
+        return ""
+    events = tuple(getattr(radar, "events", ()) or ())
+    cap = getattr(radar, "capacity", None)
+    credits = getattr(radar, "credits", None)
+    has_capacity = cap is not None and any(
+        int(getattr(cap, field, 0) or 0) > 0
+        for field in (
+            "claude_fable_total_seats",
+            "claude_locked_relogin_seats",
+            "codex_total_seats",
+            "codex_locked_relogin_seats",
+        )
+    )
+    has_credits = credits is not None and (
+        int(getattr(credits, "total_available", 0) or 0) > 0
+        or bool(getattr(credits, "accounts", ()))
+    )
+    if not events and not has_capacity and not has_credits:
+        return ""
+
+    parts: list[str] = []
+    kpi_html = _reset_kpi_strip(radar)
+    if kpi_html:
+        parts.append(kpi_html)
+    advisor_html = _reset_advisor_callout(radar)
+    if advisor_html:
+        parts.append(advisor_html)
+    gantt_html = _reset_gantt_svg(radar)
+    if gantt_html:
+        parts.append('<h3 class="rr-subhead">7-Day Reset Swimlanes</h3>' + gantt_html)
+    table_html = _reset_schedule_table(radar)
+    if table_html:
+        parts.append(
+            '<h3 class="rr-subhead">Unified Reset Schedule &amp; Banked Credits</h3>'
+            + table_html
+        )
+    return "".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # Style
 # ---------------------------------------------------------------------------
 
@@ -1513,11 +2683,19 @@ def _style() -> str:
     return (
         ":root{color-scheme:light dark;--bg:#f7f7f5;--panel:#ffffff;--ink:#1b1c1e;"
         "--dim:#5d6169;--rule:#e0e0dc;--accent:#b3402f;--ok:#3f8b62;--track:#e8e8e4;"
+        "--rr-unlock:#15803d;--rr-unlock-bg:#dcfce7;--rr-perish:#b45309;--rr-perish-bg:#fef3c7;"
+        "--rr-upcoming:#4f46e5;--rr-upcoming-bg:#e0e7ff;--rr-credit:#0e7490;--rr-credit-bg:#cffafe;"
+        "--rr-warn-bg:#fee2e2;--rr-band24:#f0f9ff;--rr-lane-alt:#f8f9fb;--rr-card:#fafaf8;"
+        "--rr-claude:#b3402f;--rr-codex:#0e7490;"
         + light
         + "}"
         "@media (prefers-color-scheme: dark){:root{--bg:#0d0e12;--panel:#15171e;"
         "--ink:#f4f5f7;--dim:#9499a6;--rule:#242733;--accent:#ff6b2c;--ok:#30d175;"
-        "--track:#242733;" + dark + "}}"
+        "--track:#242733;"
+        "--rr-unlock:#34d399;--rr-unlock-bg:#0c2c20;--rr-perish:#fbbf24;--rr-perish-bg:#2e220b;"
+        "--rr-upcoming:#818cf8;--rr-upcoming-bg:#1e2140;--rr-credit:#38bdf8;--rr-credit-bg:#0f293a;"
+        "--rr-warn-bg:#331515;--rr-band24:#182032;--rr-lane-alt:#191c26;--rr-card:#12141c;"
+        "--rr-claude:#ff6b2c;--rr-codex:#38bdf8;" + dark + "}}"
         "*{box-sizing:border-box}"
         "body{margin:0;background:var(--bg);color:var(--ink);"
         "font:14px/1.5 -apple-system,BlinkMacSystemFont,'Helvetica Neue',Arial,sans-serif}"
@@ -1584,6 +2762,72 @@ def _style() -> str:
         ".bk-stage-head h4,.bk-badge-head h4{margin:0;font-size:13px}"
         ".bk-badge-icon{font-size:20px}"
         ".bk-tag{font-size:11px;color:var(--dim);font-weight:600}"
+        ".rr-kpi-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(205px,1fr));gap:12px;margin-bottom:12px}"
+        ".rr-kpi{background:var(--rr-card);border:1px solid var(--rule);border-radius:8px;padding:11px 12px}"
+        ".rr-kpi-warn{border-color:var(--rr-perish)}"
+        ".rr-kpi-label{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.03em;color:var(--dim);margin-bottom:4px}"
+        ".rr-kpi-val{font-size:17px;font-weight:700;font-variant-numeric:tabular-nums;display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-bottom:6px}"
+        ".rr-kpi-sub{font-size:12px;color:var(--dim);line-height:1.4}"
+        ".rr-mini-track{height:5px;background:var(--track);border-radius:99px;overflow:hidden;margin:0 0 6px}"
+        ".rr-mini-fill{height:100%;border-radius:99px}"
+        ".rr-fill-unlock{background:var(--rr-unlock)}.rr-fill-credit{background:var(--rr-credit)}"
+        ".rr-v-claude{color:var(--rr-claude);font-weight:700}.rr-v-codex{color:var(--rr-codex);font-weight:700}"
+        ".rr-advisor{display:flex;flex-wrap:wrap;gap:10px;align-items:center;border:1px solid var(--rule);border-left:4px solid var(--rr-upcoming);border-radius:8px;background:var(--rr-card);padding:10px 12px;margin-bottom:14px}"
+        ".rr-advisor-use_reset_credit,.rr-advisor-unlock_soon{border-left-color:var(--rr-unlock)}"
+        ".rr-advisor-burn_perishable{border-left-color:var(--rr-perish)}"
+        ".rr-advisor-relogin_capacity{border-left-color:var(--accent)}"
+        ".rr-advisor-badge{font-size:10px;font-weight:700;letter-spacing:.04em;padding:3px 8px;border-radius:99px;background:var(--rr-upcoming-bg);color:var(--rr-upcoming);white-space:nowrap}"
+        ".rr-advisor-use_reset_credit .rr-advisor-badge,.rr-advisor-unlock_soon .rr-advisor-badge{background:var(--rr-unlock-bg);color:var(--rr-unlock)}"
+        ".rr-advisor-burn_perishable .rr-advisor-badge{background:var(--rr-perish-bg);color:var(--rr-perish)}"
+        ".rr-advisor-relogin_capacity .rr-advisor-badge{background:var(--rr-warn-bg);color:var(--accent)}"
+        ".rr-advisor-body{flex:1;min-width:200px;display:flex;flex-direction:column;gap:2px;font-size:13px}"
+        ".rr-advisor-detail{font-size:12px;color:var(--dim)}"
+        ".rr-subhead{margin:14px 0 8px;font-size:13px;color:var(--ink)}"
+        ".rr-gantt-wrap{border:1px solid var(--rule);border-radius:8px;padding:10px;background:var(--rr-card);overflow-x:auto}"
+        "svg.rr-gantt{width:100%;min-width:680px;height:auto;display:block;font-family:-apple-system,BlinkMacSystemFont,'Helvetica Neue',Arial,sans-serif}"
+        "rect.rr-band-24h{fill:var(--rr-band24)}"
+        "text.rr-band-label{fill:var(--rr-credit);font-size:10px;font-weight:700;letter-spacing:.04em}"
+        "line.rr-grid{stroke:var(--rule);stroke-width:1;stroke-dasharray:2 3}"
+        "line.rr-grid-now{stroke:var(--ink);stroke-width:1.4;stroke-dasharray:none;opacity:.55}"
+        "text.rr-axis-txt{fill:var(--dim);font-size:10.5px;font-weight:600}"
+        "rect.rr-lane-bg{fill:transparent;transition:fill .12s ease}"
+        "rect.rr-lane-alt{fill:var(--rr-lane-alt)}"
+        "g.rr-lane:hover rect.rr-lane-bg{fill:var(--rr-band24)}"
+        "line.rr-track-line{stroke:var(--track);stroke-width:2}"
+        "text.rr-svg-v-claude{fill:var(--rr-claude);font-size:12px;font-weight:700}"
+        "text.rr-svg-v-codex{fill:var(--rr-codex);font-size:12px;font-weight:700}"
+        "text.rr-lane-name{fill:var(--ink);font-size:12px;font-weight:500}"
+        "text.rr-lane-active{font-weight:700}"
+        "text.rr-lane-muted{fill:var(--dim)}"
+        "text.rr-lane-win{fill:var(--dim);font-size:10px;font-weight:600}"
+        "rect.rr-bar-unlock{fill:var(--rr-unlock);opacity:.78}"
+        "rect.rr-bar-perish{fill:var(--rr-perish);opacity:.78}"
+        "rect.rr-bar-upcoming{fill:var(--rr-upcoming);opacity:.55}"
+        "circle.rr-halo-unlock{fill:var(--rr-unlock);opacity:.22}"
+        "circle.rr-halo-perish{fill:var(--rr-perish);opacity:.22}"
+        "circle.rr-halo-upcoming{fill:var(--rr-upcoming);opacity:.18}"
+        "circle.rr-mk{stroke:var(--panel);stroke-width:1.6}"
+        "circle.rr-mk-unlock{fill:var(--rr-unlock)}"
+        "circle.rr-mk-perish{fill:var(--rr-perish)}"
+        "circle.rr-mk-upcoming{fill:var(--rr-upcoming)}"
+        "text.rr-right-txt{fill:var(--dim);font-size:10.5px;font-variant-numeric:tabular-nums}"
+        "rect.rr-svg-pill-usable{fill:var(--rr-unlock-bg);stroke:var(--rr-unlock);stroke-width:1}"
+        "rect.rr-svg-pill-credit{fill:var(--rr-credit-bg);stroke:var(--rr-credit);stroke-width:1}"
+        "text.rr-svg-pill-txt-usable{fill:var(--rr-unlock);font-size:10px;font-weight:700}"
+        "text.rr-svg-pill-txt-credit{fill:var(--rr-credit);font-size:10px;font-weight:700}"
+        ".rr-sw-unlock{background:var(--rr-unlock)}.rr-sw-perish{background:var(--rr-perish)}"
+        ".rr-sw-upcoming{background:var(--rr-upcoming)}.rr-sw-credit{background:var(--rr-credit)}"
+        ".rr-legend{margin-top:8px;font-size:11px;color:var(--dim)}"
+        ".rr-table-wrap{overflow-x:auto}"
+        ".rr-pill{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:600;white-space:nowrap;margin:1px 2px 1px 0}"
+        ".rr-pill-unlock{background:var(--rr-unlock-bg);color:var(--rr-unlock)}"
+        ".rr-pill-perish{background:var(--rr-perish-bg);color:var(--rr-perish)}"
+        ".rr-pill-upcoming{background:var(--rr-upcoming-bg);color:var(--rr-upcoming)}"
+        ".rr-pill-credit{background:var(--rr-credit-bg);color:var(--rr-credit)}"
+        ".rr-pill-warn{background:var(--rr-warn-bg);color:var(--accent)}"
+        ".rr-tag{display:inline-block;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:600;background:var(--track);color:var(--dim);vertical-align:middle}"
+        ".rr-tag-active{background:var(--rr-unlock-bg);color:var(--rr-unlock)}"
+        ".rr-tag-muted{opacity:.8}"
         "footer{padding:8px 20px 32px;color:var(--dim);font-size:11px}"
         "footer p{margin:2px 0}"
     )
@@ -1605,6 +2849,9 @@ def render_dashboard(
     indexing: str | None = None,
     workflow_runs: Sequence[Any] = (),
     monthly_subscription_usd: float = 0.0,
+    account_notes: Mapping[int, str] | None = None,
+    fable_guard: bool = True,
+    reset_radar: Any = None,
 ) -> str:
     """One self-contained HTML document describing what the stores hold.
 
@@ -1642,6 +2889,17 @@ def render_dashboard(
         history, rollups, today=today, days=max(WINDOW_DAYS), pricing=pricing
     )
     rows = tuple(accounts) + tuple(quota_rows)
+    radar = (
+        reset_radar
+        if reset_radar is not None
+        else _build_reset_radar(
+            accounts,
+            quota_rows,
+            now=stamp,
+            account_notes=account_notes,
+            fable_guard=fable_guard,
+        )
+    )
     wall_body, wall_note = _wall_section(rows, stamp, history=history)
 
     sections = [
@@ -1671,6 +2929,11 @@ def render_dashboard(
         ),
         _section("By project", _project_section(history, today, pricing=pricing)),
         _section("Workflow runs", _workflow_section(workflow_runs), note=WORKFLOW_NOTE),
+        _section(
+            RESET_RADAR_HEADING,
+            _reset_radar_section(radar),
+            ident="fleet-reset-radar",
+        ),
         _section("Quota windows", _quota_section(rows)),
         _section("Hours at the wall", wall_body, note=wall_note),
         _section("Unpriced volume", _unpriced_section(cells, today)),
@@ -1749,6 +3012,9 @@ def build_dashboard(
     indexing: str | None = None,
     projects_dir: Path | str | None = None,
     monthly_subscription_usd: float = 0.0,
+    account_notes: Mapping[int, str] | None = None,
+    fable_guard: bool = True,
+    reset_radar: Any = None,
 ) -> Path:
     """Render and write in one call. Returns the file written.
 
@@ -1768,6 +3034,9 @@ def build_dashboard(
         indexing=indexing,
         workflow_runs=_workflow_runs_beside(rollups, pricing, projects_dir),
         monthly_subscription_usd=monthly_subscription_usd,
+        account_notes=account_notes,
+        fable_guard=fable_guard,
+        reset_radar=reset_radar,
     )
     destination = (
         Path(path)
