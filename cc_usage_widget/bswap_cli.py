@@ -23,12 +23,13 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, is_dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 from . import belkins_game
-from .contracts import VENDOR_CLAUDE, VENDOR_CODEX, AccountRow
+from .contracts import CODEX_FETCH_EXPIRE_SECONDS, VENDOR_CLAUDE, VENDOR_CODEX, AccountRow
 from .pricing import DEFAULT_PRICING
 from .rollup import DailyRollupStore
 
@@ -342,12 +343,105 @@ def _build_belkins_tui_app(switcher: object, *, start: str = "dashboard", detect
             t.append(f"🏆 {comp.unlocked_badges_count}/{len(comp.badges)} Trophies", style="bold #FAC22E")
             return t
 
+    class BelkinsResetRadarPanel(Static):
+        """Compact Reset Radar & Banked Credits HUD strip for the interactive TUI Watch view."""
+
+        def render(self) -> Text:
+            palette = Palette.from_theme(self.app.current_theme)
+            try:
+                radar = _load_live_reset_radar()
+            except Exception:
+                return Text("🔭 RESET RADAR  │  unavailable", style=palette.muted)
+
+            cap = radar.capacity
+            cred = radar.credits
+            rec = radar.recommendation
+            nxt = _next_fleet_unlock(radar)
+
+            t = Text()
+            t.append("🔭 RESET RADAR", style="bold #4DB8FF")
+            t.append("  │  ", style=palette.muted)
+            t.append(
+                f"✦ Fable {cap.claude_fable_free_seats:.1f}/{cap.claude_fable_total_seats}",
+                style="bold #38D97A" if cap.claude_fable_free_seats > 0 else "bold #F55454",
+            )
+            t.append("  │  ", style=palette.muted)
+            t.append(
+                f"◈ Codex {cap.codex_free_seats:.1f}/{cap.codex_total_seats}",
+                style="bold #38D97A" if cap.codex_free_seats > 0 else "bold #FAC22E",
+            )
+            t.append("  │  ", style=palette.muted)
+            if cred.total_usable > 0:
+                t.append(
+                    f"↺ Credits {cred.live_available}× live ({cred.total_usable}× usable now)",
+                    style="bold #38D97A",
+                )
+            elif cred.live_available > 0 or cred.total_available > 0:
+                extra = (
+                    f" ({cred.total_available}× total)"
+                    if cred.total_available > cred.live_available
+                    else ""
+                )
+                t.append(f"↺ Credits {cred.live_available}× live{extra}", style="bold #FAC22E")
+            else:
+                t.append("↺ Credits 0", style=palette.muted)
+
+            t.append("  │  ", style=palette.muted)
+            if nxt is not None:
+                t.append(
+                    f"Next unlock: {_format_event_ref(nxt)} in {nxt.countdown_label} ({nxt.reset_label})",
+                    style="bold #FF5C26",
+                )
+            elif radar.events:
+                ev0 = radar.events[0]
+                t.append(
+                    f"Next reset: {_format_event_ref(ev0)} in {ev0.countdown_label} ({ev0.reset_label})",
+                    style=palette.muted,
+                )
+            else:
+                t.append("Next unlock: none", style=palette.muted)
+
+            t.append("\n")
+            if rec is not None:
+                headline = _scrub_emails(str(rec.headline or ""))
+                detail = _scrub_emails(str(rec.detail or ""))
+                rec_style = {
+                    "use_reset_credit": "bold #38D97A",
+                    "burn_perishable": "bold #FAC22E",
+                    "unlock_soon": "bold #4DB8FF",
+                    "relogin_capacity": "bold #F55454",
+                }.get(str(rec.kind or ""), "bold #38D97A")
+                t.append("💡 ", style=rec_style)
+                t.append(headline, style=rec_style)
+                if detail:
+                    t.append(f" — {detail}", style=palette.muted)
+            else:
+                t.append("💡 Fleet capacity balanced — run `bswap resets` for full schedule", style=palette.muted)
+            return t
+
+    class BelkinsWatchScreen(WatchScreen):
+        """Live multi-account Watch screen enhanced with the unified Reset Radar strip."""
+
+        def compose(self) -> ComposeResult:
+            yield BelkinsResetRadarPanel(id="belkins-reset-radar")
+            yield Static("", id="list-title")
+            yield ListView(id="accounts")
+            yield Footer()
+
+        async def _on_snapshot(self, snap) -> None:
+            await super()._on_snapshot(snap)
+            try:
+                self.query_one("#belkins-reset-radar", BelkinsResetRadarPanel).refresh(layout=True)
+            except Exception:
+                pass
+
     class BelkinsDashboardScreen(DashboardScreen):
         """Interactive arrow-key dashboard combining Claude Swap + Belkins Cyber-Forge."""
 
         BINDINGS = [
             Binding("s", "open_switch", "Switch accounts"),
             Binding("w", "app.open_watch", "Watch"),
+            Binding("u", "open_resets", "Resets"),
             Binding("v", "open_vault", "Spark Vault"),
             Binding("r", "open_raid", "Boss Raid"),
             Binding("m", "open_morph", "Morph Form"),
@@ -391,6 +485,7 @@ def _build_belkins_tui_app(switcher: object, *, start: str = "dashboard", detect
             return [
                 ("Switch account…", "switch"),
                 ("Watch accounts", "watch"),
+                ("🔭 Reset Radar & Banked Credits…", "belkins-resets"),
                 ("🎁 Claim Daily Supply Crate (+150 CR & +15K XP)", "belkins-claim"),
                 ("⚡ Belkins Spark Vault (Buy / Equip Relics)…", "belkins-vault"),
                 ("⚔️ Boss Raid Arena (Strike Raid Boss)…", "belkins-raid"),
@@ -405,6 +500,43 @@ def _build_belkins_tui_app(switcher: object, *, start: str = "dashboard", detect
                 ("Theme…", "theme-menu"),
                 ("Quit", "quit"),
             ]
+
+        def _resets_entries(self) -> MenuEntries:
+            radar = _load_live_reset_radar()
+            cap = radar.capacity
+            cred = radar.credits
+            entries: MenuEntries = [
+                (
+                    f"✦ Claude Fable {cap.claude_fable_free_seats:.1f}/{cap.claude_fable_total_seats} free  │  "
+                    f"◈ Codex {cap.codex_free_seats:.1f}/{cap.codex_total_seats} free  │  "
+                    f"↺ Credits {cred.live_available}× live ({cred.total_usable}× usable)",
+                    "resets-refresh",
+                ),
+            ]
+            if radar.recommendation is not None:
+                entries.append(
+                    (
+                        f"💡 {_scrub_emails(str(radar.recommendation.headline or ''))}",
+                        "resets-advisor",
+                    )
+                )
+            for idx, ev in enumerate(radar.events[:12]):
+                badge = (
+                    "🔓 UNLOCK  "
+                    if ev.kind == "unlock"
+                    else ("⏳ EXPIRING" if ev.kind == "perishable" else "↺ RESET   ")
+                )
+                pct_s = f"{ev.used_pct:3.0f}%" if ev.used_pct is not None else " — "
+                entries.append(
+                    (
+                        f"{badge}  {_format_event_ref(ev):<28} {pct_s:>4}  in {ev.countdown_label:<8} ({ev.reset_label})",
+                        f"resets-event:{idx}",
+                    )
+                )
+            if not radar.events:
+                entries.append(("No upcoming Claude or Codex resets reported.", "resets-refresh"))
+            entries.append(_BACK)
+            return entries
 
         def _vault_entries(self) -> MenuEntries:
             comp = _load_companion_state()
@@ -490,6 +622,11 @@ def _build_belkins_tui_app(switcher: object, *, start: str = "dashboard", detect
             entries.append(_BACK)
             return entries
 
+        async def action_open_resets(self) -> None:
+            while len(self._menu_stack) > 1:
+                self._menu_stack.pop()
+            await self._push_menu("🔭 reset radar", self._resets_entries())
+
         async def action_open_vault(self) -> None:
             while len(self._menu_stack) > 1:
                 self._menu_stack.pop()
@@ -506,6 +643,25 @@ def _build_belkins_tui_app(switcher: object, *, start: str = "dashboard", detect
             await self._push_menu("🧬 morph cyber-form", self._morph_entries())
 
         async def _dispatch(self, action_id: str) -> None:
+            if action_id == "belkins-resets":
+                await self._push_menu("🔭 reset radar", self._resets_entries())
+                return
+            if action_id == "resets-refresh":
+                await self._refresh_current_menu(self._resets_entries())
+                self.app.notify("Reset Radar refreshed")
+                return
+            if action_id == "resets-advisor":
+                radar = _load_live_reset_radar()
+                if radar.recommendation is not None:
+                    self.app.notify(
+                        _scrub_emails(
+                            f"{radar.recommendation.headline}: {radar.recommendation.detail}"
+                        )
+                    )
+                return
+            if action_id.startswith("resets-event:"):
+                await self._refresh_current_menu(self._resets_entries())
+                return
             if action_id == "belkins-vault":
                 await self._push_menu("⚡ spark vault", self._vault_entries())
                 return
@@ -575,7 +731,7 @@ def _build_belkins_tui_app(switcher: object, *, start: str = "dashboard", detect
         TITLE = "Belkins Swap (bswap)"
         CSS_PATH = Path(inspect.getfile(cswap_app_mod)).with_name("cswap.tcss")
         CSS = """
-        #belkins-hud {
+        #belkins-hud, #belkins-reset-radar {
             height: auto;
             padding: 1 3;
             background: $background;
@@ -586,6 +742,8 @@ def _build_belkins_tui_app(switcher: object, *, start: str = "dashboard", detect
         def push_screen(self, screen, *args, **kwargs):  # type: ignore[override]
             if type(screen) is DashboardScreen:
                 screen = BelkinsDashboardScreen()
+            elif type(screen) is WatchScreen:
+                screen = BelkinsWatchScreen()
             return super().push_screen(screen, *args, **kwargs)
 
     return BelkinsTuiApp(switcher, start=start, detected=detected)
@@ -1733,8 +1891,9 @@ def _cmd_doctor(args: list[str]) -> int:
             elif status_lbl.startswith("NO FABLE"):
                 no_fable_cnt += 1
             active_mark = f"{GREEN}●{RESET}" if r.is_active else " "
+            safe_alias = _sanitize_alias(r.alias, vendor=VENDOR_CLAUDE, slot=r.slot)
             print(
-                f"    {active_mark} #{r.slot:<2} {BOLD}{r.alias:<18}{RESET} "
+                f"    {active_mark} #{r.slot:<2} {BOLD}{safe_alias:<18}{RESET} "
                 f"{color}[{status_lbl}]{RESET}  {DIM}{detail}{RESET}"
             )
         print(
@@ -1814,6 +1973,17 @@ def _cmd_doctor(args: list[str]) -> int:
     la_color = GREEN if la_state == "running" else (DIM if la_state == "skipped" else GOLD)
     la_icon = "✓" if la_state == "running" else ("·" if la_state == "skipped" else "⚠")
     print(f"     {la_color}{la_icon} LaunchAgent (com.cc-usage-widget): {la_state} — {la_detail}{RESET}")
+    try:
+        codex_rows = _collect_codex_quota_rows()
+        doctor_radar = _build_fleet_reset_radar(
+            row_list,
+            codex_rows,
+            account_notes=sentinels,
+            fable_guard=fable_guard,
+        )
+        print(_format_doctor_radar_line(doctor_radar))
+    except Exception:
+        pass
     print()
 
     # Final verdict
@@ -2626,6 +2796,1237 @@ def _cmd_unpin(args: list[str]) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Unified Reset Radar (Claude + Codex) & Banked Reset-Credits CLI integration
+# ---------------------------------------------------------------------------
+
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+_MONTH_MAP = {
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
+}
+_WEEKDAY_MAP = {
+    "mon": 0,
+    "tue": 1,
+    "wed": 2,
+    "thu": 3,
+    "fri": 4,
+    "sat": 5,
+    "sun": 6,
+}
+
+
+def _scrub_emails(text: str) -> str:
+    """Scrub any accidental raw email addresses from rendered CLI/JSON text."""
+    if not text:
+        return ""
+    return _EMAIL_RE.sub("[redacted]", text)
+
+
+def _sanitize_alias(
+    raw_alias: str | None,
+    *,
+    vendor: str,
+    slot: int,
+    account_id: str = "",
+) -> str:
+    """Return a privacy-safe display alias (never a raw email address)."""
+    cleaned = str(raw_alias or "").strip()
+    if cleaned and "@" not in cleaned and not _EMAIL_RE.search(cleaned):
+        return cleaned
+    if vendor == VENDOR_CODEX:
+        short_id = str(account_id or "").strip()[:8]
+        if short_id:
+            return f"codex-{short_id}"
+        return f"codex-{abs(int(slot)) or 1}"
+    return f"slot-{slot}"
+
+
+def _sanitize_account_row(row: Any) -> Any:
+    """Return a copy of *row* with email cleared and alias guaranteed email-free."""
+    vendor = str(getattr(row, "vendor", VENDOR_CLAUDE) or VENDOR_CLAUDE)
+    slot = int(getattr(row, "slot", 0) or 0)
+    safe_alias = _sanitize_alias(getattr(row, "alias", ""), vendor=vendor, slot=slot)
+    if is_dataclass(row) and hasattr(row, "alias") and hasattr(row, "email"):
+        try:
+            return replace(row, alias=safe_alias, email="")
+        except Exception:
+            pass
+    return row
+
+
+def _codex_auth_path() -> Path:
+    """Resolve ``~/.codex/auth.json`` (or test-overridden path); strictly read-only."""
+    override = (os.environ.get("CC_USAGE_WIDGET_CODEX_AUTH_PATH") or "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".codex" / "auth.json"
+
+
+def _now_ts() -> float:
+    """Return current wall-clock POSIX timestamp (seam for deterministic tests)."""
+    return dt.datetime.now().timestamp()
+
+
+def _epoch_to_utc_iso(epoch: float) -> str:
+    return dt.datetime.fromtimestamp(float(epoch), dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _collect_codex_quota_rows(*, now: float | None = None) -> list[AccountRow]:
+    """Read live Codex rows strictly read-only from local widget JSON files.
+
+    Never makes network requests, never reads OAuth access/refresh tokens, and
+    never emits raw email addresses.
+    """
+    from .codex_accounts import CodexAccountQuota, Registry
+
+    now_ts = _now_ts() if now is None else float(now)
+    reg_path = WIDGET_DIR / "codex_accounts.json"
+    snap_path = WIDGET_DIR / "codex_quota_snapshots.json"
+
+    snap_data: dict[str, Any] = {}
+    if snap_path.is_file():
+        try:
+            parsed = json.loads(snap_path.read_text(encoding="utf-8", errors="replace"))
+            if isinstance(parsed, Mapping):
+                snap_data = dict(parsed)
+        except Exception:
+            snap_data = {}
+
+    snap_accounts_raw = snap_data.get("accounts")
+    snap_accounts: dict[str, Mapping[str, Any]] = (
+        {str(k): v for k, v in snap_accounts_raw.items() if isinstance(v, Mapping)}
+        if isinstance(snap_accounts_raw, Mapping)
+        else {}
+    )
+
+    active_codex_id = str(snap_data.get("desktop_account_id") or "").strip()
+    if not active_codex_id:
+        auth_path = _codex_auth_path()
+        if auth_path.is_file():
+            try:
+                auth_obj = json.loads(auth_path.read_text(encoding="utf-8", errors="replace"))
+                if isinstance(auth_obj, Mapping) and isinstance(auth_obj.get("tokens"), Mapping):
+                    active_codex_id = str(auth_obj["tokens"].get("account_id") or "").strip()
+            except Exception:
+                active_codex_id = ""
+
+    ordered_accounts: list[tuple[str, str]] = []
+    if reg_path.is_file():
+        try:
+            registry = Registry(reg_path)
+            for entry in registry.enabled_entries():
+                ordered_accounts.append((entry.account_id, entry.alias))
+        except Exception:
+            ordered_accounts = []
+    elif snap_accounts:
+        for acc_id in sorted(snap_accounts):
+            ordered_accounts.append((acc_id, ""))
+
+    rows: list[AccountRow] = []
+    for idx, (acc_id, raw_alias) in enumerate(ordered_accounts):
+        slot = -(idx + 1)
+        safe_alias = _sanitize_alias(
+            raw_alias, vendor=VENDOR_CODEX, slot=slot, account_id=acc_id
+        )
+        is_active = bool(active_codex_id) and acc_id == active_codex_id
+        record = snap_accounts.get(acc_id)
+        if not isinstance(record, Mapping):
+            rows.append(
+                AccountRow(
+                    slot=slot,
+                    alias=safe_alias,
+                    email="",
+                    is_active=is_active,
+                    vendor=VENDOR_CODEX,
+                    switchable=False,
+                    attention_note="awaiting first reading",
+                    attention_kind="info",
+                )
+            )
+            continue
+
+        note = str(record.get("note") or "").strip()
+        note_kind = str(record.get("note_kind") or "").strip()
+        quota = CodexAccountQuota.from_json(record.get("quota"))
+        if quota is None:
+            rows.append(
+                AccountRow(
+                    slot=slot,
+                    alias=safe_alias,
+                    email="",
+                    is_active=is_active,
+                    vendor=VENDOR_CODEX,
+                    switchable=False,
+                    attention_note=note or "awaiting first reading",
+                    attention_kind=note_kind or ("warn" if note else "info"),
+                )
+            )
+            continue
+
+        age = max(0.0, now_ts - quota.fetched_at) if quota.fetched_at else None
+        note_low = note.lower()
+        is_warn = bool(note) and (
+            note_kind == "warn"
+            or "relogin" in note_low
+            or "no access" in note_low
+            or "unreadable" in note_low
+        )
+        is_stale_expired = age is not None and age > CODEX_FETCH_EXPIRE_SECONDS
+        withheld = is_warn or is_stale_expired
+
+        five_pct: float | None = None
+        seven_pct: float | None = None
+        five_reset: str | None = None
+        seven_reset: str | None = None
+        scoped_pcts: list[tuple[str, float]] = []
+        scoped_resets: list[tuple[str, str]] = []
+        expired: list[str] = []
+
+        if not withheld:
+            if quota.five_hour is not None:
+                five_pct = quota.five_hour.used_percent
+                if quota.five_hour.reset_at is not None:
+                    five_reset = _epoch_to_utc_iso(quota.five_hour.reset_at)
+                    if now_ts > quota.five_hour.reset_at + 120.0:
+                        expired.append("five_hour")
+            if quota.seven_day is not None:
+                seven_pct = quota.seven_day.used_percent
+                if quota.seven_day.reset_at is not None:
+                    seven_reset = _epoch_to_utc_iso(quota.seven_day.reset_at)
+                    if now_ts > quota.seven_day.reset_at + 120.0:
+                        expired.append("seven_day")
+            for label, sample in quota.scoped:
+                if sample.used_percent is not None:
+                    scoped_pcts.append((label, sample.used_percent))
+                if sample.reset_at is not None:
+                    scoped_resets.append((label, _epoch_to_utc_iso(sample.reset_at)))
+                    if now_ts > sample.reset_at + 120.0:
+                        expired.append(label)
+
+        eff_note = note
+        eff_kind = note_kind
+        if not eff_note and not withheld and (not quota.allowed or quota.limit_reached):
+            eff_note = quota.capped_note
+            eff_kind = "crit"
+        elif is_warn and not eff_kind:
+            eff_kind = "warn"
+
+        # Preserve banked reset_credits_available even on relogin rows so Reset Radar
+        # accurately distinguishes total_available vs live_available vs total_usable.
+        credits_avail = (
+            None if (is_stale_expired and not is_warn) else quota.reset_credits_available
+        )
+        credits_usable = (
+            0
+            if (is_warn and quota.reset_credits_usable is not None)
+            else (None if is_stale_expired else quota.reset_credits_usable)
+        )
+
+        rows.append(
+            AccountRow(
+                slot=slot,
+                alias=safe_alias,
+                email="",
+                is_active=is_active,
+                five_hour_pct=five_pct,
+                seven_day_pct=seven_pct,
+                scoped_windows=tuple(scoped_pcts),
+                five_hour_resets_at=five_reset,
+                seven_day_resets_at=seven_reset,
+                scoped_resets_at=tuple(scoped_resets),
+                usage_age_seconds=age,
+                vendor=VENDOR_CODEX,
+                switchable=False,
+                plan_type=quota.plan_type,
+                expired_windows=tuple(expired),
+                attention_note=eff_note,
+                attention_kind=eff_kind,
+                soonest_reset_at=None if withheld else quota.soonest_reset_at,
+                reset_credits_available=credits_avail,
+                reset_credits_usable=credits_usable,
+            )
+        )
+
+    return rows
+
+
+def _collect_claude_radar_rows() -> tuple[list[AccountRow], dict[int, str]]:
+    """Collect live Claude rows + sentinel notes read-only with bare-python3 fallback."""
+    claude_rows: list[AccountRow] = []
+    sentinels: dict[int, str] = {}
+    src_available = True
+    try:
+        from . import accounts as _accounts_mod
+
+        src = _accounts_mod.create_account_source()
+        src.refresh(force=False)
+        claude_rows = [
+            _sanitize_account_row(r)
+            for r in src.rows()
+            if getattr(r, "slot", -1) >= 0 and getattr(r, "vendor", VENDOR_CLAUDE) == VENDOR_CLAUDE
+        ]
+        if callable(getattr(src, "sentinels", None)):
+            raw_sent = src.sentinels()
+            if isinstance(raw_sent, Mapping):
+                sentinels = {int(k): _scrub_emails(str(v)) for k, v in raw_sent.items() if v}
+        avail_attr = getattr(src, "available", True)
+        src_available = bool(avail_attr()) if callable(avail_attr) else bool(avail_attr)
+    except Exception:
+        claude_rows = []
+        sentinels = {}
+        src_available = False
+
+    if not claude_rows and not src_available:
+        seq_path = _backup_dir() / "sequence.json"
+        if seq_path.is_file():
+            try:
+                st = json.loads(seq_path.read_text(encoding="utf-8", errors="replace"))
+                if isinstance(st, Mapping):
+                    active_slot = (
+                        st.get("activeAccountNumber")
+                        or st.get("active_account")
+                        or st.get("active")
+                    )
+                    raw_accounts = st.get("accounts")
+                    if isinstance(raw_accounts, Mapping):
+                        for k, v in raw_accounts.items():
+                            if not isinstance(v, Mapping):
+                                continue
+                            try:
+                                slot_num = int(k)
+                            except (TypeError, ValueError):
+                                continue
+                            usage = v.get("usage") if isinstance(v.get("usage"), Mapping) else {}
+                            fh_obj = usage.get("five_hour") if isinstance(usage.get("five_hour"), Mapping) else {}
+                            sd_obj = usage.get("seven_day") if isinstance(usage.get("seven_day"), Mapping) else {}
+                            fh_pct = _safe_float(fh_obj.get("utilization"))
+                            sd_pct = _safe_float(sd_obj.get("utilization"))
+                            fh_reset = str(fh_obj.get("resets_at") or "").strip() or None
+                            sd_reset = str(sd_obj.get("resets_at") or "").strip() or None
+                            claude_rows.append(
+                                AccountRow(
+                                    slot=slot_num,
+                                    alias=_sanitize_alias(
+                                        v.get("alias"), vendor=VENDOR_CLAUDE, slot=slot_num
+                                    ),
+                                    email="",
+                                    is_active=(str(slot_num) == str(active_slot)),
+                                    disabled=bool(v.get("disabled", False)),
+                                    five_hour_pct=fh_pct,
+                                    seven_day_pct=sd_pct,
+                                    five_hour_resets_at=fh_reset,
+                                    seven_day_resets_at=sd_reset,
+                                    vendor=VENDOR_CLAUDE,
+                                )
+                            )
+                        claude_rows.sort(key=lambda r: r.slot)
+            except Exception:
+                claude_rows = []
+
+    return claude_rows, sentinels
+
+
+def _load_resets_module() -> Any | None:
+    """Lazily import ``cc_usage_widget.resets`` (returns ``None`` when absent pre-merge)."""
+    try:
+        from . import resets as _resets_mod
+
+        return _resets_mod
+    except Exception:
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class _FallbackResetEvent:
+    vendor: str
+    slot: int
+    alias: str
+    window: str
+    used_pct: float | None
+    free_pct: float | None
+    resets_at_epoch: float
+    seconds_until: float
+    reset_label: str
+    countdown_label: str
+    kind: str
+    is_active: bool = False
+    disabled: bool = False
+    plan_label: str = ""
+    no_fable: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _FallbackResetCreditAccount:
+    vendor: str
+    slot: int
+    alias: str
+    available: int
+    usable: int
+    used_pct: float | None
+    is_active: bool = False
+    needs_relogin: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _FallbackResetCreditsSummary:
+    total_available: int
+    live_available: int
+    total_usable: int
+    accounts: tuple[_FallbackResetCreditAccount, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _FallbackFleetCapacitySummary:
+    claude_fable_free_seats: float
+    claude_fable_total_seats: int
+    claude_locked_relogin_seats: int
+    claude_next_unlock: _FallbackResetEvent | None
+    codex_free_seats: float
+    codex_total_seats: int
+    codex_locked_relogin_seats: int
+    codex_next_unlock: _FallbackResetEvent | None
+    perishable_seats_48h: float
+
+
+@dataclass(frozen=True, slots=True)
+class _FallbackFleetRecommendation:
+    kind: str
+    headline: str
+    detail: str
+    target_vendor: str | None = None
+    target_slot: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _FallbackFleetResetRadar:
+    generated_at: float
+    events: tuple[_FallbackResetEvent, ...]
+    unlocks: tuple[_FallbackResetEvent, ...]
+    perishable: tuple[_FallbackResetEvent, ...]
+    credits: _FallbackResetCreditsSummary
+    capacity: _FallbackFleetCapacitySummary
+    recommendation: _FallbackFleetRecommendation | None
+
+
+def _fb_parse_reset_epoch(value: Any, *, now: float | None = None) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    now_ts = _now_ts() if now is None else float(now)
+    if isinstance(value, (int, float)):
+        f = float(value)
+        return f if math.isfinite(f) and f > 0 else None
+    text = str(value).strip()
+    if not text or text.lower().startswith("overdue"):
+        return None
+    try:
+        iso_s = text[:-1] + "+00:00" if text.endswith("Z") else text
+        parsed = dt.datetime.fromisoformat(iso_s)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.datetime.now().astimezone().tzinfo)
+        return parsed.timestamp()
+    except ValueError:
+        pass
+
+    local_now = dt.datetime.fromtimestamp(now_ts).astimezone()
+    m_hm = re.match(r"^(\d{1,2}):(\d{2})$", text)
+    if m_hm:
+        hh, mm = int(m_hm.group(1)), int(m_hm.group(2))
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            cand = local_now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if cand.timestamp() < now_ts - 300:
+                cand += dt.timedelta(days=1)
+            return cand.timestamp()
+
+    m_wd = re.match(r"^([A-Za-z]{3})\s+(\d{1,2}):(\d{2})$", text)
+    if m_wd and m_wd.group(1).lower() in _WEEKDAY_MAP:
+        wd = _WEEKDAY_MAP[m_wd.group(1).lower()]
+        hh, mm = int(m_wd.group(2)), int(m_wd.group(3))
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            days_ahead = (wd - local_now.weekday()) % 7
+            cand = (local_now + dt.timedelta(days=days_ahead)).replace(
+                hour=hh, minute=mm, second=0, microsecond=0
+            )
+            if cand.timestamp() < now_ts - 300:
+                cand += dt.timedelta(days=7)
+            return cand.timestamp()
+
+    m_md = re.match(r"^([A-Za-z]{3})\s+(\d{1,2})\s+(\d{1,2}):(\d{2})$", text)
+    if m_md and m_md.group(1).lower() in _MONTH_MAP:
+        mon = _MONTH_MAP[m_md.group(1).lower()]
+        day = int(m_md.group(2))
+        hh, mm = int(m_md.group(3)), int(m_md.group(4))
+        for year in (local_now.year, local_now.year + 1, local_now.year - 1):
+            try:
+                cand = local_now.replace(
+                    year=year, month=mon, day=day, hour=hh, minute=mm, second=0, microsecond=0
+                )
+            except ValueError:
+                continue
+            diff = cand.timestamp() - now_ts
+            if -7 * 86400 <= diff <= 300 * 86400:
+                return cand.timestamp()
+    return None
+
+
+def _fb_format_countdown(seconds: float) -> str:
+    if seconds <= 0:
+        return "now"
+    if seconds < 60:
+        return "<1m"
+    total_min = int(seconds // 60)
+    if total_min < 60:
+        return f"{total_min}m"
+    hours, mins = divmod(total_min, 60)
+    if hours < 24:
+        return f"{hours}h {mins}m" if mins else f"{hours}h"
+    days, rem_h = divmod(hours, 24)
+    return f"{days}d {rem_h}h" if rem_h else f"{days}d"
+
+
+def _fb_format_local_reset_label(epoch: float, *, now: float) -> str:
+    local_now = dt.datetime.fromtimestamp(now).astimezone()
+    local_ev = dt.datetime.fromtimestamp(epoch).astimezone()
+    day_diff = (local_ev.date() - local_now.date()).days
+    hm = local_ev.strftime("%H:%M")
+    if day_diff <= 0:
+        return hm
+    if day_diff == 1:
+        return f"Tom {hm}"
+    if day_diff <= 6:
+        return f"{local_ev.strftime('%a')} {hm}"
+    return f"{local_ev.strftime('%b')} {local_ev.day} {hm}"
+
+
+def _fallback_build_fleet_reset_radar(
+    accounts_rows: Iterable[Any],
+    quota_rows: Iterable[Any],
+    *,
+    account_notes: Mapping[int, str] | None = None,
+    now: float | None = None,
+    fable_guard: bool = True,
+) -> _FallbackFleetResetRadar:
+    """Clean contract-compatible fallback used only before ``cc_usage_widget.resets`` is merged."""
+    from . import accounts as _accounts_mod
+
+    now_ts = _now_ts() if now is None else float(now)
+    notes = dict(account_notes or {})
+    claude_list = [r for r in accounts_rows if getattr(r, "vendor", VENDOR_CLAUDE) == VENDOR_CLAUDE]
+    codex_list = [r for r in quota_rows if getattr(r, "vendor", VENDOR_CODEX) == VENDOR_CODEX]
+    fleet_has_fable = _accounts_mod.fleet_has_fable_accounts(claude_list, sentinels=notes)
+
+    events: list[_FallbackResetEvent] = []
+    claude_fable_free = 0.0
+    claude_fable_total = 0
+    claude_locked = 0
+    codex_free = 0.0
+    codex_total = 0
+    codex_locked = 0
+
+    credit_accounts: list[_FallbackResetCreditAccount] = []
+    total_avail = 0
+    live_avail = 0
+    total_usable = 0
+
+    def _add_row_events(
+        row: Any,
+        *,
+        vendor: str,
+        excluded_for_capacity: bool,
+        no_fable: bool,
+    ) -> None:
+        alias = _sanitize_alias(getattr(row, "alias", ""), vendor=vendor, slot=int(row.slot))
+        expired = {str(w).lower() for w in (getattr(row, "expired_windows", ()) or ())}
+        raw_candidates: list[tuple[str, float | None, Any]] = []
+        if getattr(row, "five_hour_resets_at", None) and "five_hour" not in expired:
+            raw_candidates.append(("5h", _safe_float(getattr(row, "five_hour_pct", None)), row.five_hour_resets_at))
+        if getattr(row, "seven_day_resets_at", None) and "seven_day" not in expired:
+            raw_candidates.append(("7d", _safe_float(getattr(row, "seven_day_pct", None)), row.seven_day_resets_at))
+        scoped_pct_map = {
+            str(n): _safe_float(p) for n, p in (getattr(row, "scoped_windows", ()) or ())
+        }
+        for name, r_label in (getattr(row, "scoped_resets_at", ()) or ()):
+            if str(name).lower() in expired:
+                continue
+            raw_candidates.append((str(name), scoped_pct_map.get(str(name)), r_label))
+
+        by_minute: dict[int, tuple[str, float | None, float]] = {}
+        for win, used, raw_ts in raw_candidates:
+            ep = _fb_parse_reset_epoch(raw_ts, now=now_ts)
+            if ep is None or ep <= now_ts - 30.0:
+                continue
+            minute_key = int(round(ep / 60.0))
+            prev = by_minute.get(minute_key)
+            if prev is None:
+                by_minute[minute_key] = (win, used, ep)
+            else:
+                prev_win, prev_used, _ = prev
+                cur_rank = (1 if win.lower().startswith("fable") else 0, float(used or -1.0))
+                prev_rank = (1 if prev_win.lower().startswith("fable") else 0, float(prev_used or -1.0))
+                if cur_rank > prev_rank:
+                    by_minute[minute_key] = (win, used, ep)
+
+        for win, used, ep in by_minute.values():
+            sec = max(0.0, ep - now_ts)
+            free = max(0.0, 100.0 - used) if used is not None else None
+            if excluded_for_capacity or no_fable:
+                kind = "upcoming"
+            elif used is not None and used >= 85.0:
+                kind = "unlock"
+            elif win != "5h" and free is not None and free >= 25.0 and sec <= 48.0 * 3600.0:
+                kind = "perishable"
+            else:
+                kind = "upcoming"
+            events.append(
+                _FallbackResetEvent(
+                    vendor=vendor,
+                    slot=int(row.slot),
+                    alias=alias,
+                    window=win,
+                    used_pct=used,
+                    free_pct=free,
+                    resets_at_epoch=ep,
+                    seconds_until=sec,
+                    reset_label=_fb_format_local_reset_label(ep, now=now_ts),
+                    countdown_label=_fb_format_countdown(sec),
+                    kind=kind,
+                    is_active=bool(getattr(row, "is_active", False)),
+                    disabled=bool(getattr(row, "disabled", False)),
+                    plan_label=str(getattr(row, "plan_type", "") or ""),
+                    no_fable=no_fable,
+                )
+            )
+
+    for r in claude_list:
+        note = notes.get(r.slot) or str(getattr(r, "attention_note", "") or "")
+        needs_relogin = bool(note) or (not getattr(r, "switchable", True) and not getattr(r, "disabled", False))
+        disabled = bool(getattr(r, "disabled", False))
+        no_fable = bool(fable_guard and fleet_has_fable and _accounts_mod.row_lacks_fable_quota(r))
+        if needs_relogin and not disabled:
+            claude_locked += 1
+        elif not disabled and not no_fable:
+            claude_fable_total += 1
+            f_pct, _ = _fable_pct_and_reset(r)
+            eff_used = f_pct if f_pct is not None else _safe_float(getattr(r, "seven_day_pct", None))
+            if eff_used is not None:
+                claude_fable_free += max(0.0, 100.0 - eff_used) / 100.0
+            else:
+                claude_fable_free += 1.0
+        _add_row_events(r, vendor=VENDOR_CLAUDE, excluded_for_capacity=(disabled or needs_relogin), no_fable=no_fable)
+
+    for r in codex_list:
+        note = str(getattr(r, "attention_note", "") or "")
+        kind_s = str(getattr(r, "attention_kind", "") or "")
+        disabled = bool(getattr(r, "disabled", False))
+        needs_relogin = kind_s == "warn" or "relogin" in note.lower() or "no access" in note.lower()
+        avail = getattr(r, "reset_credits_available", None)
+        usable = getattr(r, "reset_credits_usable", None)
+        sd_used = _safe_float(getattr(r, "seven_day_pct", None))
+        alias = _sanitize_alias(getattr(r, "alias", ""), vendor=VENDOR_CODEX, slot=int(r.slot))
+
+        if isinstance(avail, int) and avail > 0:
+            u_int = int(usable) if (isinstance(usable, int) and usable > 0 and not needs_relogin and not disabled) else 0
+            total_avail += avail
+            if not needs_relogin and not disabled:
+                live_avail += avail
+                total_usable += u_int
+            credit_accounts.append(
+                _FallbackResetCreditAccount(
+                    vendor=VENDOR_CODEX,
+                    slot=int(r.slot),
+                    alias=alias,
+                    available=avail,
+                    usable=u_int,
+                    used_pct=sd_used,
+                    is_active=bool(getattr(r, "is_active", False)),
+                    needs_relogin=needs_relogin,
+                )
+            )
+
+        if needs_relogin and not disabled:
+            codex_locked += 1
+        elif not disabled:
+            codex_total += 1
+            if sd_used is not None:
+                codex_free += max(0.0, 100.0 - sd_used) / 100.0
+            elif getattr(r, "five_hour_pct", None) is not None:
+                codex_free += max(0.0, 100.0 - float(r.five_hour_pct)) / 100.0
+
+        _add_row_events(r, vendor=VENDOR_CODEX, excluded_for_capacity=(disabled or needs_relogin), no_fable=False)
+
+    events.sort(key=lambda e: (e.resets_at_epoch, e.vendor, e.slot, e.window))
+    unlocks = tuple(e for e in events if e.kind == "unlock")
+    perishable = tuple(e for e in events if e.kind == "perishable")
+    perishable_seats = sum((e.free_pct or 0.0) / 100.0 for e in perishable)
+
+    claude_next_unlock = next((e for e in unlocks if e.vendor == VENDOR_CLAUDE), None)
+    codex_next_unlock = next((e for e in unlocks if e.vendor == VENDOR_CODEX), None)
+
+    rec: _FallbackFleetRecommendation | None = None
+    usable_accts = [a for a in credit_accounts if a.usable > 0 and not a.needs_relogin]
+    if usable_accts:
+        top = sorted(usable_accts, key=lambda a: (not a.is_active, -(a.used_pct or 0.0)))[0]
+        rec = _FallbackFleetRecommendation(
+            kind="use_reset_credit",
+            headline=f"Use {top.usable}× Codex reset credit on {top.alias}",
+            detail=f"Banked reset credit is usable now on {top.alias} to instantly restore quota.",
+            target_vendor=VENDOR_CODEX,
+            target_slot=top.slot,
+        )
+    else:
+        urgent_perish = [
+            e for e in perishable if (e.free_pct or 0.0) >= 40.0 and e.seconds_until <= 36.0 * 3600.0
+        ]
+        if urgent_perish:
+            p0 = urgent_perish[0]
+            rec = _FallbackFleetRecommendation(
+                kind="burn_perishable",
+                headline=f"Burn {p0.free_pct:.0f}% free {p0.window} on {p0.alias} ({p0.countdown_label})",
+                detail=f"{p0.alias} resets at {p0.reset_label} — harvest expiring quota before it rolls over.",
+                target_vendor=p0.vendor,
+                target_slot=p0.slot,
+            )
+        else:
+            soon_unlocks = [e for e in unlocks if e.seconds_until <= 6.0 * 3600.0]
+            if soon_unlocks and (claude_fable_free <= 1.5 or codex_free <= 1.5):
+                u0 = soon_unlocks[0]
+                rec = _FallbackFleetRecommendation(
+                    kind="unlock_soon",
+                    headline=f"{u0.alias} {u0.window} unlocks in {u0.countdown_label} ({u0.reset_label})",
+                    detail="Capped seat reopens shortly to replenish low fleet capacity.",
+                    target_vendor=u0.vendor,
+                    target_slot=u0.slot,
+                )
+            elif claude_locked >= 2 or codex_locked >= 2:
+                rec = _FallbackFleetRecommendation(
+                    kind="relogin_capacity",
+                    headline=f"Re-login {claude_locked + codex_locked} locked seat(s) to recover capacity",
+                    detail=f"{claude_locked} Claude and {codex_locked} Codex account(s) need fresh auth.",
+                    target_vendor=VENDOR_CLAUDE if claude_locked >= codex_locked else VENDOR_CODEX,
+                    target_slot=None,
+                )
+            else:
+                nxt = unlocks[0] if unlocks else (events[0] if events else None)
+                nxt_txt = f" · next reset {nxt.alias} in {nxt.countdown_label}" if nxt else ""
+                rec = _FallbackFleetRecommendation(
+                    kind="healthy",
+                    headline=f"Fleet healthy: {claude_fable_free:.1f} Fable + {codex_free:.1f} Codex seats free",
+                    detail=f"{claude_fable_total} Fable and {codex_total} Codex live seat(s) tracked{nxt_txt}.",
+                    target_vendor=None,
+                    target_slot=None,
+                )
+
+    return _FallbackFleetResetRadar(
+        generated_at=now_ts,
+        events=tuple(events),
+        unlocks=unlocks,
+        perishable=perishable,
+        credits=_FallbackResetCreditsSummary(
+            total_available=total_avail,
+            live_available=live_avail,
+            total_usable=total_usable,
+            accounts=tuple(credit_accounts),
+        ),
+        capacity=_FallbackFleetCapacitySummary(
+            claude_fable_free_seats=round(claude_fable_free, 2),
+            claude_fable_total_seats=claude_fable_total,
+            claude_locked_relogin_seats=claude_locked,
+            claude_next_unlock=claude_next_unlock,
+            codex_free_seats=round(codex_free, 2),
+            codex_total_seats=codex_total,
+            codex_locked_relogin_seats=codex_locked,
+            codex_next_unlock=codex_next_unlock,
+            perishable_seats_48h=round(perishable_seats, 2),
+        ),
+        recommendation=rec,
+    )
+
+
+def _build_fleet_reset_radar(
+    claude_rows: Iterable[Any],
+    codex_rows: Iterable[Any],
+    *,
+    account_notes: Mapping[int, str] | None = None,
+    now: float | None = None,
+    fable_guard: bool = True,
+) -> Any:
+    """Build ``FleetResetRadar`` via canonical ``cc_usage_widget.resets`` (with pre-merge fallback)."""
+    safe_claude = [_sanitize_account_row(r) for r in claude_rows]
+    safe_codex = [_sanitize_account_row(r) for r in codex_rows]
+    safe_notes = (
+        {int(k): _scrub_emails(str(v)) for k, v in account_notes.items() if v}
+        if account_notes
+        else None
+    )
+    resets_mod = _load_resets_module()
+    build_fn = getattr(resets_mod, "build_fleet_reset_radar", None) if resets_mod is not None else None
+    if callable(build_fn):
+        return build_fn(
+            safe_claude,
+            safe_codex,
+            account_notes=safe_notes,
+            now=now,
+            fable_guard=fable_guard,
+        )
+    return _fallback_build_fleet_reset_radar(
+        safe_claude,
+        safe_codex,
+        account_notes=safe_notes,
+        now=now,
+        fable_guard=fable_guard,
+    )
+
+
+def _load_live_reset_radar(*, now: float | None = None) -> Any:
+    """Collect live Claude + Codex rows read-only and build ``FleetResetRadar``."""
+    now_ts = _now_ts() if now is None else float(now)
+    claude_rows, sentinels = _collect_claude_radar_rows()
+    codex_rows = _collect_codex_quota_rows(now=now_ts)
+    return _build_fleet_reset_radar(
+        claude_rows,
+        codex_rows,
+        account_notes=sentinels,
+        now=now_ts,
+        fable_guard=_fable_guard_enabled(),
+    )
+
+
+def _vendor_icon(vendor: str) -> str:
+    return "✦" if str(vendor).lower() == VENDOR_CLAUDE else "◈"
+
+
+def _format_event_ref(ev: Any) -> str:
+    vendor = str(getattr(ev, "vendor", VENDOR_CLAUDE))
+    slot = int(getattr(ev, "slot", 0) or 0)
+    alias = _sanitize_alias(getattr(ev, "alias", ""), vendor=vendor, slot=slot)
+    win = _scrub_emails(str(getattr(ev, "window", "") or ""))
+    icon = _vendor_icon(vendor)
+    if vendor == VENDOR_CLAUDE:
+        return f"{icon} #{slot} {alias} {win}".strip()
+    return f"{icon} {alias} {win}".strip()
+
+
+def _next_fleet_unlock(radar: Any) -> Any | None:
+    unlocks = getattr(radar, "unlocks", ()) or ()
+    if unlocks:
+        return unlocks[0]
+    cap = getattr(radar, "capacity", None)
+    if cap is None:
+        return None
+    candidates = [
+        ev
+        for ev in (getattr(cap, "claude_next_unlock", None), getattr(cap, "codex_next_unlock", None))
+        if ev is not None
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda e: float(getattr(e, "seconds_until", 0.0)))
+
+
+def _timeline_bucket(resets_at_epoch: float, now_ts: float) -> str:
+    local_now = dt.datetime.fromtimestamp(now_ts).astimezone().date()
+    local_ev = dt.datetime.fromtimestamp(float(resets_at_epoch)).astimezone().date()
+    day_diff = (local_ev - local_now).days
+    if day_diff <= 0:
+        return "TODAY"
+    if day_diff == 1:
+        return "TOMORROW"
+    return "THIS WEEK"
+
+
+def _event_to_json(ev: Any, *, now_ts: float) -> dict[str, Any]:
+    vendor = str(ev.vendor)
+    slot = int(ev.slot)
+    ep = float(ev.resets_at_epoch)
+    return {
+        "bucket": _timeline_bucket(ep, now_ts),
+        "vendor": vendor,
+        "slot": slot,
+        "alias": _sanitize_alias(ev.alias, vendor=vendor, slot=slot),
+        "window": _scrub_emails(str(ev.window)),
+        "used_pct": ev.used_pct,
+        "free_pct": ev.free_pct,
+        "resets_at_epoch": ep,
+        "seconds_until": float(ev.seconds_until),
+        "reset_label": _scrub_emails(str(ev.reset_label)),
+        "countdown_label": _scrub_emails(str(ev.countdown_label)),
+        "kind": str(ev.kind),
+        "is_active": bool(ev.is_active),
+        "disabled": bool(ev.disabled),
+        "plan_label": _scrub_emails(str(ev.plan_label or "")),
+        "no_fable": bool(ev.no_fable),
+    }
+
+
+def _radar_to_json(radar: Any, *, now_ts: float | None = None) -> dict[str, Any]:
+    """Serialize ``FleetResetRadar`` to clean machine-readable JSON (strictly aliases & metrics)."""
+    ref_now = (
+        float(now_ts)
+        if now_ts is not None
+        else float(getattr(radar, "generated_at", _now_ts()))
+    )
+    cap = radar.capacity
+    cred = radar.credits
+    rec = radar.recommendation
+
+    events_json = [_event_to_json(ev, now_ts=ref_now) for ev in (radar.events or ())]
+    timeline: dict[str, list[dict[str, Any]]] = {
+        "TODAY": [],
+        "TOMORROW": [],
+        "THIS WEEK": [],
+    }
+    for item in events_json:
+        timeline[item["bucket"]].append(item)
+
+    credit_accounts_json = [
+        {
+            "vendor": str(a.vendor),
+            "slot": int(a.slot),
+            "alias": _sanitize_alias(a.alias, vendor=str(a.vendor), slot=int(a.slot)),
+            "available": int(a.available),
+            "usable": int(a.usable),
+            "used_pct": a.used_pct,
+            "is_active": bool(a.is_active),
+            "needs_relogin": bool(a.needs_relogin),
+        }
+        for a in (cred.accounts or ())
+    ]
+
+    rec_json = (
+        {
+            "kind": str(rec.kind),
+            "headline": _scrub_emails(str(rec.headline)),
+            "detail": _scrub_emails(str(rec.detail)),
+            "target_vendor": rec.target_vendor,
+            "target_slot": rec.target_slot,
+        }
+        if rec is not None
+        else None
+    )
+
+    return {
+        "generated_at": float(getattr(radar, "generated_at", ref_now)),
+        "capacity": {
+            "claude_fable_free_seats": float(cap.claude_fable_free_seats),
+            "claude_fable_total_seats": int(cap.claude_fable_total_seats),
+            "claude_locked_relogin_seats": int(cap.claude_locked_relogin_seats),
+            "claude_next_unlock": (
+                _event_to_json(cap.claude_next_unlock, now_ts=ref_now)
+                if cap.claude_next_unlock is not None
+                else None
+            ),
+            "codex_free_seats": float(cap.codex_free_seats),
+            "codex_total_seats": int(cap.codex_total_seats),
+            "codex_locked_relogin_seats": int(cap.codex_locked_relogin_seats),
+            "codex_next_unlock": (
+                _event_to_json(cap.codex_next_unlock, now_ts=ref_now)
+                if cap.codex_next_unlock is not None
+                else None
+            ),
+            "perishable_seats_48h": float(cap.perishable_seats_48h),
+        },
+        "credits": {
+            "total_available": int(cred.total_available),
+            "live_available": int(cred.live_available),
+            "total_usable": int(cred.total_usable),
+            "accounts": credit_accounts_json,
+        },
+        "recommendation": rec_json,
+        "events": events_json,
+        "timeline": timeline,
+        "unlocks": [_event_to_json(ev, now_ts=ref_now) for ev in (radar.unlocks or ())],
+        "perishable": [_event_to_json(ev, now_ts=ref_now) for ev in (radar.perishable or ())],
+    }
+
+
+def _format_status_radar_lines(radar: Any) -> tuple[str, str]:
+    """Build the compact 2-line Reset Radar summary block for ``bswap status``."""
+    cap = radar.capacity
+    cred = radar.credits
+    rec = radar.recommendation
+    nxt = _next_fleet_unlock(radar)
+
+    if nxt is not None:
+        unlock_txt = (
+            f"{ORANGE}🔓 {_format_event_ref(nxt)}{RESET} "
+            f"in {BOLD}{nxt.countdown_label}{RESET} {DIM}({nxt.reset_label}){RESET}"
+        )
+    elif radar.events:
+        ev0 = radar.events[0]
+        unlock_txt = (
+            f"{DIM}none capped (next reset {_format_event_ref(ev0)} "
+            f"in {ev0.countdown_label}){RESET}"
+        )
+    else:
+        unlock_txt = f"{DIM}none queued{RESET}"
+
+    if cred.total_usable > 0:
+        cred_txt = (
+            f"{GREEN}{BOLD}{cred.live_available}× live "
+            f"({cred.total_usable}× usable now){RESET}"
+        )
+    elif cred.live_available > 0 or cred.total_available > 0:
+        extra = (
+            f" · {cred.total_available}× total"
+            if cred.total_available > cred.live_available
+            else ""
+        )
+        cred_txt = f"{GOLD}{cred.live_available}× live ({cred.total_usable}× usable now{extra}){RESET}"
+    else:
+        cred_txt = f"{DIM}0 banked{RESET}"
+
+    line1 = (
+        f"  {BOLD}{CYAN}🔭 Reset Radar:{RESET}  Next Unlock: {unlock_txt}  "
+        f"{DIM}│{RESET}  Codex Credits: {cred_txt}"
+    )
+
+    if rec is not None:
+        headline = _scrub_emails(str(rec.headline or ""))
+        detail = _scrub_emails(str(rec.detail or ""))
+        rec_color = {
+            "use_reset_credit": GREEN,
+            "burn_perishable": GOLD,
+            "unlock_soon": CYAN,
+            "relogin_capacity": RED,
+        }.get(str(rec.kind or ""), GREEN)
+        detail_part = f" {DIM}— {detail}{RESET}" if detail else ""
+        line2 = f"     {BOLD}Advisor:{RESET} {rec_color}{headline}{RESET}{detail_part}"
+    else:
+        line2 = (
+            f"     {DIM}Fleet: ✦ Fable {cap.claude_fable_free_seats:.1f}/{cap.claude_fable_total_seats} free"
+            f" · ◈ Codex {cap.codex_free_seats:.1f}/{cap.codex_total_seats} free (`bswap resets`){RESET}"
+        )
+    return line1, line2
+
+
+def _format_doctor_radar_line(radar: Any) -> str:
+    """Build the Reset Radar diagnostic line for ``bswap doctor``."""
+    cap = radar.capacity
+    cred = radar.credits
+    unlocks = tuple(radar.unlocks or ())
+    perishable = tuple(radar.perishable or ())
+    imminent = [e for e in unlocks if float(e.seconds_until) <= 6.0 * 3600.0]
+
+    if imminent:
+        u0 = imminent[0]
+        unlock_part = f"{len(imminent)} imminent unlock ({_format_event_ref(u0)} in {u0.countdown_label})"
+    elif unlocks:
+        u0 = unlocks[0]
+        unlock_part = f"next unlock {_format_event_ref(u0)} in {u0.countdown_label}"
+    else:
+        unlock_part = "no capped unlocks"
+
+    if cap.perishable_seats_48h > 0 or perishable:
+        perish_part = f"{cap.perishable_seats_48h:.1f} perishable seat(s) <48h"
+    else:
+        perish_part = "0 perishable <48h"
+
+    if cred.total_usable > 0:
+        cred_part = f"{cred.live_available}× live Codex reset credits ({cred.total_usable}× usable now)"
+    elif cred.live_available > 0 or cred.total_available > 0:
+        extra = (
+            f", {cred.total_available}× total"
+            if cred.total_available > cred.live_available
+            else ""
+        )
+        cred_part = f"{cred.live_available}× live Codex reset credits{extra}"
+    else:
+        cred_part = "0 banked Codex reset credits"
+
+    notable = bool(imminent or perishable or cred.total_usable > 0)
+    color = GOLD if notable else GREEN
+    icon = "!" if notable else "✓"
+    return (
+        f"     {color}{icon} Reset Radar: {unlock_part} · {perish_part} · {cred_part}{RESET} "
+        f"{DIM}(`bswap resets`){RESET}"
+    )
+
+
+def _cmd_resets(args: list[str]) -> int:
+    """Unified Claude + Codex Reset Radar & Banked Reset Credits CLI dashboard."""
+    if any(a in {"-h", "--help"} for a in args):
+        print(f"{BOLD}Usage:{RESET} {ORANGE}bswap resets [--json]{RESET}  {DIM}(aliases: schedule, calendar, unlocks){RESET}")
+        return 0
+
+    as_json = False
+    for arg in args:
+        if arg in {"--json", "-j"}:
+            as_json = True
+        else:
+            print(
+                f"{RED}Unknown option for `bswap resets`: {arg!r}. Usage: bswap resets [--json]{RESET}",
+                file=sys.stderr,
+            )
+            return 2
+
+    now_ts = _now_ts()
+    radar = _load_live_reset_radar(now=now_ts)
+
+    if as_json:
+        print(json.dumps(_radar_to_json(radar, now_ts=now_ts), indent=2))
+        return 0
+
+    cap = radar.capacity
+    cred = radar.credits
+    rec = radar.recommendation
+    ref_now = float(getattr(radar, "generated_at", now_ts))
+
+    _print_banner()
+    print(f"{BOLD}{ORANGE}━━━ 🔭 BELKINS UNIFIED RESET RADAR & BANKED CREDITS (Claude ✦ + Codex ◈) ━━━{RESET}\n")
+
+    # Section 1: Fleet Capacity & Banked Credits Summary
+    print(f"  {BOLD}{CYAN}1. Fleet Capacity & Banked Credits{RESET}")
+    if cap.claude_next_unlock is not None:
+        cu = cap.claude_next_unlock
+        c_unlock = f"{ORANGE}🔓 {_format_event_ref(cu)}{RESET} in {BOLD}{cu.countdown_label}{RESET} {DIM}({cu.reset_label}){RESET}"
+    else:
+        c_unlock = f"{DIM}none capped{RESET}"
+    c_color = GREEN if cap.claude_fable_free_seats > 0 else (DIM if cap.claude_fable_total_seats == 0 else RED)
+    print(
+        f"     {ORANGE}✦ Claude Fable:{RESET}  {c_color}{BOLD}{cap.claude_fable_free_seats:.1f} / {cap.claude_fable_total_seats}{RESET} seats free  "
+        f"{DIM}│{RESET}  Next unlock: {c_unlock}"
+    )
+
+    if cap.codex_next_unlock is not None:
+        xu = cap.codex_next_unlock
+        x_unlock = f"{ORANGE}🔓 {_format_event_ref(xu)}{RESET} in {BOLD}{xu.countdown_label}{RESET} {DIM}({xu.reset_label}){RESET}"
+    else:
+        x_unlock = f"{DIM}none capped{RESET}"
+    x_color = GREEN if cap.codex_free_seats > 0 else (DIM if cap.codex_total_seats == 0 else GOLD)
+    print(
+        f"     {CYAN}◈ Codex Fleet:{RESET}   {x_color}{BOLD}{cap.codex_free_seats:.1f} / {cap.codex_total_seats}{RESET} seats free  "
+        f"{DIM}│{RESET}  Next unlock: {x_unlock}"
+    )
+
+    extra_total = (
+        f" · {cred.total_available}× total incl. relogin"
+        if cred.total_available > cred.live_available
+        else ""
+    )
+    cred_color = GREEN if cred.total_usable > 0 else (GOLD if cred.live_available > 0 else DIM)
+    print(
+        f"     {GOLD}↺ Reset Credits:{RESET} {cred_color}{BOLD}{cred.live_available}× live{RESET} · "
+        f"{cred_color}{BOLD}{cred.total_usable}× usable now{RESET}{DIM}{extra_total}{RESET}"
+    )
+    for acct in cred.accounts or ():
+        a_alias = _sanitize_alias(acct.alias, vendor=str(acct.vendor), slot=int(acct.slot))
+        a_icon = _vendor_icon(str(acct.vendor))
+        a_mark = f"{GREEN}●{RESET} " if acct.is_active else ""
+        parts = [f"{acct.available}× banked"]
+        if acct.usable > 0:
+            parts.append(f"{GREEN}{acct.usable}× usable now{RESET}")
+        if acct.used_pct is not None:
+            parts.append(f"{acct.used_pct:.0f}% used")
+        if acct.needs_relogin:
+            parts.append(f"{RED}relogin needed{RESET}")
+        print(f"       {DIM}↳{RESET} {a_mark}{a_icon} {BOLD}{a_alias}{RESET}: {' · '.join(parts)}")
+
+    perish_color = GOLD if cap.perishable_seats_48h > 0 else DIM
+    locked_total = int(cap.claude_locked_relogin_seats) + int(cap.codex_locked_relogin_seats)
+    locked_color = RED if locked_total > 0 else DIM
+    print(
+        f"     {perish_color}⏳ Perishable <48h:{RESET} {BOLD}{cap.perishable_seats_48h:.1f}{RESET} seats  "
+        f"{DIM}│{RESET}  {locked_color}🔒 Locked (re-login):{RESET} "
+        f"{cap.claude_locked_relogin_seats} Claude · {cap.codex_locked_relogin_seats} Codex"
+    )
+    print()
+
+    # Section 2: Chronological Unified Reset Timeline
+    print(f"  {BOLD}{CYAN}2. Chronological Unified Reset Timeline{RESET}")
+    grouped: dict[str, list[Any]] = {"TODAY": [], "TOMORROW": [], "THIS WEEK": []}
+    for ev in sorted(
+        radar.events or (),
+        key=lambda e: (float(e.resets_at_epoch), str(e.vendor), int(e.slot), str(e.window)),
+    ):
+        grouped[_timeline_bucket(float(ev.resets_at_epoch), ref_now)].append(ev)
+
+    if not any(grouped.values()):
+        print(f"     {DIM}No upcoming Claude or Codex resets reported yet.{RESET}\n")
+    else:
+        for bucket in ("TODAY", "TOMORROW", "THIS WEEK"):
+            bucket_events = grouped[bucket]
+            if not bucket_events:
+                continue
+            print(f"     {BOLD}{GOLD}{bucket}{RESET}")
+            for ev in bucket_events:
+                kind = str(ev.kind or "upcoming")
+                if kind == "unlock":
+                    u_col = RED if (ev.used_pct is not None and ev.used_pct >= 95.0) else ORANGE
+                    badge = f"{u_col}🔓 UNLOCK  {RESET}"
+                elif kind == "perishable":
+                    badge = f"{GOLD}⏳ EXPIRING{RESET}"
+                else:
+                    badge = f"{CYAN}↺  RESET   {RESET}"
+
+                v_col = ORANGE if ev.vendor == VENDOR_CLAUDE else CYAN
+                v_glyph = _vendor_icon(str(ev.vendor))
+                alias = _sanitize_alias(ev.alias, vendor=str(ev.vendor), slot=int(ev.slot))
+                who = f"#{ev.slot} {alias}" if ev.vendor == VENDOR_CLAUDE else alias
+                active_dot = f"{GREEN}●{RESET}" if ev.is_active else " "
+                pct_txt = f"{ev.used_pct:3.0f}% used" if ev.used_pct is not None else "  — used"
+                win_txt = _scrub_emails(str(ev.window or ""))
+                tags: list[str] = []
+                if kind == "perishable" and ev.free_pct is not None:
+                    tags.append(f"{GOLD}{ev.free_pct:.0f}% free{RESET}")
+                if ev.no_fable:
+                    tags.append(f"{DIM}no-Fable{RESET}")
+                if ev.disabled:
+                    tags.append(f"{DIM}disabled{RESET}")
+                tag_s = f"  [{', '.join(tags)}]" if tags else ""
+                print(
+                    f"      {active_dot} {badge}  {v_col}{v_glyph}{RESET} {BOLD}{who:<20}{RESET} "
+                    f"{win_txt:<10} {pct_txt:<9}  in {BOLD}{ev.countdown_label:<8}{RESET} "
+                    f"{DIM}({ev.reset_label}){RESET}{tag_s}"
+                )
+            print()
+
+    # Section 3: Smart Fleet Advisor
+    print(f"  {BOLD}{CYAN}3. Smart Fleet Advisor{RESET}")
+    if rec is not None:
+        rec_icon, rec_color = {
+            "use_reset_credit": ("↺", GREEN),
+            "burn_perishable": ("⏳", GOLD),
+            "unlock_soon": ("🔓", CYAN),
+            "relogin_capacity": ("🔒", RED),
+            "healthy": ("✓", GREEN),
+        }.get(str(rec.kind or ""), ("💡", GREEN))
+        headline = _scrub_emails(str(rec.headline or ""))
+        detail = _scrub_emails(str(rec.detail or ""))
+        print(f"     {rec_color}{rec_icon} {BOLD}{headline}{RESET}")
+        if detail:
+            print(f"       {DIM}{detail}{RESET}")
+    else:
+        print(f"     {GREEN}✓ Fleet capacity balanced — no urgent reset actions right now.{RESET}")
+    print()
+    return 0
+
+
+def _cmd_status(args: list[str]) -> int:
+    """Print Companion HUD + Claude status + compact 2-line Reset Radar summary."""
+    if "--json" in args:
+        return _run_cswap(["status", *args], show_banner=False)
+    rc = _run_cswap(["status", *args], show_banner=True)
+    try:
+        radar = _load_live_reset_radar()
+        line1, line2 = _format_status_radar_lines(radar)
+        print()
+        print(line1)
+        print(line2)
+    except Exception:
+        pass
+    return rc
+
+
 def _cmd_help() -> int:
     _print_banner()
     print(f"{BOLD}Usage:{RESET} {ORANGE}bswap{RESET} [command]   (or {ORANGE}belkins{RESET} [command])")
@@ -2633,8 +4034,9 @@ def _cmd_help() -> int:
     print(f"{BOLD}Interactive TUI & Companion Commands:{RESET}")
     print(f"  {ORANGE}bswap{RESET} / {ORANGE}bswap tui{RESET}          Launch interactive arrow-key TUI (Switch, Watch, Spark Vault, Boss Raid)")
     print(f"  {ORANGE}bswap update{RESET}               Pull latest Belkins Usage Bar from GitHub & restart menu bar")
-    print(f"  {ORANGE}bswap watch{RESET}                Launch live multi-account Watch monitor in TUI")
-    print(f"  {ORANGE}bswap status{RESET}               Print Companion HUD + Claude & Codex fleet status")
+    print(f"  {ORANGE}bswap watch{RESET}                Launch live multi-account Watch monitor in TUI (with Reset Radar)")
+    print(f"  {ORANGE}bswap status{RESET}               Print Companion HUD + Claude & Codex fleet status + Reset Radar")
+    print(f"  {ORANGE}bswap resets [--json]{RESET}      Unified Claude + Codex reset timeline, banked credits & advisor (aliases: schedule, calendar, unlocks)")
     print(f"  {ORANGE}bswap evo{RESET} / {ORANGE}bswap dex{RESET}      Inspect 8-Stage Cyber-Forms, Boss Raid Arena & 14 Hall of Fame Trophies")
     print(f"  {ORANGE}bswap claim{RESET}                Claim your Daily Supply Crate (+150..300 CR & +15K..45K XP)")
     print(f"  {ORANGE}bswap raid [strikes]{RESET}       Attack the active Raid Boss for SparkCoins & Bonus XP")
@@ -2699,7 +4101,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args:
         if sys.stdin.isatty() and sys.stdout.isatty():
             return _run_belkins_tui(start="dashboard")
-        return _run_cswap(["status"], show_banner=True)
+        return _cmd_status([])
 
     cmd = args[0].lower()
     if cmd == "tui":
@@ -2707,7 +4109,9 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "watch" and len(args) == 1 and sys.stdin.isatty() and sys.stdout.isatty():
         return _run_belkins_tui(start="watch")
     if cmd == "status":
-        return _run_cswap(["status", *args[1:]], show_banner=True)
+        return _cmd_status(args[1:])
+    if cmd in {"resets", "schedule", "calendar", "unlocks"}:
+        return _cmd_resets(args[1:])
     if cmd == "best":
         return _cmd_best(args[1:])
     if cmd in {"doctor", "diag", "diagnose", "health"}:
