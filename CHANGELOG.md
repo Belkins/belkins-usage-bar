@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-11-21 — Unified Fleet Reset Radar, Banked Codex Reset Credits & 7-Day Capacity Forecast
+
+- **Pure Zero-I/O Fleet Reset Radar Engine (`resets.py`):**
+  - Added `build_fleet_reset_radar()` (`ResetEvent`, `ResetCreditAccount`, `ResetCreditsSummary`, `FleetCapacitySummary`, `FleetRecommendation`, `FleetResetRadar`) as the canonical stdlib-only domain layer computing unified Claude (`5h`, `7d`, `Fable`/`Opus`/`Sonnet`) and Codex (`5h`, `7d`) reset timelines, banked reset-credit balances (`total_available`, `live_available`, `total_usable`), effective fleet capacity equivalents, and privacy-safe advisor recommendations (`use_reset_credit`, `burn_perishable`, `unlock_soon`, `relogin_capacity`, `healthy`).
+- **Menu-Bar Fleet Reset Radar Card, Next-Unlock Chip & Smart Alerts (`themes/belkins.py`, `app.py`, `contracts.py`, `notify.py`):**
+  - Added an interactive **Fleet Reset Radar** card in Belkins `Hub` (compact + click-to-expand with next unlocks, perishable quota highlights, advisor insight, and banked Codex reset credits) plus banked Codex reset-credit pills (`↺ USE N×` / `↺ N×`) and per-row reset countdown clocks (`↺ 4d`, `Capped · 3h`) on the `Claude` and `Codex` party tabs.
+  - Added opt-in `title_show_next_unlock` (`🔓3h` / `🔓45m` menu-bar token when a capped Fable/Codex seat unlocks within 24h, off by default) and `reset_imminent_alert_enabled` (default on) for ledger-deduped imminent-unlock (`<= 15m`) and high-usage Codex reset-credit (`>= 90%` with banked credits) alerts.
+- **HTML Dashboard Fleet Reset Timeline & 7-Day Capacity Forecast (`dashboard.py`):**
+  - Added a **Fleet Reset Timeline & Capacity Forecast** section to the local Belkins HTML dashboard with KPI cards, banked reset-credit summary, advisor callouts, and an interactive inline 7-day SVG swimlane timeline showing Claude & Codex unlock/perishable milestones with HTML-escaped, email-free labels.
+- **Unified `bswap resets [--json]` CLI & TUI Integration (`bswap_cli.py`):**
+  - Added `bswap resets [--json]` (also accessible from `bswap status`, `bswap doctor`, `bswap watch`, and the interactive `bswap` TUI) displaying live Claude + Codex reset countdowns, banked Codex reset credits, aggregate fleet capacity, and actionable recommendations with zero raw email or credential exposure.
+
 ## 2026-11-20 — Fable Guard, Earlier Proactive Fable Rotation & Manual-Switch Protection
 
 - **Fable Guard — Exclude Non-Fable Team/Pro Seats from Auto-Rotation (`accounts.py`, `app.py`, `themes/belkins.py`, `contracts.py`):**

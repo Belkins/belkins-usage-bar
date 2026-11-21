@@ -129,6 +129,7 @@ bswap                       # Launch interactive arrow-key TUI (Switch, Watch, S
 bswap update                # Pull latest Belkins Usage Bar from GitHub & restart menu-bar agent
 bswap claim                 # Claim your Daily Supply Crate (+150..300 CR & +15K..45K XP)
 bswap status                # Print Companion HUD + Claude & Codex fleet status in terminal
+bswap resets [--json]       # Show unified Claude & Codex Fleet Reset Radar, banked reset credits & advisor
 bswap watch                 # Launch live multi-account Watch monitor in TUI
 bswap roi [monthly_usd]     # Print 30d notional API value, subscription ROI multiple & cache savings
 bswap shim [on|off|status]  # Install/remove optional shell wrapper routing `claude` -> `bswap claude`
