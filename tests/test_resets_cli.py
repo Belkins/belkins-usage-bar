@@ -729,11 +729,16 @@ def test_bswap_resets_json_schema_and_zero_leaks() -> None:
 
 def test_strict_resets_module_contract_alignment() -> None:
     """When `cc_usage_widget.resets` is present, CLI delegates cleanly using exact contract fields."""
+    import cc_usage_widget as pkg
+
     strict_mod = _build_strict_contract_resets_module()
     fake_src = _FakeAccountSource(_sample_claude_rows(), sentinels={5: "re-login needed"})
     orig_mod = sys.modules.get("cc_usage_widget.resets")
+    had_pkg_attr = hasattr(pkg, "resets")
+    orig_pkg_attr = getattr(pkg, "resets", None)
     try:
         sys.modules["cc_usage_widget.resets"] = strict_mod
+        setattr(pkg, "resets", strict_mod)
         with tempfile.TemporaryDirectory() as tmp:
             with _isolated_env(Path(tmp), fake_source=fake_src):
                 # 1. Human mode
@@ -769,6 +774,10 @@ def test_strict_resets_module_contract_alignment() -> None:
             sys.modules.pop("cc_usage_widget.resets", None)
         else:
             sys.modules["cc_usage_widget.resets"] = orig_mod
+        if had_pkg_attr:
+            setattr(pkg, "resets", orig_pkg_attr)
+        elif hasattr(pkg, "resets"):
+            delattr(pkg, "resets")
 
 
 def test_resets_alias_dispatch_and_flags() -> None:
