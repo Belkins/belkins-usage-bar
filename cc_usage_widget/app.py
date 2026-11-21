@@ -274,6 +274,7 @@ _TITLE_TOGGLES = (
     # credit marker is listed only where Codex exists (see `_settings_submenu`).
     ("title_merge_alerts", "Merge alerts into ⚠N"),
     ("title_show_reset_credit", "Reset-credit marker (↺now)"),
+    ("title_show_next_unlock", "Next unlock countdown (🔓3h)"),
 )
 
 _HEADER_VIEW_LABELS: dict[str, str] = {
@@ -6349,6 +6350,10 @@ class CCUsageWidgetApp(rumps.App):
                 # next (nowhere to switch), so it is not dimmed like the rest.
                 room = _claude_room(snapshot)
                 parts.append([(fleet, "warn" if room is not None and room[0] == 0 else "dim")])
+        if settings.get("title_show_next_unlock", False):
+            unlock_tok = self._title_next_unlock_token(snapshot)
+            if unlock_tok:
+                parts.append(unlock_tok)
         if getattr(self, "_running", False) and len(render.join_title_tokens(parts)) > 16:
             slim: list[list[tuple[str, str | None]]] = []
             for idx, group in enumerate(parts):
@@ -6484,6 +6489,73 @@ class CCUsageWidgetApp(rumps.App):
         ):
             return False
         return (getattr(row, "reset_credits_usable", None) or 0) > 0
+
+    def _title_next_unlock_token(
+        self, snapshot: UiSnapshot
+    ) -> list[tuple[str, str | None]]:
+        """Compact ``🔓3h`` / ``🔓45m`` token when a capped Claude Fable or Codex
+        seat unlocks within 24 hours (opt-in via ``title_show_next_unlock``).
+
+        Zero I/O, lazy-imports ``cc_usage_widget.resets`` with a safe fallback,
+        and never runs when the setting is at its default ``False``.
+        """
+        try:
+            from . import resets as _resets_mod
+        except Exception:
+            return []
+        builder = getattr(_resets_mod, "build_fleet_reset_radar", None)
+        if not callable(builder):
+            return []
+        try:
+            radar = builder(
+                snapshot.accounts,
+                self._visible_quota_rows(snapshot),
+                account_notes=snapshot.account_notes,
+                now=self._now(),
+                fable_guard=bool(snapshot.settings.get("belkins_fable_guard", True)),
+            )
+        except Exception:
+            return []
+        if radar is None:
+            return []
+        candidates: list[Any] = []
+        cap = getattr(radar, "capacity", None)
+        if cap is not None:
+            for ev in (
+                getattr(cap, "claude_next_unlock", None),
+                getattr(cap, "codex_next_unlock", None),
+            ):
+                if ev is not None:
+                    candidates.append(ev)
+        if not candidates:
+            for ev in getattr(radar, "unlocks", ()) or ():
+                if getattr(ev, "disabled", False) or getattr(ev, "no_fable", False):
+                    continue
+                candidates.append(ev)
+        valid: list[tuple[float, Any]] = []
+        for ev in candidates:
+            raw_secs = getattr(ev, "seconds_until", None)
+            if raw_secs is None or isinstance(raw_secs, bool):
+                continue
+            try:
+                secs = float(raw_secs)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(secs) and 0.0 <= secs <= 86_400.0:
+                valid.append((secs, ev))
+        if not valid:
+            return []
+        secs, _soonest = min(valid, key=lambda pair: pair[0])
+        if secs < 60.0:
+            short = "<1m"
+        elif secs < 3_600.0:
+            mins = max(1, int(round(secs / 60.0)))
+            short = "1h" if mins >= 60 else f"{mins}m"
+        else:
+            hrs = max(1, int(round(secs / 3_600.0)))
+            short = f"{hrs}h"
+        kind = "good" if secs <= 3_600.0 else "dim"
+        return [(f"🔓{short}", kind)]
 
     @staticmethod
     def _title_threshold(snapshot: UiSnapshot) -> float:
@@ -9399,6 +9471,21 @@ class CCUsageWidgetApp(rumps.App):
                     callback=self._make_setting_toggle("expiring_quota_alert_enabled"),
                 ),
                 exp_quota_on,
+            )
+        )
+        imminent_on = bool(
+            settings.get(
+                "reset_imminent_alert_enabled",
+                SETTINGS_DEFAULTS["reset_imminent_alert_enabled"],
+            )
+        )
+        children.append(
+            _check(
+                rumps.MenuItem(
+                    self._switch_label("Imminent unlock & reset-credit alerts", imminent_on),
+                    callback=self._make_setting_toggle("reset_imminent_alert_enabled"),
+                ),
+                imminent_on,
             )
         )
         thresh = int(

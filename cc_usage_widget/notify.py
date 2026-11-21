@@ -155,6 +155,20 @@ this threshold while Auto-switch is OFF."""
 FABLE_BURN_RECOVER_MINUTES: Final[float] = 15.0
 """Hysteresis ceiling so ETA jitter around 12 min does not re-trigger the alert."""
 
+IMMINENT_UNLOCK_PCT: Final[float] = 95.0
+"""Utilization floor (>= 95%) for an imminent-unlock notification."""
+
+IMMINENT_UNLOCK_SECONDS: Final[float] = 15.0 * 60.0
+"""Lead time (<= 15 min) before reset when an imminent-unlock alert fires once."""
+
+RESET_CREDIT_ALERT_PCT: Final[float] = 90.0
+"""Weekly Codex utilization floor (>= 90%) for the reset-credit-ready alert."""
+
+_RESET_BUCKET_SECONDS: Final[int] = 1800
+"""Nearest 30-minute bucket for reset-window dedup keys, absorbing minor API
+``reset_after_seconds`` drift across boundaries while staying distinct across
+5h/7d cycles."""
+
 SPEND_CAP_PCT: Final[float] = 100.0
 """An extra-usage spend limit at or past this is ``crit``: the next request is
 billed past the limit the operator set, or refused."""
@@ -411,6 +425,7 @@ def _standing_conditions(
     now: float | None = None,
     threshold: float | None = None,
     unpriced_min_tokens: int | None = None,
+    reset_imminent_alert_enabled: bool | None = None,
 ) -> dict[str, Event]:
     """Conditions that are simply TRUE of one snapshot, keyed by ledger key.
 
@@ -428,14 +443,19 @@ def _standing_conditions(
     out: dict[str, Event] = {}
     if snapshot is None:
         return out
+    imminent_on = _reset_imminent_enabled(snapshot, reset_imminent_alert_enabled)
     if now is not None:
         out.update(_expiring_conditions(snapshot, now=now))
         out.update(_expiring_quota_conditions(snapshot, now=now))
+        if imminent_on:
+            out.update(_imminent_unlock_conditions(snapshot, now=now))
     if threshold is not None:
         out.update(_spend_conditions(snapshot, threshold=threshold))
     if unpriced_min_tokens:
         out.update(_unpriced_conditions(snapshot, min_tokens=unpriced_min_tokens))
     out.update(_reset_usable_conditions(snapshot))
+    if imminent_on:
+        out.update(_codex_reset_credit_conditions(snapshot, now=now))
     out.update(_latched_session_conditions(snapshot))
     out.update(_fable_burn_conditions(snapshot))
 
@@ -777,6 +797,262 @@ def _unpriced_conditions(snapshot: Any, *, min_tokens: int) -> dict[str, Event]:
     return out
 
 
+def _reset_imminent_enabled(snapshot: Any, override: bool | None = None) -> bool:
+    """Whether imminent-unlock and Codex reset-credit alerts are enabled."""
+    if override is not None:
+        return bool(override)
+    snap_settings = getattr(snapshot, "settings", None)
+    if isinstance(snap_settings, Mapping):
+        return bool(
+            snap_settings.get(
+                "reset_imminent_alert_enabled",
+                SETTINGS_DEFAULTS["reset_imminent_alert_enabled"],
+            )
+        )
+    return bool(SETTINGS_DEFAULTS["reset_imminent_alert_enabled"])
+
+
+_WEEKDAY_ABBR: Final[Mapping[str, int]] = {
+    "mon": 0,
+    "tue": 1,
+    "wed": 2,
+    "thu": 3,
+    "fri": 4,
+    "sat": 5,
+    "sun": 6,
+}
+
+
+def _parse_reset_epoch(value: Any, *, now: float | None = None) -> float | None:
+    """Parse an epoch, ISO-8601 timestamp, or local reset clock to POSIX seconds.
+
+    Delegates to ``cc_usage_widget.resets.parse_reset_epoch`` when available,
+    falling back to a pure-stdlib parser so this works before and after merge.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        from . import resets as _resets_mod
+    except Exception:
+        _resets_mod = None
+    parser = getattr(_resets_mod, "parse_reset_epoch", None)
+    if callable(parser):
+        try:
+            res = parser(value, now=now)
+            if res is not None:
+                return float(res)
+        except Exception:
+            pass
+    if isinstance(value, (int, float)):
+        val = float(value)
+        return val if math.isfinite(val) and val > 0.0 else None
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    iso = _parse_iso_epoch(raw)
+    if iso is not None:
+        return iso
+    if now is None:
+        return None
+    try:
+        base = dt.datetime.fromtimestamp(float(now))
+    except (OSError, OverflowError, TypeError, ValueError):
+        return None
+    parts = raw.split()
+    # "HH:MM"
+    if len(parts) == 1 and ":" in parts[0]:
+        hh_s, _, mm_s = parts[0].partition(":")
+        if hh_s.isdigit() and mm_s.isdigit() and len(mm_s) == 2:
+            hh, mm = int(hh_s), int(mm_s)
+            if 0 <= hh <= 23 and 0 <= mm <= 59:
+                cand = base.replace(hour=hh, minute=mm, second=0, microsecond=0)
+                if cand.timestamp() < float(now) - 30.0:
+                    cand = cand + dt.timedelta(days=1)
+                return cand.timestamp()
+    # "Mon HH:MM"
+    if len(parts) == 2 and parts[0].lower()[:3] in _WEEKDAY_ABBR and ":" in parts[1]:
+        hh_s, _, mm_s = parts[1].partition(":")
+        if hh_s.isdigit() and mm_s.isdigit() and len(mm_s) == 2:
+            hh, mm = int(hh_s), int(mm_s)
+            if 0 <= hh <= 23 and 0 <= mm <= 59:
+                target_wd = _WEEKDAY_ABBR[parts[0].lower()[:3]]
+                delta_days = (target_wd - base.weekday()) % 7
+                cand = (base + dt.timedelta(days=delta_days)).replace(
+                    hour=hh, minute=mm, second=0, microsecond=0
+                )
+                if cand.timestamp() < float(now) - 30.0:
+                    cand = cand + dt.timedelta(days=7)
+                return cand.timestamp()
+    # "Nov 27 13:00"
+    try:
+        cand = dt.datetime.strptime(f"{base.year} {raw}", "%Y %b %d %H:%M")
+    except ValueError:
+        return None
+    if cand < base - dt.timedelta(days=183):
+        try:
+            cand = cand.replace(year=base.year + 1)
+        except ValueError:
+            return None
+    elif cand > base + dt.timedelta(days=183):
+        try:
+            cand = cand.replace(year=base.year - 1)
+        except ValueError:
+            return None
+    return cand.timestamp()
+
+
+def _reset_bucket(epoch: float | None) -> str:
+    """Stable dedup bucket for a reset window, rounded to nearest 30 minutes."""
+    if epoch is None:
+        return "none"
+    try:
+        val = float(epoch)
+    except (TypeError, ValueError):
+        return "none"
+    if not math.isfinite(val):
+        return "none"
+    return str(int(round(val / _RESET_BUCKET_SECONDS)) * _RESET_BUCKET_SECONDS)
+
+
+def _imminent_unlock_conditions(snapshot: Any, *, now: float) -> dict[str, Event]:
+    """``unlock_soon:<vendor>:<slot>:<window>:<reset_bucket>`` — capped seat
+    (>= 95% Claude Fable or Codex) unlocking within 15 minutes.
+    """
+    out: dict[str, Event] = {}
+    notes = getattr(snapshot, "account_notes", None)
+    noted_slots = set(notes.keys()) if isinstance(notes, Mapping) else set()
+    for key, row in _rows(snapshot).items():
+        if bool(getattr(row, "disabled", False)):
+            continue
+        vendor = str(getattr(row, "vendor", "claude") or "claude")
+        attn_kind = (getattr(row, "attention_kind", "") or "").strip()
+        if attn_kind == SEVERITY_WARN:
+            continue
+        slot = getattr(row, "slot", "?")
+        if vendor == "claude" and slot in noted_slots:
+            continue
+        expired = set(getattr(row, "expired_windows", ()) or ())
+        candidates: list[tuple[str, float, Any, Any]] = []
+        if vendor == "claude":
+            scoped_resets = dict(getattr(row, "scoped_resets_at", ()) or ())
+            for name, pct in getattr(row, "scoped_windows", ()) or ():
+                if name in expired or pct is None or isinstance(pct, bool):
+                    continue
+                if not str(name).strip().lower().startswith("fable"):
+                    continue
+                try:
+                    pct_val = float(pct)
+                except (TypeError, ValueError):
+                    continue
+                if pct_val >= IMMINENT_UNLOCK_PCT:
+                    candidates.append((str(name), pct_val, scoped_resets.get(name), None))
+        elif vendor == VENDOR_CODEX:
+            soonest = getattr(row, "soonest_reset_at", None)
+            if _SEVEN_DAY_KEY not in expired:
+                pct7 = getattr(row, "seven_day_pct", None)
+                if pct7 is not None and not isinstance(pct7, bool):
+                    try:
+                        pct7_val = float(pct7)
+                    except (TypeError, ValueError):
+                        pct7_val = -1.0
+                    if pct7_val >= IMMINENT_UNLOCK_PCT:
+                        candidates.append(
+                            ("7d", pct7_val, getattr(row, "seven_day_resets_at", None), soonest)
+                        )
+            if _FIVE_HOUR_KEY not in expired:
+                pct5 = getattr(row, "five_hour_pct", None)
+                if pct5 is not None and not isinstance(pct5, bool):
+                    try:
+                        pct5_val = float(pct5)
+                    except (TypeError, ValueError):
+                        pct5_val = -1.0
+                    if pct5_val >= IMMINENT_UNLOCK_PCT:
+                        candidates.append(
+                            (
+                                "5h",
+                                pct5_val,
+                                getattr(row, "five_hour_resets_at", None),
+                                soonest if not candidates else None,
+                            )
+                        )
+        name = _display_name(row)
+        for win_label, _pct_val, raw_reset, fallback_epoch in candidates:
+            reset_epoch = _parse_reset_epoch(raw_reset, now=now)
+            if reset_epoch is None and fallback_epoch is not None:
+                reset_epoch = _parse_reset_epoch(fallback_epoch, now=now)
+            if reset_epoch is None:
+                continue
+            left = reset_epoch - float(now)
+            if not (0.0 < left <= IMMINENT_UNLOCK_SECONDS):
+                continue
+            mins = max(1, int(round(left / 60.0)))
+            bucket = _reset_bucket(reset_epoch)
+            ledger_key = f"unlock_soon:{vendor}:{slot}:{win_label}:{bucket}"
+            out[ledger_key] = Event(
+                key=ledger_key,
+                kind="unlock_soon",
+                severity=SEVERITY_INFO,
+                scope=key,
+                title=f"{vendor_label(vendor)} {name}",
+                subtitle=f"{win_label} unlocks in {mins}m",
+                message=f"🔓 {name} ({win_label}) unlocks in {mins}m — fresh capacity incoming",
+            )
+    return out
+
+
+def _codex_reset_credit_conditions(
+    snapshot: Any, *, now: float | None = None
+) -> dict[str, Event]:
+    """``reset_credit:<slot>:<reset_bucket>`` — Codex seat >= 90% with usable reset credits."""
+    out: dict[str, Event] = {}
+    for key, row in _rows(snapshot).items():
+        if getattr(row, "vendor", "") != VENDOR_CODEX:
+            continue
+        if bool(getattr(row, "disabled", False)):
+            continue
+        if (getattr(row, "attention_kind", "") or "").strip() == SEVERITY_WARN:
+            continue
+        expired = set(getattr(row, "expired_windows", ()) or ())
+        if _SEVEN_DAY_KEY in expired:
+            continue
+        usable = getattr(row, "reset_credits_usable", None)
+        if usable is None or isinstance(usable, bool):
+            continue
+        try:
+            count = int(usable)
+        except (TypeError, ValueError):
+            continue
+        if count < 1:
+            continue
+        pct = getattr(row, "seven_day_pct", None)
+        if pct is None or isinstance(pct, bool):
+            continue
+        try:
+            pct_val = float(pct)
+        except (TypeError, ValueError):
+            continue
+        if pct_val < RESET_CREDIT_ALERT_PCT:
+            continue
+        reset_epoch = _parse_reset_epoch(getattr(row, "seven_day_resets_at", None), now=now)
+        if reset_epoch is None:
+            reset_epoch = _parse_reset_epoch(getattr(row, "soonest_reset_at", None), now=now)
+        bucket = _reset_bucket(reset_epoch)
+        slot = getattr(row, "slot", "?")
+        name = _display_name(row)
+        noun = "credit" if count == 1 else "credits"
+        ledger_key = f"reset_credit:{slot}:{bucket}"
+        out[ledger_key] = Event(
+            key=ledger_key,
+            kind="reset_credit",
+            severity=SEVERITY_WARN,
+            scope=key,
+            title=f"{vendor_label(VENDOR_CODEX)} {name}",
+            subtitle=f"Codex {format_pct(pct_val)} · {count} reset {noun} usable",
+            message=f"⚡ {name} (Codex {format_pct(pct_val)}) has {count} usable reset {noun} available",
+        )
+    return out
+
+
 def _reset_usable_conditions(snapshot: Any) -> dict[str, Event]:
     """``reset-usable:<row>`` — a Codex reset credit that can be spent now.
 
@@ -967,6 +1243,7 @@ def detect(
     threshold: float | None = None,
     now: float | None = None,
     unpriced_min_tokens: int | None = None,
+    reset_imminent_alert_enabled: bool | None = None,
 ) -> list[Event]:
     """Everything that became true between *previous* and *current*. PURE.
 
@@ -982,6 +1259,8 @@ def detect(
             clock) leaves the pre-expiry rule out, which keeps this pure.
         unpriced_min_tokens: the unpriced-model floor; ``None`` means the
             settings default, 0 turns the rule off.
+        reset_imminent_alert_enabled: override for imminent-unlock and Codex
+            reset-credit alerts; ``None`` reads ``snapshot.settings``.
 
     Returns:
         Events in a stable order: percentage transitions first, then standing
@@ -993,7 +1272,12 @@ def detect(
         {"unpriced_alert_min_tokens": unpriced_min_tokens} if unpriced_min_tokens is not None else None
     )
     events = _pct_events(previous, current, threshold=limit)
-    options = {"now": now, "threshold": limit, "unpriced_min_tokens": floor}
+    options = {
+        "now": now,
+        "threshold": limit,
+        "unpriced_min_tokens": floor,
+        "reset_imminent_alert_enabled": reset_imminent_alert_enabled,
+    }
     before = _standing_conditions(previous, **options)
     standing = _standing_conditions(current, **options)
     for key in sorted(standing):
@@ -1008,6 +1292,7 @@ def retained_keys(
     threshold: float,
     now: float | None = None,
     unpriced_min_tokens: int | None = None,
+    reset_imminent_alert_enabled: bool | None = None,
 ) -> set[str]:
     """Ledger keys whose condition is still true of *snapshot*.
 
@@ -1017,7 +1302,11 @@ def retained_keys(
     """
     keys: set[str] = set(
         _standing_conditions(
-            snapshot, now=now, threshold=threshold, unpriced_min_tokens=unpriced_min_tokens
+            snapshot,
+            now=now,
+            threshold=threshold,
+            unpriced_min_tokens=unpriced_min_tokens,
+            reset_imminent_alert_enabled=reset_imminent_alert_enabled,
         )
     )
     if snapshot is not None:
@@ -1469,12 +1758,20 @@ class Notifier:
     def observe(self, previous: Any, current: Any, *, now: float | None = None) -> list[Event]:
         """:func:`detect` at the configured threshold and unpriced floor, judged
         at *now* (default: the injected clock). No I/O, no sends."""
+        settings = self._current_settings()
+        reset_imminent = bool(
+            settings.get(
+                "reset_imminent_alert_enabled",
+                SETTINGS_DEFAULTS["reset_imminent_alert_enabled"],
+            )
+        )
         return detect(
             previous,
             current,
             threshold=self.threshold(),
             now=float(self._clock()) if now is None else float(now),
             unpriced_min_tokens=self.unpriced_floor(),
+            reset_imminent_alert_enabled=reset_imminent,
         )
 
     def unpriced_floor(self) -> int:
@@ -1504,6 +1801,12 @@ class Notifier:
             return []
         threshold = self.threshold()
         floor = self.unpriced_floor()
+        reset_imminent = bool(
+            settings.get(
+                "reset_imminent_alert_enabled",
+                SETTINGS_DEFAULTS["reset_imminent_alert_enabled"],
+            )
+        )
         now = float(self._clock())
         events = self.observe(previous, current, now=now)
         fresh = [event for event in events if not self._ledger.suppressed(event.key)]
@@ -1513,7 +1816,11 @@ class Notifier:
         # standing set directly, and committing it below restamps its age.
         sent = {event.key for event in fresh}
         standing = _standing_conditions(
-            current, now=now, threshold=threshold, unpriced_min_tokens=floor
+            current,
+            now=now,
+            threshold=threshold,
+            unpriced_min_tokens=floor,
+            reset_imminent_alert_enabled=reset_imminent,
         )
         for key in sorted(standing):
             if key in sent or not rearms(key):
@@ -1526,7 +1833,13 @@ class Notifier:
         # the next time it walls, and that release happens on a quiet tick.
         self._ledger.commit(
             fresh,
-            retained_keys(current, threshold=threshold, now=now, unpriced_min_tokens=floor),
+            retained_keys(
+                current,
+                threshold=threshold,
+                now=now,
+                unpriced_min_tokens=floor,
+                reset_imminent_alert_enabled=reset_imminent,
+            ),
             observed_scopes(current),
             now=now,
         )

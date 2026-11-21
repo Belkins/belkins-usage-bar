@@ -73,6 +73,7 @@ _TAB_ACCENTS: dict[str, str] = {
 _ACTIVE_TAB: str = "party"
 _DEX_SUBTAB: str = "pokedex"     # "pokedex" | "trophies"
 _SHOP_SUBTAB: str = "gear"       # "gear" | "style"
+_RESET_RADAR_EXPANDED: bool = False
 _LAST_SHOP_NOTE: str = ""
 _LAST_BOSS_NOTE: str = ""
 _LAST_CFG_NOTE: str = ""
@@ -80,6 +81,20 @@ _LIVE_SETTINGS: dict[str, Any] = {}
 _LIVE_AUTOSWITCH: bool = True
 _LIVE_AUTOSWITCH_THRESHOLD: float = 85.0
 _HUB_VIEWS: tuple[str, ...] = ("luxury", "detailed", "bento", "cleanmymac")
+
+
+def get_reset_radar_expanded() -> bool:
+    return bool(_RESET_RADAR_EXPANDED)
+
+
+def set_reset_radar_expanded(expanded: bool) -> None:
+    global _RESET_RADAR_EXPANDED
+    _RESET_RADAR_EXPANDED = bool(expanded)
+
+
+def toggle_reset_radar_expanded() -> None:
+    global _RESET_RADAR_EXPANDED
+    _RESET_RADAR_EXPANDED = not _RESET_RADAR_EXPANDED
 
 
 def _cur_hub_view(snapshot: Any = None) -> str:
@@ -1385,6 +1400,79 @@ def _fmt_burn_eta(eta_min: float) -> str:
     return f"~{hrs}h {rem}m to wall" if rem else f"~{hrs}h to wall"
 
 
+def _concise_reset_clock(
+    A: Any,
+    row: Any,
+    window_label: str,
+    reset_mark: str,
+    now: float,
+) -> str:
+    """Compact reset countdown/clock (e.g. ``↺ 3h``, ``↺ 4d``, ``↺ Mon``, ``↺ 13:00``)."""
+    epoch: float | None = None
+    vendor = str(getattr(row, "vendor", "claude") or "claude")
+    raw_reset: Any = None
+    if vendor == "claude":
+        if window_label:
+            raw_reset = A._window_reset(row, window_label)
+        if not raw_reset:
+            raw_reset = A._primary_reset(row)
+    else:
+        raw_reset = getattr(row, "seven_day_resets_at", None) or A._primary_reset(row)
+        soonest = getattr(row, "soonest_reset_at", None)
+        if isinstance(soonest, (int, float)) and not isinstance(soonest, bool):
+            epoch = float(soonest)
+    if epoch is None and raw_reset:
+        try:
+            from .. import resets as _resets_mod
+
+            parser = getattr(_resets_mod, "parse_reset_epoch", None)
+            if callable(parser):
+                epoch = parser(raw_reset, now=now)
+        except Exception:
+            epoch = None
+        if epoch is None and isinstance(raw_reset, str):
+            try:
+                epoch = A._reset_clock_epoch(raw_reset, now)
+            except Exception:
+                epoch = None
+    if epoch is not None and math.isfinite(epoch):
+        secs = epoch - float(now)
+        if secs > 0.0:
+            if secs < 60.0:
+                return "↺ <1m"
+            if secs < 3_600.0:
+                mins = max(1, int(round(secs / 60.0)))
+                return "↺ 1h" if mins >= 60 else f"↺ {mins}m"
+            if secs < 86_400.0:
+                hrs = max(1, int(round(secs / 3_600.0)))
+                return "↺ 1d" if hrs >= 24 else f"↺ {hrs}h"
+            days = max(1, int(round(secs / 86_400.0)))
+            return f"↺ {days}d"
+    return _short_reset_mark(reset_mark or "", ultra_short=True)
+
+
+def _fleet_reset_radar(A: Any, snapshot: Any, now: float) -> Any | None:
+    """Lazily build ``FleetResetRadar`` via ``cc_usage_widget.resets`` (safe fallback when absent)."""
+    try:
+        from .. import resets as _resets_mod
+    except Exception:
+        return None
+    builder = getattr(_resets_mod, "build_fleet_reset_radar", None)
+    if not callable(builder):
+        return None
+    try:
+        visible_quota = A._visible_quota_rows_of(snapshot)
+        return builder(
+            getattr(snapshot, "accounts", ()) or (),
+            visible_quota,
+            account_notes=getattr(snapshot, "account_notes", None),
+            now=now,
+            fable_guard=bool(snapshot.settings.get("belkins_fable_guard", True)),
+        )
+    except Exception:
+        return None
+
+
 def _claude_tip(
     A: Any,
     row: Any,
@@ -1591,6 +1679,10 @@ def _claude_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) -
                 f"{row_tip}\nNo included Fable weekly allowance (Fable 5.2 requires usage credits) — "
                 "skipped by Fable Auto-Switch. Click only if switching manually for Sonnet/Opus."
             )
+        reset_mark = A._reset_mark_text(A._window_reset(r, binding[0]), now) if binding else (
+            A._reset_mark_text(A._primary_reset(r), now)
+        )
+        reset_short = _concise_reset_clock(A, r, binding[0] if binding else "", reset_mark, now)
         rows.append(
             {
                 "key": f"belkins-claude-{r.slot}",
@@ -1608,7 +1700,8 @@ def _claude_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) -
                 "label": binding[0] if binding else "",
                 "pct": binding[1] if binding else None,
                 "sev": R.severity(binding[1]) if binding else "dim",
-                "reset": A._reset_mark_text(A._window_reset(r, binding[0]), now) if binding else "",
+                "reset": reset_mark,
+                "reset_short": reset_short,
                 "withheld": None,
                 "captions": caps,
                 "tip": row_tip,
@@ -1686,6 +1779,10 @@ def _codex_tip(A: Any, row: Any, now: float) -> str:
     win = A._plan_window(row)
     if win and win[1] is not None:
         lines.append(f"{win[0]} {format_pct(win[1])} {A._quota_reset_mark(row, now)}")
+    avail_cr = int(getattr(row, "reset_credits_available", None) or 0)
+    usable_cr = int(getattr(row, "reset_credits_usable", None) or 0)
+    if avail_cr > 0 or usable_cr > 0:
+        lines.append(f"Banked reset credits: {avail_cr}× ({usable_cr}× usable now)")
     note, _ = A._quota_note(row)
     if note:
         lines.append(note)
@@ -1739,6 +1836,8 @@ def _codex_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) ->
             "bars": [(win[0], win[1], A._quota_reset_mark(active, now), win[2])] if known else [],
             "captions": caps,
             "captions_compact": caps_compact,
+            "reset_credits_available": int(getattr(active, "reset_credits_available", None) or 0),
+            "reset_credits_usable": int(getattr(active, "reset_credits_usable", None) or 0),
             "tip": _codex_tip(A, active, now),
             "action": act,
         }
@@ -1764,6 +1863,8 @@ def _codex_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) ->
             if (win and win[1] is not None and not win[2])
             else None
         )
+        reset_mark = A._quota_reset_mark(r, now) if win else ""
+        reset_short = _concise_reset_clock(A, r, "7d", reset_mark, now) if win else ""
         rows.append(
             {
                 "key": f"belkins-codex-{r.slot}",
@@ -1780,7 +1881,10 @@ def _codex_spec(A: Any, R: Any, snap: Any, now: float, actions: ThemeActions) ->
                 "label": "",
                 "pct": win[1] if win else None,
                 "sev": "dim" if (not win or win[2]) else R.severity(win[1]),
-                "reset": A._quota_reset_mark(r, now) if win else "",
+                "reset": reset_mark,
+                "reset_short": reset_short,
+                "reset_credits_available": int(getattr(r, "reset_credits_available", None) or 0),
+                "reset_credits_usable": int(getattr(r, "reset_credits_usable", None) or 0),
                 "withheld": None,
                 "captions": caps,
                 "tip": _codex_tip(A, r, now),
@@ -1998,10 +2102,22 @@ def _hero(hero: dict[str, Any], *, compact: bool = False) -> Callable[[Any, floa
             bw = text_w(pen, badge_txt, "primary_med")
             text(pen, badge_txt, "primary_med", badge_role, px1, b1, right=True)
 
+        # Codex banked / usable reset-credit pill beside the right-aligned readout
+        cred_usable = int(hero.get("reset_credits_usable", 0) or 0)
+        cred_avail = int(hero.get("reset_credits_available", 0) or 0)
+        if cred_usable > 0 or cred_avail > 0:
+            cred_lbl = f"↺ USE {cred_usable}×" if cred_usable > 0 else f"↺ {cred_avail}×"
+            cred_role = "good_text" if cred_usable > 0 else "belkins_cmm_aqua"
+            cred_bg = "belkins_good_pill" if cred_usable > 0 else "belkins_plan_pill"
+            cred_w = _pill_w(pen, cred_lbl)
+            cred_x = (px1 - bw - 6.0 - cred_w) if bw > 0 else (px1 - cred_w)
+            pen.pill(cred_lbl, cred_x, b1 - 0.5, F["tag"][0], role=cred_role, bg=cred_bg, weight="semibold")
+            bw = (bw + 6.0 + cred_w) if bw > 0 else cred_w
+
         # Live status dot + Account Name + ACTIVE badge (Plan label shown in expanded tab view)
         pen.circle(px0, b1 - 7.5, 6.4, sev_dot)
         nx = px0 + 11.5
-        name_max = max(60.0, px1 - bw - 12.0 - nx)
+        name_max = max(56.0, px1 - bw - 10.0 - nx)
         act_lbl = "ACTIVE"
         act_w = _pill_w(pen, act_lbl) + 6.5
         plan_raw = (hero.get("plan") or "").split("·")[0].strip() if not compact else ""
@@ -2178,6 +2294,25 @@ def _row_hub(r: dict[str, Any]) -> Callable[[Any, float], float]:
         rw = text_w(pen, free_s, "caption_med")
         text(pen, free_s, "caption_med", free_role, X1 - 2.0, b, right=True)
 
+        cred_usable = int(r.get("reset_credits_usable", 0) or 0)
+        cred_avail = int(r.get("reset_credits_available", 0) or 0)
+        if cred_usable > 0 or cred_avail > 0:
+            c_lbl = f"↺ USE {cred_usable}×" if cred_usable > 0 else f"↺ {cred_avail}×"
+            c_role = "good_text" if cred_usable > 0 else "belkins_cmm_aqua"
+            c_bg = "belkins_good_pill" if cred_usable > 0 else "belkins_plan_pill"
+            c_w = _pill_w(pen, c_lbl)
+            if (X1 - 2.0 - rw - 6.0 - c_w) >= x + 64.0:
+                pen.pill(
+                    c_lbl,
+                    X1 - 2.0 - rw - 6.0 - c_w,
+                    b - 0.5,
+                    F["tag"][0],
+                    role=c_role,
+                    bg=c_bg,
+                    weight="semibold",
+                )
+                rw += c_w + 6.0
+
         # Left side: Account Name + quiet `NEXT` / `BEST` indicator only
         avail_w = max(60.0, (X1 - rw - 14.0) - x)
         tag_cap = next((c[0] for c in r["captions"] if c[1] == "tag"), "")
@@ -2245,9 +2380,12 @@ def _row(r: dict[str, Any]) -> Callable[[Any, float], float]:
                 right_edge -= pw_pause + 6.0
 
             if free_pct is not None:
+                rst_s = str(
+                    r.get("reset_short") or _short_reset_mark(r.get("reset") or "", ultra_short=True)
+                ).strip()
                 if free_pct <= 0:
-                    short_rst = _short_reset_mark(r.get("reset") or "", ultra_short=True)
-                    sw_lbl = f"Capped {short_rst}".strip() if short_rst else "Capped"
+                    rst_bare = rst_s.lstrip("↺ ").strip()
+                    sw_lbl = f"Capped · {rst_bare}" if rst_bare else "Capped"
                     sw_role = "crit_text"
                     bar_val: float | None = 0.0
                     bar_sev = "crit"
@@ -2261,13 +2399,37 @@ def _row(r: dict[str, Any]) -> Callable[[Any, float], float]:
                     sw_role = "good_text"
                     bar_val = float(free_pct)
                     bar_sev = "ok"
-                sw_w = max(34.0, text_w(pen, sw_lbl, "caption_med"))
+                sw_w = max(32.0, text_w(pen, sw_lbl, "caption_med"))
                 text(pen, sw_lbl, "caption_med", sw_role, right_edge, b, right=True)
-                right_edge -= sw_w + 8.0
+                right_edge -= sw_w + 6.0
                 if free_pct > 0:
-                    bar_w = 46.0
+                    bar_w = 38.0
                     luxury_bar(pen, right_edge - bar_w, b - 3.6, bar_w, bar_val, bar_sev, h=4.2)
-                    right_edge -= bar_w + 10.0
+                    right_edge -= bar_w + 7.0
+                    if rst_s:
+                        rst_w = text_w(pen, rst_s, "num_small")
+                        if right_edge - rst_w - 6.0 >= x + 52.0:
+                            text(pen, rst_s, "num_small", "belkins_cmm_sub", right_edge, b, right=True)
+                            right_edge -= rst_w + 6.0
+
+            cred_usable = int(r.get("reset_credits_usable", 0) or 0)
+            cred_avail = int(r.get("reset_credits_available", 0) or 0)
+            if cred_usable > 0 or cred_avail > 0:
+                c_lbl = f"↺ USE {cred_usable}×" if cred_usable > 0 else f"↺ {cred_avail}×"
+                c_role = "good_text" if cred_usable > 0 else "belkins_cmm_aqua"
+                c_bg = "belkins_good_pill" if cred_usable > 0 else "belkins_plan_pill"
+                c_w = _pill_w(pen, c_lbl)
+                if right_edge - c_w - 6.0 >= x + 48.0:
+                    pen.pill(
+                        c_lbl,
+                        right_edge - c_w,
+                        b - 0.5,
+                        F["tag"][0],
+                        role=c_role,
+                        bg=c_bg,
+                        weight="semibold",
+                    )
+                    right_edge -= c_w + 6.0
 
         if r["slot"]:
             text(pen, r["slot"], "slot", "belkins_cmm_sub", X0 + 15.0, b, right=True)
@@ -3064,6 +3226,321 @@ def _draw_provider_bento_tile(
     text(pen, act_txt, "caption_med", "belkins_cmm_aqua", ix_right, b3, right=True, maxw=inner_w)
 
 
+def _reset_radar_card(
+    radar: Any,
+    snapshot: Any,
+    actions: ThemeActions,
+    *,
+    expanded: bool = False,
+    key_prefix: str = "belkins-hub-radar",
+) -> _Card | None:
+    """Unified Minimalist Luxury ``↺ Reset Radar`` card for the Hub tab."""
+    if radar is None:
+        return None
+    events = tuple(getattr(radar, "events", ()) or ())
+    credits = getattr(radar, "credits", None)
+    cap = getattr(radar, "capacity", None)
+    rec = getattr(radar, "recommendation", None)
+
+    live_credits = int(getattr(credits, "live_available", 0) or 0)
+    total_credits = int(getattr(credits, "total_available", 0) or 0)
+    usable_credits = int(getattr(credits, "total_usable", 0) or 0)
+    credit_accounts = tuple(getattr(credits, "accounts", ()) or ())
+
+    fable_free = float(getattr(cap, "claude_fable_free_seats", 0.0) or 0.0)
+    fable_total = int(getattr(cap, "claude_fable_total_seats", 0) or 0)
+    claude_locked = int(getattr(cap, "claude_locked_relogin_seats", 0) or 0)
+    claude_next = getattr(cap, "claude_next_unlock", None)
+    codex_free = float(getattr(cap, "codex_free_seats", 0.0) or 0.0)
+    codex_total = int(getattr(cap, "codex_total_seats", 0) or 0)
+    codex_locked = int(getattr(cap, "codex_locked_relogin_seats", 0) or 0)
+    codex_next = getattr(cap, "codex_next_unlock", None)
+    perishable_48h = float(getattr(cap, "perishable_seats_48h", 0.0) or 0.0)
+
+    if not events and live_credits <= 0 and fable_total <= 0 and codex_total <= 0:
+        return None
+
+    codex_alias_by_slot: dict[int, str] = {}
+    for row in getattr(snapshot, "quota_rows", ()) or ():
+        if getattr(row, "vendor", "") == "codex":
+            al = str(getattr(row, "alias", "") or "").strip()
+            if al:
+                try:
+                    codex_alias_by_slot[int(getattr(row, "slot", 0))] = al
+                except (TypeError, ValueError):
+                    pass
+
+    card = _Card("belkins_card", "belkins_card_edge", rule="belkins_codex_rule")
+    can_expand = len(events) > 3
+    toggle_lbl = "Compact" if expanded else "Show all"
+
+    # 1. Header: `↺ Reset Radar` + live banked reset credits badge + expandable toggle pill
+    def draw_head(pen: Any, y0: float) -> float:
+        base = y0 + HEAD_BASE
+        cur_r = X1
+        if can_expand:
+            tw_tog = _pill_w(pen, toggle_lbl)
+            pen.pill(
+                toggle_lbl,
+                cur_r - tw_tog,
+                base - 0.5,
+                F["tag"][0],
+                role="belkins_cmm_aqua",
+                bg="belkins_plan_pill",
+                weight="semibold",
+            )
+            cur_r -= tw_tog + 5.0
+        if live_credits > 0:
+            cr_lbl = f"↺ {live_credits}× banked"
+            cr_role = "good_text" if usable_credits > 0 else "belkins_cmm_aqua"
+            cr_bg = "belkins_good_pill" if usable_credits > 0 else "belkins_plan_pill"
+            tw_cr = _pill_w(pen, cr_lbl)
+            if cur_r - tw_cr >= X0 + 96.0:
+                pen.pill(
+                    cr_lbl,
+                    cur_r - tw_cr,
+                    base - 0.5,
+                    F["tag"][0],
+                    role=cr_role,
+                    bg=cr_bg,
+                    weight="semibold",
+                )
+                cur_r -= tw_cr + 5.0
+        text(pen, "↺ Reset Radar", "title", "label", X0, base, maxw=max(80.0, cur_r - X0 - 4.0))
+        return base + HEAD_AFTER - 2.0
+
+    head_tips = [f"Reset Radar · {len(events)} upcoming reset(s)"]
+    if live_credits > 0 or total_credits > 0:
+        head_tips.append(
+            f"Banked reset credits: {live_credits}× live / {total_credits}× total ({usable_credits}× usable now)"
+        )
+        for ca in credit_accounts:
+            ca_alias = str(getattr(ca, "alias", "") or f"#{getattr(ca, 'slot', '?')}")
+            ca_avail = int(getattr(ca, "available", 0) or 0)
+            ca_usable = int(getattr(ca, "usable", 0) or 0)
+            ca_relogin = " [re-login]" if getattr(ca, "needs_relogin", False) else ""
+            head_tips.append(f"  · {ca_alias}: {ca_avail}× ({ca_usable}× usable){ca_relogin}")
+    if perishable_48h > 0.0:
+        head_tips.append(f"Perishable quota <=48h: {perishable_48h:.1f} seat-eq")
+    if can_expand:
+        head_tips.append("Click to toggle Show all / Compact")
+
+    card.add(
+        draw_head,
+        key=f"{key_prefix}-head",
+        ax=". ".join(head_tips[:2]),
+        tooltip="\n".join(head_tips),
+        action=toggle_reset_radar_expanded if can_expand else None,
+        keep_open=True,
+    )
+
+    # 2. Compact 2-pill Fleet Runway Strip (Claude Fable + Codex)
+    fable_line1 = f"✦ Fable: {fable_free:.1f}/{fable_total} seats" if fable_total > 0 else "✦ Fable: —"
+    if claude_next is not None:
+        fable_line2 = f"Next 🔓 {getattr(claude_next, 'alias', '')} {getattr(claude_next, 'countdown_label', '')}".strip()
+        fable_line2_role = "good_text"
+    elif claude_locked > 0:
+        fable_line2 = f"{claude_locked} locked (re-login)"
+        fable_line2_role = "warn_text"
+    else:
+        fable_line2 = "All seats open" if fable_total > 0 else "No Fable seats"
+        fable_line2_role = "belkins_cmm_sub"
+
+    codex_line1 = f"◈ Codex: {codex_free:.1f}/{codex_total} seats" if codex_total > 0 else "◈ Codex: —"
+    if live_credits > 0 and codex_next is not None:
+        codex_line2 = f"↺ {live_credits}× · 🔓 {getattr(codex_next, 'countdown_label', '')}".strip()
+        codex_line2_role = "good_text" if usable_credits > 0 else "belkins_cmm_aqua"
+    elif live_credits > 0:
+        codex_line2 = (
+            f"↺ {live_credits}× ({usable_credits} usable)"
+            if usable_credits > 0
+            else f"↺ {live_credits}× banked"
+        )
+        codex_line2_role = "good_text" if usable_credits > 0 else "belkins_cmm_aqua"
+    elif codex_next is not None:
+        codex_line2 = f"Next 🔓 {getattr(codex_next, 'alias', '')} {getattr(codex_next, 'countdown_label', '')}".strip()
+        codex_line2_role = "good_text"
+    elif codex_locked > 0:
+        codex_line2 = f"{codex_locked} locked (re-login)"
+        codex_line2_role = "warn_text"
+    else:
+        codex_line2 = "All seats open" if codex_total > 0 else "No Codex seats"
+        codex_line2_role = "belkins_cmm_sub"
+
+    def draw_runway(pen: Any, y0: float) -> float:
+        gap = 6.0
+        pw = (W_INNER - gap) / 2.0
+        ph = 37.0
+        ly = y0 + 1.0
+        rx = X0 + pw + gap
+        pen.rrect(X0, ly, pw, ph, 8.0, "belkins_inner_panel", stroke="belkins_inner_edge", stroke_width=0.7)
+        pen.rrect(rx, ly, pw, ph, 8.0, "belkins_inner_panel", stroke="belkins_inner_edge", stroke_width=0.7)
+
+        b1 = ly + 14.5
+        b2 = ly + 29.0
+        inner_max = pw - 14.0
+        text(pen, fable_line1, "caption_med", "label", X0 + 7.5, b1, maxw=inner_max)
+        text(pen, fable_line2, "tag", fable_line2_role, X0 + 7.5, b2, maxw=inner_max)
+        text(pen, codex_line1, "caption_med", "label", rx + 7.5, b1, maxw=inner_max)
+        text(pen, codex_line2, "tag", codex_line2_role, rx + 7.5, b2, maxw=inner_max)
+        return ly + ph + 5.0
+
+    runway_tip = f"{fable_line1} ({fable_line2})\n{codex_line1} ({codex_line2})\nClick left for Claude tab, right for Codex tab"
+    card.add(
+        draw_runway,
+        key=f"{key_prefix}-runway",
+        ax=f"{fable_line1}, {fable_line2}. {codex_line1}, {codex_line2}.",
+        tooltip=runway_tip,
+        action=lambda: set_active_tab("claude"),
+        on_click_x=lambda cx: set_active_tab("claude" if cx < W / 2.0 else "codex"),
+        keep_open=True,
+    )
+
+    # 3. Upcoming Resets Timeline (top 3 in compact, up to 8 in expanded)
+    limit = 8 if expanded else 3
+    shown_events = events[:limit]
+    if shown_events:
+        card.add(_hair(), key=f"{key_prefix}-rule")
+        for idx, ev in enumerate(shown_events):
+            ev_vendor = str(getattr(ev, "vendor", "claude") or "claude")
+            ev_slot = int(getattr(ev, "slot", 0) or 0)
+            ev_alias = str(getattr(ev, "alias", "") or f"#{ev_slot}")
+            ev_window = str(getattr(ev, "window", "") or "")
+            ev_kind = str(getattr(ev, "kind", "upcoming") or "upcoming")
+            ev_countdown = str(getattr(ev, "countdown_label", "") or "")
+            ev_reset_lbl = str(getattr(ev, "reset_label", "") or "")
+            ev_secs = float(getattr(ev, "seconds_until", 0.0) or 0.0)
+            ev_disabled = bool(getattr(ev, "disabled", False))
+            ev_no_fable = bool(getattr(ev, "no_fable", False))
+            ev_active = bool(getattr(ev, "is_active", False))
+
+            time_s = " · ".join(p for p in (ev_countdown, ev_reset_lbl) if p)
+            if ev_kind == "unlock":
+                p_lbl, p_role, p_bg = "🔓 UNLOCK", "good_text", "belkins_good_pill"
+            elif ev_kind == "perishable":
+                p_lbl, p_role, p_bg = "⏳ USE", "warn_text", "belkins_warn_pill"
+            else:
+                p_lbl, p_role, p_bg = "↺", "belkins_cmm_sub", "belkins_plan_pill"
+
+            glyph = "✦" if ev_vendor == "claude" else "◈"
+            glyph_role = "belkins_claude_rule" if ev_vendor == "claude" else "belkins_codex_rule"
+            label_s = f"{ev_alias} · {ev_window}" if ev_window else ev_alias
+            lbl_role = "belkins_cmm_sub" if (ev_disabled or ev_no_fable) else "label"
+            time_role = "good_text" if (ev_kind == "unlock" and ev_secs <= 3_600.0) else "belkins_cmm_sub"
+
+            ev_act: Callable[[], Any] | None = None
+            if ev_kind == "perishable" and not ev_disabled and not ev_active and not ev_no_fable:
+                if ev_vendor == "claude" and callable(actions.switch_to):
+                    ev_act = lambda s=ev_slot: actions.switch_to(s)
+                elif ev_vendor == "codex" and callable(actions.switch_codex):
+                    target_alias = codex_alias_by_slot.get(ev_slot, ev_alias)
+                    if target_alias:
+                        ev_act = lambda a=target_alias: actions.switch_codex(a)
+
+            def draw_event_row(
+                pen: Any,
+                y0: float,
+                g: str = glyph,
+                gr: str = glyph_role,
+                lbl: str = label_s,
+                lr: str = lbl_role,
+                pl: str = p_lbl,
+                pr: str = p_role,
+                pb: str = p_bg,
+                ts: str = time_s,
+                tr: str = time_role,
+            ) -> float:
+                b = y0 + 16.5
+                tw_time = text(pen, ts, "num_small", tr, X1, b, right=True, maxw=112.0)
+                pw_st = _pill_w(pen, pl)
+                pill_x = X1 - tw_time - 6.0 - pw_st
+                pen.pill(pl, pill_x, b - 0.5, F["tag"][0], role=pr, bg=pb, weight="semibold")
+                gw = text(pen, g, "caption_med", gr, X0 + 2.0, b)
+                text(
+                    pen,
+                    lbl,
+                    "caption_med",
+                    lr,
+                    X0 + 2.0 + gw + 4.5,
+                    b,
+                    maxw=max(42.0, pill_x - (X0 + 2.0 + gw + 10.0)),
+                )
+                return b + 9.0
+
+            v_label = "Claude" if ev_vendor == "claude" else "Codex"
+            used_s = format_pct(getattr(ev, "used_pct", None))
+            free_s = format_pct(getattr(ev, "free_pct", None))
+            tip_lines = [
+                f"{v_label} · {ev_alias} ({ev_window})",
+                f"Used {used_s} · Free {free_s} · Resets {ev_reset_lbl} (in {ev_countdown})",
+            ]
+            if ev_act is not None:
+                tip_lines.append("Click to switch straight onto this seat before quota expires")
+            ev_tip = "\n".join(tip_lines)
+
+            card.add(
+                draw_event_row,
+                key=f"{key_prefix}-ev-{idx}",
+                ax=f"{v_label} {ev_alias} {ev_window}: {p_lbl}, {time_s}",
+                tooltip=ev_tip,
+                action=ev_act,
+                keep_open=False,
+                **(ROW_HL if ev_act is not None else {}),
+            )
+
+    # 4. 1-Line Smart Fleet Advisor Strip (when recommendation is actionable)
+    rec_kind = str(getattr(rec, "kind", "") or "") if rec is not None else ""
+    rec_headline = str(getattr(rec, "headline", "") or "").strip() if rec is not None else ""
+    rec_detail = str(getattr(rec, "detail", "") or "").strip() if rec is not None else ""
+    if rec_kind in ("burn_perishable", "use_reset_credit", "unlock_soon", "relogin_capacity") and rec_headline:
+        adv_style = {
+            "use_reset_credit": ("belkins_good_pill", "good_text", "bolt.fill"),
+            "burn_perishable": ("belkins_warn_pill", "warn_text", "hourglass"),
+            "unlock_soon": ("belkins_good_pill", "good_text", "lock.open.fill"),
+            "relogin_capacity": ("belkins_warn_pill", "warn_text", "exclamationmark.triangle.fill"),
+        }[rec_kind]
+        adv_bg, adv_role, adv_ic = adv_style
+
+        adv_act: Callable[[], Any] | None = None
+        adv_keep_open = True
+        tv = getattr(rec, "target_vendor", None)
+        ts_raw = getattr(rec, "target_slot", None)
+        if rec_kind == "burn_perishable" and tv and ts_raw is not None:
+            if tv == "claude" and callable(actions.switch_to):
+                adv_act = lambda s=int(ts_raw): actions.switch_to(s)
+                adv_keep_open = False
+            elif tv == "codex" and callable(actions.switch_codex):
+                ta = codex_alias_by_slot.get(int(ts_raw), "")
+                if ta:
+                    adv_act = lambda a=ta: actions.switch_codex(a)
+                    adv_keep_open = False
+        elif rec_kind == "relogin_capacity":
+            adv_act = lambda t=("codex" if tv == "codex" else "claude"): set_active_tab(t)
+            adv_keep_open = True
+
+        def draw_advisor(pen: Any, y0: float) -> float:
+            ay = y0 + 4.0
+            ah = 22.0
+            pen.rrect(X0, ay, W_INNER, ah, 6.0, adv_bg)
+            symbol(pen, adv_ic, X0 + 7.0, ay + ah / 2.0, 9.5, adv_role, "semibold")
+            text(pen, rec_headline, "caption_med", adv_role, X0 + 20.5, ay + 14.5, maxw=W_INNER - 26.0)
+            return ay + ah + 3.0
+
+        adv_tip = f"{rec_headline}\n{rec_detail}" if rec_detail else rec_headline
+        card.add(
+            draw_advisor,
+            key=f"{key_prefix}-advisor",
+            ax=f"Fleet Advisor: {rec_headline}. {rec_detail}".strip(),
+            tooltip=adv_tip,
+            action=adv_act,
+            keep_open=adv_keep_open,
+            **(ROW_HL if adv_act is not None else {}),
+        )
+
+    card.add(_gap(6.0), key=f"{key_prefix}-foot")
+    return card
+
+
 def _hub_bento_blocks(
     claude_spec: dict[str, Any] | None,
     codex_spec: dict[str, Any] | None,
@@ -3073,6 +3550,7 @@ def _hub_bento_blocks(
     *,
     view_mode: str = "luxury",
     key_prefix: str = "belkins-hub",
+    radar: Any = None,
 ) -> list[Block]:
     """Build Unified Dual-Party Command Center supporting all 4 Hub View Styles (`luxury`, `detailed`, `bento`, `cleanmymac`)."""
     out: list[Block] = []
@@ -3307,6 +3785,37 @@ def _hub_bento_blocks(
                 expand_attn=expand_all,
                 extra_notes=list(extras) if not claude_spec else None,
             ).blocks(4.0, 4.0)
+
+    # 3b. Unified Fleet Reset Radar Card (compact top-3 + expandable top-8 in-menu!)
+    if radar is not None:
+        radar_events = tuple(getattr(radar, "events", ()) or ())
+        compact_radar = _reset_radar_card(
+            radar,
+            snapshot,
+            actions,
+            expanded=False,
+            key_prefix=f"{key_prefix}-radar",
+        )
+        if compact_radar is not None:
+            compact_blocks = compact_radar.blocks(4.0, 4.0)
+            if len(radar_events) > 3:
+                for blk in compact_blocks:
+                    blk.is_visible = lambda: not _RESET_RADAR_EXPANDED
+                out += compact_blocks
+                exp_radar = _reset_radar_card(
+                    radar,
+                    snapshot,
+                    actions,
+                    expanded=True,
+                    key_prefix=f"{key_prefix}-radar-exp",
+                )
+                if exp_radar is not None:
+                    exp_blocks = exp_radar.blocks(4.0, 4.0)
+                    for blk in exp_blocks:
+                        blk.is_visible = lambda: bool(_RESET_RADAR_EXPANDED)
+                    out += exp_blocks
+            else:
+                out += compact_blocks
 
     # 4. Minimalist Side-by-Side Single-Line Telemetry Pills (`Today` & `30d`)
     cost = getattr(snapshot, "cost", None)
@@ -4240,6 +4749,27 @@ def _config_card(snapshot: Any, actions: ThemeActions, subtab: str = "header") -
         ],
     )
 
+    _add_segmented_bar(
+        "belkins-cfg-radar-bar",
+        "RESET RADAR",
+        [
+            (
+                lambda: f"Unlock: {'ON' if bool(_get_s('title_show_next_unlock', False)) else 'OFF'}",
+                "lock.open.fill",
+                lambda: bool(_get_s("title_show_next_unlock", False)),
+                lambda: _toggle_key("title_show_next_unlock", "Next Unlock Chip", False),
+                "Show next capped Claude Fable / Codex unlock countdown (🔓3h) in the menu bar",
+            ),
+            (
+                lambda: f"Reset Bell: {'ON' if bool(_get_s('reset_imminent_alert_enabled', True)) else 'OFF'}",
+                "bell.badge.fill",
+                lambda: bool(_get_s("reset_imminent_alert_enabled", True)),
+                lambda: _toggle_key("reset_imminent_alert_enabled", "Reset & Credit Alerts", True),
+                "Notify once when a capped seat unlocks in <=15m or a Codex seat >=90% has usable reset credits",
+            ),
+        ],
+    )
+
     # 8. Core Engine Switches & Classic Menu Tail (4-Segment Bar with explicit :ON / :OFF labels!)
     def _trig_update() -> None:
         global _LAST_CFG_NOTE
@@ -4340,10 +4870,15 @@ def _tag_blocks(
 ) -> list[Block]:
     for b in blocks:
         b.tab = tab_id
-        if extra_pred is None:
+        prev = b.is_visible
+        if extra_pred is None and prev is None:
             b.is_visible = lambda t=tab_id: _ACTIVE_TAB == t
-        else:
+        elif extra_pred is None:
+            b.is_visible = lambda t=tab_id, pv=prev: (_ACTIVE_TAB == t) and pv()
+        elif prev is None:
             b.is_visible = lambda t=tab_id, p=extra_pred: (_ACTIVE_TAB == t) and p()
+        else:
+            b.is_visible = lambda t=tab_id, p=extra_pred, pv=prev: (_ACTIVE_TAB == t) and p() and pv()
     return blocks
 
 
@@ -4492,6 +5027,7 @@ def build(snapshot: Any, now: float, actions: ThemeActions | None = None) -> lis
 
     # 2. Tab "party" ("Hub"): Pre-build all 4 Hub View Styles (`luxury`, `detailed`, `bento`, `cleanmymac`) for instant in-menu switching!
     attn = _attention_spec(A, snapshot, acts)
+    radar = _fleet_reset_radar(A, snapshot, now)
     initial_hub = _cur_hub_view(snapshot)
     for hub_mode in _HUB_VIEWS:
         kp = "belkins-hub" if hub_mode == initial_hub else f"belkins-hub-{hub_mode}"
@@ -4504,6 +5040,7 @@ def build(snapshot: Any, now: float, actions: ThemeActions | None = None) -> lis
                 acts,
                 view_mode=hub_mode,
                 key_prefix=kp,
+                radar=radar,
             ),
             "party",
             extra_pred=lambda m=hub_mode: _cur_hub_view(snapshot) == m,

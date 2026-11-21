@@ -2901,6 +2901,7 @@ SETTINGS_DEFAULTS: dict[str, Any] = {
     # --- menu design (wave 2, 2026-09-25) ---------------------------------
     "title_merge_alerts": False,
     "title_show_reset_credit": True,
+    "title_show_next_unlock": False,
     "menu_layout_classic": False,
     # --- menu themes (design 3, 2026-09-25; belkins default) -------------
     "menu_theme": "belkins",
@@ -2913,6 +2914,7 @@ SETTINGS_DEFAULTS: dict[str, Any] = {
     # --- smart fleet & ROI upgrades --------------------------------------
     "codex_autoswitch_enabled": False,
     "expiring_quota_alert_enabled": True,
+    "reset_imminent_alert_enabled": True,
     "telegram_commands_enabled": True,
     "global_hotkeys_enabled": False,
     "monthly_subscription_usd": 0,
@@ -3062,6 +3064,18 @@ Notification keys (roadmap item 7, ``notify.py``):
     countdown becomes a green ``↺now`` (four characters, the same budget) and
     the compact title appends ``↺``. Display only - nothing consumes a credit.
     Off = today's countdown. Listed in Settings only where Codex exists.
+
+``title_show_next_unlock``
+    Defaults ``False`` (opt-in). When enabled (and not in compact or icon-only
+    mode), appends a compact next-unlock token (e.g. ``🔓3h``) when a capped
+    Claude Fable or Codex seat is unlocking within 24 hours. Off by default so
+    the steady-state menu-bar title stays byte-for-byte unchanged.
+
+``reset_imminent_alert_enabled``
+    Defaults ``True``. Gates ledger-deduped imminent-unlock alerts (capped
+    Claude Fable or Codex seat unlocking within 15 minutes) and high-usage
+    Codex reset-credit alerts (>= 90% with ``reset_credits_usable > 0``).
+    Still gated by ``notifications_enabled``.
 
 ``menu_layout_classic``
     Defaults ``False`` (design wave 2). The dropdown is the glance layout
